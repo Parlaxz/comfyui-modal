@@ -25,6 +25,10 @@ DEFAULT_MAX_EVENTS = 256
 DEFAULT_MAX_RUNS = 32
 DEFAULT_TTL_SECONDS = 15 * 60
 
+# Studio's own Golden adapter.  It exists solely to carry the live stage
+# progress bridge; the ordinary v2ctl Golden methods must never contain it.
+STUDIO_STREAM_METHOD = "run_golden_studio_stream"
+
 
 class GoldenRunError(ValueError):
     """A Golden request was invalid or could not be submitted safely."""
@@ -250,10 +254,20 @@ def _materialize_image(result: Any, request_id: str) -> dict[str, Any]:
         (out_dir / name).write_bytes(raw)
 
         expected_sha = str(result.get("image_sha256") or "")
+        observed = ""
         if expected_sha:
             observed = hashlib.sha256(raw).hexdigest()
             data["materialized_sha256"] = observed
             data["materialized_sha256_match"] = observed == expected_sha
+            if observed != expected_sha:
+                # A mis-hashed write must never be presented as a successful
+                # materialization.  Remove it and fail closed: no output_paths
+                # is published, so the Studio canvas/carousel cannot paint it.
+                try:
+                    (out_dir / name).unlink()
+                except OSError:
+                    pass
+                raise ValueError("materialized_sha256_mismatch")
 
         data["output_paths"] = [name]
         # The inline copy is large and no longer needed once it is on disk.
@@ -365,11 +379,16 @@ async def run_golden_workflow(
             if handle_factory is not None
             else _default_handle_factory(profile, workspace)
         )
-        remote_method = getattr(handle, profile.target["method"])
+        # Studio MUST go through the dedicated Studio adapter.  Calling the
+        # profile's own Golden method would put the stage-progress bridge
+        # (observer, queue, extra task) inside the ordinary v2ctl path, which
+        # is exactly what that path must never contain.  The profile's target
+        # still decides the real Golden class/mode and is reported verbatim.
+        remote_method = getattr(handle, STUDIO_STREAM_METHOD)
         remote_gen = getattr(remote_method, "remote_gen", None)
         if remote_gen is None or not callable(getattr(remote_gen, "aio", None)):
             raise GoldenRunError(
-                f"resolved target method {profile.target['method']!r} is not a stream"
+                f"Studio adapter {STUDIO_STREAM_METHOD!r} is not a stream"
             )
         stream = remote_gen.aio(payload)
         if hasattr(stream, "__await__"):

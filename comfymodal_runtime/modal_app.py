@@ -23530,9 +23530,132 @@ class ModalRuntimeEntrypoint:
         async for event in self._run_golden_stream_impl(request):
             yield event
 
+    async def run_golden_studio_stream(
+        self,
+        request: Mapping[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Studio-only Golden adapter with bounded live stage delivery.
+
+        The ordinary v2ctl methods never enter this method.  Keeping the queue,
+        observer, and execution task here makes the Studio progress bridge
+        structurally separate from the plain Golden await.
+        """
+        if not isinstance(request, Mapping):
+            yield {
+                "type": "error",
+                "request_id": "",
+                "message": "golden_request_must_be_mapping",
+            }
+            return
+
+        loop = asyncio.get_running_loop()
+        _loop_thread = threading.current_thread()
+        stage_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
+        delivery_lock = threading.Lock()
+        delivery_failure: dict[str, str] | None = None
+
+        def _record_delivery_failure(exc: BaseException) -> None:
+            nonlocal delivery_failure
+            with delivery_lock:
+                if delivery_failure is None:
+                    delivery_failure = {
+                        "error_type": type(exc).__name__,
+                        "message": str(exc)[:512],
+                    }
+
+        def _put_stage_event(event: dict[str, Any]) -> None:
+            try:
+                stage_queue.put_nowait(event)
+            except BaseException as exc:
+                _record_delivery_failure(exc)
+
+        def _observe_golden_stage(event: dict[str, Any]) -> None:
+            try:
+                if threading.current_thread() is _loop_thread:
+                    # Already on the loop: deliver directly and skip the
+                    # self-pipe write call_soon_threadsafe would perform.
+                    _put_stage_event(event)
+                else:
+                    # Stage callbacks may run on Golden's private worker
+                    # thread, and asyncio.Queue is not thread-safe.
+                    loop.call_soon_threadsafe(_put_stage_event, event)
+            except BaseException as exc:
+                _record_delivery_failure(exc)
+
+        async def _studio_stage_stream(
+            execute_golden: Callable[..., Any],
+            golden_request: Any,
+            **execute_kwargs: Any,
+        ) -> AsyncIterator[Any]:
+            # No polling.  A previous revision re-armed a 50 ms
+            # asyncio.wait_for timer for the whole request purely to notice
+            # completion, which added hundreds of timer/task-switch cycles to
+            # the same event loop that must also service Golden's source
+            # drain.  The sentinel closes the stream instead, so the consumer
+            # costs exactly one wakeup per stage boundary plus one.
+            done_marker: dict[str, Any] = {"type": "__golden_stage_stream_done__"}
+
+            async def _execute_and_signal() -> Any:
+                try:
+                    return await execute_golden(
+                        golden_request,
+                        **execute_kwargs,
+                        stage_observer=_observe_golden_stage,
+                    )
+                finally:
+                    # Runs on the loop, so put_nowait is safe here.
+                    stage_queue.put_nowait(done_marker)
+
+            execution_task = asyncio.create_task(_execute_and_signal())
+            try:
+                while True:
+                    item = await stage_queue.get()
+                    if item is done_marker:
+                        break
+                    yield item
+                # Drain anything a worker thread delivered after the sentinel.
+                while True:
+                    try:
+                        item = stage_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if item is done_marker:
+                        continue
+                    yield item
+                with delivery_lock:
+                    failure = dict(delivery_failure) if delivery_failure else None
+                if failure is not None:
+                    raise RuntimeError(
+                        "golden_stage_event_delivery_failed:" + json.dumps(
+                            failure, sort_keys=True
+                        )
+                    )
+                yield ("__golden_execution_result__", await execution_task)
+            finally:
+                if not execution_task.done():
+                    execution_task.cancel()
+                try:
+                    await execution_task
+                except BaseException:
+                    pass
+
+        studio_request = dict(request)
+        # Streaming is selected by the METHOD, never by a payload key.  There is
+        # deliberately no request flag that can turn the ordinary adapter into
+        # a streaming one.
+        async for event in self._run_golden_stream_impl(
+            studio_request,
+            studio_entrypoint=True,
+            stage_stream_factory=_studio_stage_stream,
+        ):
+            yield event
+
     async def _run_golden_stream_impl(
         self,
         request: Mapping[str, Any],
+        *,
+        studio_entrypoint: bool = False,
+        stage_stream_factory: Callable[..., AsyncIterator[Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Thin Golden Modal adapter: validate/normalize the request, then hand
         off to ``golden_serial_execute`` exactly once.
@@ -23669,6 +23792,11 @@ class ModalRuntimeEntrypoint:
             identity_telemetry["deep_trace_level_effective"] = "off"
             identity_telemetry["output_durability_mode"] = output_policy.mode
             identity_telemetry["durability_requested"] = output_policy.durability_requested
+            request_origin_info = request.get("request_origin_info")
+            if isinstance(request_origin_info, Mapping):
+                identity_telemetry["request_origin_info"] = copy.deepcopy(
+                    dict(request_origin_info)
+                )
             identity_telemetry.update(
                 _golden_sage_provenance(self)
             )
@@ -23929,6 +24057,10 @@ class ModalRuntimeEntrypoint:
                     or key in {"attention_backend_configured", "golden_mode"}
                 }
             )
+            if isinstance(request_origin_info, Mapping):
+                golden_extra_data["request_origin_info"] = copy.deepcopy(
+                    dict(request_origin_info)
+                )
             if resolve_clip_residency() == "fp32_cast_once":
                 golden_extra_data["clip_source_identity"] = _golden_ra9g_identity(
                     prompt, extra_data_raw,
@@ -23940,6 +24072,7 @@ class ModalRuntimeEntrypoint:
                 attention_backend=attention_backend,
                 cpu_qd2_prefetch=cpu_prefetch_raw,
                 deep_trace=_full_trace_request_requested,
+                studio_advisory=studio_entrypoint,
             )
             # ── Golden DynamicVRAM activation seam (official-equivalent) ──
             # Exactly one call per request; the callee is idempotent per
@@ -24036,16 +24169,17 @@ class ModalRuntimeEntrypoint:
                     if _full_trace_claimed
                     else nullcontext()
                 )
-                stream_golden_stage_events = (
-                    request.get("stream_golden_stage_events") is True
+                execute_golden = (
+                    golden_parallel_execute
+                    if requested_mode == "parallel"
+                    else golden_serial_execute
                 )
                 with _golden_trace_scope:
-                    execute_golden = (
-                        golden_parallel_execute
-                        if requested_mode == "parallel"
-                        else golden_serial_execute
-                    )
-                    if not stream_golden_stage_events:
+                    if stage_stream_factory is None:
+                        # Ordinary v2ctl path: direct, unconditional, and free
+                        # of any Studio machinery.  No request-payload switch can
+                        # reach the branch below -- only run_golden_studio_stream
+                        # injects a factory, and it is the sole caller that does.
                         result = await execute_golden(
                             golden_request,
                             volume=volume,
@@ -24058,52 +24192,29 @@ class ModalRuntimeEntrypoint:
                             cpu_prefetch_ticket=cpu_prefetch_ticket,
                         )
                     else:
-                        stage_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
-
-                        def _observe_golden_stage(event: dict[str, Any]) -> None:
-                            try:
-                                stage_queue.put_nowait(event)
-                            except BaseException:
-                                pass
-
-                        execution_task = asyncio.create_task(
-                            execute_golden(
-                                golden_request,
-                                volume=volume,
-                                volume_mount_root=volume_mount_root,
-                                output_root=str(output_root),
-                                telemetry_path=str(telemetry_path),
-                                node_classes=node_classes,
-                                snapshot_proof=_golden_snapshot_proof_supplier,
-                                restore_metadata=restore_metadata,
-                                cpu_prefetch_ticket=cpu_prefetch_ticket,
-                                stage_observer=_observe_golden_stage,
-                            )
-                        )
-                if stream_golden_stage_events:
-                    try:
-                        while True:
-                            if execution_task.done():
-                                while True:
-                                    try:
-                                        yield stage_queue.get_nowait()
-                                    except asyncio.QueueEmpty:
-                                        break
-                                result = execution_task.result()
+                        # Studio-only.  The observer, the bounded queue and the
+                        # extra task exist solely for truthful live stage
+                        # delivery and never touch the ordinary path.
+                        async for _studio_item in stage_stream_factory(
+                            execute_golden,
+                            golden_request,
+                            volume=volume,
+                            volume_mount_root=volume_mount_root,
+                            output_root=str(output_root),
+                            telemetry_path=str(telemetry_path),
+                            node_classes=node_classes,
+                            snapshot_proof=_golden_snapshot_proof_supplier,
+                            restore_metadata=restore_metadata,
+                            cpu_prefetch_ticket=cpu_prefetch_ticket,
+                        ):
+                            if (
+                                isinstance(_studio_item, tuple)
+                                and len(_studio_item) == 2
+                                and _studio_item[0] == "__golden_execution_result__"
+                            ):
+                                result = _studio_item[1]
                                 break
-                            try:
-                                yield await asyncio.wait_for(
-                                    stage_queue.get(), timeout=0.05
-                                )
-                            except asyncio.TimeoutError:
-                                continue
-                    finally:
-                        if not execution_task.done():
-                            execution_task.cancel()
-                        try:
-                            await execution_task
-                        except BaseException:
-                            pass
+                            yield _studio_item
             finally:
                 golden_call_end_wall_ns = time.time_ns()
                 golden_call_end_mono_ns = time.monotonic_ns()
@@ -24581,6 +24692,7 @@ def _build_decorated_v2_class() -> type:
         "run_plan_stream", "run_prompt_stream",
         "run_golden_serial_stream",
         "run_golden_parallel_stream",
+        "run_golden_studio_stream",
         "read_output_asset", "run_checkpoint_stream",
         "publish_restore_plan", "run_rehoming_experiment",
         "run_numa_experiment",
@@ -24607,6 +24719,7 @@ def _build_decorated_v2_class() -> type:
         "read_output_asset",
         "run_golden_serial_stream",
         "run_golden_parallel_stream",
+        "run_golden_studio_stream",
         "run_env_probe", "run_entry_probe",
         "run_numa_experiment", "run_rehoming_experiment",
         "publish_restore_plan",
@@ -24725,6 +24838,13 @@ def _build_decorated_v2_class() -> type:
         cls,
         "run_golden_serial_stream",
         _modal.method(is_generator=True)(cls.run_golden_serial_stream),
+    )
+    # Studio-only Golden adapter.  Separate from the ordinary adapter so the
+    # live stage-progress bridge cannot exist on the v2ctl path at all.
+    setattr(
+        cls,
+        "run_golden_studio_stream",
+        _modal.method(is_generator=True)(cls.run_golden_studio_stream),
     )
     setattr(
         cls,

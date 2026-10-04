@@ -229,16 +229,24 @@ class StructuralAdmissionStaysFailClosedTests(unittest.TestCase):
         self.assertIn("canonical_nodes_duplicate", str(ctx.exception))
 
     def test_replacement_models_are_accepted(self) -> None:
-        """A caller-selected workflow may name replacement CLIP/UNET/VAE.
+        """A caller-selected Studio workflow may name replacement CLIP/UNET/VAE.
 
         Structural admission is by node class and cardinality, so a replacement
-        triple is admitted and its declared identities are returned as the
-        values the run must load.
+        triple is admitted for a Studio run and its declared identities are
+        returned as the values the run must load. The ordinary Golden path does
+        NOT get this: it stays fail-closed unless the caller is Studio.
         """
         prompt = _prompt(clip_name="replacement_clip.safetensors")
         prompt["1"]["inputs"]["unet_name"] = "replacement_unet.safetensors"
         prompt["3"]["inputs"]["vae_name"] = "replacement_vae.safetensors"
-        node_map = resolve_golden_node_map(prompt)
+
+        # Ordinary Golden: fail closed on a non-canonical declared identity.
+        with self.assertRaises(RuntimeError) as ctx:
+            resolve_golden_node_map(prompt)
+        self.assertIn("golden_noncanonical_model_identity", str(ctx.exception))
+
+        # Studio: admitted, identities returned.
+        node_map = resolve_golden_node_map(prompt, allow_replacements=True)
         self.assertEqual(node_map.clip_name, "replacement_clip.safetensors")
         self.assertEqual(node_map.unet_name, "replacement_unet.safetensors")
         self.assertEqual(node_map.vae_name, "replacement_vae.safetensors")

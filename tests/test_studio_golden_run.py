@@ -155,8 +155,11 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
 
             return events()
 
+    # Studio must reach Golden through the dedicated Studio adapter, never
+    # through the profile's own method: the ordinary method must stay free of
+    # the progress bridge.
     handle = SimpleNamespace(
-        run_golden_parallel_stream=SimpleNamespace(remote_gen=RemoteGenerator())
+        run_golden_studio_stream=SimpleNamespace(remote_gen=RemoteGenerator())
     )
     bundle = {
         "status": "ok",
@@ -191,6 +194,5 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
     )
     assert result["status"] == "ok"
     assert captured["payload"]["prompt"]["1"]["inputs"]["strength"] == 7
-    assert captured["payload"]["stream_golden_stage_events"] is True
     assert captured["payload"]["golden_mode"] == "parallel"
     assert store.read("studio-test")["terminal"] is True

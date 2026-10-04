@@ -865,6 +865,9 @@ class GoldenRequest:
     # source owner.
     cpu_qd2_prefetch: bool = False
     deep_trace: bool = False
+    # Only the dedicated Studio Modal entrypoint may enable caller-selected
+    # workflow/model identities.  Ordinary v2ctl requests remain fail-closed.
+    studio_advisory: bool = False
 
     def __post_init__(self) -> None:
         if self.attention_backend is not None:
@@ -877,6 +880,8 @@ class GoldenRequest:
         if not isinstance(self.cpu_qd2_prefetch, bool):
             raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
         object.__setattr__(self, "deep_trace", normalize_deep_trace_level(self.deep_trace) == "full")
+        if not isinstance(self.studio_advisory, bool):
+            raise ValueError("golden_studio_advisory_must_be_bool")
 
     @property
     def clip_residency_mode(self) -> str:
@@ -1501,6 +1506,7 @@ class GoldenTelemetryRecorder:
         self._stage_sequence = 0
         self._intervals: dict[str, GoldenStageInterval] = {}
         self._events: list[dict] = []
+        self._stage_observer_failures: list[dict[str, Any]] = []
         self._open_stage: Optional[str] = None
         self.allow_stage_overlap = False
         self._open_stages: set[str] = set()
@@ -1685,12 +1691,12 @@ class GoldenTelemetryRecorder:
         ok: Optional[bool],
         exc: Optional[BaseException] = None,
     ) -> None:
-        """Publish only authoritative stage-boundary marks, best effort.
+        """Publish authoritative stage-boundary marks without failing Golden.
 
         The existing stage lock also guards the per-request sequence counter.
         The callback is deliberately invoked under that lock so parallel stage
-        boundaries cannot be observed out of sequence; queue callbacks are
-        non-blocking and every callback failure is isolated from Golden.
+        boundaries cannot be observed out of sequence. Observer failures are
+        isolated from Golden itself, but retained as explicit evidence.
         """
         observer = self._stage_observer
         if observer is None:
@@ -1714,8 +1720,13 @@ class GoldenTelemetryRecorder:
                 event["error"] = f"{type(exc).__name__}: {exc}"[:512]
             try:
                 observer(event)
-            except BaseException:
-                pass
+            except BaseException as observer_exc:
+                self._stage_observer_failures.append({
+                    "stage": interval.name,
+                    "phase": phase,
+                    "sequence": self._stage_sequence,
+                    "error": f"{type(observer_exc).__name__}: {observer_exc}"[:512],
+                })
 
     def _require_open(self, name: str) -> GoldenStageInterval:
         interval = self._intervals.get(name)
@@ -1901,6 +1912,10 @@ class GoldenTelemetryRecorder:
     def events(self) -> list[dict]:
         return copy.deepcopy(self._events)
 
+    @property
+    def stage_observer_failures(self) -> list[dict]:
+        return copy.deepcopy(self._stage_observer_failures)
+
     # -- seriality reconciliation -------------------------------------------
 
     def reconcile_seriality(self) -> dict:
@@ -2008,6 +2023,7 @@ class GoldenTelemetryRecorder:
                 for iv in self._intervals.values()
             ],
             "events": copy.deepcopy(self._events),
+            "stage_observer_failures": copy.deepcopy(self._stage_observer_failures),
         }
         if self.clip_forward_timing:
             payload["clip_forward_timing"] = copy.deepcopy(self.clip_forward_timing)
@@ -8288,6 +8304,7 @@ class GoldenFinalResult:
     # never blocked execution.
     workflow_sha_match: Optional[bool] = None
     workflow_sha_warning: Optional[dict] = None
+    stage_observer_failures: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Keep manually constructed historical strict results compatible while
@@ -8476,6 +8493,7 @@ class GoldenSession:
             "deep_trace_level_requested": request.deep_trace_level,
             "deep_trace_level_effective": request.deep_trace_level,
             "deep_trace_requested": bool(request.deep_trace),
+            "studio_advisory": bool(request.studio_advisory),
         }
         if isinstance(request.extra_data, Mapping):
             self.run_identity.update(
@@ -8490,6 +8508,11 @@ class GoldenSession:
                     if key in request.extra_data
                 }
             )
+            request_origin_info = request.extra_data.get("request_origin_info")
+            if isinstance(request_origin_info, Mapping):
+                self.run_identity["request_origin_info"] = copy.deepcopy(
+                    dict(request_origin_info)
+                )
         self.recorder.event("golden_qd_transport_selector", arm=self.qd_transport_arm)
         self.recorder.run_identity = dict(self.run_identity)
 
@@ -8626,6 +8649,7 @@ class GoldenSession:
             golden_mode=self.golden_mode,
             workflow_sha_match=self.workflow_sha_match,
             workflow_sha_warning=self.workflow_sha_warning,
+            stage_observer_failures=self.recorder.stage_observer_failures,
         )
 
 
@@ -9339,7 +9363,12 @@ def _sampler_bound_patcher(session: GoldenSession) -> Any:
 # ── Canonical workflow resolution (pure) ──────────────────────────────────
 
 
-def resolve_golden_node_map(prompt: dict, *, contract: Optional[GoldenWorkflowContract] = None) -> GoldenNodeMap:
+def resolve_golden_node_map(
+    prompt: dict,
+    *,
+    contract: Optional[GoldenWorkflowContract] = None,
+    allow_replacements: bool = False,
+) -> GoldenNodeMap:
     """Locate the canonical nodes in the workflow prompt.  Pure; fails closed.
 
     Structural admission is by node *class* and cardinality: exactly one
@@ -9347,13 +9376,9 @@ def resolve_golden_node_map(prompt: dict, *, contract: Optional[GoldenWorkflowCo
     sampler of the contract's sampler class.  A missing or duplicated role is
     rejected.
 
-    Model identity defaults to the contract's canonical CLIP/UNET/VAE, but a
-    caller-selected workflow may name replacements.  The loader nodes' own
-    ``clip_name`` / ``type`` / ``unet_name`` / ``vae_name`` inputs are the
-    authoritative values the run must load, and are returned on the node map so
-    the caller can build the effective contract.  Defaults therefore apply when
-    the workflow uses the canonical triple, and replacements are accepted
-    without weakening any structural rule.
+    Model identity defaults to the contract's canonical CLIP/UNET/VAE.  Studio
+    may explicitly admit declared replacements; ordinary requests remain
+    fail-closed against the canonical triple.
 
     Only the single-checkpoint CLIPLoader shape is supported for workflow
     discovery; multi-checkpoint specs fail closed here (no multi-loader
@@ -9418,6 +9443,15 @@ def resolve_golden_node_map(prompt: dict, *, contract: Optional[GoldenWorkflowCo
         raise RuntimeError("golden_unet_loader_requires_unet_name")
     if not declared.get("vae_name"):
         raise RuntimeError("golden_vae_loader_requires_vae_name")
+    canonical_clip = spec.checkpoint_names[0]
+    canonical_models = (
+        declared["clip_name"] == canonical_clip
+        and declared["clip_type"] == spec.clip_type
+        and declared["unet_name"] == contract.unet_name
+        and declared["vae_name"] == contract.vae_name
+    )
+    if not canonical_models and not allow_replacements:
+        raise RuntimeError("golden_noncanonical_model_identity")
     return GoldenNodeMap(
         clip_loader_id=resolved["clip_loader"],
         clip_encode_id=resolved["clip_encode"],
@@ -10151,14 +10185,6 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
         workflow_hash_check_enabled = workflow_hash_check_value not in {
             "0", "false", "no", "off"
         }
-        # The workflow SHA comparison is ADVISORY.  Golden is driven by
-        # Studio runs that legitimately carry a caller-selected workflow and
-        # caller-applied control values, so the prompt is not expected to be
-        # byte-identical to the frozen benchmark prompt.  Hash computation and
-        # telemetry are unconditional: a mismatch is recorded, logged, and
-        # carried on the result so callers can still detect it, but it never
-        # blocks execution.  Structural admission is owned by
-        # ``resolve_golden_node_map`` below, which fails closed.
         workflow_sha_match = actual_sha == contract.workflow_sha256
         workflow_sha_warning = None
         if not workflow_sha_match:
@@ -10167,16 +10193,17 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
                 "observed": actual_sha,
                 "reason": "workflow_sha_mismatch",
             }
-            LOG.warning(
-                "Golden workflow SHA mismatch is warning-only: expected=%s observed=%s",
-                contract.workflow_sha256,
-                actual_sha,
-            )
-            print(
-                "[v2.golden_p1] WARNING workflow_sha_mismatch "
-                f"expected={contract.workflow_sha256} observed={actual_sha}",
-                flush=True,
-            )
+            if session.request.studio_advisory:
+                LOG.warning(
+                    "Studio Golden workflow SHA mismatch is advisory: expected=%s observed=%s",
+                    contract.workflow_sha256,
+                    actual_sha,
+                )
+                print(
+                    "[v2.golden_p1] WARNING workflow_sha_mismatch "
+                    f"expected={contract.workflow_sha256} observed={actual_sha}",
+                    flush=True,
+                )
         rec.event(
             "golden_workflow_hash_check",
             actual_sha256=actual_sha,
@@ -10186,10 +10213,17 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
             bypassed=not workflow_hash_check_enabled,
             workflow_sha_match=workflow_sha_match,
             workflow_sha_warning=workflow_sha_warning,
+            advisory=bool(session.request.studio_advisory),
         )
         session.workflow_sha_match = workflow_sha_match
         session.workflow_sha_warning = workflow_sha_warning
-        node_map = resolve_golden_node_map(session.request.prompt, contract=contract)
+        if not workflow_sha_match and workflow_hash_check_enabled and not session.request.studio_advisory:
+            raise RuntimeError("golden_workflow_sha_mismatch")
+        node_map = resolve_golden_node_map(
+            session.request.prompt,
+            contract=contract,
+            allow_replacements=session.request.studio_advisory,
+        )
         session.node_map = node_map
 
         import folder_paths  # upstream ComfyUI module (allowed import)
@@ -11766,7 +11800,7 @@ async def golden_clip_load(
     clip_lifecycle_phase = "constructor_preflight"
     residency = getattr(session, "clip_residency", "bf16")
     try:
-        contract = session.contract
+        contract = getattr(session, "effective_contract", None) or session.contract
         spec = contract.clip_spec or CANONICAL_CLIP_SPEC
         request = getattr(session, "request", None)
         residency = resolve_clip_residency(
@@ -13559,7 +13593,7 @@ async def golden_unet_load(
         import comfy.model_patcher as mp  # upstream
         import comfy.utils as cu  # upstream
 
-        contract = session.contract
+        contract = getattr(session, "effective_contract", None) or session.contract
         unet_path = session.model_paths["unet"]
         shared_transport = None
         shared_transport_task = None
@@ -14612,7 +14646,7 @@ async def golden_vae_load(
     try:
         import comfy.sd  # upstream
 
-        contract = session.contract
+        contract = getattr(session, "effective_contract", None) or session.contract
         transport_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
         if preloaded_transport is not None:
             # Loader-process experiment: reuse the worker's CUDA-IPC-mapped
