@@ -673,13 +673,16 @@ function statusDetail(overrides) {
     assert.equal(experimentRunSurface(modern), "modern", "modern workflow/version selection shows the modern section");
 
     // Workflow without a version is not yet a modern run selection → still
-    // the modern section, gated with a version-specific reason.
+    // the modern section, gated with a version-specific reason. Under the
+    // one-current-Workflow revision model a selected Workflow resolves to its
+    // current version server-side, so the gap is "no current version exists"
+    // rather than "pick a Version".
     const noVersion = makeState({ workflowId: "wf_1", workflowVersionId: "" });
     assert.equal(experimentRunSurface(noVersion), "modern", "workflow without version stays modern-gated");
     assert.equal(
       modernExperimentDisabledReason(noVersion),
-      "Select a Workflow Version before running an experiment.",
-      "version-only gap names the Version",
+      "The selected Workflow has no current version available for this experiment.",
+      "version-only gap reports that the Workflow has no current version",
     );
 
     // An in-flight/persisted active modern experiment forces the modern
