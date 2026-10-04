@@ -26,6 +26,24 @@ import {
   createRunEvent,
   createRunStore,
 } from "../web/studio-run-model.js";
+import {
+  createGoldenProgressState,
+  applyGoldenProgressPage,
+  markGoldenPostTerminal,
+  goldenProgressResponseAction,
+} from "../web/studio-golden-progress.js";
+import { resolveExecutionRunnable } from "../web/studio-workflow-run.js";
+import {
+  resolveRunImageUrl,
+  normalizeStudioRun,
+  resolveDirectRunSelection,
+  resolveSelectionResultKey,
+} from "../web/studio-run-normalizer.js";
+import {
+  saveRunResult,
+  loadRunResult,
+  clearAllRunResults,
+} from "../web/studio-playground-state.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -698,3 +716,234 @@ function buildLegacyForStatus(status) {
 }
 
 console.log("PASS: studio playground run controller unit tests");
+
+// ── 22. Generated output wins over workflow graph assets ──────────────────
+{
+  const run = {
+    primary_asset_id: "ast_c9bba02f54a6",
+    asset_id: "ast_c9bba02f54a6",
+    output_path: "golden_3a6a03064c7e6e01_123.png",
+  };
+  assert.equal(
+    resolveRunImageUrl(run, "/comfymodal"),
+    "/comfymodal/studio/outputs/golden_3a6a03064c7e6e01_123.png",
+    "AST graph assets must fall through to the generated output path",
+  );
+  const normalized = normalizeStudioRun(run, "/comfymodal");
+  assert.equal(normalized.imageUrl, "/comfymodal/studio/outputs/golden_3a6a03064c7e6e01_123.png");
+  section("22. AST assets never replace generated output images");
+}
+
+// ── 23. Persisted normalized output remains the canvas image ───────────────
+{
+  const previousStorage = globalThis.localStorage;
+  const values = new Map();
+  globalThis.localStorage = {
+    getItem: (key) => values.has(key) ? values.get(key) : null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+  };
+  try {
+    const run = normalizeStudioRun({
+      id: "run-persisted",
+      primary_asset_id: "ast_graph_thumbnail",
+      output_path: "golden_output.png",
+      status: "completed",
+    }, "/comfymodal");
+    saveRunResult("preset-a", "txt2img", run);
+    const loaded = loadRunResult("preset-a", "txt2img");
+    assert.equal(loaded.imageUrl, "/comfymodal/studio/outputs/golden_output.png");
+    assert.notEqual(loaded.imageUrl, "/comfymodal/assets/ast_graph_thumbnail");
+    section("23. Persisted run keeps the generated canvas URL");
+  } finally {
+    clearAllRunResults();
+    globalThis.localStorage = previousStorage;
+  }
+}
+
+//  24. Direct Golden results inherit the active Playground selection 
+{
+  // This is the modern Playground run shape: workflow selection lives in the
+  // workflow-run store, while the direct-result caller passes the exact
+  // payload selection to the result handler. The legacy selectedBackendId /
+  // _currentPreset fields are not required on this path.
+  const state = {
+    playground: {
+      _workflowRun: {
+        workflowId: "workflow-golden",
+        workflowVersionId: "version-golden",
+        presets: [{ preset_id: "preset-golden" }],
+        controlValues: { steps: 4 },
+        runContext: { mapping: {} },
+      },
+      selectedBackendId: "",
+      featureId: "txt2img",
+    },
+  };
+  const activeSelection = {
+    presetId: "",
+    featureId: state.playground.featureId,
+  };
+
+  const fallback = resolveDirectRunSelection(state, {}, activeSelection);
+  assert.deepEqual(fallback, {
+    presetId: "workflow-golden",
+    featureId: "txt2img",
+  }, "modern direct runs persist under workflow id");
+
+  assert.deepEqual(
+    resolveSelectionResultKey(state, state.playground._workflowRun),
+    fallback,
+    "save and reload resolve the same modern workflow key",
+  );
+
+  const metadata = resolveDirectRunSelection(state, {
+    studio_preset_id: "metadata-preset",
+    studio_feature_id: "metadata-feature",
+  }, activeSelection);
+  assert.deepEqual(metadata, {
+    presetId: "workflow-golden",
+    featureId: "txt2img",
+  }, "modern workflow identity takes precedence over response preset metadata");
+
+  assert.deepEqual(
+    resolveDirectRunSelection({ playground: {} }, {}),
+    { presetId: "", featureId: "" },
+    "unknown selection stays empty for the persistence guard",
+  );
+
+  const normalized = normalizeStudioRun({
+    id: "golden-direct",
+    status: "completed",
+    output_path: "golden_output.png",
+    extra: {
+      studio_preset_id: fallback.presetId,
+      studio_feature_id: fallback.featureId,
+    },
+  }, "/comfymodal");
+  assert.equal(normalized.presetId, "workflow-golden");
+  assert.equal(normalized.featureId, "txt2img");
+
+  const previousStorage = globalThis.localStorage;
+  const values = new Map();
+  globalThis.localStorage = {
+    getItem: (key) => values.has(key) ? values.get(key) : null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+  };
+  try {
+    const key = resolveSelectionResultKey(state, state.playground._workflowRun);
+    saveRunResult(key.presetId, key.featureId, normalized);
+    assert.equal(
+      loadRunResult(key.presetId, key.featureId).imageUrl,
+      normalized.imageUrl,
+      "reload queries the exact key used by modern save",
+    );
+  } finally {
+    clearAllRunResults();
+    globalThis.localStorage = previousStorage;
+  }
+  section("24. Direct Golden results persist the active selection ids");
+}
+
+//  21. Golden stage cursor pages are idempotent and POST owns completion 
+{
+  const notReady = { status: "error", message: "unknown or expired request_id" };
+  assert.equal(
+    goldenProgressResponseAction(notReady, false),
+    "retry",
+    "an unregistered request is retried quietly while the run is active",
+  );
+  assert.equal(
+    goldenProgressResponseAction(notReady, true),
+    "stop",
+    "an unavailable cursor is ignored once the run is terminal",
+  );
+  assert.equal(
+    goldenProgressResponseAction({ status: "error", message: "stage failed" }, false),
+    "error",
+    "genuine progress endpoint failures remain visible",
+  );
+
+  const state = createGoldenProgressState("req-1");
+  applyGoldenProgressPage(state, {
+    request_id: "req-1",
+    cursor: 1,
+    terminal: false,
+    events: [{
+      type: "golden_stage", request_id: "req-1", sequence: 1,
+      stage: "golden_clip_load", phase: "started",
+      entry_wall_ns: 1000000000, entry_monotonic_ns: 1000000000,
+    }],
+  });
+  applyGoldenProgressPage(state, {
+    request_id: "req-1",
+    cursor: 3,
+    terminal: false,
+    events: [
+      {
+        type: "golden_stage", request_id: "req-1", sequence: 2,
+        stage: "golden_clip_load", phase: "completed",
+        entry_wall_ns: 1000000000, entry_monotonic_ns: 1000000000,
+        end_wall_ns: 1040000000, end_monotonic_ns: 1040000000, ok: true,
+      },
+      {
+        type: "golden_stage", request_id: "req-1", sequence: 3,
+        stage: "golden_decode", phase: "started",
+        entry_wall_ns: 1050000000, entry_monotonic_ns: 1050000000,
+      },
+    ],
+  });
+  // Replaying the same cursor page does not duplicate visible stage rows.
+  applyGoldenProgressPage(state, {
+    request_id: "req-1", cursor: 3, terminal: false, events: [
+      {
+        type: "golden_stage", request_id: "req-1", sequence: 2,
+        stage: "golden_clip_load", phase: "completed",
+        entry_wall_ns: 1000000000, entry_monotonic_ns: 1000000000,
+        end_wall_ns: 1040000000, end_monotonic_ns: 1040000000, ok: true,
+      },
+    ],
+  });
+  assert.deepEqual(state.stages.map((stage) => stage.stage), ["golden_clip_load", "golden_decode"]);
+  assert.equal(state.stages[0].durationMs, 40);
+  assert.equal(state.terminalResult, false);
+  assert.ok(state.percent < 100, "stage completion cannot claim POST completion");
+  applyGoldenProgressPage(state, {
+    request_id: "other", cursor: 99, terminal: true,
+    events: [{ type: "golden_stage", request_id: "other", sequence: 9, stage: "wrong", phase: "completed" }],
+  });
+  assert.equal(state.stages.length, 2, "foreign request events are ignored");
+  markGoldenPostTerminal(state);
+  assert.equal(state.terminalResult, true);
+  assert.equal(state.percent, 100);
+  const failed = createGoldenProgressState("req-failed");
+  applyGoldenProgressPage(failed, {
+    request_id: "req-failed",
+    cursor: 2,
+    events: [{
+      type: "golden_stage", request_id: "req-failed", sequence: 1,
+      stage: "golden_unet_load", phase: "failed", error: "load failed",
+      entry_wall_ns: 1000000000, entry_monotonic_ns: 1000000000,
+      end_wall_ns: 1030000000, end_monotonic_ns: 1030000000, ok: false,
+    }],
+  });
+  assert.equal(failed.failedStage, "golden_unet_load");
+  assert.equal(failed.error, "load failed");
+  section("21. Golden cursor stage progress is ordered, timed, deduplicated, and POST-terminal");
+}
+
+// ── 22. Remote Golden execution gate ignores host-local reasons ───────────
+
+{
+  const blocked = {
+    runnable: false,
+    reasons: ["missing model: local-only.safetensors", "uninstalled custom node: LocalOnly"],
+  };
+  assert.deepEqual(resolveExecutionRunnable(blocked, true), {
+    runnable: true,
+    reasons: [],
+  });
+  assert.deepEqual(resolveExecutionRunnable(blocked, false), blocked);
+  section("22. Remote Golden execution gate ignores host-local reasons");
+}

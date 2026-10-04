@@ -330,7 +330,11 @@ export async function loadModalOptions(apiBase) {
     mode = window._comfyModalExecutionMode;
   }
   return Object.assign(
-    { execution_mode: mode || "v2" },
+    {
+      execution_mode: mode || "v2",
+      golden_profile: typeof (config.golden_profile || config.profile_name || config.profile) === "string"
+        ? (config.golden_profile || config.profile_name || config.profile) : null,
+    },
     buildModalOptions(source),
   );
 }

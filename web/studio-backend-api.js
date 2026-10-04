@@ -139,6 +139,16 @@ export async function runStudioPreset(apiBase, payload) {
   return data;
 }
 
+export async function listGoldenProfiles(apiBase) {
+  return apiFetch(apiBase, "/studio/golden/profiles");
+}
+
+export async function getGoldenRunProgress(apiBase, requestId, cursor) {
+  if (!requestId) return null;
+  const suffix = cursor != null ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return apiFetch(apiBase, `/studio/run-progress/${encodeURIComponent(requestId)}${suffix}`);
+}
+
 export async function getStudioRunStatus(apiBase, id) {
   return apiFetch(apiBase, `/experiments/${encodeURIComponent(id)}`);
 }

@@ -155,6 +155,33 @@ test.describe("Studio Settings (redesigned)", () => {
     }
   });
 
+  test("Golden profile selector uses only the server catalog and persists the name", async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem("comfymodal.studio.golden.profile.v1", "production-009");
+    });
+    await openSettings(page);
+    const select = page.locator('[data-testid="settings-golden-profile"]');
+    await expect(select).toBeVisible({ timeout: 15000 });
+    await expect(select.locator('option[value="production-009"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="settings-golden-profile-row"]')).toHaveCount(2);
+    await expect(page.locator('[data-testid="settings-golden-profile-row"]').nth(0)).toContainText("production-008");
+    await expect(page.locator('[data-testid="settings-golden-profile-row"]').nth(0)).toContainText("run_golden_parallel_stream");
+    await expect(select.locator('option:disabled')).toContainText("deploy before use");
+
+    await select.selectOption("golden_p1_parallel_c0_p8_h100");
+    await expect.poll(() => readLocalStorage(page, "comfymodal.studio.golden.profile.v1"))
+      .toBe("golden_p1_parallel_c0_p8_h100");
+  });
+
+  test("Golden profile catalog failure is surfaced instead of an empty success", async ({ page }) => {
+    const api = await installStudioMockApi(page);
+    api.failNext("GET", "/studio/golden/profiles", 503, { status: "error", message: "catalog unavailable" });
+    await openSettings(page);
+    await expect(page.locator('[data-testid="settings-golden-profile-error"]'))
+      .toContainText("Could not load Golden profiles: HTTP 503", { timeout: 15000 });
+    expect(await page.locator('[data-testid="settings-golden-profile"]').count()).toBe(0);
+  });
+
   // ── Test 4: Settings persist across reload ───────────────────────────────
   test("settings persist across reload", async ({ page }) => {
     let guard;

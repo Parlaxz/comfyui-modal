@@ -94,6 +94,7 @@ export async function installStudioMockApi(page, options = {}) {
     saveRequests: [], // { run_id, output_index } from POST /run-history/:id/save
     configPost: null, // last POST /comfymodal/config body (Settings page)
     profileLevel: "off", // in-memory /comfymodal/profile/level stored value
+    goldenProfile: "golden_p1_parallel_c0_p8_h100",
   };
 
   let lastRunRequest = null;
@@ -339,6 +340,7 @@ export async function installStudioMockApi(page, options = {}) {
   /** POST /comfymodal/studio/run */
   async function studioRun(route, url, body) {
     lastRunRequest = body;
+    if (options.runDelayMs) await new Promise((resolve) => setTimeout(resolve, options.runDelayMs));
     const expId = _makeExperimentId();
     const runId = _makeRunId();
 
@@ -406,8 +408,55 @@ export async function installStudioMockApi(page, options = {}) {
       status: "ok",
       runId,
       experimentId: expId,
+      request_id: body?.request_id || "",
+      terminal: true,
+      direct_run: true,
+      output_paths: ["studio_output_final.png"],
+      timings: { end_to_end_total_ms: 120, golden_clip_load_ms: 40 },
       message: "Run started",
     });
+  }
+
+  async function listGoldenProfiles() {
+    return _json({
+      status: "ok",
+      defaultProfile: "golden_p1_parallel_c0_p8_h100",
+      profiles: [
+        {
+          name: "golden_p1_parallel_c0_p8_h100",
+          owner: "production-008",
+          target: { app: "batch-c0-p8-h100", class: "ModalRuntimeEntrypointV2", method: "run_golden_parallel_stream" },
+          resources: { gpu: "h100!", cpu: 12, memory_mb: 24576 },
+          deployed: true,
+        },
+        {
+          name: "golden_p1_parallel_c0_p8_h100_pending",
+          owner: "production-008",
+          target: { app: "batch-c0-p8-h100", class: "ModalRuntimeEntrypointV2", method: "run_golden_parallel_stream" },
+          resources: { gpu: "h100!", cpu: 12, memory_mb: 24576 },
+          deployed: false,
+        },
+      ],
+    });
+  }
+
+  async function goldenRunProgress(route, url, body, params) {
+    const cursor = parseInt(url.searchParams.get("cursor") || "0", 10);
+    const requestId = params.request_id;
+    if (cursor === 0) {
+      return _json({ status: "ok", request_id: requestId, cursor: 1, terminal: false, events: [
+        { schema: "golden_stage_event_v1", type: "golden_stage", request_id: requestId, sequence: 1, stage: "golden_clip_load", phase: "started", entry_wall_ns: 1000000000, entry_monotonic_ns: 1000000000, end_wall_ns: null, end_monotonic_ns: null, ok: null, error: null },
+      ] });
+    }
+    if (cursor === 1) {
+      return _json({ status: "ok", request_id: requestId, cursor: 3, terminal: false, events: [
+        { schema: "golden_stage_event_v1", type: "golden_stage", request_id: requestId, sequence: 2, stage: "golden_clip_load", phase: "completed", entry_wall_ns: 1000000000, entry_monotonic_ns: 1000000000, end_wall_ns: 1040000000, end_monotonic_ns: 1040000000, ok: true, error: null },
+        { schema: "golden_stage_event_v1", type: "golden_stage", request_id: requestId, sequence: 3, stage: "golden_decode", phase: "started", entry_wall_ns: 1050000000, entry_monotonic_ns: 1050000000, end_wall_ns: null, end_monotonic_ns: null, ok: null, error: null },
+      ] });
+    }
+    return _json({ status: "ok", request_id: requestId, cursor: 4, terminal: true, events: [
+      { schema: "golden_stage_event_v1", type: "golden_stage", request_id: requestId, sequence: 4, stage: "golden_decode", phase: "completed", entry_wall_ns: 1050000000, entry_monotonic_ns: 1050000000, end_wall_ns: 1120000000, end_monotonic_ns: 1120000000, ok: true, error: null },
+    ] });
   }
 
   /** POST /comfymodal/studio/experiment */
@@ -946,6 +995,7 @@ export async function installStudioMockApi(page, options = {}) {
       gpu: "mock-gpu",
       deploy_state: "deployed",
       frontend_version: "0.1.0",
+      golden_profile: state.goldenProfile,
     });
   }
 
@@ -967,6 +1017,7 @@ export async function installStudioMockApi(page, options = {}) {
       gpu: "rtx-pro-6000",
       deploy_state: "deployed",
       frontend_version: "0.1.0",
+      golden_profile: state.goldenProfile,
       // Execution engine options
       execution_mode: "v2",
       available_execution_modes: [
@@ -993,6 +1044,7 @@ export async function installStudioMockApi(page, options = {}) {
   /** POST /comfymodal/config — record the last posted body and acknowledge. */
   async function saveSettingsConfig(route, url, body) {
     state.configPost = body || null;
+    if (body && typeof body.golden_profile === "string") state.goldenProfile = body.golden_profile;
     return _json({ status: "ok" });
   }
 
@@ -1078,6 +1130,8 @@ export async function installStudioMockApi(page, options = {}) {
 
     // Studio run & experiment
     ["POST", "/comfymodal/studio/run", studioRun],
+    ["GET", "/comfymodal/studio/golden/profiles", listGoldenProfiles],
+    ["GET", "/comfymodal/studio/run-progress/:request_id", goldenRunProgress],
     ["POST", "/comfymodal/studio/experiment", studioExperiment],
 
     // Experiment detail (poll-based lifecycle) & stop-now
@@ -1241,6 +1295,7 @@ export async function installStudioMockApi(page, options = {}) {
       state.saveRequests.length = 0;
       state.configPost = null;
       state.profileLevel = "off";
+      state.goldenProfile = "golden_p1_parallel_c0_p8_h100";
       lastRunRequest = null;
       lastExperimentRequest = null;
       failQueue.length = 0;

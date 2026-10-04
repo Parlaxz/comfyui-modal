@@ -20,7 +20,8 @@
 //   3. run.output_path         → /studio/outputs/<path>
 
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines } from "./studio-run-normalizer.js";
-import { listUnifiedHistory, listExperiments, updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
+import { updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
+import { createHistoryRepository } from "./history-v2-repository.js";
 import { loadExperimentIntoPlayground } from "./studio-playground.js";
 import { el, createImagePreviewOverlay, registerLayerHandler } from "./studio-ui.js";
 
@@ -58,6 +59,29 @@ function isFailed(run) {
 
 function normalizeAggregateExperiment(rawExperiment) {
   if (!rawExperiment) return null;
+
+  // History V2 is the supported experiment feed.  Its repository returns a
+  // normalized ExperimentRecord, rather than the legacy definition/snapshot
+  // envelope handled below.
+  if (rawExperiment.kind === "experiment" && !rawExperiment.definition) {
+    var v2ExperimentId = rawExperiment.id || "";
+    var v2TotalCells = Number(rawExperiment.trueCellCount || rawExperiment.cellCount || 0);
+    if (!v2ExperimentId || v2TotalCells < 2) return null;
+    return {
+      id: v2ExperimentId,
+      experimentId: v2ExperimentId,
+      kind: "studio_experiment",
+      status: rawExperiment.status || "completed",
+      totalCells: v2TotalCells,
+      prompt: rawExperiment.name || rawExperiment.prompt || "Studio Experiment",
+      startedAt: rawExperiment.startedAt || "",
+      completedAt: rawExperiment.completedAt || "",
+      presetId: rawExperiment.preset || "",
+      featureId: "txt2img",
+      raw: rawExperiment,
+    };
+  }
+
   var definition = rawExperiment.definition || {};
   var snapshot = rawExperiment.snapshot || {};
   var studioMeta = definition.studio_meta || {};
@@ -526,6 +550,48 @@ export function renderHistory(state, context) {
   var _QUERY_CACHE_TTL = 2000; // 2s
   var _QUERY_CACHE_MAX = 50;   // max entries before pruning
   var _aggregateExperiments = null;
+  var _historyRepository = null;
+  var _historyRepositoryPromise = null;
+
+  function getHistoryRepository() {
+    if (_historyRepository) return Promise.resolve(_historyRepository);
+    if (!_historyRepositoryPromise) {
+      _historyRepositoryPromise = createHistoryRepository({
+        mode: "v2",
+        apiBase: apiBase,
+      }).then(function (repository) {
+        _historyRepository = repository;
+        return repository;
+      });
+    }
+    return _historyRepositoryPromise;
+  }
+
+  function listHistoryPage(params) {
+    var p = params || {};
+    var query = {
+      limit: p.page_size || 50,
+      search: p.search || "",
+      sort: p.sort || "newest",
+    };
+    if (p.type === "experiment") query.kinds = ["experiment"];
+    else if (p.type) query.kinds = ["generation"];
+    if (p.status) query.statuses = [p.status];
+    if (p.favorite) query.favoriteOnly = true;
+    if (p.preset) query.preset = p.preset;
+    if (p.date_from) query.dateFrom = p.date_from;
+    if (p.date_to) query.dateTo = p.date_to;
+    if (p.has_image) query.hasImage = true;
+    return getHistoryRepository().then(function (repository) {
+      return repository.listFeed(query);
+    }).then(function (page) {
+      return {
+        items: Array.isArray(page && page.items) ? page.items : [],
+        total: page && typeof page.total === "number" ? page.total : 0,
+        has_more: !!(page && page.hasMore),
+      };
+    });
+  }
 
   // ── Debounce helper ─────────────────────────────────────────────────
   var _searchTimer = null;
@@ -966,8 +1032,8 @@ export function renderHistory(state, context) {
     if (_aggregateExperiments !== null) {
       return Promise.resolve(_aggregateExperiments);
     }
-    return listExperiments(apiBase).then(function (experiments) {
-      _aggregateExperiments = Array.isArray(experiments) ? experiments : [];
+    return listHistoryPage({ type: "experiment", page_size: 50, sort: "newest" }).then(function (result) {
+      _aggregateExperiments = Array.isArray(result && result.items) ? result.items : [];
       return _aggregateExperiments;
     }).catch(function () {
       _aggregateExperiments = [];
@@ -1049,7 +1115,7 @@ export function renderHistory(state, context) {
     if (queryParams.sort) apiParams.sort = queryParams.sort;
 
     Promise.all([
-      listUnifiedHistory(apiBase, apiParams, signal),
+      listHistoryPage(apiParams),
       getAggregateExperiments(),
     ]).then(function (responses) {
       var result = responses[0];

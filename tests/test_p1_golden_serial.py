@@ -1651,19 +1651,55 @@ def test_request_setup_validates_workflow_hash_not_output_sha(monkeypatch):
 
 
 @pytest.mark.parametrize("env_value", [None, "1"], ids=["default", "enabled"])
-def test_request_setup_fails_closed_on_workflow_hash_mismatch(monkeypatch, env_value):
+def test_request_setup_records_but_does_not_fail_on_workflow_hash_mismatch(
+    monkeypatch, env_value
+):
+    """A workflow-SHA mismatch is advisory evidence, not a rejection.
+
+    Studio runs carry a caller-selected workflow with caller-applied control
+    values, so the executed prompt is not expected to be byte-identical to the
+    frozen benchmark prompt. The mismatch must be recorded (event + result)
+    while structural admission stays fail-closed.
+    """
     monkeypatch.setitem(sys.modules, "folder_paths", _FakeFolderPaths())
     if env_value is None:
         monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", raising=False)
     else:
         monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", env_value)
     contract = dataclasses.replace(gs.GoldenWorkflowContract(), workflow_sha256="0" * 64)
-    with pytest.raises(RuntimeError, match="workflow_sha_mismatch"):
-        asyncio.run(gs.golden_request_setup(_setup_session(_canonical_prompt(), contract)))
+    session = _setup_session(_canonical_prompt(), contract)
+
+    node_map = asyncio.run(gs.golden_request_setup(session))
+
+    # Structural admission still resolved the canonical nodes.
+    assert node_map.clip_loader_id == "1"
+    assert node_map.sampler_id == "5"
+
+    # The mismatch is preserved as evidence.
+    assert session.workflow_sha_match is False
+    assert session.workflow_sha_warning == {
+        "expected": "0" * 64,
+        "observed": gs.canonical_workflow_sha256(_canonical_prompt()),
+        "reason": "workflow_sha_mismatch",
+    }
+    hash_event = next(
+        event for event in session.recorder.events
+        if event["name"] == "golden_workflow_hash_check"
+    )
+    assert hash_event["fields"]["workflow_sha_match"] is False
+    assert hash_event["fields"]["workflow_sha_warning"]["reason"] == "workflow_sha_mismatch"
+    # The stage itself completed; it did not fail.
+    assert session.recorder.intervals["golden_request_setup"].ok is True
 
 
 @pytest.mark.parametrize("env_value", ["0", "false"], ids=["zero", "false"])
-def test_request_setup_rejects_disabled_workflow_hash_check(monkeypatch, env_value):
+def test_request_setup_allows_disabled_workflow_hash_check(monkeypatch, env_value):
+    """Disabling the registered guard must not abort the request.
+
+    ``config/v2/flag_registry.toml`` documents that hash computation and
+    telemetry remain enabled when the guard is disabled, so the request has to
+    proceed and still report the comparison.
+    """
     monkeypatch.setitem(sys.modules, "folder_paths", _FakeFolderPaths())
     monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", env_value)
     prompt = _canonical_prompt()
@@ -1671,22 +1707,20 @@ def test_request_setup_rejects_disabled_workflow_hash_check(monkeypatch, env_val
     contract = dataclasses.replace(gs.GoldenWorkflowContract(), workflow_sha256="0" * 64)
     session = _setup_session(prompt, contract)
 
-    with pytest.raises(RuntimeError, match="workflow_hash_check_disabled"):
-        asyncio.run(gs.golden_request_setup(session))
+    node_map = asyncio.run(gs.golden_request_setup(session))
 
+    assert node_map.clip_loader_id == "1"
     hash_event = next(
         event for event in session.recorder.events
         if event["name"] == "golden_workflow_hash_check"
     )
-    assert hash_event["fields"] == {
-        "actual_sha256": actual_sha,
-        "expected_sha256": "0" * 64,
-        "attention_backend": None,
-        "enabled": False,
-        "bypassed": True,
-    }
-    details = session.recorder.intervals["golden_request_setup"].details
-    assert details["error"].startswith("RuntimeError: workflow_hash_check_disabled")
+    assert hash_event["fields"]["actual_sha256"] == actual_sha
+    assert hash_event["fields"]["expected_sha256"] == "0" * 64
+    assert hash_event["fields"]["bypassed"] is True
+    assert hash_event["fields"]["enabled"] is False
+    # Comparison still ran and still reported the mismatch.
+    assert hash_event["fields"]["workflow_sha_match"] is False
+    assert session.recorder.intervals["golden_request_setup"].ok is True
 
 
 # ── 10. VAE load/decode stage boundaries ───────────────────────────────────

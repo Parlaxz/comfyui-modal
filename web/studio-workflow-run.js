@@ -627,6 +627,16 @@ export function resolveRunnable(store) {
   return { runnable, reasons };
 }
 
+/**
+ * Apply the execution target gate after local workflow validation. A remote
+ * Golden target does not use the host's model/custom-node inventory; the
+ * deployed container remains responsible for rejecting invalid structure.
+ */
+export function resolveExecutionRunnable(gated, remoteSelected) {
+  if (gated.runnable || !remoteSelected) return gated;
+  return { runnable: true, reasons: [] };
+}
+
 // ── Run payload ───────────────────────────────────────────────────────────
 
 /**

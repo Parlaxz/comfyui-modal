@@ -237,6 +237,7 @@ async def golden_parallel_execute(
     restore_metadata: Optional[dict] = None,
     restore_observation: Optional[dict] = None,
     cpu_prefetch_ticket: Any = None,
+    stage_observer: Optional[Callable[[dict[str, Any]], Any]] = None,
 ) -> GoldenFinalResult:
     """Overlap independent model stages while retaining canonical ownership."""
     session = GoldenSession(
@@ -251,6 +252,7 @@ async def golden_parallel_execute(
         restore_metadata=restore_metadata,
         restore_observation=restore_observation,
         cpu_prefetch_ticket=cpu_prefetch_ticket,
+        stage_observer=stage_observer,
     )
     primary_error: BaseException | None = None
     teardown_error: BaseException | None = None

@@ -12,15 +12,22 @@ import {
   enhanceControlWithAxisCheckbox,
 } from "./studio-experiment-mode.js";
 import { getRuntimePresets } from "./studio-backend.js";
-import { runStudioPreset, getStudioRunStatus, stopExperiment, listModels } from "./studio-backend-api.js";
+import {
+  runStudioPreset,
+  getStudioRunStatus,
+  getGoldenRunProgress,
+  stopExperiment,
+  listModels,
+} from "./studio-backend-api.js";
 import { loadModalOptions } from "./studio-output-preferences.js";
+import { goldenProgressResponseAction } from "./studio-golden-progress.js";
 
 import {
   getVisibleControlsForPreset,
   getPresetCapabilitySummary,
   getUnavailableControlReasons,
 } from "./studio-preset-capabilities.js";
-import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines } from "./studio-run-normalizer.js";
+import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines, resolveSelectionResultKey } from "./studio-run-normalizer.js";
 import {
   saveSelection,
   loadSelection,
@@ -36,6 +43,7 @@ import {
   loadExperimentDraft,
   setCarouselCleared,
   isCarouselCleared,
+  loadGoldenProfileSelection,
 } from "./studio-playground-state.js";
 import {
   createPlaygroundRunController,
@@ -50,6 +58,19 @@ export async function buildStudioModalOptions(apiBase) {
   const options = await loadModalOptions(apiBase);
   if (typeof window !== "undefined") window._comfyModalExecutionMode = options.execution_mode;
   return options;
+}
+
+// Compatibility seam for the retired legacy History renderer. Experiment
+// details now belong to History V2; route the old tile action through its
+// supported focus request instead of reviving the deleted legacy loader.
+export async function loadExperimentIntoPlayground(state, context, experimentId) {
+  if (!experimentId) return { ok: false, error: "Experiment ID is missing." };
+  requestHistoryRecordFocus(String(experimentId), "experiment");
+  if (!context || typeof context.setPage !== "function") {
+    return { ok: false, error: "Studio navigation is unavailable." };
+  }
+  context.setPage("history");
+  return { ok: true };
 }
 import { el, createZoomableImageEl, createImagePreviewOverlay, renderEmptyState } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
@@ -78,6 +99,86 @@ import {
 
 const POLL_INTERVAL_MS = 3000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;
+
+function _stopGoldenProgressPolling(state, requestId) {
+  const poll = state && state.playground && state.playground._goldenProgressPoll;
+  if (!poll || (requestId && poll.requestId !== requestId)) return;
+  poll.active = false;
+  if (poll.timer != null) clearTimeout(poll.timer);
+  if (state.playground) state.playground._goldenProgressPoll = null;
+}
+
+// Golden progress deliberately uses a chained timeout. The next request is
+// created only after the previous response has been handled, so a slow poll
+// cannot overlap the next cursor read.
+function _startGoldenProgressPolling(state, context, requestId, ctrl) {
+  if (!state || !state.playground || !requestId || !ctrl) return;
+  _stopGoldenProgressPolling(state);
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  const poll = { requestId: String(requestId), cursor: 0, timer: null, active: true };
+  state.playground._goldenProgressPoll = poll;
+
+  const schedule = () => {
+    if (!poll.active) return;
+    poll.timer = setTimeout(pollOnce, 100);
+  };
+  const pollOnce = async () => {
+    if (!poll.active || state.playground._goldenProgressPoll !== poll) return;
+    let data;
+    try {
+      data = await getGoldenRunProgress(apiBase, poll.requestId, poll.cursor);
+    } catch (error) {
+      // The POST may have completed while this request was in flight.  Its
+      // terminal handler already stopped this poll, so do not report the
+      // expected expired-request response as a user-visible failure.
+      if (!poll.active || state.playground._goldenProgressPoll !== poll) return;
+      if (typeof ctrl.isTerminal === "function" && ctrl.isTerminal()) {
+        _stopGoldenProgressPolling(state, poll.requestId);
+        return;
+      }
+      ctrl.setGoldenProgressError("Golden progress polling failed: " + (error.message || "request failed"));
+      schedule();
+      return;
+    }
+    if (!poll.active || state.playground._goldenProgressPoll !== poll) return;
+    const responseAction = goldenProgressResponseAction(
+      data,
+      typeof ctrl.isTerminal === "function" && ctrl.isTerminal(),
+    );
+    if (responseAction === "retry") {
+      // The run POST and event store register the request independently. Keep
+      // the cursor quiet during that small startup window and retry.
+      schedule();
+      return;
+    }
+    if (responseAction === "stop") {
+      _stopGoldenProgressPolling(state, poll.requestId);
+      return;
+    }
+    if (responseAction === "error") {
+      const message = data && (data.message || data.error)
+        ? (data.message || data.error)
+        : "Golden progress endpoint returned no usable response";
+      ctrl.setGoldenProgressError("Golden progress polling failed: " + message);
+      schedule();
+      return;
+    }
+    if (data.request_id != null && String(data.request_id) !== poll.requestId) {
+      schedule();
+      return;
+    }
+    const nextCursor = Number(data.cursor);
+    if (Number.isFinite(nextCursor) && nextCursor >= poll.cursor) poll.cursor = nextCursor;
+    ctrl.applyGoldenProgress({ ...data, request_id: poll.requestId });
+    if (data.terminal) {
+      _stopGoldenProgressPolling(state, poll.requestId);
+    } else {
+      schedule();
+    }
+  };
+  // Start immediately, before the still-in-flight run POST is awaited.
+  pollOnce();
+}
 
 /**
  * Idempotent stop: clear the poll timer and null the reference.
@@ -318,11 +419,36 @@ function _getRecentRunsRepo(apiBase) {
   return _recentRunsRepoPromise;
 }
 
-export async function refreshRecentRuns(apiBase) {
+export async function refreshRecentRuns(apiBase, outputOverride) {
   try {
     const repo = await _getRecentRunsRepo(apiBase);
     const page = await repo.listFeed({ limit: 50, sort: "newest" }); 
     var items = [];
+
+    // A graph/AST asset is a workflow thumbnail, not a generated output.  Keep
+    // the normal thumbnail/preview ordering, but skip graph assets and use the
+    // durable original (or another non-graph variant) when one is available.
+    const historyImageUrl = function (output) {
+      if (!output) return "";
+      const candidates = [output.thumbUrl, output.previewUrl, output.originalUrl];
+      for (var hi = 0; hi < candidates.length; hi++) {
+        const candidate = candidates[hi];
+        if (candidate && !/\/assets\/(?:ast|graph|workflow[-_]?graph)[-_]/i.test(String(candidate))) {
+          return candidate;
+        }
+      }
+      return "";
+    };
+    const overrideImageFor = function (rec) {
+      if (!outputOverride || !outputOverride.imageUrl) return "";
+      const overrideIds = [outputOverride.id, outputOverride.runId, outputOverride.experimentId]
+        .filter(Boolean).map(String);
+      const recordIds = [rec && rec.id, rec && rec.runId, rec && rec.experimentId]
+        .filter(Boolean).map(String);
+      return overrideIds.some(function (id) { return recordIds.indexOf(id) !== -1; })
+        ? outputOverride.imageUrl
+        : "";
+    };
     (page.items || []).forEach(function (rec) {
       if (!rec) return;
       if (rec.kind === "experiment") {
@@ -330,11 +456,12 @@ export async function refreshRecentRuns(apiBase) {
         var cover = rec.cover || [];
         for (var ci = 0; ci < cover.length; ci++) {
           var c = cover[ci];
-          if (c && (c.thumbUrl || c.previewUrl)) {
-            coverThumb = c.thumbUrl || c.previewUrl;
+          coverThumb = historyImageUrl(c);
+          if (coverThumb) {
             break;
           }
         }
+        if (!coverThumb) coverThumb = overrideImageFor(rec);
         items.push({
           kind: "experiment",
           id: rec.id,
@@ -356,7 +483,7 @@ export async function refreshRecentRuns(apiBase) {
         });
       } else {
         var feat = rec.featuredOutput || null;
-        var imageUrl = feat ? (feat.thumbUrl || feat.previewUrl || "") : "";
+        var imageUrl = historyImageUrl(feat) || overrideImageFor(rec);
         // Keep only finished generations that actually produced an image.
         if (!((rec.status === "completed" || rec.status === "completed_with_failures") && imageUrl)) return;
         items.push({
@@ -381,6 +508,41 @@ export async function refreshRecentRuns(apiBase) {
         });
       }
     });
+
+    // A direct Golden response can arrive before its History V2 projection is
+    // visible. Keep that same run in the cache using its real output URL;
+    // this is still the carousel's one data source, not a second persistence
+    // path. A later feed refresh replaces the fallback when the durable record
+    // appears.
+    if (outputOverride && outputOverride.imageUrl) {
+      var overrideIdsForAppend = [outputOverride.id, outputOverride.runId, outputOverride.experimentId]
+        .filter(Boolean).map(String);
+      var overrideAlreadyPresent = items.some(function (item) {
+        var itemIds = [item && item.id, item && item.runId, item && item.experimentId]
+          .filter(Boolean).map(String);
+        return overrideIdsForAppend.some(function (id) { return itemIds.indexOf(id) !== -1; });
+      });
+      if (!overrideAlreadyPresent && !/\/assets\/(?:ast|graph|workflow[-_]?graph)[-_]/i.test(String(outputOverride.imageUrl))) {
+        items.push({
+          kind: "generation",
+          id: outputOverride.id || outputOverride.runId || outputOverride.experimentId,
+          experimentId: outputOverride.experimentId || "",
+          runId: outputOverride.runId || outputOverride.id || "",
+          prompt: outputOverride.prompt || "",
+          presetId: outputOverride.presetId || "",
+          presetLabel: outputOverride.presetLabel || "",
+          featureId: outputOverride.featureId || "",
+          status: outputOverride.status || "completed",
+          imageUrl: outputOverride.imageUrl,
+          startedAt: outputOverride.startedAt || "",
+          completedAt: outputOverride.completedAt || new Date().toISOString(),
+          durationMs: outputOverride.durationMs || null,
+          favorite: !!outputOverride.favorite,
+          note: outputOverride.note || "",
+          _historyKind: "generation",
+        });
+      }
+    }
 
     // Sort by created time (newest first)
     items.sort(function (a, b) {
@@ -445,6 +607,25 @@ function _fetchSameRunHistoryEntry(apiBase, experimentId) {
 // Restore saved selection, fetch presets + history, validate preset,
 // restore latest completed run preview plus draft/snapshot defaults.
 
+function _loadPersistedSelectionResult(state, store, fallback, context) {
+  const key = resolveSelectionResultKey(state, store, fallback);
+  if (!key.presetId || !key.featureId || !state || !state.playground) return null;
+  const persistedRun = loadRunResult(key.presetId, key.featureId);
+  if (persistedRun) {
+    state.playground._selectedRun = persistedRun;
+    state.playground.lastRunOutput = persistedRun.imageUrl || null;
+    // The local result is also the direct-run carousel fallback when the
+    // durable History V2 projection is not visible yet after reload.
+    if (context) {
+      const apiBase = context.apiBase || "/comfymodal";
+      refreshRecentRuns(apiBase, persistedRun).then(function () {
+        if (context.setPage) context.setPage("playground");
+      });
+    }
+  }
+  return persistedRun;
+}
+
 export async function hydratePlayground(state, context) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
 
@@ -485,7 +666,11 @@ export async function hydratePlayground(state, context) {
         if (state.playground) {
           state.playground.selectedBackendId = targetPresetId;
         }
-        saveSelection(targetPresetId, featureId);
+        const resolvedSelection = resolveSelectionResultKey(state, null, {
+          presetId: targetPresetId,
+          featureId,
+        });
+        saveSelection(resolvedSelection.presetId, resolvedSelection.featureId);
       } else {
         clearSelection();
         targetPresetId = "";
@@ -507,13 +692,14 @@ export async function hydratePlayground(state, context) {
   }
 
   // 6a. Try to restore from localStorage persisted run result first
-  const persistedRun = loadRunResult(targetPresetId, featureId);
-  if (persistedRun) {
-    state.playground._selectedRun = persistedRun;
-    state.playground.lastRunOutput = persistedRun.imageUrl || null;
-  } else if (!isCarouselCleared()) {
-    await refreshRecentRuns(apiBase);
-    if (targetPresetId) {
+  const persistedKey = resolveSelectionResultKey(state, null, {
+    presetId: targetPresetId,
+    featureId,
+  });
+  const persistedRun = _loadPersistedSelectionResult(state, null, persistedKey);
+  if (!isCarouselCleared()) {
+    await refreshRecentRuns(apiBase, persistedRun);
+    if (!persistedRun && targetPresetId) {
       const matchingCompleted = getRecentRuns().filter(function (nr) {
         return nr.presetId === targetPresetId;
       });
@@ -530,7 +716,7 @@ export async function hydratePlayground(state, context) {
           state.playground.lastRunOutput = latest.imageUrl;
           state.playground._selectedRun = latest;
           // Persist to localStorage for next reload
-          saveRunResult(targetPresetId, featureId, latest);
+          saveRunResult(persistedKey.presetId, persistedKey.featureId, latest);
         }
       }
     }
@@ -545,7 +731,11 @@ export async function hydratePlayground(state, context) {
 
   // 7. Persist the resolved selection
   if (targetPresetId) {
-    saveSelection(targetPresetId, featureId);
+    const resolvedSelection = resolveSelectionResultKey(state, null, {
+      presetId: targetPresetId,
+      featureId,
+    });
+    saveSelection(resolvedSelection.presetId, resolvedSelection.featureId);
   }
 
   // 8. Kick off the modern workflow selector init (idempotent â€” it is also
@@ -930,8 +1120,12 @@ function buildActions(state, context) {
       const prevPresetId = state.playground.selectedBackendId;
       const prevFeatureId = state.playground.featureId;
       const prevRun = state.playground._selectedRun;
-      if (prevPresetId && prevFeatureId && prevRun) {
-        saveRunResult(prevPresetId, prevFeatureId, prevRun);
+      const prevKey = resolveSelectionResultKey(state, null, {
+        presetId: prevPresetId,
+        featureId: prevFeatureId,
+      });
+      if (prevKey.presetId && prevKey.featureId && prevRun) {
+        saveRunResult(prevKey.presetId, prevKey.featureId, prevRun);
       }
 
       state.playground.featureId = featureId;
@@ -939,11 +1133,14 @@ function buildActions(state, context) {
       state.playground.controls = {};
       state.playground._selectedRun = null;
       state.playground.lastRunOutput = null;
-      const presetId = state.playground.selectedBackendId;
-      const currentPreset = getCurrentPresetForSelection(state, presetId);
+      const selectionKey = resolveSelectionResultKey(state, null, {
+        featureId,
+      });
+      const presetId = selectionKey.presetId;
+      const currentPreset = getCurrentPresetForSelection(state, state.playground.selectedBackendId);
 
       // Load persisted run result for the new feature
-      const loadedRun = loadRunResult(presetId, featureId);
+      const loadedRun = loadRunResult(selectionKey.presetId, selectionKey.featureId);
       if (loadedRun) {
         state.playground._selectedRun = loadedRun;
         state.playground.lastRunOutput = loadedRun.imageUrl || null;
@@ -955,7 +1152,7 @@ function buildActions(state, context) {
       // Dispose scoped tracker â€” switching features invalidates current run
       _disposeScopedTracker(state);
       // Persist selection
-      saveSelection(state.playground.selectedBackendId, featureId);
+      saveSelection(selectionKey.presetId, selectionKey.featureId);
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -967,8 +1164,12 @@ function buildActions(state, context) {
       const prevPresetId = state.playground.selectedBackendId;
       const prevFeatureId = state.playground.featureId;
       const prevRun = state.playground._selectedRun;
-      if (prevPresetId && prevFeatureId && prevRun) {
-        saveRunResult(prevPresetId, prevFeatureId, prevRun);
+      const prevKey = resolveSelectionResultKey(state, null, {
+        presetId: prevPresetId,
+        featureId: prevFeatureId,
+      });
+      if (prevKey.presetId && prevKey.featureId && prevRun) {
+        saveRunResult(prevKey.presetId, prevKey.featureId, prevRun);
       }
 
       state.playground.selectedBackendId = backendId;
@@ -977,10 +1178,14 @@ function buildActions(state, context) {
       state.playground.controls = {};
       state.playground._selectedRun = null;
       state.playground.lastRunOutput = null;
+      const selectionKey = resolveSelectionResultKey(state, null, {
+        presetId: backendId,
+        featureId: state.playground.featureId,
+      });
       const currentPreset = getCurrentPresetForSelection(state, backendId);
 
       // Load persisted run result for the new preset+feature
-      const loadedRun = loadRunResult(backendId, state.playground.featureId);
+      const loadedRun = loadRunResult(selectionKey.presetId, selectionKey.featureId);
       if (loadedRun) {
         state.playground._selectedRun = loadedRun;
         state.playground.lastRunOutput = loadedRun.imageUrl || null;
@@ -992,7 +1197,7 @@ function buildActions(state, context) {
       // Dispose scoped tracker â€” switching backends invalidates current run
       _disposeScopedTracker(state);
       // Persist selection
-      saveSelection(backendId, state.playground.featureId);
+      saveSelection(selectionKey.presetId, selectionKey.featureId);
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -1143,10 +1348,17 @@ function buildActions(state, context) {
           state.playground.lastRunOutput = runState.primaryOutput;
         }
         // Keep preset/feature selected
-        saveSelection(state.playground.selectedBackendId, state.playground.featureId);
+         if (!_isModernRunSelected(state)) {
+           const completedSelection = resolveSelectionResultKey(state);
+           saveSelection(completedSelection.presetId, completedSelection.featureId);
+         }
         // Refresh recent runs and try to select finalized normalized run
         const apiBase = (context && context.apiBase) || "/comfymodal";
-        refreshRecentRuns(apiBase).then(function (runs) {
+        refreshRecentRuns(apiBase, {
+          id: runState.experimentId,
+          experimentId: runState.experimentId,
+          imageUrl: runState.primaryOutput,
+        }).then(function (runs) {
           const experimentId = runState.experimentId;
           let matched = null;
           if (experimentId && runs && runs.length > 0) {
@@ -1176,11 +1388,8 @@ function buildActions(state, context) {
               state.playground.lastRunOutput = matched.imageUrl;
             }
             // Persist the finalized run result to localStorage
-            saveRunResult(
-              state.playground.selectedBackendId,
-              state.playground.featureId || "txt2img",
-              matched
-            );
+             const completedKey = resolveSelectionResultKey(state);
+             saveRunResult(completedKey.presetId, completedKey.featureId, matched);
             if (context && context.setPage) context.setPage("playground");
           }
           if (!matched && experimentId) {
@@ -1204,11 +1413,8 @@ function buildActions(state, context) {
               state.playground._selectedRun = fallback;
               // Persist the finalized run result to localStorage
               try {
-                saveRunResult(
-                  state.playground.selectedBackendId,
-                  state.playground.featureId || "txt2img",
-                  fallback
-                );
+                 const fallbackKey = resolveSelectionResultKey(state);
+                 saveRunResult(fallbackKey.presetId, fallbackKey.featureId, fallback);
               } catch (e) {}
               if (context && context.setPage) context.setPage("playground");
             });
@@ -1468,7 +1674,7 @@ function _resolveWorkflowRunnable(store, wf, modelRecords) {
   };
 }
 
-function _workflowGatingInfo(store, wf, state) {
+function workflowGatingInfo(store, wf, state) {
   if (!store) return { text: "Select a workflow", color: "" };
   if (store.statusLine) return { text: store.statusLine, color: "#d9a441" };
   if (store.status === "error") return { text: store.error || "Load error", color: "#f87171" };
@@ -1477,8 +1683,10 @@ function _workflowGatingInfo(store, wf, state) {
   if (store.status === "loading" || !wf || !store.runContext) {
     return { text: store.status === "loading" ? "Loading\u2026" : "Loading workflow\u2026", color: "" };
   }
-  const modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
-  const { runnable, reasons } = _resolveWorkflowRunnable(store, wf, modelRecords);
+  // Use the same local/remote decision as the Run button. A selected Golden
+  // profile executes in the deployed container, so host-local dependency
+  // reasons must not be shown as a reason that remote execution is blocked.
+  const { runnable, reasons } = _workflowRunnableForExecution(state, store, wf);
   if (runnable) return { text: "Ready to run", color: "var(--color-success)" };
   return { text: reasons.length ? reasons.join("; ") : "Not runnable", color: "#d9a441" };
 }
@@ -1568,7 +1776,7 @@ function _workflowPresetSelectEl(state, actions, context) {
 
 function _workflowGatingLineEl(state, wf, context) {
   const store = state && state.playground && state.playground._workflowRun;
-  const info = _workflowGatingInfo(store, wf, state);
+  const info = workflowGatingInfo(store, wf, state);
   const line = el("div", {
     "data-testid": "workflow-run-gating",
     class: "comfymodal-studio-control-note",
@@ -1815,7 +2023,7 @@ function _syncWorkflowGating(state, context, actions) {
   if (line) {
     const store = state && state.playground && state.playground._workflowRun;
     const wf = state && state.playground && state.playground._workflowRunModule;
-    const info = _workflowGatingInfo(store, wf, state);
+    const info = workflowGatingInfo(store, wf, state);
     line.style.color = info.color ? info.color : "";
     line.textContent = info.text;
   }
@@ -1983,6 +2191,7 @@ async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff
     workflowName: store.workflowName || "",
     presetName: store.presetName || "",
   });
+  _loadPersistedSelectionResult(state, store, null, context);
 }
 
 async function _restoreWorkflowSelection(state, context, actions, wf, store, saved) {
@@ -2045,6 +2254,7 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
     }
   }
   await _loadWorkflowModelLibrary(state, apiBase);
+  _loadPersistedSelectionResult(state, store, null, context);
 }
 
 async function _handleWorkflowChange(state, context, actions, workflowId) {
@@ -2063,6 +2273,7 @@ async function _handleWorkflowChange(state, context, actions, workflowId) {
       workflowName: store.workflowName || "",
       presetName: store.presetName || "",
     });
+    _loadPersistedSelectionResult(state, store, null, context);
   }
   // Shelf: a new Workflow loads its own durably autosaved field values.
   _rerenderWorkflowSection(state, context, actions, { applySaved: true });
@@ -2083,12 +2294,34 @@ async function _handlePresetChange(state, context, actions, presetId) {
       workflowName: store.workflowName || "",
       presetName: store.presetName || "",
     });
+    _loadPersistedSelectionResult(state, store, null, context);
   }
   _rerenderWorkflowSection(state, context, actions);
 }
 
 // â”€â”€ Run button gating (modern mode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+function _remoteGoldenSelected() {
+  // A selected Golden profile executes on the deployed Modal container, so the
+  // host-local dependency gate (missing models / uninstalled custom nodes here)
+  // describes the wrong machine and must not disable Run.  The backend applies
+  // the same rule and still fails closed on structure.
+  try {
+    return !!loadGoldenProfileSelection();
+  } catch (e) {
+    return false;
+  }
+}
+function _workflowRunnableForExecution(state, store, wf) {
+  const modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
+  const gated = _resolveWorkflowRunnable(store, wf, modelRecords);
+  if (typeof wf.resolveExecutionRunnable === "function") {
+    return wf.resolveExecutionRunnable(gated, _remoteGoldenSelected());
+  }
+  // Compatibility with an older dynamically-loaded workflow module.
+  if (gated.runnable || !_remoteGoldenSelected()) return gated;
+  return { runnable: true, reasons: [] };
+}
 function _applyModernRunButtonState(state, context, actions, btn, reason) {
   const store = state && state.playground && state.playground._workflowRun;
   const wf = state && state.playground && state.playground._workflowRunModule;
@@ -2097,7 +2330,7 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
   const runState = state && state.playground && state.playground.runState;
   if (runState && runState.status && LEGACY_TERMINAL_STATUSES.indexOf(runState.status) === -1) return;
   if (reason) while (reason.firstChild) reason.removeChild(reason.firstChild);
-  const g = _workflowGatingInfo(store, wf, state);
+  const g = workflowGatingInfo(store, wf, state);
   if (store.status === "loading" || store.status === "error" || !store.runContext) {
     btn.disabled = true;
     btn.textContent = "Run";
@@ -2114,7 +2347,7 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
     return;
   }
   const modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
-  const { runnable, reasons } = _resolveWorkflowRunnable(store, wf, modelRecords);
+  const { runnable, reasons } = _workflowRunnableForExecution(state, store, wf);
   if (!runnable) {
     btn.disabled = true;
     btn.textContent = "Run";
@@ -2163,7 +2396,7 @@ function _syncRunButtonGating(state, context, actions) {
 
 // â”€â”€ Modern run submission â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-async function _modernRunSubmit(state, context, actions, btn) {
+async function _modernRunSubmit(state, context, actions, btn, requestId) {
   const store = state && state.playground && state.playground._workflowRun;
   const wf = state && state.playground && state.playground._workflowRunModule;
   if (!store || !wf) {
@@ -2171,6 +2404,9 @@ async function _modernRunSubmit(state, context, actions, btn) {
     return;
   }
   const apiBase = (context && context.apiBase) || "/comfymodal";
+  requestId = requestId || (typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : "studio-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2));
   var ctrl = _getRunController(state, actions);
   if (!ctrl) {
     if (btn) { btn.disabled = false; btn.textContent = "Run"; }
@@ -2181,7 +2417,7 @@ async function _modernRunSubmit(state, context, actions, btn) {
   // Gating mirrors the Run-button state; this is a defensive re-check so a
   // terminal-state re-run cannot bypass the disabled button.
   const _modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
-  const _gated = _resolveWorkflowRunnable(store, wf, _modelRecords);
+  const _gated = _workflowRunnableForExecution(state, store, wf);
   if (!_gated.runnable) {
     const _reasonText = (_gated.reasons && _gated.reasons.length)
       ? _gated.reasons[0]
@@ -2200,7 +2436,7 @@ async function _modernRunSubmit(state, context, actions, btn) {
   // (mirrors the legacy handler). beginRun must precede any applyLocalError.
   var _modernSteps = store.controlValues && store.controlValues.steps;
   var _runMaxSteps = (_modernSteps != null && Number(_modernSteps) > 0) ? Number(_modernSteps) : 0;
-  ctrl.beginRun({ samplerMaximum: _runMaxSteps });
+  ctrl.beginRun({ samplerMaximum: _runMaxSteps }, requestId);
 
   // Cold-path guard: selection normally preloads run-context; refetch only
   // when it is missing (rare). Measured via performance.now.
@@ -2226,6 +2462,7 @@ async function _modernRunSubmit(state, context, actions, btn) {
     return String(p.preset_id) === String(store.presetId || "");
   }) || null;
   const merged = wf.mergePresetAndOverrides(presetObj, store.controlValues || {}, schema);
+  const directSelection = resolveSelectionResultKey(state, store);
   ctrl.mark("validation_end");
   if (merged.errors && merged.errors.length) {
     ctrl.applyLocalError(merged.errors[0].message);
@@ -2253,15 +2490,25 @@ async function _modernRunSubmit(state, context, actions, btn) {
     t0_perf_now_ms: t0_now,
     t0_client_press_ms: t0_now,
   });
+  payload.request_id = requestId;
+  payload.profile_name = loadGoldenProfileSelection() || modalOptions.golden_profile || null;
   ctrl.mark("build_end");
 
   ctrl.mark("http_invoked");
+  _startGoldenProgressPolling(state, context, requestId, ctrl);
   const result = await runStudioPreset(apiBase, payload);
   ctrl.mark("backend_ack");
 
   if (result && result.status === "ok") {
+    if (_isGoldenTerminalResult(result, requestId)) {
+      _stopGoldenProgressPolling(state, requestId);
+      ctrl.applyGoldenPostTerminal();
+      _handleDirectRunResult({ ...result, direct_run: true }, state, context, actions, merged.values, directSelection);
+      return;
+    }
     // â”€â”€ Direct run: result is already completed, no polling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if (_handleDirectRunResult(result, state, context, actions, merged.values)) {
+    if (_handleDirectRunResult(result, state, context, actions, merged.values, directSelection)) {
+      _stopGoldenProgressPolling(state, requestId);
       return;
     }
     // â”€â”€ Scheduler path: submission, start polling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2276,6 +2523,7 @@ async function _modernRunSubmit(state, context, actions, btn) {
     }
     _startLocalElapsedTimer(state, context);
   } else {
+    _stopGoldenProgressPolling(state, requestId);
     const errMsg = (result && result.message) || "Run failed.";
     if (result && result.error_code) {
       console.error("[Studio run] execution failed", {
@@ -2292,6 +2540,16 @@ async function _modernRunSubmit(state, context, actions, btn) {
 //
 // Creates a compact info icon with a hover/focus tooltip to replace bulky
 // visible description paragraphs under headings and section labels.
+
+function _isGoldenTerminalResult(result, requestId) {
+  if (!result || result.status !== "ok") return false;
+  if (result.request_id != null && String(result.request_id) !== String(requestId)) return false;
+  return result.terminal === true
+    || Array.isArray(result.outputs)
+    || Array.isArray(result.output_paths)
+    || result.history_id != null
+    || result.run_history_id != null;
+}
 
 export function createInfoHint(text, options) {
   const hint = el("span", {
@@ -2728,12 +2986,18 @@ function validateControls(controls, preset) {
  * Returns true when the result was a direct_run and was handled,
  * false when the caller should fall through to the scheduler/polling path.
  */
-function _handleDirectRunResult(result, state, context, actions, controls) {
+function _handleDirectRunResult(result, state, context, actions, controls, callerSelection) {
   if (!result || !result.direct_run) return false;
   if (result.status !== "ok") return false;
 
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  const outputPaths = result.output_paths || [];
+  const outputPaths = Array.isArray(result.output_paths)
+    ? result.output_paths
+    : (Array.isArray(result.outputs)
+      ? result.outputs.map((output) => typeof output === "string"
+        ? output
+        : (output && (output.path || output.output_path || output.filename))).filter(Boolean)
+      : []);
   const primaryAssetId = result.primary_asset_id || (result.meta && result.meta.primary_asset_id) || "";
   var primaryOutput = null;
   if (outputPaths.length > 0) {
@@ -2746,9 +3010,13 @@ function _handleDirectRunResult(result, state, context, actions, controls) {
   // re-renders synchronously, so assigning the run afterward can leave the
   // completed direct result's timing card out of the first render.
   const meta = result.meta || {};
+  const selection = resolveSelectionResultKey(state, state.playground && state.playground._workflowRun, {
+    presetId: meta.studio_preset_id || (callerSelection && callerSelection.presetId),
+    featureId: meta.studio_feature_id || (callerSelection && callerSelection.featureId),
+  });
   const timings = result.timings || {};
   var rawRun = {
-    id: result.runId || result.runHistoryId || meta.experiment_id || "",
+    id: result.runId || result.runHistoryId || result.run_history_id || result.history_id || meta.experiment_id || "",
     experiment_id: result.experimentId || meta.experiment_id || "",
     status: "completed",
     output_path: result.output_path || (outputPaths.length > 0 ? outputPaths[0] : ""),
@@ -2759,10 +3027,10 @@ function _handleDirectRunResult(result, state, context, actions, controls) {
     workflow_hash: meta.workflow_hash || "",
     extra: {
       experiment_id: result.experimentId || meta.experiment_id || "",
-      studio_preset_id: meta.studio_preset_id || "",
+      studio_preset_id: selection.presetId,
       studio_preset_label: meta.preset_label || "",
       studio_snapshot_id: meta.studio_snapshot_id || "",
-      studio_feature_id: meta.studio_feature_id || "",
+      studio_feature_id: selection.featureId,
       prompt: (controls && controls.prompt) || "",
       negative_prompt: (controls && controls.negative_prompt) || "",
       resolved_controls: meta.resolved_controls || {},
@@ -2783,11 +3051,9 @@ function _handleDirectRunResult(result, state, context, actions, controls) {
       state.playground.lastRunOutput = normalized.imageUrl || primaryOutput;
       state.playground._selectedRun = normalized;
     }
-    // Persist via saveRunResult so the result survives reload.
-    var _presetId = meta.studio_preset_id || "";
-    var _featureId = meta.studio_feature_id || "";
-    if (_presetId && _featureId) {
-      saveRunResult(_presetId, _featureId, normalized);
+    // Persist via the shared selection key so reload queries the same entry.
+    if (selection.presetId && selection.featureId) {
+      saveRunResult(selection.presetId, selection.featureId, normalized);
     }
   }
 
@@ -2826,14 +3092,14 @@ async function doRunSubmit(state, context, actions, clickedBtn) {
   // run button (never an unscoped first-match that could be hidden/stale).
   if (_isModernRunSelected(state)) {
     var _modernBtn = clickedBtn || _resolvePrimaryRunButton();
-    await _modernRunSubmit(state, context, actions, _modernBtn);
+    await _modernRunSubmit(state, context, actions, _modernBtn, requestId);
     return;
   }
 
   const apiBase = (context && context.apiBase) || "/comfymodal";
   var ctrl = _getRunController(state, actions);
   if (!ctrl) return;
-  ctrl.beginRun();
+  ctrl.beginRun(undefined, requestId);
   ctrl.mark("submit_entered");
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
   const selectedId = state.playground && state.playground.selectedBackendId;
@@ -2847,6 +3113,10 @@ async function doRunSubmit(state, context, actions, clickedBtn) {
   ctrl.mark("build_end");
 
   const controls = buildEffectiveControls(state, preset, currentFeatureId);
+  const directSelection = resolveSelectionResultKey(state, null, {
+    presetId: preset.id || selectedId,
+    featureId: currentFeatureId,
+  });
 
   ctrl.mark("validation_start");
   const validationError = validateControls(controls, preset);
@@ -2874,7 +3144,7 @@ async function doRunSubmit(state, context, actions, clickedBtn) {
   const t0_now = Date.now();
 
   ctrl.mark("http_invoked");
-  const result = await runStudioPreset(apiBase, {
+  const legacyPayload = {
     presetId: preset.id || selectedId,
     featureId: currentFeatureId,
     controls: controls,
@@ -2889,12 +3159,23 @@ async function doRunSubmit(state, context, actions, clickedBtn) {
       t0_client_press_ms: t0_now,
       request_id: requestId,
     },
-  });
+  };
+  legacyPayload.request_id = requestId;
+  legacyPayload.profile_name = loadGoldenProfileSelection() || modalOptions.golden_profile || null;
+  _startGoldenProgressPolling(state, context, requestId, ctrl);
+  const result = await runStudioPreset(apiBase, legacyPayload);
   ctrl.mark("backend_ack");
 
   if (result && result.status === "ok") {
+    if (_isGoldenTerminalResult(result, requestId)) {
+      _stopGoldenProgressPolling(state, requestId);
+      ctrl.applyGoldenPostTerminal();
+      _handleDirectRunResult({ ...result, direct_run: true }, state, context, actions, controls, directSelection);
+      return;
+    }
     // â”€â”€ Direct run: result is already completed, no polling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if (_handleDirectRunResult(result, state, context, actions, controls)) {
+    if (_handleDirectRunResult(result, state, context, actions, controls, directSelection)) {
+      _stopGoldenProgressPolling(state, requestId);
       return;
     }
 
@@ -2911,6 +3192,7 @@ async function doRunSubmit(state, context, actions, clickedBtn) {
     // Restart local elapsed timer; preserves original _localStartTime
     _startLocalElapsedTimer(state, context);
   } else {
+    _stopGoldenProgressPolling(state, requestId);
     const errMsg = (result && result.message) || "Run failed.";
     if (result && result.error_code) {
       console.error("[Studio run] execution failed", {
@@ -3206,10 +3488,17 @@ function renderRunButton(state, context, actions) {
         btn.disabled = true;
         btn.textContent = "Running\u2026";
         var ctrl = _getRunController(state, actions);
+        var requestId = (typeof crypto !== "undefined" && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : "studio-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
 
         // Build controls early so sampler fields are available for running state
         if (ctrl) ctrl.mark("build_start");
         const controls = buildEffectiveControls(state);
+        const directSelection = resolveSelectionResultKey(state, null, {
+          presetId: preset.id || selectedId,
+          featureId: currentFeatureId,
+        });
         if (ctrl) ctrl.mark("build_end");
 
         // Clear previous output so canvas shows live progress immediately
@@ -3219,7 +3508,7 @@ function renderRunButton(state, context, actions) {
         // Put determinate sampler fields into running state BEFORE remote call
         var _runSteps = controls.steps;
         var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
-        if (ctrl) ctrl.beginRun({ samplerMaximum: _runMaxSteps });
+        if (ctrl) ctrl.beginRun({ samplerMaximum: _runMaxSteps }, requestId);
         // Start local elapsed timer immediately on press
         _startLocalElapsedTimer(state, context);
 
@@ -3237,7 +3526,7 @@ function renderRunButton(state, context, actions) {
         var t0_now = Date.now();
 
         if (ctrl) ctrl.mark("http_invoked");
-        const result = await runStudioPreset(apiBase, {
+        const legacyPayload = {
           presetId: preset.id || selectedId,
           featureId: currentFeatureId,
           controls: controls,
@@ -3249,13 +3538,25 @@ function renderRunButton(state, context, actions) {
             t0_perf_ms: t0_perf_ms,
             t0_perf_now_ms: t0_now,
             t0_client_press_ms: t0_now,
+            request_id: requestId,
           },
-        });
+        };
+        legacyPayload.request_id = requestId;
+        legacyPayload.profile_name = loadGoldenProfileSelection() || modalOptions.golden_profile || null;
+        if (ctrl) _startGoldenProgressPolling(state, context, requestId, ctrl);
+        const result = await runStudioPreset(apiBase, legacyPayload);
         if (ctrl) ctrl.mark("backend_ack");
 
         if (result && result.status === "ok") {
+          if (_isGoldenTerminalResult(result, requestId)) {
+            _stopGoldenProgressPolling(state, requestId);
+            if (ctrl) ctrl.applyGoldenPostTerminal();
+            _handleDirectRunResult({ ...result, direct_run: true }, state, context, actions, controls, directSelection);
+            return;
+          }
           // â”€â”€ Direct run: result is already completed, no polling â”€â”€
-          if (_handleDirectRunResult(result, state, context, actions, controls)) {
+          if (_handleDirectRunResult(result, state, context, actions, controls, directSelection)) {
+            _stopGoldenProgressPolling(state, requestId);
             return;
           }
 
@@ -3273,6 +3574,7 @@ function renderRunButton(state, context, actions) {
           // Restart local elapsed timer; preserves original _localStartTime
           _startLocalElapsedTimer(state, context);
         } else {
+          _stopGoldenProgressPolling(state, requestId);
           const errMsg = (result && result.message) || "Run failed.";
           if (ctrl) ctrl.applyLocalError(errMsg);
         }
@@ -3324,6 +3626,7 @@ function renderProgressSection(state, context) {
         style: "font-size:10px;color:#aaa;",
         text: "Stage: " + terminalLabel,
       }));
+      _appendGoldenProgress(section, runState);
     }
     return section;
   }
@@ -3367,6 +3670,7 @@ function renderProgressSection(state, context) {
   else if (runState.status === "running") stageLabel = "Running";
   else if (runState.status === "submitted") stageLabel = "Submitted";
   else if (runState.status === "waiting") stageLabel = "Waiting";
+  if (runState.goldenStage) stageLabel = runState.goldenStage;
 
   stageEl.textContent = "Stage: " + stageLabel;
   if (runState.totalNodes != null && runState.totalNodes > 0) {
@@ -3386,7 +3690,10 @@ function renderProgressSection(state, context) {
   }
 
   // Update progress bar width
-  if (runState.overallPercent != null) {
+  if (runState.goldenProgressPercent != null) {
+    barFill.style.width = Math.max(0, Math.min(100, runState.goldenProgressPercent)) + "%";
+    barFill.style.animation = "";
+  } else if (runState.overallPercent != null) {
     barFill.style.width = Math.max(0, Math.min(100, runState.overallPercent)) + "%";
   } else {
     // Indeterminate: show a partial bar with animation
@@ -3394,7 +3701,53 @@ function renderProgressSection(state, context) {
     barFill.style.animation = "cm-pb-pulse 1.6s ease-in-out infinite";
   }
 
+  _appendGoldenProgress(section, runState);
+
   return section;
+}
+
+function _formatGoldenTiming(ms) {
+  if (ms == null || !Number.isFinite(Number(ms))) return "timing pending";
+  return "duration: " + _formatDuration(Number(ms));
+}
+
+function _formatGoldenNs(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? (n / 1e6).toFixed(1) + "ms" : "pending";
+}
+
+function _goldenStageTimingText(stage) {
+  const start = stage && stage.started ? (stage.started.entryMonotonicNs ?? stage.started.entryWallNs) : null;
+  const terminal = stage && (stage.completed || stage.failed);
+  const end = terminal ? (terminal.endMonotonicNs ?? terminal.endWallNs) : null;
+  return "start: " + _formatGoldenNs(start) + " · end: " + _formatGoldenNs(end)
+    + " · " + _formatGoldenTiming(stage && stage.durationMs);
+}
+
+function _appendGoldenProgress(section, runState) {
+  const golden = runState && runState.goldenProgress;
+  if (!golden) return;
+  const list = el("div", {
+    "data-testid": "progress-golden-stages",
+    style: "display:flex;flex-direction:column;gap:2px;margin-top:6px;font-size:10px;",
+  });
+  (Array.isArray(golden.stages) ? golden.stages : []).forEach((stage) => {
+    const phaseText = stage.phase === "failed" ? "failed" : stage.phase;
+    list.appendChild(el("div", {
+      "data-testid": "progress-golden-stage-row",
+      "data-stage": stage.stage,
+      text: stage.stage + " — " + phaseText + " · " + _goldenStageTimingText(stage),
+      style: stage.phase === "failed" ? "color:var(--color-danger,#f87171);" : "color:#aaa;",
+    }));
+  });
+  section.appendChild(list);
+  if (golden.error) {
+    section.appendChild(el("div", {
+      "data-testid": "progress-golden-stage-error",
+      text: "Golden stage failure: " + golden.error,
+      style: "font-size:10px;color:var(--color-danger,#f87171);margin-top:4px;",
+    }));
+  }
 }
 
 // â”€â”€ Legacy Experiment grid viewport â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -3430,6 +3783,7 @@ function _domPatchProgress(state) {
     else if (rs.status === "waiting") stageLabel = "Waiting";
     else if (rs.status === "canceled") stageLabel = "Canceled";
     else if (rs.status === "interrupted") stageLabel = "Interrupted";
+    if (rs.goldenStage) stageLabel = rs.goldenStage;
     stageEl.textContent = "Stage: " + stageLabel;
   }
 
@@ -3466,12 +3820,42 @@ function _domPatchProgress(state) {
 
   var barFill = document.querySelector('[data-testid="progress-bar-fill"]');
   if (barFill) {
-    if (rs.overallPercent != null) {
+    if (rs.goldenProgressPercent != null) {
+      barFill.style.width = Math.max(0, Math.min(100, rs.goldenProgressPercent)) + "%";
+      barFill.style.animation = "";
+    } else if (rs.overallPercent != null) {
       barFill.style.width = Math.max(0, Math.min(100, rs.overallPercent)) + "%";
       barFill.style.animation = "";
     } else {
       barFill.style.width = "30%";
       barFill.style.animation = "cm-pb-pulse 1.6s ease-in-out infinite";
+    }
+  }
+
+  var stageList = document.querySelector('[data-testid="progress-golden-stages"]');
+  if (!stageList && rs.goldenProgress) {
+    var progressSection = document.querySelector('[data-testid="progress-section"]');
+    if (progressSection) _appendGoldenProgress(progressSection, rs);
+    stageList = document.querySelector('[data-testid="progress-golden-stages"]');
+  }
+  if (stageList && rs.goldenProgress) {
+    while (stageList.firstChild) stageList.removeChild(stageList.firstChild);
+    (Array.isArray(rs.goldenProgress.stages) ? rs.goldenProgress.stages : []).forEach(function (stage) {
+      stageList.appendChild(el("div", {
+        "data-testid": "progress-golden-stage-row",
+        "data-stage": stage.stage,
+        text: stage.stage + " — " + stage.phase + " · " + _goldenStageTimingText(stage),
+        style: stage.phase === "failed" ? "color:var(--color-danger,#f87171);" : "color:#aaa;",
+      }));
+    });
+    var stageError = document.querySelector('[data-testid="progress-golden-stage-error"]');
+    if (rs.goldenProgress.error && !stageError) {
+      var errorSection = document.querySelector('[data-testid="progress-section"]');
+      if (errorSection) _appendGoldenProgress(errorSection, rs);
+    } else if (stageError) {
+      stageError.textContent = rs.goldenProgress.error
+        ? "Golden stage failure: " + rs.goldenProgress.error : "";
+      stageError.style.display = rs.goldenProgress.error ? "" : "none";
     }
   }
 }

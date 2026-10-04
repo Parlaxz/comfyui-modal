@@ -127,6 +127,13 @@ const SETTINGS_KEY_CONTRACT = {
       [settingsSource, 'localStorage.setItem("comfymodal_heavy_tracing"'],
     ],
   },
+  "comfymodal.studio.golden.profile.v1": {
+    classification: "value-setting",
+    evidence: [
+      [playgroundStateSource, 'GOLDEN_PROFILE_KEY = "comfymodal.studio.golden.profile.v1"'],
+      [settingsSource, 'clearGoldenProfileSelection();'],
+    ],
+  },
   "comfymodal-studio-panel-width": {
     classification: "ui-preference",
     evidence: [[playgroundSource, '"comfymodal-studio-panel-width"']],

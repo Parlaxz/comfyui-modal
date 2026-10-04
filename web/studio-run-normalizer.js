@@ -50,6 +50,58 @@ export function nilOrEmptyTo(value, fallback) {
   return value;
 }
 
+/**
+ * Resolve the single key used for Playground result persistence.
+ *
+ * Modern Workflow runs and legacy preset runs have different state owners,
+ * so callers must not derive this key themselves.  The workflow store wins
+ * when it has a preset id; otherwise an active Workflow uses its own stable
+ * id (never a stale legacy backend selection).  With no active Workflow the
+ * legacy selected backend is used.  The optional
+ * fallback is only for response/caller metadata and legacy callers that have
+ * an id not yet copied into Playground state.
+ */
+export function resolveSelectionResultKey(state, store, fallback) {
+  const playground = (state && state.playground) || {};
+  const workflowStore = store || playground._workflowRun || {};
+  const currentPreset = playground._currentPreset || {};
+  const extra = fallback || {};
+  const presetId = workflowStore.presetId
+    || (workflowStore.workflowId ? workflowStore.workflowId : playground.selectedBackendId)
+    || extra.presetId
+    || currentPreset.id
+    || currentPreset.label
+    || "";
+  return {
+    presetId: presetId ? String(presetId) : "",
+    featureId: playground.featureId
+      || extra.featureId
+      || "txt2img",
+  };
+}
+
+/**
+ * Resolve the ids that identify a direct run in Playground.
+ * Kept as a compatibility helper for normalizer consumers; persistence uses
+ * resolveSelectionResultKey directly so save and load share one derivation.
+ */
+export function resolveDirectRunSelection(state, meta, selection) {
+  const playground = (state && state.playground) || {};
+  const callerSelection = selection || {};
+  const directMeta = meta || {};
+  const resolved = resolveSelectionResultKey(state, playground._workflowRun, {
+    presetId: directMeta.studio_preset_id || callerSelection.presetId,
+    featureId: directMeta.studio_feature_id || callerSelection.featureId,
+  });
+  // Preserve the legacy helper's empty result for a completely unknown
+  // selection; the persistence guard still rejects it.
+  if (!resolved.presetId && !playground.featureId
+      && !directMeta.studio_feature_id && !callerSelection.featureId) {
+    resolved.featureId = "";
+  }
+  return resolved;
+}
+
 // ── Timing normalization helpers ─────────────────────────────────────────
 //
 // Given a raw timings object (or trace, remote_timings, wall_clock_trace,
@@ -719,19 +771,27 @@ export function resolveRunImageUrl(run, apiBase) {
   if (!run) return null;
   const extra = (run && run.extra) || {};
 
+  // History V2 also exposes a tiny workflow-graph preview as an asset.  It is
+  // useful for graph UI, but it is never the generated run output.  Ignore
+  // those ids so an actual output_path can win below.
+  const isWorkflowGraphAsset = function (assetId) {
+    const value = String(assetId || "").trim();
+    return /^(?:ast|graph|workflow[-_]?graph)[-_]/i.test(value);
+  };
+
   // 1. primary_asset_id (from experiment materialization)
   const primaryAssetId = extra.primary_asset_id || run.primary_asset_id || "";
-  if (primaryAssetId) {
+  if (primaryAssetId && !isWorkflowGraphAsset(primaryAssetId)) {
     return apiBase + "/assets/" + encodeURIComponent(primaryAssetId);
   }
 
   // 2. run-level asset_id (from ordinary runs)
   const assetId = run.asset_id || extra.asset_id || "";
-  if (assetId) {
+  if (assetId && !isWorkflowGraphAsset(assetId)) {
     return apiBase + "/assets/" + encodeURIComponent(assetId);
   }
 
-  // 3. output_path (fallback for older runs without asset registration)
+  // 3. output_path (fallback when no usable generated asset is registered)
   const outputPath = run.output_path || extra.output_path || run.primary_image_path || "";
   if (outputPath) {
     const normalizedPath = String(outputPath).replace(/\\/g, "/");

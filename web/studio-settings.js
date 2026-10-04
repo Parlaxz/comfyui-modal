@@ -16,6 +16,11 @@
 //  - All new localStorage keys are flat strings.
 
 import { publishStudioSync, subscribeStudioSync } from "./studio-sync.js";
+import {
+  loadGoldenProfileSelection,
+  saveGoldenProfileSelection,
+  clearGoldenProfileSelection,
+} from "./studio-playground-state.js";
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -59,6 +64,7 @@ const MODERN_SETTINGS_KEYS = [
   "comfymodal_preview_quality",
   "comfymodal-studio-history-columns",
   "comfymodal_heavy_tracing",
+  "comfymodal.studio.golden.profile.v1",
   "comfymodal-studio-panel-width",
   "comfymodal.studio.playground.carousel-cleared.v1",
 ];
@@ -200,6 +206,8 @@ export function renderSettings(state, context) {
   // restart banner compares these, never the browser-stored selection.
   let persistedTracingLevel = null;
   let effectiveTracingLevel = null;
+  let goldenProfiles = [];
+  let goldenProfilesError = null;
 
   // ── Pending-restart banner (persistent across rebuilds) ──
   const bannerEl = el("div", {
@@ -344,6 +352,14 @@ export function renderSettings(state, context) {
           body: JSON.stringify({ level: "off" }),
         });
       } catch (_) {}
+      clearGoldenProfileSelection();
+      try {
+        await fetch(apiBase + "/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ golden_profile: null }),
+        });
+      } catch (_) {}
     },
   };
 
@@ -362,6 +378,7 @@ export function renderSettings(state, context) {
     );
     if (!ok) return;
     removeKeys(MODERN_SETTINGS_KEYS);
+    clearGoldenProfileSelection();
     try {
       const defaultGpu = await fetchDefaultGpu();
       const resp = await fetch(apiBase + "/config", {
@@ -668,6 +685,20 @@ export function renderSettings(state, context) {
 
     section.appendChild(runtimeGroup);
 
+    const goldenProfileWrap = el("div", {
+      class: "comfymodal-settings-control",
+      "data-search": "golden profile owner method deployed undeployed runtime",
+    });
+    goldenProfileWrap.appendChild(settingsRow("Golden profile", el("div", {
+      "data-testid": "settings-golden-profile-host",
+      style: "width:100%;",
+    })));
+    goldenProfileWrap.appendChild(el("div", {
+      class: "comfymodal-studio-settings-hint",
+      text: "Select a server-catalogued Golden profile. Undeployed profiles must be deployed before use; Studio will not fall back to another profile.",
+    }));
+    section.appendChild(goldenProfileWrap);
+
     return section;
   }
 
@@ -712,6 +743,7 @@ export function renderSettings(state, context) {
     refreshRuntimeCounts(apiBase);
     refreshOutputsPrefs(apiBase);
     refreshProfileLevel(apiBase);
+    refreshGoldenProfiles(apiBase);
   }
 
   // ── H12 engine migration notice (server-backed, one-time) ──
@@ -1083,6 +1115,134 @@ export function renderSettings(state, context) {
     }
 
     fetchProfileLevel();
+  }
+
+  // Golden profiles are a server catalog, never a browser-authored list. The
+  // browser may remember only the selected name; resources and deployment
+  // metadata remain server truth and are deliberately not persisted.
+  function refreshGoldenProfiles(base) {
+    const host = sectionsHost.querySelector('[data-testid="settings-golden-profile-host"]');
+    if (!host) return;
+    while (host.firstChild) host.removeChild(host.firstChild);
+    host.appendChild(el("p", {
+      class: "comfymodal-studio-settings-hint",
+      text: "Loading Golden profiles...",
+    }));
+
+    Promise.all([
+      fetch(base + "/studio/golden/profiles").then(async (response) => {
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        const data = await response.json();
+        if (!data || data.status !== "ok" || !Array.isArray(data.profiles)) {
+          throw new Error((data && (data.message || data.error)) || "invalid catalog response");
+        }
+        return data;
+      }),
+      fetch(base + "/config").then(async (response) => {
+        if (!response.ok) return {};
+        return response.json();
+      }).catch(() => ({})),
+    ]).then(([catalog, config]) => {
+      if (!host.isConnected) return;
+      goldenProfiles = catalog.profiles.filter((profile) => profile && typeof profile.name === "string" && profile.name);
+      goldenProfilesError = null;
+      const names = new Set(goldenProfiles.map((profile) => profile.name));
+      const serverSelected = config && (config.golden_profile || config.profile_name || config.profile);
+      const localSelected = loadGoldenProfileSelection();
+      // Prefer an explicitly persisted server/local selection, but never add
+      // an option that the catalog did not return.
+      const selected = names.has(serverSelected) ? serverSelected
+        : names.has(localSelected) ? localSelected
+          : names.has(catalog.defaultProfile) ? catalog.defaultProfile : "";
+      if (selected) saveGoldenProfileSelection(selected);
+      renderGoldenProfileHost(host, base, selected);
+    }).catch((error) => {
+      if (!host.isConnected) return;
+      goldenProfiles = [];
+      goldenProfilesError = error && error.message ? error.message : "unknown catalog error";
+      while (host.firstChild) host.removeChild(host.firstChild);
+      host.appendChild(el("p", {
+        class: "comfymodal-studio-settings-error",
+        "data-testid": "settings-golden-profile-error",
+        text: "Could not load Golden profiles: " + goldenProfilesError,
+      }));
+    });
+  }
+
+  function renderGoldenProfileHost(host, base, selected) {
+    while (host.firstChild) host.removeChild(host.firstChild);
+    if (goldenProfilesError) {
+      host.appendChild(el("p", {
+        class: "comfymodal-studio-settings-error",
+        "data-testid": "settings-golden-profile-error",
+        text: "Could not load Golden profiles: " + goldenProfilesError,
+      }));
+      return;
+    }
+    const select = el("select", {
+      class: "comfymodal-input",
+      "data-testid": "settings-golden-profile",
+      "aria-label": "Golden execution profile",
+    });
+    if (goldenProfiles.length === 0) {
+      select.appendChild(el("option", { value: "", text: "No Golden profiles available", disabled: true, selected: true }));
+      select.disabled = true;
+    } else {
+      goldenProfiles.forEach((profile) => {
+        const deployed = profile.deployed === true;
+        const option = el("option", {
+          value: profile.name,
+          text: profile.name + (deployed ? " (deployed)" : " (undeployed — deploy before use)"),
+          disabled: !deployed,
+        });
+        if (profile.name === selected) option.selected = true;
+        select.appendChild(option);
+      });
+      select.value = selected || "";
+    }
+    select.addEventListener("change", async () => {
+      const profile = goldenProfiles.find((item) => item.name === select.value);
+      if (!profile || profile.deployed !== true) return;
+      const previous = loadGoldenProfileSelection();
+      try {
+        const response = await fetch(base + "/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ golden_profile: profile.name }),
+        });
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        saveGoldenProfileSelection(profile.name);
+        publishStudioSync("settings");
+      } catch (error) {
+        select.value = previous || "";
+        const errorEl = host.querySelector('[data-testid="settings-golden-profile-save-error"]');
+        if (errorEl) errorEl.textContent = "Could not save Golden profile: " + (error.message || "request failed");
+      }
+    });
+    host.appendChild(select);
+
+    const catalogList = el("div", {
+      class: "comfymodal-studio-settings-golden-profile-catalog",
+      "data-testid": "settings-golden-profile-catalog",
+    });
+    goldenProfiles.forEach((profile) => {
+      const target = profile.target && typeof profile.target === "object" ? profile.target : {};
+      const row = el("div", {
+        class: "comfymodal-studio-settings-hint",
+        "data-testid": "settings-golden-profile-row",
+        "data-profile-name": profile.name,
+        text: profile.name + " · owner: " + (profile.owner || "unknown")
+          + " · method: " + (target.method || "unknown")
+          + " · " + (profile.deployed === true ? "deployed" : "undeployed — must be deployed before use"),
+      });
+      catalogList.appendChild(row);
+    });
+    host.appendChild(catalogList);
+    host.appendChild(el("p", {
+      class: "comfymodal-studio-settings-hint",
+      "data-testid": "settings-golden-profile-save-error",
+      text: "",
+    }));
   }
 
   // Initial build
