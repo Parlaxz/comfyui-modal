@@ -412,6 +412,55 @@ function _compilePattern(pattern) {
   return { regex, paramNames };
 }
 
+// The single deployed Golden profile this fake deployment advertises.  Matches
+// the shape of GoldenProfile.to_dict() in tools/v2_control/profile_catalog.py.
+const FAKE_GOLDEN_PROFILE = "golden_p1_parallel_c0_p8_h100";
+
+/**
+ * Deterministic golden_stage_event_v1 script for one request id.
+ *
+ * Mirrors studio_golden_run.GoldenRunEventStore.read() semantics: every event
+ * carries a monotonic `cursor`, a poll returns only events with a greater
+ * cursor, and `terminal` is true once the caller has consumed the last one.
+ */
+function fakeGoldenStageScript(requestId) {
+  const event = (cursor, stage, phase, extra) => ({
+    schema: "golden_stage_event_v1",
+    type: "golden_stage",
+    request_id: requestId,
+    sequence: cursor,
+    cursor,
+    stage,
+    phase,
+    entry_wall_ns: 1000000000 + cursor * 1000000,
+    entry_monotonic_ns: 1000000000 + cursor * 1000000,
+    end_wall_ns: null,
+    end_monotonic_ns: null,
+    ok: null,
+    error: null,
+    ...extra,
+  });
+  return [
+    event(1, "golden_clip_load", "started", {}),
+    event(2, "golden_clip_load", "completed", {
+      end_wall_ns: 1040000000,
+      end_monotonic_ns: 1040000000,
+      ok: true,
+    }),
+    event(3, "golden_decode", "started", {
+      entry_wall_ns: 1050000000,
+      entry_monotonic_ns: 1050000000,
+    }),
+    event(4, "golden_decode", "completed", {
+      entry_wall_ns: 1050000000,
+      entry_monotonic_ns: 1050000000,
+      end_wall_ns: 1120000000,
+      end_monotonic_ns: 1120000000,
+      ok: true,
+    }),
+  ];
+}
+
 const ROUTES = [
   // Presets (detail before list)
   ["GET", "/comfymodal/studio/presets/:id", async (res, body, params, sid) => _json(res, _sessionOrError(res, sid, () => engine.getPreset(sid, params.id)))],
@@ -659,6 +708,58 @@ const ROUTES = [
   }],
   ["POST", "/comfymodal/config", async (res, body) => {
     _json(res, engine.setConfig(res._sid, body || {}));
+  }],
+
+  // Golden: read-only profile catalog + bounded stage-event cursor.  The
+  // Settings page fetches the catalog on load, so a missing route here shows up
+  // as a 404 console error in every fake spec, not just the Golden ones.
+  // Shapes mirror __init__.py studio_golden_profiles / studio_run_progress and
+  // tools/v2_control/profile_catalog.py GoldenProfile.to_dict().
+  ["GET", "/comfymodal/studio/golden/profiles", async (res) => {
+    _json(res, {
+      status: "ok",
+      defaultProfile: FAKE_GOLDEN_PROFILE,
+      profiles: [
+        {
+          name: FAKE_GOLDEN_PROFILE,
+          owner: "fake",
+          target: {
+            app: "fake-golden-h100",
+            class: "ModalRuntimeEntrypointV2",
+            method: "run_golden_serial_stream",
+          },
+          resources: { gpu: "h100!", cpu: 12, memory_mb: 24576 },
+          deployed: true,
+        },
+      ],
+    });
+  }],
+  ["GET", "/comfymodal/studio/run-progress/:request_id", async (res, body, params) => {
+    const requestId = String(params.request_id || "");
+    if (!/^[\w.:-]+$/.test(requestId)) {
+      _json(res, { status: "error", message: "unknown or expired request_id" }, 404);
+      return;
+    }
+    const rawCursor = res._url.searchParams.get("cursor") ?? "0";
+    if (!/^\d+$/.test(String(rawCursor))) {
+      _json(res, { status: "error", message: "cursor must be a non-negative integer" }, 400);
+      return;
+    }
+    const cursor = Number.parseInt(String(rawCursor), 10);
+    // Deterministic three-poll script: clip started, clip completed + decode
+    // started, decode completed and terminal.  Events carry `cursor` exactly as
+    // GoldenRunEvent does, so EVENT_STORE.read's `cursor > last` filter and its
+    // terminal flag behave identically here.
+    const script = fakeGoldenStageScript(requestId);
+    const events = script.filter((event) => event.cursor > cursor);
+    const nextCursor = events.length ? events[events.length - 1].cursor : cursor;
+    _json(res, {
+      status: "ok",
+      request_id: requestId,
+      cursor: nextCursor,
+      events,
+      terminal: cursor >= script[script.length - 1].cursor,
+    });
   }],
 
   // Studio Workflows (deterministic fake dataset; see _studioSeed above).
