@@ -11,7 +11,15 @@ produces the numbers the decision tree needs:
 * slot-identity and source-offset correlation for the slow copies, including
   whether the same slot or the same offset recurs as pathological across
   independent containers;
-* the single-thread versus four-thread comparison for arms C and D.
+* the single-thread versus four-thread comparison for arms C and D;
+* for the population arms A2 and A3, the setup cost of the treatment itself and
+  the ordinal-0..7 head/tail split, so a fast copy loop cannot hide a slow setup.
+
+Cohorts are keyed by **deployment fingerprint**, not by arm and not by profile.
+Arm A was run from three different deployments across the two phases, and a
+profile is not a deployment: one profile was deployed twice.  Pooling across
+deployments would silently present two different code states as one homogeneous
+cohort, which is the one thing the deployment-identity rule exists to prevent.
 
 Nothing here selects evidence by modification time and nothing here drops an
 invalid attempt: every attempt found is listed with its validity, and only
@@ -33,6 +41,8 @@ from comfymodal_runtime.source_copy_isolation import (  # noqa: E402
     ARMS,
     STALL_THRESHOLDS_MS,
     describe,
+    ordinal_head,
+    setup_costs,
     summarize_copies,
 )
 
@@ -238,12 +248,112 @@ def arm_summary(rows: Sequence[Mapping[str, Any]], variant: str | None = None) -
         "slowest": pooled["slowest"],
         "distinct_source_offsets": pooled["distinct_source_offsets"],
         "distinct_dest_slots": pooled["distinct_dest_slots"],
+        "ordinal_head": ordinal_head(copies),
         "per_container": per_container,
         "source_offset_repeat": repeat_analysis(copies, "source_offset", containers=containers),
         "dest_slot_repeat": repeat_analysis(copies, "dest_slot", containers=containers),
         "reader_repeat": repeat_analysis(copies, "reader", containers=containers),
         "ordinal_repeat": repeat_analysis(copies, "copy_ordinal", containers=containers),
     }
+
+
+def population_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """What each container's arm payload says about the population treatment.
+
+    Aggregated rather than taken from one row because the interesting failure
+    mode is "the treatment landed in some containers and not others", which a
+    single row would hide.
+    """
+    arms: Counter = Counter()
+    fadvise_counts: Counter = Counter()
+    fadvise_return_codes: Counter = Counter()
+    mmap_flags: Counter = Counter()
+    reasons: Counter = Counter()
+    errors: Counter = Counter()
+    fadvise_wall_ms: list[float] = []
+    mmap_wall_ms: list[float] = []
+    plan_build_ms: list[float] = []
+    for row in rows:
+        population = (row.get("report") or {}).get("population") or {}
+        arms[str(population.get("arm") or "")] += 1
+        fadvise_counts[str(population.get("fadvise_call_count"))] += 1
+        fadvise_return_codes[str(population.get("fadvise_return_code"))] += 1
+        mmap_flags[str(population.get("mmap_flags"))] += 1
+        if population.get("reason"):
+            reasons[str(population["reason"])] += 1
+        if population.get("error"):
+            errors[str(population["error"])] += 1
+        for key, sink in (
+            ("fadvise_wall_ms", fadvise_wall_ms),
+            ("mmap_wall_ms", mmap_wall_ms),
+            ("plan_build_total_ms", plan_build_ms),
+        ):
+            value = population.get(key)
+            if isinstance(value, (int, float)):
+                sink.append(float(value))
+    return {
+        "containers": len(rows),
+        "arm_names": dict(arms),
+        "fadvise_call_count": dict(fadvise_counts),
+        "fadvise_return_code": dict(fadvise_return_codes),
+        "mmap_flags": dict(mmap_flags),
+        "reasons": dict(reasons),
+        "errors": dict(errors),
+        "fadvise_wall_ms": summarize_copies(
+            [{"wall_ms": value} for value in fadvise_wall_ms]
+        )["wall_ms"] if fadvise_wall_ms else None,
+        "mmap_wall_ms": summarize_copies(
+            [{"wall_ms": value} for value in mmap_wall_ms]
+        )["wall_ms"] if mmap_wall_ms else None,
+        "plan_build_total_ms": summarize_copies(
+            [{"wall_ms": value} for value in plan_build_ms]
+        )["wall_ms"] if plan_build_ms else None,
+    }
+
+
+def setup_cost_evidence(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Per-container treatment cost, taken from the payload's own accounting.
+
+    A prefetch that made the copies fast while spending seconds in ``mmap`` would
+    otherwise read as a win, because the copy loop is what the arm measures.
+    """
+    costs: list[dict[str, Any]] = []
+    for row in rows:
+        report = row.get("report") or {}
+        population = report.get("population") or {}
+        variants = report.get("variants") or []
+        primary = next(
+            (item for item in variants if str(item.get("variant")) == "concurrent4"),
+            variants[0] if variants else {},
+        )
+        # Every nanosecond input comes from the payload, so a variant that never
+        # reported one produces None costs rather than a fabricated zero.
+        if any(value is None for value in (
+            population.get("generation_open_monotonic_ns"),
+            primary.get("setup_done_monotonic_ns"),
+            primary.get("started_monotonic_ns"),
+            primary.get("ended_monotonic_ns"),
+        )):
+            computed = None
+        else:
+            computed = setup_costs(
+                population=population,
+                generation_open_ns=int(population["generation_open_monotonic_ns"]),
+                setup_done_ns=int(primary["setup_done_monotonic_ns"]),
+                copy_started_ns=int(primary["started_monotonic_ns"]),
+                copy_ended_ns=int(primary["ended_monotonic_ns"]),
+                copies=primary.get("copies") or [],
+            )
+        costs.append({
+            "request_id": row.get("request_id"),
+            "arm": str(population.get("arm") or ""),
+            "declared_arm": population.get("declared_arm"),
+            "observed_arm": population.get("observed_arm"),
+            "satisfied": population.get("satisfied"),
+            "mapped_bytes": population.get("mapped_bytes"),
+            "computed": computed,
+        })
+    return costs
 
 
 def host_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -295,24 +405,33 @@ def build(root: Path, profile_prefix: str = PROFILE_PREFIX) -> dict[str, Any]:
             "source": report.get("source"),
             "destination": report.get("destination"),
             "host": host_evidence(rows),
+            "population": population_evidence(rows),
             "pooled": arm_summary(rows),
             "variants": {},
             "cohorts": {},
         }
-        by_profile: dict[str, list[Mapping[str, Any]]] = {}
+        by_deployment: dict[str, list[Mapping[str, Any]]] = {}
         for row in rows:
-            by_profile.setdefault(str(row.get("profile") or ""), []).append(row)
-        for profile_name, profile_rows in sorted(by_profile.items()):
-            profile_pooled = arm_summary(profile_rows)
-            entry["cohorts"][profile_name] = {
-                "usable_containers": len(profile_rows),
-                "images": sorted({
-                    str(row.get("image_id") or "") for row in profile_rows
+            by_deployment.setdefault(
+                str(row.get("deployment_fingerprint") or "unknown"), []
+            ).append(row)
+        for fingerprint, deploy_rows in sorted(by_deployment.items()):
+            deploy_pooled = arm_summary(deploy_rows)
+            entry["cohorts"][fingerprint] = {
+                "deploy_fingerprint": fingerprint,
+                "profiles": sorted({
+                    str(row.get("profile") or "") for row in deploy_rows
                 }),
-                "pooled": profile_pooled,
-                "pathological": is_pathological(
-                    profile_pooled, len(profile_rows)
-                ),
+                "usable_containers": len(deploy_rows),
+                "images": sorted({
+                    str(row.get("image_id") or "") for row in deploy_rows
+                }),
+                "request_ids": [
+                    str(row.get("request_id") or "") for row in deploy_rows
+                ],
+                "pooled": deploy_pooled,
+                "setup_costs": setup_cost_evidence(deploy_rows),
+                "pathological": is_pathological(deploy_pooled, len(deploy_rows)),
             }
         for variant in report.get("arm_layout", {}).get("variants", []):
             if not variant_complete(rows, str(variant)):
@@ -419,8 +538,146 @@ def classify(summary: Mapping[str, Any]) -> dict[str, Any]:
         single_p99 = single.get("p99")
         four_p99 = four.get("p99")
         if single_p99 and four_p99 and four_p99 > 3.0 * max(single_p99, 1e-9):
-            outcome = "CONCURRENCY_SPECIFIC"
+                outcome = "CONCURRENCY_SPECIFIC"
     return {"arm_verdicts": verdicts, "classification": outcome}
+
+
+# The population question is narrower than the placement question above, so it
+# gets its own rule instead of being forced through the A/B/C/D structure.  A is
+# the control: same mapped source, no treatment.  A2 adds one POSIX_FADV_WILLNEED
+# and A3 adds MAP_POPULATE.  "Pathological" keeps the identical absolute rule, so
+# a treatment is only credited with removing the stall, never with being slow.
+POPULATION_CONTROL_ARM = "A"
+POPULATION_ARMS_BY_TREATMENT = {"A2": "WILLNEED", "A3": "MAP_POPULATE"}
+
+
+def pathological_containers(per_container: Sequence[Mapping[str, Any]]) -> int:
+    """How many individual containers showed the pathological regime at all.
+
+    The pooled decision rule is a statement about a distribution.  A mechanism
+    that fires in one container out of five is invisible to a pooled p99 diluted
+    by four healthy containers, so a treatment can clear the pooled thresholds
+    while its own arm still contains a full-blown pathological container.  This
+    count is what separates "the treatment removed the stall" from "the
+    treatment was lucky", and it is the number the decision has to respect.
+    """
+    total = 0
+    for container in per_container:
+        thresholds = container.get("over_thresholds") or {}
+        if int(thresholds.get(">100ms") or 0) > 0:
+            total += 1
+    return total
+
+
+def classify_population(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Did forcing the backing pages in remove the mapped-source copy stall?
+
+    Read off the per-deployment cohorts, because an arm name is not a deployment
+    and this decision must not be taken across two code states.
+    """
+    arms = summary.get("arms") or {}
+    verdicts: dict[str, Any] = {}
+    control_sick: bool | None = None
+    for arm in (POPULATION_CONTROL_ARM, *sorted(POPULATION_ARMS_BY_TREATMENT)):
+        cohorts = (arms.get(arm) or {}).get("cohorts") or {}
+        records: list[dict[str, Any]] = []
+        for fingerprint, cohort in sorted(cohorts.items()):
+            pooled = cohort.get("pooled") or {}
+            wall = pooled.get("wall_ms") or {}
+            count = int(wall.get("count") or 0)
+            over_100 = int((pooled.get("over_thresholds") or {}).get(">100ms") or 0)
+            records.append({
+                "deploy_fingerprint": fingerprint,
+                "profiles": cohort.get("profiles"),
+                "usable_containers": cohort.get("usable_containers"),
+                "images": cohort.get("images"),
+                "copy_count": count,
+                "p50_ms": wall.get("p50"),
+                "p90_ms": wall.get("p90"),
+                "p99_ms": wall.get("p99"),
+                "max_ms": wall.get("max"),
+                "over_100ms": over_100,
+                "over_100ms_fraction": round(over_100 / count, 6) if count else None,
+                "over_250ms": (pooled.get("over_thresholds") or {}).get(">250ms"),
+                "over_1000ms": (pooled.get("over_thresholds") or {}).get(">1000ms"),
+                "pathological": cohort.get("pathological"),
+                "pathological_containers": pathological_containers(
+                    (cohort.get("pooled") or {}).get("per_container") or []
+                ),
+                "containers": cohort.get("usable_containers"),
+                "ordinal_head": pooled.get("ordinal_head"),
+                "setup_costs": cohort.get("setup_costs"),
+                "population": (arms.get(arm) or {}).get("population"),
+            })
+        verdicts[arm] = {"deployments": records}
+        if arm == POPULATION_CONTROL_ARM and records:
+            # More than one control deployment means the cohort is not a single
+            # code state; say so instead of picking one silently.
+            control_sick = any(item.get("pathological") for item in records)
+            verdicts[arm]["multiple_deployments"] = len(records) > 1
+    def _sick_container_count(arm: str) -> int:
+        records = verdicts[arm]["deployments"]
+        return int(records[-1].get("pathological_containers") or 0) if records else 0
+
+    pooled_healthy = {
+        arm for arm in POPULATION_ARMS_BY_TREATMENT
+        if verdicts[arm]["deployments"]
+        and not verdicts[arm]["deployments"][-1].get("pathological")
+    }
+    pooled_sick = set(POPULATION_ARMS_BY_TREATMENT) - pooled_healthy
+    control_records = verdicts[POPULATION_CONTROL_ARM]["deployments"]
+    control_sick_containers = _sick_container_count(POPULATION_CONTROL_ARM)
+    treatment_sick_containers = {
+        arm: _sick_container_count(arm) for arm in POPULATION_ARMS_BY_TREATMENT
+    }
+    # A treatment is only credited when its own arm contains no pathological
+    # container.  Clearing the pooled thresholds is not enough, because the
+    # mechanism is intermittent: an arm with one catastrophic container out of
+    # five still has that catastrophic container.
+    healthy = {arm for arm in pooled_healthy if treatment_sick_containers[arm] == 0}
+    sick = set(POPULATION_ARMS_BY_TREATMENT) - healthy
+    reasons: list[str] = []
+    if control_sick is None:
+        outcome = "INCONCLUSIVE_CURRENT_COHORT"
+        reasons.append("no_control_cohort")
+    elif not control_sick:
+        outcome = "INCONCLUSIVE_CURRENT_COHORT"
+        reasons.append("control_did_not_reproduce_the_stall")
+    elif control_sick_containers == 0:
+        outcome = "INCONCLUSIVE_CURRENT_COHORT"
+        reasons.append("control_has_no_pathological_container_to_explain")
+    elif healthy == {"A2"}:
+        outcome = "WILLNEED_ONLY_EFFECTIVE"
+    elif healthy:
+        outcome = "BACKING_POPULATION_CONFIRMED"
+    elif pooled_sick == set(POPULATION_ARMS_BY_TREATMENT) and all(
+        count >= control_sick_containers for count in treatment_sick_containers.values()
+    ):
+        outcome = "PREFETCH_FAMILY_FAILED"
+        reasons.append(
+            "every_treatment_arm_still_contains_a_pathological_container"
+        )
+    elif pooled_healthy - healthy:
+        outcome = "INCONCLUSIVE_CURRENT_COHORT"
+        reasons.append(
+            "pooled_thresholds_and_per_container_evidence_disagree"
+        )
+    else:
+        outcome = "MIXED"
+    if control_records and len(control_records) > 1:
+        reasons.append("control_spans_multiple_deployments")
+    return {
+        "arm_verdicts": verdicts,
+        "classification": outcome,
+        "healthy_treatment_arms": sorted(healthy),
+        "pooled_healthy_treatment_arms": sorted(pooled_healthy),
+        "pathological_treatment_arms": sorted(sick),
+        "pathological_containers": {
+            POPULATION_CONTROL_ARM: control_sick_containers,
+            **treatment_sick_containers,
+        },
+        "reasons": reasons,
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -432,6 +689,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     root = Path(args.root).resolve()
     summary = build(root, args.profile_prefix)
     summary["classification"] = classify(summary)
+    summary["population_decision"] = classify_population(summary)
     text = json.dumps(summary, indent=2, sort_keys=True)
     if args.out:
         out = Path(args.out)

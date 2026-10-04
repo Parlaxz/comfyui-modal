@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from comfymodal_runtime import golden_source_threads as gsrc  # noqa: E402
 from comfymodal_runtime import source_copy_isolation as sci  # noqa: E402
 from comfymodal_runtime.source_copy_probe import SourceCopyProbe  # noqa: E402
+from tools import source_copy_isolation_report as report_tool  # noqa: E402
 
 _MIB = 1024 * 1024
 
@@ -492,3 +493,102 @@ def test_driver_runs_production_copies_and_reports_slot_identity(monkeypatch):
     finally:
         sci._release_anonymous(source_buffer)
         sci._release_anonymous(destination)
+
+# ── the population decision must survive an intermittent mechanism ────────
+# The measured A/A2/A3 cohort made this concrete: MAP_POPULATE cleared the
+# pooled p99 and the >=1% slow-fraction floor, yet one of its five containers
+# still contained a 2.1 s copy.  Pooling four healthy containers with one
+# catastrophic one is how a treatment gets credited with removing a stall that it
+# did not remove.
+
+def _population_summary(*, control_pathological, control_slow_containers,
+                         arm2_pathological, arm2_slow_containers,
+                         arm3_pathological, arm3_slow_containers):
+    def cohort(pathological, slow_containers):
+        return {
+            "pathological": pathological,
+            "usable_containers": 5,
+            "pooled": {
+                "per_container": [
+                    {"over_thresholds": {">100ms": 3 if index < slow_containers else 0}}
+                    for index in range(5)
+                ],
+            },
+        }
+
+    def arm(pathological, slow_containers):
+        return {"cohorts": {"deploy1": cohort(pathological, slow_containers)}}
+
+    return {"arms": {
+        "A": arm(control_pathological, control_slow_containers),
+        "A2": arm(arm2_pathological, arm2_slow_containers),
+        "A3": arm(arm3_pathological, arm3_slow_containers),
+    }}
+
+
+def test_a_treatment_that_leaves_a_pathological_container_is_not_credited():
+    # Exactly the measured A3 shape: pooled-clean, one bad container.
+    decision = report_tool.classify_population(_population_summary(
+        control_pathological=True, control_slow_containers=1,
+        arm2_pathological=True, arm2_slow_containers=2,
+        arm3_pathological=False, arm3_slow_containers=2,
+    ))
+    assert decision["pooled_healthy_treatment_arms"] == ["A3"]
+    assert decision["healthy_treatment_arms"] == []
+    assert decision["classification"] == "INCONCLUSIVE_CURRENT_COHORT"
+    assert "pooled_thresholds_and_per_container_evidence_disagree" in decision["reasons"]
+    assert decision["pathological_containers"] == {"A": 1, "A2": 2, "A3": 2}
+
+
+def test_a_treatment_with_no_pathological_container_is_credited():
+    decision = report_tool.classify_population(_population_summary(
+        control_pathological=True, control_slow_containers=2,
+        arm2_pathological=True, arm2_slow_containers=2,
+        arm3_pathological=False, arm3_slow_containers=0,
+    ))
+    assert decision["healthy_treatment_arms"] == ["A3"]
+    assert decision["classification"] == "BACKING_POPULATION_CONFIRMED"
+
+
+def test_willneed_alone_working_is_reported_as_such():
+    decision = report_tool.classify_population(_population_summary(
+        control_pathological=True, control_slow_containers=2,
+        arm2_pathological=False, arm2_slow_containers=0,
+        arm3_pathological=True, arm3_slow_containers=2,
+    ))
+    assert decision["classification"] == "WILLNEED_ONLY_EFFECTIVE"
+    assert decision["healthy_treatment_arms"] == ["A2"]
+
+
+def test_a_control_that_never_goes_pathological_cannot_credit_a_treatment():
+    decision = report_tool.classify_population(_population_summary(
+        control_pathological=False, control_slow_containers=0,
+        arm2_pathological=True, arm2_slow_containers=2,
+        arm3_pathological=True, arm3_slow_containers=2,
+    ))
+    assert decision["classification"] == "INCONCLUSIVE_CURRENT_COHORT"
+    assert "control_did_not_reproduce_the_stall" in decision["reasons"]
+    assert decision["healthy_treatment_arms"] == []
+
+
+def test_the_prefetch_family_fails_only_when_no_container_improves():
+    decision = report_tool.classify_population(_population_summary(
+        control_pathological=True, control_slow_containers=1,
+        arm2_pathological=True, arm2_slow_containers=1,
+        arm3_pathological=True, arm3_slow_containers=1,
+    ))
+    assert decision["classification"] == "PREFETCH_FAMILY_FAILED"
+    assert "every_treatment_arm_still_contains_a_pathological_container" in (
+        decision["reasons"])
+
+
+def test_pathological_containers_counts_containers_not_copies():
+    # One container with fifty slow copies is one sick container; that is the
+    # distinction the pooled distribution cannot make.
+    per_container = [
+        {"over_thresholds": {">100ms": 50}},
+        {"over_thresholds": {">100ms": 0}},
+        {"over_thresholds": {">100ms": 1}},
+    ]
+    assert report_tool.pathological_containers(per_container) == 2
+    assert report_tool.pathological_containers([]) == 0
