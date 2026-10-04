@@ -1696,6 +1696,31 @@ _GOLDEN_ENVELOPE_ORDER = (
 )
 
 
+def _executed_source_sha256() -> str:
+    """SHA-256 of the module file this code was actually imported from.
+
+    The source probe hashes the file mounted in a *fresh* container, which is
+    not necessarily the file the running interpreter holds. After a redeploy a
+    warm container from the previous image can still serve a request, so the
+    probe can report MATCH while the executing module is stale code. Emitting
+    the executing sha with every call closes that gap: the run itself states
+    which bytes ran, and a caller can compare it with the expected local sha.
+    """
+    try:
+        import hashlib as _hashlib
+
+        path = globals().get("__file__")
+        if not path:
+            return ""
+        digest = _hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:  # noqa: BLE001 - identity aid must never fail a run
+        return ""
+
+
 def _emit_golden_envelope(request_id: str) -> None:
     """Print the measured call envelope as deltas from method entry."""
     marks = _GOLDEN_ENVELOPE.pop(request_id, None)
@@ -1710,7 +1735,8 @@ def _emit_golden_envelope(request_id: str) -> None:
         delta = "" if base is None else " delta_ms=%.3f" % ((value - base) / 1e6)
         parts.append("%s=%d%s" % (key, value, delta))
     print(
-        "[v2.golden.envelope] request_id=%s %s" % (request_id, " ".join(parts)),
+        "[v2.golden.envelope] request_id=%s executed_source_sha256=%s %s"
+        % (request_id, _executed_source_sha256(), " ".join(parts)),
         flush=True,
     )
 _GOLDEN_WATERFALL_STATUS_WIDTH = 10
