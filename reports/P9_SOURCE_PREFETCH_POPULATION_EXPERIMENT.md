@@ -141,8 +141,15 @@ so the stall is not a "first touch the mapping" artefact:
 ## 6. What was run
 
 Lane `exp/source-copy-isolation`, base `211d204b06f1246bbd2b5b591473d7d08b629030`.
-Destination `Testing 9 / ws_ee7221847f7d` was over its Modal spend limit, so the
-operator redirected the experiment to `Testing 1 / ws_e677ab553606`.
+Destination `Testing 9 / ws_ee7221847f7d` was over its Modal spend limit
+(`Workspace ac-tL3lF9qiTsfwGw0lr4esfg has exceeded its spend limit`, deploy exit
+1, no manifest written), so the operator redirected the experiment to
+`Testing 1 / ws_e677ab553606`.
+
+> **Open item for the destination owner:** that redirection is a committed edit
+> to `config/v2/modal_target.toml` (`ws_ee7221847f7d` → `ws_e677ab553606`). It is
+> in this lane's diff, not a local-only override. Restore it to `Testing 9`, or
+> keep `Testing 1` deliberately, before this lane is merged.
 
 | arm | profile | app | deploy fingerprint | image | source/config identity |
 |:--|:--|:--|:--|:--|:--|
