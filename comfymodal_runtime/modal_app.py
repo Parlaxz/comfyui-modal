@@ -648,9 +648,20 @@ def _triton_observer_install_record() -> dict[str, Any]:
     }
 
 
-def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str, Any]:
-    """Return cache-file evidence without causing a compile."""
+def _triton_cache_observation(
+    *,
+    reset_compile_events: bool = False,
+    post_forward: bool = False,
+) -> dict[str, Any]:
+    """Return cache-file evidence without causing a compile.
+
+    ``post_forward`` selects the after-the-fact reading.  The pre-forward call
+    site is the last boundary before CLIP can begin, so on its own an empty
+    event list proves nothing about whether a compile occurred during the
+    request.
+    """
     disabled = not env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE")
+    prefix = "triton_post_forward_" if post_forward else "triton_pre_forward_"
     base: dict[str, Any] = {
         "cuda_utils_cache_present_before_request": False,
         "exact_kernel_cache_present_before_clip_forward": False,
@@ -712,7 +723,7 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
             key=lambda row: (row["suffix"], row["name"]),
         )
         base.update({
-            "triton_observer_install": _triton_observer_install_record(),
+            f"{prefix}observer_install": _triton_observer_install_record(),
             "cache_identity_match": compatible,
             "cuda_utils_cache_present_before_request": bool(
                 compatible and helper_files and helper_files <= files
@@ -727,15 +738,17 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
             # The real compile request captured at JITFunction._do_compile, plus
             # Triton's own cache tree. The directory names ARE Triton's cache
             # keys, which is why this needs no re-derived key formula.
-            "triton_compile_requests": compile_request_events(),
-            "triton_cache_dirs_seen": sorted(
-                {
-                    str(row.get("path", "")).split("/", 1)[0]
-                    for row in compile_request_events()
-                    if row.get("matched")
-                }
+            f"{prefix}compile_requests": compile_request_events(),
+            f"{prefix}compile_request_total": len(compile_request_events()),
+            f"{prefix}matched_request_total": sum(
+                1 for row in compile_request_events() if row.get("matched")
             ),
-            "triton_cache_tree": snapshot_triton_cache_tree(TRITON_CACHE_DIR),
+            f"{prefix}matched_compile_ms": [
+                round(float(row.get("duration_ms") or 0.0), 3)
+                for row in compile_request_events()
+                if row.get("matched")
+            ],
+            f"{prefix}cache_tree": snapshot_triton_cache_tree(TRITON_CACHE_DIR),
             "cache_root": TRITON_CACHE_DIR,
             "cache_file_count": len(listing),
             "cache_artifacts": listing[:64],
@@ -19852,6 +19865,38 @@ class ModalRuntimeEntrypoint:
             pass
         return result
 
+    def clear_triton_cache(
+        self,
+        *,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """Empty the Triton cache Volume to establish a cold-Volume control.
+
+        This is measurement infrastructure, not a treatment: it exists so the
+        control and the treatment can be measured on one deployment with one
+        instrumentation, instead of comparing numbers produced by two different
+        deployments.
+        """
+        if not env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE"):
+            return {"status": "disabled", "request_id": str(request_id or "")}
+        try:
+            from .triton_cache import clear_cache  # noqa: PLC0415
+
+            result = clear_cache(cache_root=TRITON_CACHE_VOLUME_PATH)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "status": "error",
+                "request_id": str(request_id or ""),
+                "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+            }
+        volume = globals().get("_MODAL_RESOURCES", {}).get("triton_cache_volume")
+        commit = getattr(volume, "commit", None)
+        if callable(commit):
+            commit()
+        result["request_id"] = str(request_id or "")
+        result["volume"] = TRITON_CACHE_VOLUME_NAME
+        return result
+
     def build_triton_cache(
         self,
         *,
@@ -24782,6 +24827,15 @@ class ModalRuntimeEntrypoint:
             # base64-encodes to ~4 MB and is serialized onto the Modal wire
             # between yield and method return.
             result_data.pop("image_data", None)
+        # Take the Triton observation AFTER the Golden call, not only before it.
+        # The pre-forward snapshot is taken at the last boundary before CLIP can
+        # begin, so on its own it cannot distinguish "no compile happened" from
+        # "the compile had not happened yet" - which is exactly the ambiguity
+        # that made Phase 2 report zero events while a ~967 ms compile was
+        # provably on the path.
+        identity_telemetry.update(
+            _triton_cache_observation(post_forward=True)
+        )
         # The adapter result is the authoritative request-scoped Golden
         # identity surface.  Keep a named copy as well as the conventional
         # result identity key so host projection can consume either terminal

@@ -418,11 +418,15 @@ def call_remote_runtime_method(
     gpu: str,
     method_name: str,
     request_id: str,
+    **extra_kwargs: Any,
 ) -> dict[str, Any]:
     """Invoke a non-streaming method on the deployed v2 runtime class.
 
     This keeps the pre-cohort metadata publication on the same transport and
     destination selection as ``source-probe`` without making it a generation.
+    ``extra_kwargs`` are forwarded verbatim so a method with a mandatory
+    argument (the Triton builder's observed specialization) can be invoked on
+    the same path.
     """
     import asyncio
 
@@ -445,10 +449,10 @@ def call_remote_runtime_method(
             raise RuntimeError(f"deployed class has no {method_name} method")
         remote = getattr(fn, "remote", None)
         if remote is not None and callable(getattr(remote, "aio", None)):
-            return remote.aio(request_id=request_id)
+            return remote.aio(request_id=request_id, **extra_kwargs)
         if asyncio.iscoroutinefunction(fn):
-            return fn(request_id=request_id)
-        return fn(request_id=request_id)
+            return fn(request_id=request_id, **extra_kwargs)
+        return fn(request_id=request_id, **extra_kwargs)
 
     @contextmanager
     def _destination_environment():

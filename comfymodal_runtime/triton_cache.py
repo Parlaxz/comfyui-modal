@@ -448,7 +448,21 @@ def install_compile_request_observer(*, name_filter: str = "bmm") -> dict[str, A
             _COMPILE_REQUEST_EVENTS.append(record)
         except Exception:  # noqa: BLE001 - observation must never break Triton
             pass
-        return original(self, *args, **kwargs)
+        _started = time.perf_counter_ns()
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            # Triton 3.8 routes a disk-cache hit through this same boundary, so
+            # the CALL COUNT cannot distinguish a compile from a cache hit.
+            # The elapsed time is the only honest measure of whether the ~286 ms
+            # compile actually happened.
+            _elapsed_ms = (time.perf_counter_ns() - _started) / 1e6
+            try:
+                _index = len(_COMPILE_REQUEST_EVENTS) - 1
+                if _index >= 0:
+                    _COMPILE_REQUEST_EVENTS[_index]["duration_ms"] = _elapsed_ms
+            except Exception:  # noqa: BLE001
+                pass
 
     _observed._comfymodal_compile_request_observer = True  # type: ignore[attr-defined]
     _observed._comfymodal_original_do_compile = original  # type: ignore[attr-defined]
@@ -518,6 +532,28 @@ def snapshot_triton_cache_tree(root: str | os.PathLike[str] = TRITON_CACHE_DIR) 
     snapshot["dirs"].sort()
     snapshot["files"].sort(key=lambda row: row["path"])
     return snapshot
+
+
+def clear_cache(*, cache_root: str | os.PathLike[str]) -> dict[str, Any]:
+    """Empty a cache root and report what was removed.
+
+    Used to establish a cold-Volume control on the *same* deployment and with
+    the *same* instrumentation as the treatment, so the compile timings being
+    compared come from one measurement method rather than two.
+    """
+    root = Path(cache_root)
+    removed: list[str] = []
+    if root.is_dir():
+        for child in sorted(root.iterdir()):
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+                removed.append(child.name)
+            except OSError:
+                continue
+    return {"status": "cleared", "root": str(root), "removed": removed}
 
 
 def build_cache(

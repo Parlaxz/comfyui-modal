@@ -4630,6 +4630,112 @@ def cmd_publish_model_metadata_cache(args, repo_root: Path) -> int:
         return 1
 
 
+def cmd_build_triton_cache(args, repo_root: Path) -> int:
+    """Populate the Triton cache Volume from an OBSERVED real specialization.
+
+    The specialization is mandatory and is never defaulted here.  This command
+    only forwards what a measured CLIP RoPE request produced; the remote method
+    refuses an absent specialization outright, so no arbitrary warm-up shape can
+    reach the cache.
+    """
+    identity_error = _reject_golden_identity_args(args)
+    if identity_error is not None:
+        return identity_error
+    observed = getattr(args, "specialization", None)
+    if isinstance(observed, str) and observed.strip():
+        try:
+            observed = json.loads(observed)
+        except ValueError as exc:
+            print(
+                "[v2ctl.build-triton-cache] ERROR: --specialization is not valid "
+                f"JSON: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+    if not isinstance(observed, Mapping):
+        if not getattr(args, "clear_only", False):
+            print(
+                "[v2ctl.build-triton-cache] refusing to run without "
+                "--specialization; the exact real CLIP RoPE specialization must "
+                "be observed first.",
+                file=sys.stderr,
+            )
+            return 2
+        observed = {}
+    try:
+        from . import source_probe as sp
+
+        (
+            _flags,
+            _profiles,
+            _resolver,
+            config,
+            _fingerprints,
+            _env_builder,
+            _backend_registry,
+        ) = _build_components_for_args(repo_root, args)
+        _reject_protected_effective_target(config, command="v2ctl build-triton-cache")
+        _reject_golden_mode_override(config, command="v2ctl build-triton-cache")
+        workspace_binding = _canonical_workspace_binding(args, repo_root, config)
+        _print_destination_preflight(workspace_binding)
+        if getattr(args, "dry_run", False):
+            print("[v2ctl.dry-run] no invocation performed; triton cache build skipped")
+            return 0
+        workspace = (
+            workspace_binding._workspace_payload()
+            if workspace_binding is not None
+            else sp._load_workspace(repo_root)
+        )
+        app_name = config.target.app
+        class_name = config.target.class_name
+        gpu = config.resources.gpu
+        probe_env = {
+            name: str(value)
+            for name, value in {
+                "COMFYMODAL_V2_APP_NAME": app_name,
+                "COMFYMODAL_V2_CLASS_NAME": class_name,
+                "COMFYMODAL_V2_GPU": gpu,
+            }.items()
+            if value
+        }
+        if getattr(args, "clear_only", False):
+            with _workspace_process_environment(workspace_binding, probe_env):
+                report = sp.call_remote_runtime_method(
+                    repo_root,
+                    workspace=workspace,
+                    gpu=str(gpu),
+                    method_name="clear_triton_cache",
+                    request_id="v2-clear-triton-cache",
+                )
+            print(f"[v2ctl.build-triton-cache] profile={args.profile}")
+            print(json.dumps(report, sort_keys=True))
+            print(
+                "[v2ctl.build-triton-cache] RESULT="
+                + str(report.get("status", "error")).upper()
+            )
+            return 0 if str(report.get("status", "")) == "cleared" else 1
+
+        with _workspace_process_environment(workspace_binding, probe_env):
+            report = sp.call_remote_runtime_method(
+                repo_root,
+                workspace=workspace,
+                gpu=str(gpu),
+                method_name="build_triton_cache",
+                specialization=dict(observed),
+                request_id="v2-build-triton-cache",
+            )
+        print(f"[v2ctl.build-triton-cache] profile={args.profile}")
+        print(json.dumps(report, sort_keys=True))
+        status = str(report.get("status", "error"))
+        succeeded = status in {"ok", "noop", "built"}
+        print(f"[v2ctl.build-triton-cache] RESULT={status.upper()}",
+              file=sys.stdout if succeeded else sys.stderr)
+        return 0 if succeeded else 1
+    except (V2CtlError, OSError, RuntimeError) as exc:
+        print(f"[v2ctl.build-triton-cache] ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_runtime_flags(args, repo_root: Path) -> int:
     inventory = ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state")
     sub = args.runtime_command
@@ -4965,6 +5071,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="publish static Golden model metadata before a cohort",
     )
     p.set_defaults(func=cmd_publish_model_metadata_cache)
+
+    p = sub.add_parser(
+        "build-triton-cache",
+        help="populate the Triton cache Volume from an OBSERVED real specialization",
+    )
+    p.add_argument(
+        "--specialization",
+        default=argparse.SUPPRESS,
+        help="JSON of the real observed CLIP RoPE specialization; required, never defaulted",
+    )
+    p.add_argument(
+        "--clear-only",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="empty the Triton cache Volume instead of building, for a cold control",
+    )
+    p.set_defaults(func=cmd_build_triton_cache)
 
     p = sub.add_parser(
         "guard",
