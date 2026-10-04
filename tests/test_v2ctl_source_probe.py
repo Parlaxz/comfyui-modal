@@ -25,28 +25,27 @@ CONTENT_B = b"# module B\nvalue = 2\n"
 
 @pytest.fixture()
 def repo_root(tmp_path: Path) -> Path:
-    """A repo tree with all required modules present (real bytes)."""
+    """A repo tree with every required module present (real, distinct bytes).
+
+    The filler is generated from ``sp.REQUIRED_MODULES`` itself rather than from
+    a hand-maintained list.  A hardcoded list silently stops covering the probe
+    the moment a module is added to it, and the failure then shows up as a
+    ``FileNotFoundError`` inside an unrelated test, which reads like a flaky
+    fixture instead of "the probe gained a module and its test did not follow".
+    """
     root = tmp_path / "repo"
     runtime = root / "comfymodal_runtime"
     runtime.mkdir(parents=True)
-    payloads = {
+    explicit = {
         "modal_app.py": CONTENT_A,
-        "config_authority.py": b"# module config\nvalue = 0\n",
-        "deployment_spec.py": b"# module deployment\nvalue = 0\n",
         "critical_path_ledger.py": CONTENT_B,
-        "runtime_bootstrap.py": b"# module C\nvalue = 3\n",
-        "runtime_executor.py": b"# module D\nvalue = 4\n",
-        "gantt_telemetry.py": b"# module E\nvalue = 5\n",
-        "model_preload.py": b"# module F\nvalue = 6\n",
-        "clip_fast_hydration_wiring.py": b"# module G\nvalue = 7\n",
-    "registry_proof_store.py": b"# module H\nvalue = 8\n",
-    "golden_serial.py": b"# module I\nvalue = 9\n",
-    "golden_io_process_v2.py": b"# module J\nvalue = 10\n",
-    "golden_model_transport.py": b"# module K\nvalue = 11\n",
-    "golden_qd_transport.py": b"# module L\nvalue = 12\n",
-    "golden_source_threads.py": b"# module M\nvalue = 13\n",
-    "output_durability.py": b"# module N\nvalue = 14\n",
-}
+    }
+    payloads: dict[str, bytes] = {}
+    for index, rel in enumerate(sp.REQUIRED_MODULES):
+        name = Path(rel).name
+        payloads[name] = explicit.get(
+            name, f"# module {index:02d} {name}\nvalue = {index}\n".encode("utf-8")
+        )
     for name, data in payloads.items():
         (runtime / name).write_bytes(data)
     return root
@@ -105,13 +104,33 @@ def test_sha256_file_deterministic(repo_root: Path) -> None:
 def test_compute_expected_local(repo_root: Path) -> None:
     expected = sp.compute_expected_local(repo_root)
     assert "comfymodal_runtime/registry_proof_store.py" in sp.REQUIRED_MODULES
-    assert sp.REQUIRED_MODULES[-5:] == (
+    # Set membership, not list position: a probe that gains a module must be a
+    # deliberate edit here, but it must not read as a broken tail slice.
+    assert set(sp.REQUIRED_MODULES) == {
+        "comfymodal_runtime/modal_app.py",
+        "comfymodal_runtime/config_authority.py",
+        "comfymodal_runtime/deployment_spec.py",
+        "comfymodal_runtime/critical_path_ledger.py",
+        "comfymodal_runtime/runtime_bootstrap.py",
+        "comfymodal_runtime/runtime_executor.py",
+        "comfymodal_runtime/gantt_telemetry.py",
+        "comfymodal_runtime/model_preload.py",
+        "comfymodal_runtime/clip_fast_hydration_wiring.py",
+        "comfymodal_runtime/registry_proof_store.py",
+        "comfymodal_runtime/golden_serial.py",
         "comfymodal_runtime/golden_io_process_v2.py",
         "comfymodal_runtime/golden_model_transport.py",
         "comfymodal_runtime/golden_qd_transport.py",
         "comfymodal_runtime/golden_source_threads.py",
+        "comfymodal_runtime/source_copy_isolation.py",
+        "comfymodal_runtime/source_population_policy.py",
+        "comfymodal_runtime/source_copy_probe.py",
+        "comfymodal_runtime/source_stall_classification.py",
+        "comfymodal_runtime/golden_parallel.py",
         "comfymodal_runtime/output_durability.py",
-    )
+    }
+    assert len(sp.REQUIRED_MODULES) == len(set(sp.REQUIRED_MODULES))
+    assert set(sp.REMOTE_MODULE_NAMES) == set(sp.REQUIRED_MODULES)
     assert expected["modules"]["comfymodal_runtime/modal_app.py"]["sha256"] == sp.sha256_file(
         repo_root / "comfymodal_runtime/modal_app.py"
     )

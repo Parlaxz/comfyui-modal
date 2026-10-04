@@ -1,0 +1,64 @@
+# v2ctl profile: P9 source POPULATION arm A3 on H100.
+#
+# DIAGNOSTIC EXPERIMENT.  Arm A3 of the fixed A / A2 / A3 comparison, on its own
+# app so the arm is a deploy-level identity rather than a run-time override.
+#
+#   ARM A   control  whole-file MAP_PRIVATE mmap, no treatment (batch-p9srccopy-a-control-h100)
+#   ARM A2  treatment  + posix_fadvise(POSIX_FADV_WILLNEED) once per generation
+#   ARM A3  treatment  + MAP_POPULATE on the same whole-file mmap
+#
+# TREATMENT A3. Identical to arm A except that the one existing whole-file
+#   mapping is created with MAP_PRIVATE | MAP_POPULATE. Nothing else
+#   changes: same descriptor, same size, same offset, same single mapping
+#   per generation, no fadvise call at all.
+#
+# Why the arm is DEPLOY-baked rather than a run-only --set override: the
+# container reads COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ARM from the class
+# environment, which _runtime_env() freezes at deploy time. A run-only override
+# changes the run fingerprint and then never reaches the container, so all arms
+# silently execute as arm A. That was measured, not assumed: fifteen requests
+# requested as B, C and D all executed arm A with a clean source identity, a
+# clean gate and a valid result.
+#
+# The population hooks themselves are additionally gated by a PROCESS-LOCAL
+# COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_POPULATION that the experiment raises
+# only around its own build_plan call and lowers again immediately. The real
+# Golden source owner is a separate process spawned later in the same container
+# and never sees the gate, so:
+#   * MAP_POPULATE on a 12 GiB mapping next to the 1 GiB pinned arena in a 24 GiB
+#     container cannot OOM the real request, and
+#   * the following real Golden request is an untreated control, so its CLIP and
+#     UNET source walls stay comparable across arms.
+#
+# Everything else is inherited from golden_p1_parallel_p9_srccopy_iso_h100 and
+# therefore from golden_p1_parallel_p9opt1_source_diag_h100 and
+# golden_p1_parallel_c0_p8_h100:
+#
+#   H100! / CPU=12 / memory 24576 MB
+#   whole mmap lifecycle                   COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE=whole
+#   thread source owner                    COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND=thread
+#   qd4_64 source/transport geometry       64 MiB blocks, 16 x 64 MiB arena
+#   per-copy stall probe                   COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE=1
+#   forced-miss conditioning               [workload] conditioning_cache=forced_miss
+#   fresh-run requirement                  [workload] fresh_required=true
+#   correctness SHA                        3a6a03064c7e6e01ede339ada63daaea4cbf793f387f4faadbb101a787024577
+#
+# Source behaviour is unchanged apart from the one declared treatment: no change
+# to QD, block size, reader count, the 4 ms pacer, slot-release semantics, H2D
+# dispatcher semantics, arena allocation, cudaHostRegister behaviour, arena
+# alignment, CPU affinity, NUMA policy, model files, workflow, sampler, Modal
+# resource configuration or GPU type. preadv is deliberately NOT implemented.
+#
+# This profile is NOT counted and NOT promotable.
+schema_version = 1
+name = "golden_p1_parallel_p9_srccopy_a3-populate_h100"
+extends = "golden_p1_parallel_p9_srccopy_iso_h100"
+owner = "p9-source-copy-isolation"
+
+[target]
+app = "batch-p9srccopy-a3-populate-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
+
+[environment]
+COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ARM = "A3"

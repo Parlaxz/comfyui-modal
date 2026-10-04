@@ -837,8 +837,8 @@ default = "A"
 consumed_at = "request"
 change_requires = "deploy"
 owner = "p9-source-copy-isolation"
-description = "Arm selector for the source-copy isolation experiment. A=production control, B=anonymous destination, C=anonymous source, D=anonymous/anonymous control. Requires COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION. DEPLOY-baked, not run-only: the container reads it from the class environment, which _runtime_env() freezes at deploy time, so a --set override at run time is silently ignored and every arm would execute as A. Each arm therefore owns its own profile and app."
-enum_values = ["A", "B", "C", "D"]
+description = "Arm selector for the source-copy isolation experiment. A=production control, B=anonymous destination, C=anonymous source, D=anonymous/anonymous control, A2=A plus posix_fadvise(POSIX_FADV_WILLNEED) once per generation, A3=A plus MAP_POPULATE on the whole-file mmap. Requires COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION. DEPLOY-baked, not run-only: the container reads it from the class environment, which _runtime_env() freezes at deploy time, so a --set override at run time is silently ignored and every arm would execute as A. Each arm therefore owns its own profile and app."
+enum_values = ["A", "A2", "A3", "B", "C", "D"]
 
 [[flag]]
 name = "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_COPIES"

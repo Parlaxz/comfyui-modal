@@ -52,6 +52,7 @@ REQUIRED_MODULES = (
     # while silently running no arm at all -- exactly the failure 975aec14 had
     # to fix for the per-copy probe.
     "comfymodal_runtime/source_copy_isolation.py",
+    "comfymodal_runtime/source_population_policy.py",
     "comfymodal_runtime/source_copy_probe.py",
     "comfymodal_runtime/source_stall_classification.py",
     "comfymodal_runtime/golden_parallel.py",
@@ -76,6 +77,7 @@ REMOTE_MODULE_NAMES = {
     "comfymodal_runtime/golden_qd_transport.py": "comfymodal_runtime.golden_qd_transport",
     "comfymodal_runtime/golden_source_threads.py": "comfymodal_runtime.golden_source_threads",
     "comfymodal_runtime/source_copy_isolation.py": "comfymodal_runtime.source_copy_isolation",
+    "comfymodal_runtime/source_population_policy.py": "comfymodal_runtime.source_population_policy",
     "comfymodal_runtime/source_copy_probe.py": "comfymodal_runtime.source_copy_probe",
     "comfymodal_runtime/source_stall_classification.py": "comfymodal_runtime.source_stall_classification",
     "comfymodal_runtime/golden_parallel.py": "comfymodal_runtime.golden_parallel",

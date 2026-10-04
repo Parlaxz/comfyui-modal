@@ -54,6 +54,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from dataclasses import field as dataclasses_field
 from multiprocessing import shared_memory
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -1587,6 +1588,11 @@ class _ChildPlan:
     map_address: int = 0
     map_length: int = 0
     plan_install_ns: int = 0
+    # Address-space-local, and deliberately NOT part of ``metadata()``: the
+    # population hooks run once per address space that opens the descriptor, so
+    # a plan handed to another reader process must never carry this address
+    # space's syscall evidence.
+    population_evidence: dict[str, Any] = dataclasses_field(default_factory=dict)
 
     def metadata(self) -> dict[str, Any]:
         """Cross-address-space form: no descriptor or mapping travels here.
@@ -1635,6 +1641,14 @@ def build_plan(message: Mapping[str, Any], *, open_source: bool) -> _ChildPlan:
 
     Descriptor and mapping lifecycle happens here, exactly once per model
     generation, instead of once per 64 MiB block.
+
+    Two opt-in population hooks live at the only two places where they can be
+    measured honestly: immediately after the persistent descriptor is opened, and
+    at mapping creation.  Both are inert unless
+    ``COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_POPULATION`` is set in this
+    process, so the default path is the unchanged ``open`` + ``MAP_PRIVATE``
+    pair.  ``fadvise_willneed`` is therefore called at most once per generation
+    and never per block.
     """
     lifecycle = str(message.get("mmap_lifecycle") or "fresh").lower()
     if lifecycle not in {"fresh", "whole"}:
@@ -1654,27 +1668,54 @@ def build_plan(message: Mapping[str, Any], *, open_source: bool) -> _ChildPlan:
     fd = -1
     map_address = 0
     map_length = 0
+    population: dict[str, Any] = {"arm": _population_policy().CONTROL_ARM}
+    open_started_ns = time.monotonic_ns()
     if open_source:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
         try:
+            population["fd_open_wall_ms"] = round(
+                (time.monotonic_ns() - open_started_ns) / 1e6, 4
+            )
+            # Once per generation, on the persistent descriptor, before the
+            # mapping is consumed.  A no-op returning its own evidence on the
+            # control arm, which is what makes "the control never called it"
+            # provable rather than assumed.
+            population.update(
+                _population_policy().fadvise_willneed(fd, generation=int(message["generation"]))
+            )
             if lifecycle == "whole":
                 if actual[2] <= 0:
                     raise SourceProtocolError("empty_source_file")
+                flags, flag_evidence = _population_policy().mapping_flags(_population_policy().MAP_PRIVATE)
+                population.update(flag_evidence)
+                map_started_ns = time.monotonic_ns()
                 mapped = _MAPPER.mmap(
-                    None, ctypes.c_size_t(actual[2]), 1, 2, fd, 0
+                    None, ctypes.c_size_t(actual[2]), 1, flags, fd, 0
                 )
-                if _map_failed(mapped):
+                map_failed = _map_failed(mapped)
+                population["mmap_wall_ms"] = round(
+                    (time.monotonic_ns() - map_started_ns) / 1e6, 4
+                )
+                if map_failed:
                     raise SourceProtocolError(f"mmap_failed:{ctypes.get_errno()}")
+                _population_policy().confirm_mapping(True, population)
                 map_address = int(ctypes.cast(mapped, ctypes.c_void_p).value)
                 map_length = int(actual[2])
         except BaseException:
             os.close(fd)
             raise
+    population["plan_build_total_ms"] = round(
+        (time.monotonic_ns() - open_started_ns) / 1e6, 4
+    )
+    population["generation"] = int(message["generation"])
+    population["generation_open_monotonic_ns"] = open_started_ns
+    population["mapped_bytes"] = int(map_length)
     return _ChildPlan(
         generation=int(message["generation"]), path=path, identity=actual,
         destination_size=int(message["destination_size"]), mmap_lifecycle=lifecycle,
         ranges=ranges, fd=fd, map_address=map_address, map_length=map_length,
         plan_install_ns=time.monotonic_ns(),
+        population_evidence=dict(population),
     )
 
 
@@ -1802,8 +1843,14 @@ _PROBE: Any = None
 _PROBE_SENTINEL_RECORD: dict = {}
 
 
-def _load_probe_module() -> Any:
-    """Import the probe module from a process that may not be a package member.
+# Opt-in source population policy.  Resolved lazily by ``build_plan`` through
+# ``_population_policy()`` so that a caller which never opens a descriptor never
+# pays for the import, and so the default path keeps exactly one boolean test.
+_POPULATION: Any = None
+
+
+def _load_sibling_module(module_name: str, filename: str) -> Any:
+    """Import a sibling module from a process that may not be a package member.
 
     The source owner is launched as a plain script::
 
@@ -1812,21 +1859,19 @@ def _load_probe_module() -> Any:
     so in that process this file is ``__main__`` with no parent package and a
     relative import raises "attempted relative import with no known parent
     package".  Because the child's stderr is a pipe nobody drains, that
-    ImportError used to surface only as a silent
-    ``source_process_exited_before_ready`` during restore.  The absolute form
-    works in both cases because the deployment root is on ``sys.path``.
+    ImportError surfaces only as a silent ``source_process_exited_before_ready``
+    during restore.  The absolute form works in both cases because the
+    deployment root is on ``sys.path``; the sibling-path fallback covers the case
+    where it is not.
     """
     try:
-        from comfymodal_runtime import source_copy_probe  # noqa: PLC0415
-
-        return source_copy_probe
+        return __import__(module_name, fromlist=["*"])
     except ImportError:
         import importlib.util  # noqa: PLC0415
 
         spec = importlib.util.spec_from_file_location(
-            "comfymodal_runtime.source_copy_probe",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "source_copy_probe.py"),
+            module_name,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), filename),
         )
         if spec is None or spec.loader is None:
             raise
@@ -1835,10 +1880,31 @@ def _load_probe_module() -> Any:
         return module
 
 
+def _population_policy() -> Any:
+    """The population policy module, loaded once per address space."""
+    global _POPULATION
+    if _POPULATION is None:
+        _POPULATION = _load_sibling_module(
+            "comfymodal_runtime.source_population_policy",
+            "source_population_policy.py",
+        )
+    return _POPULATION
+
+
+def _load_probe_module() -> Any:
+    """Import the probe module from a process that may not be a package member."""
+    return _load_sibling_module(
+        "comfymodal_runtime.source_copy_probe", "source_copy_probe.py"
+    )
+
+
 def _init_native() -> None:
     global _MAPPER, _PAGE_SIZE, _PROBE, _PROBE_SENTINEL_RECORD
     _MAPPER = _native_mmap_setup()
     _PAGE_SIZE = int(os.sysconf("SC_PAGE_SIZE"))
+    # Resolved here so a broken policy module fails at startup, next to the probe,
+    # rather than at the first descriptor open.  It is inert when its gate is off.
+    _population_policy()
     probe_module = _load_probe_module()
     _PROBE_SENTINEL_RECORD = probe_module.sentinel_record()
     _PROBE = probe_module.SourceCopyProbe()

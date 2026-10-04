@@ -19692,6 +19692,7 @@ class ModalRuntimeEntrypoint:
             # arm at all, which is the failure 975aec14 had to fix for the
             # per-copy probe.
             "comfymodal_runtime.source_copy_isolation",
+            "comfymodal_runtime.source_population_policy",
             "comfymodal_runtime.source_copy_probe",
             "comfymodal_runtime.source_stall_classification",
             "comfymodal_runtime.golden_parallel",

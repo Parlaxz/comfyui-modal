@@ -68,7 +68,7 @@ COPIES_ENV = "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_COPIES"
 MODEL_ENV = "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_MODEL"
 ANON_GIB_ENV = "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ANON_GIB"
 
-ARMS = ("A", "B", "C", "D")
+ARMS = ("A", "A2", "A3", "B", "C", "D")
 # 128 timed copies is the floor; 256 is the default because a pathological copy
 # is rare (65 of 3040 in the Phase-1 cohort) and a small sample would simply
 # miss it.  Copies are split across four readers, so 256 copies is 64 per reader.
@@ -108,7 +108,37 @@ ARM_LAYOUT: dict[str, dict[str, Any]] = {
         "variants": ("single", "concurrent4"),
         "summary": "host control: anonymous RAM -> anonymous RAM",
     },
+    # A2 and A3 are arm A plus one population treatment, selected by
+    # source_population_policy.  Identical in every other respect: same whole-file
+    # MAP_PRIVATE mapping, same pinned shared arena, same 16 x 64 MiB geometry,
+    # same 4 ms pacer, same 4 readers, same libc.memmove, same per-copy probe.
+    "A2": {
+        "source": "model_mmap",
+        "destination": "pinned_shared_arena",
+        "variants": ("concurrent4",),
+        "population_arm": "A2",
+        "summary": (
+            "arm A plus posix_fadvise(POSIX_FADV_WILLNEED) once per generation, "
+            "immediately after the source descriptor is opened"
+        ),
+    },
+    "A3": {
+        "source": "model_mmap",
+        "destination": "pinned_shared_arena",
+        "variants": ("concurrent4",),
+        "population_arm": "A3",
+        "summary": (
+            "arm A plus MAP_POPULATE on the existing whole-file MAP_PRIVATE mmap, "
+            "set once at mapping creation"
+        ),
+    },
 }
+
+# Arms whose source is the whole-file mapping of the real checkpoint.  Only
+# these three are compared in the population experiment.
+MAPPED_SOURCE_ARMS = ("A", "A2", "A3")
+# Arms that carry a population treatment, and therefore must prove it happened.
+POPULATION_TREATMENT_ARMS = ("A2", "A3")
 
 VARIANT_READERS = {"single": 1, "concurrent4": gsrc.READER_COUNT}
 
@@ -830,7 +860,119 @@ def _loadavg() -> list[float] | None:
 
 # ── arm runner ───────────────────────────────────────────────────────────
 
-def _model_mmap_source(path: str, copies: int) -> dict[str, Any]:
+class _PopulationGate:
+    """Process-local enable of the source population hooks.
+
+    Set only around the experiment's own ``build_plan`` call and removed again
+    immediately, so the real Golden source owner -- a separate process spawned
+    later in the same container -- never sees it.  Two reasons, both measured
+    rather than assumed:
+
+    * ``MAP_POPULATE`` on a 12 GiB mapping next to a 1 GiB pinned arena in a
+      24 GiB container is a real OOM risk, and an OOM would destroy the request
+      rather than the arm;
+    * the subsequent real Golden request is then an *untreated* control, so its
+      CLIP and UNET source walls are comparable across arms instead of being
+      contaminated by whichever treatment the arm names.
+    """
+
+    def __init__(self, arm: str | None):
+        self._arm = arm
+        self._previous: str | None = None
+
+    def __enter__(self) -> "_PopulationGate":
+        from . import source_population_policy as policy
+
+        self._previous = os.environ.get(policy.POPULATION_GATE_ENV)
+        if self._arm and self._arm != policy.CONTROL_ARM:
+            os.environ[policy.POPULATION_GATE_ENV] = "1"
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        from . import source_population_policy as policy
+
+        if self._previous is None:
+            os.environ.pop(policy.POPULATION_GATE_ENV, None)
+        else:
+            os.environ[policy.POPULATION_GATE_ENV] = self._previous
+
+
+def population_contract(payload: Mapping[str, Any] | None, arm: str) -> dict[str, Any]:
+    """Fail closed when the arm's declared treatment is not in the payload.
+
+    An arm name that does not match what actually happened is the exact failure
+    that produced fifteen wrong containers in the A/B/C/D phase, so it is
+    rejected here rather than being reported as a clean run.
+
+    Arms whose source is not a mapping (``C``/``D``) never establish one here and
+    so have no population evidence to check; they report the contract as
+    not-applicable rather than as an unsatisfied one, because a missing check is
+    not a failed check.  ``B`` keeps a mapped source, so it is checked as the
+    untreated control.
+    """
+    from . import source_population_policy as policy
+
+    evidence = dict(payload or {})
+    expected = policy.declared_arm()
+    observed = str(evidence.get("arm") or policy.CONTROL_ARM)
+    contract: dict[str, Any] = {
+        "declared_arm": expected,
+        "observed_arm": observed,
+        "population_gate_env": policy.POPULATION_GATE_ENV,
+        "treatment_expected": expected in POPULATION_TREATMENT_ARMS,
+        "treatment_observed": False,
+        "satisfied": False,
+    }
+    if arm_layout(arm)["source"] != "model_mmap":
+        contract.update({
+            "applicable": False,
+            "reason": "arm_maps_no_source",
+            "satisfied": True,
+        })
+        return contract
+    contract["applicable"] = True
+    if arm in POPULATION_TREATMENT_ARMS:
+        if observed != arm:
+            contract["error"] = f"arm_treatment_mismatch:{arm}!={observed}"
+            return contract
+        if arm == "A2":
+            called = bool(evidence.get("fadvise_called"))
+            count = int(evidence.get("fadvise_call_count") or 0)
+            rc = evidence.get("fadvise_return_code")
+            contract.update({
+                "fadvise_called": called,
+                "fadvise_call_count": count,
+                "fadvise_return_code": rc,
+                "fadvise_errno": evidence.get("fadvise_errno"),
+                "fadvise_wall_ms": evidence.get("fadvise_wall_ms"),
+                "satisfied": bool(called and count == 1 and rc == 0),
+            })
+        else:
+            accepted = evidence.get("map_populate_accepted_by_mmap")
+            contract.update({
+                "mmap_flags": evidence.get("mmap_flags"),
+                "map_populate_requested": evidence.get("map_populate_requested"),
+                "map_populate_in_flags": evidence.get("map_populate_in_flags"),
+                "map_populate_accepted_by_mmap": accepted,
+                "page_population_observable": evidence.get("page_population_observable"),
+                "satisfied": bool(evidence.get("map_populate_in_flags") and accepted),
+            })
+        contract["treatment_observed"] = bool(contract["satisfied"])
+        if not contract["satisfied"]:
+            contract["error"] = "arm_treatment_not_observed"
+        return contract
+    # Control arms must carry no treatment at all.
+    contract["satisfied"] = bool(
+        observed == policy.CONTROL_ARM
+        and not evidence.get("fadvise_called")
+        and not evidence.get("map_populate_requested")
+    )
+    if not contract["satisfied"]:
+        contract["error"] = "control_arm_carries_treatment"
+    return contract
+
+
+def _model_mmap_source(path: str, copies: int, *, population_arm: str | None = None) -> dict[str, Any]:
     """Establish the production whole-file mapping through the production code.
 
     ``gsrc.build_plan(open_source=True)`` is what opens the descriptor and
@@ -839,6 +981,10 @@ def _model_mmap_source(path: str, copies: int) -> dict[str, Any]:
     list is then extended, via ``dataclasses.replace``, to hold exactly ``copies``
     ranges; the descriptor, mapping address and mapping length are the ones
     production would have used.
+
+    For arms A2 and A3 the population gate is raised only around this call, so
+    the ``posix_fadvise``/``MAP_POPULATE`` hooks in ``build_plan`` apply to this
+    mapping and to nothing else in the container.
     """
     stat = os.stat(path)
     identity = (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
@@ -857,7 +1003,8 @@ def _model_mmap_source(path: str, copies: int) -> dict[str, Any]:
             for item in block_ranges
         ],
     }
-    base = gsrc.build_plan(message, open_source=True)
+    with _PopulationGate(population_arm):
+        base = gsrc.build_plan(message, open_source=True)
     if not base.map_address:
         raise RuntimeError("source_copy_isolation_whole_mapping_absent")
     extended = repeated_plan_ranges(int(stat.st_size), copies)
@@ -866,6 +1013,7 @@ def _model_mmap_source(path: str, copies: int) -> dict[str, Any]:
         ranges=extended,
         destination_size=sum(int(item[1]) for item in extended),
     )
+    population = dict(getattr(base, "population_evidence", {}) or {})
     return {
         "kind": "model_mmap",
         "path": os.path.abspath(path),
@@ -877,6 +1025,7 @@ def _model_mmap_source(path: str, copies: int) -> dict[str, Any]:
         "fd": int(base.fd),
         "plan": plan,
         "residency_first_block": _residency(plan.map_address, min(gsrc.SLOT_BYTES, plan.map_length)),
+        "population": population,
         "notes": [
             "mapping_established_by_golden_source_threads.build_plan",
             "range_list_extended_to_reach_copy_count",
@@ -915,6 +1064,89 @@ def _anonymous_source(copies: int, source_bytes: int) -> dict[str, Any]:
         "residency_first_block": _residency(address, min(gsrc.SLOT_BYTES, int(source_bytes))),
         "buffer": buffer,
         "notes": ["native_memset_pretouch", "no_file_backing"],
+    }
+
+
+def setup_costs(
+    *,
+    population: Mapping[str, Any],
+    generation_open_ns: int,
+    setup_done_ns: int,
+    copy_started_ns: int,
+    copy_ended_ns: int,
+    copies: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Where the wall went, so a fast copy loop cannot hide a slow setup.
+
+    A treatment that only moves the stall from per-copy into generation setup
+    would look like a win on copy p50 and deliver nothing.  These fields are the
+    ones that make that visible: the treatment cost, the gap between opening the
+    generation and the first copy starting, the copy loop itself, and the sum.
+    """
+    starts = [
+        int(item.get("memcpy_start_ns") or 0)
+        for item in copies
+        if int(item.get("memcpy_start_ns") or 0)
+    ]
+    first_copy_ns = min(starts) if starts else None
+    copy_loop_ms = (copy_ended_ns - copy_started_ns) / 1e6
+    setup_ms = (setup_done_ns - generation_open_ns) / 1e6
+    return {
+        "fd_open_wall_ms": population.get("fd_open_wall_ms"),
+        "fadvise_wall_ms": population.get("fadvise_wall_ms"),
+        "mmap_wall_ms": population.get("mmap_wall_ms"),
+        "plan_build_total_ms": population.get("plan_build_total_ms"),
+        "generation_open_to_setup_done_ms": round(setup_ms, 4),
+        "generation_open_to_first_copy_ms": (
+            round((first_copy_ns - generation_open_ns) / 1e6, 4)
+            if first_copy_ns else None
+        ),
+        "setup_to_first_copy_ms": (
+            round((first_copy_ns - setup_done_ns) / 1e6, 4)
+            if first_copy_ns else None
+        ),
+        "copy_loop_wall_ms": round(copy_loop_ms, 4),
+        "setup_plus_copy_loop_total_ms": round(setup_ms + copy_loop_ms, 4),
+        "first_copy_monotonic_ns": first_copy_ns,
+    }
+
+
+def ordinal_head(copies: Sequence[Mapping[str, Any]], head: int = 8) -> dict[str, Any]:
+    """Ordinals 0..head-1 reported separately from the whole distribution.
+
+    This is how "the treatment flattened the distribution" is told apart from
+    "the treatment moved the pain into the first few copies".
+    """
+    buckets: dict[str, Any] = {}
+    for index in range(head):
+        # Explicit None test: ordinal 0 is a real ordinal, and `or -1` would
+        # silently file it under "missing".
+        rows = [
+            item for item in copies
+            if item.get("copy_ordinal") is not None
+            and int(item["copy_ordinal"]) == index
+        ]
+        buckets[str(index)] = {
+            "count": len(rows),
+            "wall_ms": describe([item.get("wall_ms") for item in rows]),
+        }
+    ordered = sorted(
+        copies,
+        key=lambda item: int(item["copy_ordinal"]) if item.get("copy_ordinal") is not None else -1,
+    )
+    head_rows = ordered[:head]
+    rest = ordered[head:]
+    return {
+        "head_size": head,
+        "per_ordinal": buckets,
+        "head_wall_ms": describe([item.get("wall_ms") for item in head_rows]),
+        "tail_wall_ms": describe([item.get("wall_ms") for item in rest]),
+        "head_total_wall_ms": round(
+            sum(float(item.get("wall_ms") or 0.0) for item in head_rows), 4
+        ),
+        "head_max_wall_ms": round(
+            max((float(item.get("wall_ms") or 0.0) for item in head_rows), default=0.0), 4
+        ),
     }
 
 
@@ -957,6 +1189,7 @@ def run_arm(
         },
         "identity": runtime_identity(),
         "status": "error",
+        "population_arm": layout.get("population_arm"),
         "variants": [],
     }
 
@@ -973,9 +1206,13 @@ def run_arm(
     arena: PinnedSharedArena | None = None
     destination_buffer: Any = None
     destination_address = 0
+    generation_open_ns = time.monotonic_ns()
     try:
         if layout["source"] == "model_mmap":
-            source = _model_mmap_source(source_path, wanted_copies)
+            source = _model_mmap_source(
+                source_path, wanted_copies,
+                population_arm=layout.get("population_arm"),
+            )
         else:
             source = _anonymous_source(
                 wanted_copies, resolve_anon_source_bytes(anon_source_bytes)
@@ -992,6 +1229,7 @@ def run_arm(
             destination = _anonymous_destination_evidence(
                 destination_buffer, destination_address
             )
+        setup_done_ns = time.monotonic_ns()
 
         source_evidence = {key: value for key, value in source.items() if key != "plan"}
         source_evidence["residency_arena_fraction"] = _residency(
@@ -1003,6 +1241,15 @@ def run_arm(
             arena.shm.name if arena is not None else None
         )
         report["pinned_register_used"] = arena is not None
+
+        population = dict(source.get("population") or {})
+        population_evidence = population_contract(population, arm_name)
+        report["population"] = {**population, **population_evidence}
+        if not population_evidence["satisfied"]:
+            raise RuntimeError(
+                "source_population_contract_unsatisfied:"
+                f"{population_evidence.get('error') or 'unknown'}"
+            )
 
         plan = source["plan"]
         completed = 0
@@ -1017,6 +1264,15 @@ def run_arm(
             copies_rows = [project_copy(item) for item in variant_result.pop("records")]
             variant_result["copies"] = copies_rows
             variant_result["summary"] = summarize_copies(copies_rows)
+            variant_result["setup_costs"] = setup_costs(
+                population=population,
+                generation_open_ns=generation_open_ns,
+                setup_done_ns=setup_done_ns,
+                copy_started_ns=int(variant_result["started_monotonic_ns"]),
+                copy_ended_ns=int(variant_result["ended_monotonic_ns"]),
+                copies=copies_rows,
+            )
+            variant_result["ordinal_head"] = ordinal_head(copies_rows)
             variant_result["complete"] = bool(
                 variant_result["recorded_copies"] >= wanted_copies
                 and not variant_result["timed_out"]
@@ -1082,8 +1338,10 @@ __all__ = [
     "COPIES_ENV",
     "DEFAULT_COPIES",
     "EXPERIMENT_ENV",
+    "MAPPED_SOURCE_ARMS",
     "MODEL_ENV",
     "MODEL_KEYS",
+    "POPULATION_TREATMENT_ARMS",
     "STALL_THRESHOLDS_MS",
     "VARIANT_READERS",
     "PinnedSharedArena",
@@ -1092,6 +1350,8 @@ __all__ = [
     "enabled",
     "file_block_ranges",
     "host_facts",
+    "ordinal_head",
+    "population_contract",
     "project_copy",
     "repeated_plan_ranges",
     "resolve_anon_source_bytes",
@@ -1101,5 +1361,6 @@ __all__ = [
     "run_from_session",
     "runtime_identity",
     "selected_arm",
+    "setup_costs",
     "summarize_copies",
 ]
