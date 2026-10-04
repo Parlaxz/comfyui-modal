@@ -13171,8 +13171,30 @@ class ModalRuntimeEntrypoint:
         # restore-only: startup() may run with snap=True, while restore() runs
         # after snapshot materialization with snap=False.  Both are diagnostic
         # optimizations and fail soft so a missing/stale cache or unavailable
-# Triton hook never blocks the ordinary request path.
-        self._triton_cache_restore = _prepare_triton_cache_for_restore()
+        # Triton hook never blocks the ordinary request path.
+        #
+        # Hydration reads ~180 KB off a Modal Volume, and first-touch Volume I/O
+        # costs ~400 ms - MORE than the ~290 ms of Triton compilation it
+        # removes.  Run serially it therefore makes the root wall slightly
+        # worse.  It is started here, before any of the restore work, and joined
+        # at the very end of restore() so the cost overlaps model reload, CUDA
+        # initialisation and GPU state repair instead of being added to them.
+        # This is genuine overlap, not a relocation: nothing waits on it until
+        # the request, and a failure still leaves Triton's own compile path.
+        _triton_hydration: dict[str, Any] = {}
+
+        def _hydrate_triton_cache() -> None:
+            _triton_hydration["result"] = _prepare_triton_cache_for_restore()
+
+        _triton_hydration_thread: threading.Thread | None = None
+        if env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE"):
+            _triton_hydration_thread = threading.Thread(
+                target=_hydrate_triton_cache,
+                name="comfymodal-triton-cache-hydrate",
+                daemon=True,
+            )
+            _triton_hydration_thread.start()
+        self._triton_cache_restore = {"status": "not_started"}
         try:
             if env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE"):
                 from .triton_cache import (
@@ -16409,6 +16431,16 @@ class ModalRuntimeEntrypoint:
             except Exception:
                 pass
             raise
+        finally:
+            # Join the overlapped Triton cache hydration on BOTH the success and
+            # the failure path, so the request never starts against a
+            # half-written cache directory and a failed restore cannot leave the
+            # hydration thread writing into a torn-down container.
+            if _triton_hydration_thread is not None:
+                _triton_hydration_thread.join()
+                self._triton_cache_restore = dict(
+                    _triton_hydration.get("result") or {"status": "fallback"}
+                )
 
     def _enforce_snapshot_activation_invariant(
         self,
