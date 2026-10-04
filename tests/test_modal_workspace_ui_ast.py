@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -150,10 +151,24 @@ class StudioPlaygroundUiAstTests(unittest.TestCase):
         self.assertIn("getStudioRunStatus", self.source)
         # Must import from studio-backend-api (or be defined locally)
         self.assertIn('from "./studio-backend-api.js"', self.source)
-        # Check the static imports explicitly — the dynamic import in hydratePlayground
-        # uses import() not import, so split by static imports only
-        static_import_lines = [line for line in self.source.split("\n") if line.strip().startswith("import ")]
-        has_static_import = any("getStudioRunStatus" in line for line in static_import_lines)
+        # Match static import STATEMENTS, not lines: this file uses several
+        # multi-line `import { ... } from` blocks, so a per-line check only
+        # ever saw single-line specifier lists. The protected contract is that
+        # getStudioRunStatus is statically bound -- the dynamic `import()` calls
+        # elsewhere in this module must not be what satisfies it.
+        static_backend_api_imports = re.findall(
+            r"import\s*\{([^}]*)\}\s*from\s*[\"']\./studio-backend-api\.js[\"']",
+            self.source,
+            re.DOTALL,
+        )
+        self.assertTrue(
+            static_backend_api_imports,
+            "Expected a static import from ./studio-backend-api.js",
+        )
+        has_static_import = any(
+            "getStudioRunStatus" in specifiers
+            for specifiers in static_backend_api_imports
+        )
         self.assertTrue(has_static_import, "Expected getStudioRunStatus in static imports")
 
     def test_polls_experiment_status_after_submitted(self):

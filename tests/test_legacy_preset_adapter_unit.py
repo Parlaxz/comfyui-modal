@@ -326,11 +326,27 @@ class RunContractIntegrationTests(unittest.TestCase):
                          "krea_model.safetensors")
 
     def test_unknown_control_errors_visibly_never_silently_dropped(self):
-        _workflow_id, version_id, root = self._setup_canonical_version()
-        bundle = self._bundle(_workflow_id, version_id, "", root)
-        # No preset yet → bundle reports NO_PRESET (contract holds).
-        self.assertEqual(bundle["status"], "error")
-        self.assertEqual(bundle["error_code"], "NO_PRESET")
+        workflow_id, version_id, root = self._setup_canonical_version()
+        # Presets are optional in this domain: the Shelf runs the Workflow's
+        # current version, so an absent preset resolves from the version's own
+        # executable prompt rather than refusing the run.
+        bundle = self._bundle(workflow_id, version_id, "", root)
+        self.assertEqual(bundle["status"], "ok")
+        self.assertEqual(bundle["preset"]["preset_id"], "")
+        # The synthesized preset is seeded from the version, so required
+        # controls are the version's own values rather than missing.
+        seeded = bundle["preset"]["values"]
+        self.assertTrue(seeded)
+        for role in bundle["control_schema"]:
+            if role in seeded:
+                continue
+            self.fail(f"role {role} left unseeded by the version prompt")
+        # Unknown control input is still refused visibly, never dropped.
+        merged = prepare_legacy_run_controls(
+            bundle["control_schema"], {"values": dict(seeded)},
+            {"totally_unknown": 1})
+        self.assertTrue(any(e["field"] == "totally_unknown"
+                            for e in merged["errors"]))
 
         preset = self.service.create_preset_from_legacy(
             version_id, {"name": "P", "values": dict(LEGACY_VALUES)})
