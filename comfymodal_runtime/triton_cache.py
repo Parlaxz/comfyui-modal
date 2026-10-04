@@ -8,6 +8,7 @@ software, CUDA, GPU, and specialization identities match exactly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -25,6 +26,8 @@ TRITON_CACHE_MANIFEST = "comfymodal_triton_cache_manifest.json"
 _COMPILE_EVENTS: list[dict[str, Any]] = []
 # Real observed bmm_outer_product specializations (see install_bmm_shape_observer).
 _SHAPE_EVENTS: list[dict[str, Any]] = []
+# Real observed Triton compile requests (see install_compile_request_observer).
+_COMPILE_REQUEST_EVENTS: list[dict[str, Any]] = []
 
 
 def _jsonable(value: Any) -> Any:
@@ -297,6 +300,224 @@ def compile_events() -> list[dict[str, Any]]:
 
 def reset_compile_events() -> None:
     del _COMPILE_EVENTS[:]
+
+
+def _describe_compile_arg(value: Any) -> Any:
+    """Render one compile argument without retaining a live tensor.
+
+    Triton specializes on shape, stride, dtype and device, so exactly those are
+    recorded.  Anything unrecognised degrades to a bounded repr rather than
+    being guessed at.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:512]
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    if shape is not None and dtype is not None:
+        record: dict[str, Any] = {
+            "type": type(value).__name__,
+            "shape": [int(dim) for dim in list(shape)[:8]],
+            "dtype": str(dtype),
+        }
+        try:
+            record["stride"] = [int(s) for s in list(value.stride())[:8]]
+        except Exception:  # noqa: BLE001
+            record["stride"] = None
+        try:
+            record["device"] = str(value.device)
+        except Exception:  # noqa: BLE001
+            record["device"] = None
+        return record
+    for field in ("num_warps", "num_stages", "num_ctas", "maxnreg", "debug", "name"):
+        if hasattr(value, field):
+            try:
+                inner = getattr(value, field)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(inner, (bool, int, float, str)):
+                return {field: inner}
+    return {"type": type(value).__name__, "repr": repr(value)[:256]}
+
+
+def _kernel_identity(jit_function: Any) -> tuple[str, str]:
+    """Return ``(name, source)`` for a JITFunction *instance*.
+
+    A JITFunction instance does not expose ``__name__``; only the decorated
+    function and the stored source carry the kernel name.  Reading
+    ``self.__name__`` alone yields an empty string, which is precisely how an
+    observer can be installed successfully, match nothing, and be
+    indistinguishable from a kernel that never compiled.  The source is also
+    what proves *which* specialization is being compiled.
+    """
+    name = ""
+    for holder in (jit_function, getattr(jit_function, "fn", None)):
+        try:
+            candidate = getattr(holder, "__name__", "")
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(candidate, str) and candidate:
+            name = candidate
+            break
+    try:
+        source = str(getattr(jit_function, "src", "") or "")
+    except Exception:  # noqa: BLE001
+        source = ""
+    if not name and source:
+        # Triton stores the decorated function verbatim, so the definition line
+        # carries the real name.
+        marker = "def "
+        start = source.find(marker)
+        if start >= 0:
+            rest = source[start + len(marker):]
+            end = rest.find("(")
+            if end > 0:
+                name = rest[:end].strip()
+    return name, source
+
+
+def install_compile_request_observer(*, name_filter: str = "bmm") -> dict[str, Any]:
+    """Observe the real Triton compile request at ``JITFunction._do_compile``.
+
+    This is the boundary the exhaustive profile proved actually runs for this
+    kernel (~286 ms of the ~967 ms first-use cost), and it executes immediately
+    before Triton computes its cache key and looks up or populates the on-disk
+    cache.  It is therefore the last point at which the true specialization and
+    the true compile options are both still observable.
+
+    Observation only: the wrapper records and then calls the installed function
+    with the original arguments.  ``uninstall_compile_request_observer`` puts
+    the installed attribute back, leaving Triton exactly as shipped.
+    """
+    try:
+        from triton.runtime.jit import JITFunction  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover - Triton-only runtime branch
+        return {"installed": False, "reason": f"{type(exc).__name__}:{str(exc)[:160]}"}
+
+    original = getattr(JITFunction, "_do_compile", None)
+    if original is None:
+        return {"installed": False, "reason": "no__do_compile"}
+    if getattr(original, "_comfymodal_compile_request_observer", False):
+        return {"installed": True, "reason": "already_installed"}
+
+    target = str(name_filter).strip().lower()
+
+    def _observed(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            kernel_name, source = _kernel_identity(self)
+            # Match on the name OR the source: whichever the installed Triton
+            # happens to expose, the target kernel is still recognised.
+            matched = bool(target) and (
+                target in kernel_name.lower() or target in source.lower()
+            )
+            record: dict[str, Any] = {
+                "kernel": kernel_name,
+                "matched": matched,
+                "arg_count": len(args),
+                "kwargs": sorted(str(key) for key in kwargs),
+            }
+            if matched:
+                options = kwargs.get("options")
+                if options is None and len(args) >= 2:
+                    options = args[1]
+                # ``_do_compile(kernel, options, *args)``: everything after the
+                # options object is what Triton actually specializes on.
+                specialization_args = list(args[2:]) if len(args) >= 2 else list(args)
+                record["kernel_arg"] = _describe_compile_arg(args[0]) if args else None
+                record["specialization_args"] = [
+                    _describe_compile_arg(a) for a in specialization_args
+                ]
+                record["kwargs_detail"] = {
+                    str(key): _describe_compile_arg(val)
+                    for key, val in kwargs.items()
+                }
+                record["options"] = _describe_compile_arg(options)
+                for attr in ("num_warps", "num_stages", "num_ctas", "maxnreg", "debug"):
+                    try:
+                        record[f"option_{attr}"] = getattr(options, attr, None)
+                    except Exception:  # noqa: BLE001
+                        record[f"option_{attr}"] = None
+                src = getattr(self, "src", None)
+                if src is not None:
+                    text = source or str(src)
+                    record["src_sha256"] = hashlib.sha256(
+                        text.encode("utf-8", "replace")
+                    ).hexdigest()
+                    record["src_excerpt"] = text[:6000]
+            _COMPILE_REQUEST_EVENTS.append(record)
+        except Exception:  # noqa: BLE001 - observation must never break Triton
+            pass
+        return original(self, *args, **kwargs)
+
+    _observed._comfymodal_compile_request_observer = True  # type: ignore[attr-defined]
+    _observed._comfymodal_original_do_compile = original  # type: ignore[attr-defined]
+    JITFunction._do_compile = _observed  # type: ignore[method-assign]
+    return {
+        "installed": True,
+        "boundary": "triton.runtime.jit.JITFunction._do_compile",
+        "name_filter": target,
+    }
+
+
+def uninstall_compile_request_observer() -> dict[str, Any]:
+    """Restore the installed ``_do_compile`` so Triton is exactly as shipped."""
+    try:
+        from triton.runtime.jit import JITFunction  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover - Triton-only runtime branch
+        return {"removed": False, "reason": f"{type(exc).__name__}:{str(exc)[:160]}"}
+    current = getattr(JITFunction, "_do_compile", None)
+    original = getattr(current, "_comfymodal_original_do_compile", None)
+    if original is None:
+        return {"removed": False, "reason": "not_installed"}
+    JITFunction._do_compile = original  # type: ignore[method-assign]
+    del _COMPILE_REQUEST_EVENTS[:]
+    return {"removed": True}
+
+
+def compile_request_events() -> list[dict[str, Any]]:
+    return [dict(event) for event in _COMPILE_REQUEST_EVENTS]
+
+
+def reset_compile_request_events() -> None:
+    del _COMPILE_REQUEST_EVENTS[:]
+
+
+def snapshot_triton_cache_tree(root: str | os.PathLike[str] = TRITON_CACHE_DIR) -> dict[str, Any]:
+    """Enumerate Triton's own on-disk cache.
+
+    Triton names each compiled artifact directory after its own cache key, so
+    the directories and filenames observed here *are* the cache identity.  That
+    is strictly better evidence than re-deriving the key from a remembered
+    formula, which is exactly what Phase 2 refused to do.
+    """
+    base = Path(root)
+    snapshot: dict[str, Any] = {
+        "root": str(base),
+        "exists": base.is_dir(),
+        "dirs": [],
+        "files": [],
+    }
+    if not base.is_dir():
+        return snapshot
+    for dirpath, dirnames, filenames in os.walk(base):
+        relative = Path(dirpath).relative_to(base)
+        for name in dirnames:
+            snapshot["dirs"].append((relative / name).as_posix())
+        for name in filenames:
+            item = Path(dirpath) / name
+            try:
+                size = item.stat().st_size
+            except OSError:
+                size = None
+            # as_posix() so the recorded cache-key directory names are identical
+            # on the Linux container and on a Windows developer machine.
+            snapshot["files"].append(
+                {"path": (relative / name).as_posix(), "bytes": size}
+            )
+    snapshot["dirs"].sort()
+    snapshot["files"].sort(key=lambda row: row["path"])
+    return snapshot
 
 
 def build_cache(

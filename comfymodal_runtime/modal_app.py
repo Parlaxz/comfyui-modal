@@ -625,6 +625,29 @@ CLASS_NAME = "ModalRuntimeEntrypoint"
 _RESTORE_STAGE_TIMERS: dict[str, float] = {}
 
 
+# Install results for the restore-time Triton observers.  Kept at module scope
+# so the module-level telemetry function can report them; a silent install
+# failure must never look like an observer that was installed but never called.
+_TRITON_OBSERVER_INSTALL: dict[str, Any] = {}
+
+
+def _triton_observer_install_record() -> dict[str, Any]:
+    """Return what each Triton observer reported when it was installed.
+
+    Phase 2 lost a cycle because an observer that failed to install was
+    indistinguishable from one that was installed and never called: only the
+    (empty) event list was surfaced.  The install result is recorded explicitly
+    so a failure is visible in telemetry instead of inferred from silence.
+    """
+    return {
+        "compile_observer": dict(_TRITON_OBSERVER_INSTALL.get("compile_observer", {})),
+        "shape_observer": dict(_TRITON_OBSERVER_INSTALL.get("shape_observer", {})),
+        "compile_request_observer": dict(
+            _TRITON_OBSERVER_INSTALL.get("compile_request_observer", {})
+        ),
+    }
+
+
 def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str, Any]:
     """Return cache-file evidence without causing a compile."""
     disabled = not env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE")
@@ -643,14 +666,18 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
             cache_files,
             cache_compatible,
             compile_events,
+            compile_request_events,
             reset_compile_events as _reset_compile_events,
+            reset_compile_request_events,
             read_manifest,
             runtime_identity,
             shape_events,
+            snapshot_triton_cache_tree,
         )
 
         if reset_compile_events:
             _reset_compile_events()
+            reset_compile_request_events()
         manifest = read_manifest(TRITON_CACHE_DIR)
         identity = dict((manifest or {}).get("identity") or {})
         current = runtime_identity()
@@ -685,6 +712,7 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
             key=lambda row: (row["suffix"], row["name"]),
         )
         base.update({
+            "triton_observer_install": _triton_observer_install_record(),
             "cache_identity_match": compatible,
             "cuda_utils_cache_present_before_request": bool(
                 compatible and helper_files and helper_files <= files
@@ -696,6 +724,18 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
             "triton_compile_events": events,
             # The specialization actually compiled, read from the real tensors.
             "triton_shape_events": shapes,
+            # The real compile request captured at JITFunction._do_compile, plus
+            # Triton's own cache tree. The directory names ARE Triton's cache
+            # keys, which is why this needs no re-derived key formula.
+            "triton_compile_requests": compile_request_events(),
+            "triton_cache_dirs_seen": sorted(
+                {
+                    str(row.get("path", "")).split("/", 1)[0]
+                    for row in compile_request_events()
+                    if row.get("matched")
+                }
+            ),
+            "triton_cache_tree": snapshot_triton_cache_tree(TRITON_CACHE_DIR),
             "cache_root": TRITON_CACHE_DIR,
             "cache_file_count": len(listing),
             "cache_artifacts": listing[:64],
@@ -13125,10 +13165,24 @@ class ModalRuntimeEntrypoint:
                 from .triton_cache import (
                     install_bmm_shape_observer,
                     install_compile_observer,
+                    install_compile_request_observer,
                 )
 
                 self._triton_compile_observer = install_compile_observer()
                 self._triton_shape_observer = install_bmm_shape_observer()
+                # _do_compile is the boundary the exhaustive profile proved runs
+                # for this kernel, so it is the one that reliably observes the
+                # real compile request.  Its install status is recorded
+                # explicitly: a silent failure here is what made the earlier
+                # torch-native-op observer indistinguishable from "never called".
+                self._triton_compile_request_observer = (
+                    install_compile_request_observer()
+                )
+                _TRITON_OBSERVER_INSTALL.update({
+                    "compile_observer": self._triton_compile_observer,
+                    "shape_observer": self._triton_shape_observer,
+                    "compile_request_observer": self._triton_compile_request_observer,
+                })
             else:
                 self._triton_compile_observer = {
                     "installed": False, "reason": "disabled",
