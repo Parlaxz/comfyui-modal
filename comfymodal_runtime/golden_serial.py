@@ -13810,14 +13810,14 @@ async def golden_unet_load(
 
         with _golden_trace_span("golden.unet.binding_validation"):
             identity = validate_unet_binding(
-            model,
-            views,
-            expected_count=(
-                session.effective_contract.expected_unet_tensor_count
-                if getattr(session, "effective_contract", None) is not None
-                else contract.expected_unet_tensor_count
-            ),
-        )
+                model,
+                views,
+                expected_count=(
+                    session.effective_contract.expected_unet_tensor_count
+                    if getattr(session, "effective_contract", None) is not None
+                    else contract.expected_unet_tensor_count
+                ),
+            )
         adoption_end_ns = time.monotonic_ns()
         adoption_wall_ms = (adoption_end_ns - adoption_started_ns) / 1e6
         after_adoption = checkpoint("after_assign_adoption")

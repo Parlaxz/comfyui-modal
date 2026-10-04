@@ -250,7 +250,17 @@ def test_unet_assign_binding_is_same_storage_and_retains_owner():
         and keyword.value.value is True
         for keyword in load_calls[0].keywords
     )
-    assert "validate_unet_binding(model, views" in source
+    # Structural, not textual: the binding proof must be invoked with exactly
+    # (model, views) positionally.  A literal ``validate_unet_binding(model,
+    # views`` substring would make this shield a formatting assertion, and the
+    # call is legitimately spread over lines once the expected tensor count
+    # becomes request-dependent.
+    bind_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _called_name(node) == "validate_unet_binding"
+    ]
+    assert len(bind_calls) == 1
+    assert [ast.unparse(arg) for arg in bind_calls[0].args] == ["model", "views"]
     assert "session.unet_owner = transport[\"owner\"]" in source
     assert "session.register_qd_owner(session.unet_owner)" in source
 

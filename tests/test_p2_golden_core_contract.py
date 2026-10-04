@@ -537,11 +537,67 @@ def test_canonical_node_resolution_remains_exact_and_fail_closed():
         "1178": {"class_type": "VAEDecode", "inputs": {}},
     }
     node_map = gs.resolve_golden_node_map(prompt)
-    assert node_map == gs.GoldenNodeMap("88", "67", "214", "1242", "175", "1178")
+    # Node handles AND the model identities the loader nodes declare.  The
+    # canonical workflow declares the canonical triple, so this is the same
+    # effective contract production-009 derived from defaults -- the names are
+    # now echoed because a caller-selected workflow may name replacements.
+    assert node_map == gs.GoldenNodeMap(
+        "88", "67", "214", "1242", "175", "1178",
+        gs.CANONICAL_CLIP_NAME, gs.CANONICAL_CLIP_TYPE,
+        gs.CANONICAL_UNET_NAME, gs.CANONICAL_VAE_NAME,
+    )
     broken = dict(prompt)
     del broken["175"]
     with pytest.raises(RuntimeError, match="canonical_nodes_missing:sampler"):
         gs.resolve_golden_node_map(broken)
+
+
+def test_node_resolution_declares_replacements_but_stays_fail_closed():
+    """A declared replacement is echoed; an unnamed loader is never defaulted.
+
+    The canonical triple is the default, but a caller-selected workflow's own
+    loader inputs are authoritative for what the run must load.  An empty
+    loader input is ambiguous rather than "the default", so it fails closed
+    instead of silently loading the canonical model.
+    """
+    prompt = {
+        "88": {"class_type": "CLIPLoader", "inputs": {"clip_name": "other_clip.safetensors", "type": "lumina2"}},
+        "67": {"class_type": "CLIPTextEncode", "inputs": {}},
+        "214": {"class_type": "UNETLoader", "inputs": {"unet_name": "other_unet.safetensors"}},
+        "1242": {"class_type": "VAELoader", "inputs": {"vae_name": gs.CANONICAL_VAE_NAME}},
+        "175": {"class_type": gs.CANONICAL_SAMPLER_CLASS, "inputs": {}},
+        "1178": {"class_type": "VAEDecode", "inputs": {}},
+    }
+    node_map = gs.resolve_golden_node_map(prompt)
+    assert node_map.clip_name == "other_clip.safetensors"
+    assert node_map.unet_name == "other_unet.safetensors"
+    assert node_map.vae_name == gs.CANONICAL_VAE_NAME
+
+    for role, drop, reason in (
+        ("clip_name", "clip_name", "golden_clip_loader_requires_clip_name"),
+        ("type", "type", "golden_clip_loader_requires_type"),
+        ("unet_name", "unet_name", "golden_unet_loader_requires_unet_name"),
+        ("vae_name", "vae_name", "golden_vae_loader_requires_vae_name"),
+    ):
+        unnamed = {
+            node_id: {
+                "class_type": info["class_type"],
+                "inputs": {
+                    key: value for key, value in info["inputs"].items() if key != drop
+                },
+            }
+            for node_id, info in prompt.items()
+        }
+        with pytest.raises(RuntimeError, match=reason):
+            gs.resolve_golden_node_map(unnamed)
+
+    duplicated = dict(prompt)
+    duplicated["214b"] = {
+        "class_type": "UNETLoader",
+        "inputs": {"unet_name": gs.CANONICAL_UNET_NAME},
+    }
+    with pytest.raises(RuntimeError, match="canonical_nodes_duplicate"):
+        gs.resolve_golden_node_map(duplicated)
 
 
 def test_restore_metadata_is_authoritative_over_request_extra_data(monkeypatch, tmp_path):
