@@ -27,6 +27,15 @@ from .source_latency_telemetry import (
     summarize_source_operations,
 )
 
+# --- import-time source identity (stale-snapshot detection) --------------
+# Frozen here, not at request time: a container restored from a Modal
+# memory snapshot keeps the code objects imported before capture while the
+# mounted tree can be newer, so a request-time hash would read the NEW file
+# and wrongly vouch for OLD executing code.
+from .source_identity import freeze_imported_sha as _freeze_imported_sha
+
+_IMPORTED_SOURCE_SHA256 = _freeze_imported_sha(__name__, __file__)
+
 
 class _DeferredC0Backend:
     """Restore-owned backend shell; a model only binds its CUDA destination."""

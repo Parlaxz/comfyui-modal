@@ -139,6 +139,15 @@ from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
 from .v2_waterfall import build_waterfall, render_waterfall, waterfall_to_dict, attach_waterfall, mark_waterfall_non_applicable, is_graph_result, graph_result_from_event
 from .teardown_diagnostics import TeardownDiagnostics
 
+# --- import-time source identity (stale-snapshot detection) --------------
+# Frozen here, not at request time: a container restored from a Modal
+# memory snapshot keeps the code objects imported before capture while the
+# mounted tree can be newer, so a request-time hash would read the NEW file
+# and wrongly vouch for OLD executing code.
+from .source_identity import freeze_imported_sha as _freeze_imported_sha
+
+_IMPORTED_SOURCE_SHA256 = _freeze_imported_sha(__name__, __file__)
+
 # ── Lean production snapshot gate (diagnostic A/B; default off) ──────────
 # COMFYMODAL_V2_LEAN_SNAPSHOT=1 defers the default-off UNET-backing
 # diagnostic module from the import-time surface so the memory snapshot is

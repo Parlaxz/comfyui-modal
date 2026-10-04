@@ -47,6 +47,15 @@ import threading
 import time
 from typing import Any
 
+# --- import-time source identity (stale-snapshot detection) --------------
+# Frozen here, not at request time: a container restored from a Modal
+# memory snapshot keeps the code objects imported before capture while the
+# mounted tree can be newer, so a request-time hash would read the NEW file
+# and wrongly vouch for OLD executing code.
+from .source_identity import freeze_imported_sha as _freeze_imported_sha
+
+_IMPORTED_SOURCE_SHA256 = _freeze_imported_sha(__name__, __file__)
+
 # ── Request wall gate + progress heartbeat ────────────────────────────────
 # The per-model-load gates in golden_source_threads bound the SOURCE span
 # only.  Everything else in a Golden request (skeleton overlap, the CLIP/UNET
