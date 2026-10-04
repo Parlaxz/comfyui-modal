@@ -201,12 +201,14 @@ def test_a2_failure_is_fail_closed(tmp_path, monkeypatch):
     assert "errno" in str(excinfo.value)
 
 
-def test_a2_without_the_gate_fails_closed_rather_than_downgrading(monkeypatch):
-    monkeypatch.setenv(policy.ARM_ENV, "A2")
-    monkeypatch.delenv(policy.POPULATION_GATE_ENV, raising=False)
-    with pytest.raises(policy.SourcePopulationError) as excinfo:
-        policy.active_arm()
-    assert "requires_gate" in str(excinfo.value)
+def test_a2_without_the_gate_does_not_call_fadvise(tmp_path, monkeypatch):
+    # Gate off means this address space is not the treated one.  It records no
+    # fadvise rather than failing, because the production source owner runs in
+    # exactly this state; the experiment contract is what rejects the run.
+    plan, fake_libc, _mapper = _build(tmp_path, monkeypatch, "A2", gate=False)
+    assert fake_libc.calls == []
+    assert plan.population_evidence["arm"] == "A"
+    assert plan.population_evidence["reason"] == "control_arm"
 
 
 # ── arm A3: MAP_POPULATE set exactly once at mapping creation ────────────
@@ -530,11 +532,42 @@ def test_arms_without_a_population_treatment_resolve_to_the_control(arm, monkeyp
 
 
 @pytest.mark.parametrize("arm", ["A2", "A3"])
-def test_a_declared_treatment_arm_still_refuses_to_run_without_the_gate(arm, monkeypatch):
+def test_a_gate_off_address_space_is_the_control_even_when_treatment_is_declared(
+    arm, monkeypatch
+):
+    # The gate is process-local, so the real Golden source owner in the same
+    # container runs with the gate popped.  It must be the untreated control; an
+    # earlier build raised here and killed the real CLIP load of a correct A2 run.
     monkeypatch.delenv(policy.POPULATION_GATE_ENV, raising=False)
     monkeypatch.setenv(policy.ARM_ENV, arm)
-    with pytest.raises(policy.SourcePopulationError):
-        policy.active_arm()
+    assert policy.active_arm() == "A"
+
+
+@pytest.mark.parametrize("arm", ["A2", "A3"])
+def test_the_real_golden_source_owner_runs_untreated_inside_a_treated_deployment(
+    arm, tmp_path, monkeypatch
+):
+    # End-to-end version of the contract above, through the production hook: a
+    # deployment that declares a treatment still serves the production source
+    # owner, and that owner must record no treatment rather than raise.
+    plan = _build(tmp_path, monkeypatch, arm, gate=False)[0]
+    assert plan.population_evidence["arm"] == "A"
+    assert plan.population_evidence["fadvise_called"] is False
+    assert plan.population_evidence["map_populate_requested"] is False
+    assert plan.population_evidence["mmap_flags"] == policy.MAP_PRIVATE
+    assert plan.population_evidence["fadvise_call_count"] == 0
+
+
+@pytest.mark.parametrize("arm", ["A2", "A3"])
+def test_a_treatment_arm_that_never_ran_is_rejected_by_the_experiment_contract(
+    arm, monkeypatch
+):
+    # Removing the hook-side raise must not make a silent downgrade pass.  The
+    # contract compares the declared arm with the arm the payload recorded.
+    monkeypatch.setenv(policy.ARM_ENV, arm)
+    contract = sci.population_contract({"arm": "A"}, arm)
+    assert contract["satisfied"] is False
+    assert contract["error"] == f"arm_treatment_mismatch:{arm}!=A"
 
 
 @pytest.mark.parametrize("value", ["", "  ", "A9", "arm", "A;A", "A-"])

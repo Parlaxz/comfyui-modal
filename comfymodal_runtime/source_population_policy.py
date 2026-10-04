@@ -112,21 +112,28 @@ def declared_arm(value: Any = None) -> str:
 def active_arm(value: Any = None) -> str:
     """The population arm this address space will actually apply.
 
-    Returns ``"A"`` whenever the gate is off, which is the production path.  A
-    declared ``A2``/``A3`` with the gate off is a configuration error rather than
-    a silent downgrade to the control.
+    Returns ``"A"`` unless the gate is up *and* the deployment declares a
+    treatment arm, so a gate-off address space is always the untreated control.
 
-    ``B``/``C``/``D`` declare no population arm at all, so they are the untreated
-    control whether or not the gate is up; requiring the gate for them would
-    refuse to run arms that never asked for a treatment.
+    The gate-off-with-A2-declared case must NOT raise, and that is not a
+    relaxation. The gate is process-local on purpose, so the experiment's own
+    ``build_plan`` runs treated and then the real Golden source owner -- a
+    different process in the same container, with the gate popped -- runs
+    untreated. Raising here killed the real CLIP load of an otherwise perfect
+    A2 request with
+    ``source_population_arm_requires_gate:A2``.
+
+    A treated arm that silently ran as the control is still caught, one layer up
+    and with better evidence: ``source_copy_isolation.population_contract``
+    compares the declared arm against the arm the payload actually recorded and
+    rejects the mismatch. That check is scoped to the experiment's own mapping,
+    which is where the claim "this arm was treated" actually has to be proven.
     """
     arm = declared_arm(value)
     if arm not in POPULATION_TREATMENT_ARMS:
         return CONTROL_ARM
     if not population_enabled():
-        raise SourcePopulationError(
-            f"source_population_arm_requires_gate:{arm}:{POPULATION_GATE_ENV}"
-        )
+        return CONTROL_ARM
     return arm
 
 
