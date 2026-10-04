@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Optional
@@ -116,6 +119,59 @@ def _hb(stage: str) -> None:
     )
 
 
+_GATE_WATCHDOG_SRC = """\
+import os, signal, sys, time
+
+pid = int(sys.argv[1])
+gate = float(sys.argv[2])
+time.sleep(gate)
+
+# SIGKILL where available (the Linux container cannot catch or block it);
+# SIGTERM is the portable equivalent and maps to TerminateProcess on Windows.
+sig = getattr(signal, "SIGKILL", None) or signal.SIGTERM
+msg = ("[v2.golden.request_gate] WATCHDOG fired wall_gate_s=%r; "
+       "sending %s to pid %d\\n" % (gate, getattr(sig, "name", sig), pid))
+try:
+    sys.stdout.write(msg)
+    sys.stdout.flush()
+except Exception:
+    pass
+try:
+    os.kill(pid, sig)
+except Exception:
+    pass
+"""
+
+
+def _start_request_wall_gate_watchdog(gate_s: float) -> subprocess.Popen | None:
+    """Start an out-of-process watchdog for the Golden request wall gate.
+
+    The in-process ``threading.Timer`` gate cannot be relied on to fail closed.
+    Reaching ``os._exit`` from a Python thread requires the GIL, so while the
+    request thread sits in a blocking native/torch call that holds the GIL, the
+    timer thread never runs and the gate never fires -- observed as a Golden
+    request stuck in sampling for minutes with no gate output at all, while a
+    request that was merely slow (sampler in an async wait, which releases the
+    GIL) did trip the gate normally.
+
+    A separate process is immune to that: it shares no GIL with the request and
+    can always deliver SIGKILL, so the container is genuinely terminated
+    instead of being left holding an H100. ``subprocess`` is used rather than
+    ``multiprocessing``/``os.fork`` on purpose: forking a process that has
+    already initialised CUDA is unsafe, and this child never touches CUDA.
+
+    Best effort: if the watchdog cannot be started the in-process gate remains
+    the only guard, so this never makes the situation worse.
+    """
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-c", _GATE_WATCHDOG_SRC, str(os.getpid()), repr(float(gate_s))],
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics/bounds are best effort
+        return None
+
+
 def _install_request_wall_gate(gate_s: float = GOLDEN_REQUEST_WALL_GATE_S):
     def _fire() -> None:
         print(
@@ -137,12 +193,27 @@ def _install_request_wall_gate(gate_s: float = GOLDEN_REQUEST_WALL_GATE_S):
     timer = threading.Timer(gate_s, _fire)
     timer.daemon = True
     timer.start()
+    # Independent, GIL-immune backstop: guarantees termination even when the
+    # thread above is starved by a GIL-holding native call.
+    _PROGRESS_STATE["gate_watchdog"] = _start_request_wall_gate_watchdog(gate_s)
     _PROGRESS_STATE["gate_timer"] = timer
     return timer
 
 
 def _cancel_request_wall_gate() -> None:
     """Disarm the Golden request wall gate once the request is complete."""
+    watchdog = _PROGRESS_STATE.pop("gate_watchdog", None)
+    if watchdog is not None:
+        # The watchdog only sends SIGKILL after sleeping, so it must be reaped
+        # here: leaving it armed would let a completed request be killed later.
+        try:
+            watchdog.kill()
+        except BaseException:
+            pass
+        try:
+            watchdog.wait(timeout=5)
+        except BaseException:
+            pass
     timer = _PROGRESS_STATE.pop("gate_timer", None)
     if timer is not None:
         try:
