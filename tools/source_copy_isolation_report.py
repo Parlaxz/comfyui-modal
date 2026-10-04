@@ -42,7 +42,6 @@ from comfymodal_runtime.source_copy_isolation import (  # noqa: E402
     STALL_THRESHOLDS_MS,
     describe,
     ordinal_head,
-    setup_costs,
     summarize_copies,
 )
 
@@ -315,43 +314,38 @@ def setup_cost_evidence(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any
     """Per-container treatment cost, taken from the payload's own accounting.
 
     A prefetch that made the copies fast while spending seconds in ``mmap`` would
-    otherwise read as a win, because the copy loop is what the arm measures.
+    otherwise read as a win, because the copy loop is what the arm measures.  The
+    numbers are read from ``report["variants"][*]["setup_costs"]`` as the
+    container computed them rather than recomputed here: the boundaries were
+    taken inside the container that ran the arm, and re-deriving them from
+    artifact fields would invent a different measurement.
     """
     costs: list[dict[str, Any]] = []
     for row in rows:
         report = row.get("report") or {}
         population = report.get("population") or {}
-        variants = report.get("variants") or []
-        primary = next(
-            (item for item in variants if str(item.get("variant")) == "concurrent4"),
-            variants[0] if variants else {},
-        )
-        # Every nanosecond input comes from the payload, so a variant that never
-        # reported one produces None costs rather than a fabricated zero.
-        if any(value is None for value in (
-            population.get("generation_open_monotonic_ns"),
-            primary.get("setup_done_monotonic_ns"),
-            primary.get("started_monotonic_ns"),
-            primary.get("ended_monotonic_ns"),
-        )):
-            computed = None
-        else:
-            computed = setup_costs(
-                population=population,
-                generation_open_ns=int(population["generation_open_monotonic_ns"]),
-                setup_done_ns=int(primary["setup_done_monotonic_ns"]),
-                copy_started_ns=int(primary["started_monotonic_ns"]),
-                copy_ended_ns=int(primary["ended_monotonic_ns"]),
-                copies=primary.get("copies") or [],
-            )
+        per_variant = []
+        for item in report.get("variants") or []:
+            computed = item.get("setup_costs")
+            if not isinstance(computed, Mapping):
+                continue
+            per_variant.append({
+                "variant": str(item.get("variant")),
+                "setup_costs": dict(computed),
+                "variant_wall_ms": item.get("wall_ms"),
+                "copy_count": len(item.get("copies") or []),
+            })
         costs.append({
             "request_id": row.get("request_id"),
-            "arm": str(population.get("arm") or ""),
             "declared_arm": population.get("declared_arm"),
             "observed_arm": population.get("observed_arm"),
-            "satisfied": population.get("satisfied"),
+            "contract_satisfied": population.get("satisfied"),
             "mapped_bytes": population.get("mapped_bytes"),
-            "computed": computed,
+            "fd_open_wall_ms": population.get("fd_open_wall_ms"),
+            "fadvise_wall_ms": population.get("fadvise_wall_ms"),
+            "mmap_wall_ms": population.get("mmap_wall_ms"),
+            "plan_build_total_ms": population.get("plan_build_total_ms"),
+            "variants": per_variant,
         })
     return costs
 
