@@ -25352,10 +25352,22 @@ def _build_decorated_v2_class() -> type:
         "source_identity_probe",
         _modal.method()(cls.source_identity_probe),
     )
-    setattr(
+setattr(
         cls,
         "publish_model_metadata_cache",
         _modal.method()(cls.publish_model_metadata_cache),
+    )
+    # Exposed explicitly for the same reason as build_triton_cache: a method
+    # defined only on the base class is not reachable on the decorated V2 class.
+    setattr(
+        cls,
+        "build_triton_cache",
+        _modal.method()(cls.build_triton_cache),
+    )
+    setattr(
+        cls,
+        "clear_triton_cache",
+        _modal.method()(cls.clear_triton_cache),
     )
     return cls
 
