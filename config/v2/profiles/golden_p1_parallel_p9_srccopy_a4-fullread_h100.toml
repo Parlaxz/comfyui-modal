@@ -1,0 +1,95 @@
+# v2ctl profile: P9 source population arm A4 on H100.
+#
+# DIAGNOSTIC EXPERIMENT.  Arm A4 of the A / A4 comparison, on its own app so the
+# arm is a deploy-level identity rather than a run-time override.
+#
+#   ARM A   control    whole-file MAP_PRIVATE mmap, no treatment
+#   ARM A4  treatment  + synchronous full-file positioned read, then the same mmap
+#
+# TREATMENT A4.  Identical to arm A except for one diagnostic step, in this exact
+#   order inside the production build_plan:
+#
+#       open source fd
+#           -> whole-file MAP_PRIVATE mmap            (unchanged)
+#           -> SYNCHRONOUS positioned read of every byte of the file
+#              into a bounded reusable 64 MiB scratch buffer
+#           -> discard the scratch
+#           -> the EXACT SAME timed mmap -> arena copy loop as arm A
+#
+#   The timed copy path is untouched: same _run_reader_loop, same execute_block,
+#   same libc.memmove, same 4 readers, same 64 MiB blocks, same 4 ms pacer, same
+#   16 x 64 MiB pinned shared arena, same per-copy source-copy probe.
+#
+# Why this arm exists.  A2 and A3 could not answer the question, because on this
+#   Modal Volume / gVisor path they were accepted and then did nothing:
+#
+#       posix_fadvise(WILLNEED)   returned in 0.040 ms for 12,309,866,400 bytes
+#       mmap(MAP_POPULATE)       returned in 0.774 ms for 12,309,866,400 bytes
+#
+#   Reading 12.31 GB takes about 1.2 s.  So neither arm ever tested whether
+#   materialising the backing data fixes the copy; they tested whether the
+#   platform honours the request.  A4 removes the platform from the experiment
+#   by consuming every byte through an ordinary positioned read, which cannot be
+#   advisory and cannot be optimised away.
+#
+# Deliberately NOT done, because each would stop it being a diagnostic:
+#   * no pipelining, no QD, no second reader thread, no overlap between the warm
+#     read and the timed copies or with H2D.  The claim under test is "every byte
+#     was consumed before copy timing began";
+#   * no whole-file anonymous copy.  12.31 GB will not fit beside the 1 GiB pinned
+#     arena in a 24 GiB container, and holding it would replace the mmap read with
+#     an ordinary RAM read, which is a different experiment;
+#   * no mmap and no slicing of the source mapping for the warm read, so the warm
+#     path and the timed path are provably different code.
+#
+# Why the arm is DEPLOY-baked rather than a run-only --set override: the container
+#   reads COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ARM from the class environment,
+#   which _runtime_env() freezes at deploy time.  A run-only override changes the
+#   run fingerprint and then never reaches the container, so all arms silently
+#   execute as arm A.  That was measured, not assumed: fifteen requests requested
+#   as B, C and D all executed arm A with a clean source identity, a clean gate and
+#   a valid result.
+#
+# The population hooks are additionally gated by a PROCESS-LOCAL
+#   COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_POPULATION that the experiment raises
+#   only around its own build_plan call and lowers again immediately.  The warm
+#   read therefore applies ONLY to the experiment's own mapping.  The real Golden
+#   source owner is a separate process spawned later in the same container, never
+#   sees the gate, and stays an untreated control -- so its CLIP and UNET source
+#   walls remain comparable across arms, and a 12.31 GB synchronous read can never
+#   be triggered inside the real request.
+#
+# Everything else is inherited from golden_p1_parallel_p9_srccopy_iso_h100 and
+# therefore from golden_p1_parallel_p9opt1_source_diag_h100 and
+# golden_p1_parallel_c0_p8_h100:
+#
+#   H100! / CPU=12 / memory 24576 MB
+#   whole mmap lifecycle                   COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE=whole
+#   thread source owner                    COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND=thread
+#   qd4_64 source/transport geometry       64 MiB blocks, 16 x 64 MiB arena
+#   per-copy stall probe                   COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE=1
+#   forced-miss conditioning               [workload] conditioning_cache=forced_miss
+#   fresh-run requirement                  [workload] fresh_required=true
+#   correctness SHA                        3a6a03064c7e6e01ede339ada63daaea4cbf793f387f4faadbb101a787024577
+#
+# Source behaviour is unchanged apart from the one declared treatment: no change
+# to QD, block size, reader count, the 4 ms pacer, slot-release semantics, H2D
+# dispatcher semantics, arena allocation, cudaHostRegister behaviour, arena
+# alignment, CPU affinity, NUMA policy, mmap lifecycle, model files, workflow,
+# sampler, Modal resource configuration or GPU type.  Replacing mmap with
+# positioned reads in PRODUCTION is deliberately NOT implemented: A4 is a
+# diagnostic, and the next experiment has to earn that change.
+#
+# This profile is NOT counted and NOT promotable.
+schema_version = 1
+name = "golden_p1_parallel_p9_srccopy_a4-fullread_h100"
+extends = "golden_p1_parallel_p9_srccopy_iso_h100"
+owner = "p9-source-copy-isolation"
+
+[target]
+app = "batch-p9srccopy-a4-fullread-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
+
+[environment]
+COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ARM = "A4"

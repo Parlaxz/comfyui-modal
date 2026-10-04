@@ -68,7 +68,7 @@ COPIES_ENV = "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_COPIES"
 MODEL_ENV = "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_MODEL"
 ANON_GIB_ENV = "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ANON_GIB"
 
-ARMS = ("A", "A2", "A3", "B", "C", "D")
+ARMS = ("A", "A2", "A3", "A4", "B", "C", "D")
 # 128 timed copies is the floor; 256 is the default because a pathological copy
 # is rare (65 of 3040 in the Phase-1 cohort) and a small sample would simply
 # miss it.  Copies are split across four readers, so 256 copies is 64 per reader.
@@ -132,13 +132,29 @@ ARM_LAYOUT: dict[str, dict[str, Any]] = {
             "set once at mapping creation"
         ),
     },
+    # A4 is arm A plus the one diagnostic step A2/A3 could not supply: every byte
+    # of the file is consumed by an ordinary positioned read AFTER the mapping is
+    # built and BEFORE any timed copy.  A2 and A3 were accepted by the platform
+    # and materialised nothing, so they tested the platform rather than the
+    # hypothesis.  Nothing else differs from A.
+    "A4": {
+        "source": "model_mmap",
+        "destination": "pinned_shared_arena",
+        "variants": ("concurrent4",),
+        "population_arm": "A4",
+        "summary": (
+            "arm A plus a synchronous full-file positioned read of the source "
+            "descriptor into a bounded reusable scratch buffer, once per "
+            "generation, after mmap and before the first timed copy"
+        ),
+    },
 }
 
 # Arms whose source is the whole-file mapping of the real checkpoint.  Only
-# these three are compared in the population experiment.
-MAPPED_SOURCE_ARMS = ("A", "A2", "A3")
+# these are compared in the population experiment.
+MAPPED_SOURCE_ARMS = ("A", "A2", "A3", "A4")
 # Arms that carry a population treatment, and therefore must prove it happened.
-POPULATION_TREATMENT_ARMS = ("A2", "A3")
+POPULATION_TREATMENT_ARMS = ("A2", "A3", "A4")
 
 VARIANT_READERS = {"single": 1, "concurrent4": gsrc.READER_COUNT}
 
@@ -947,6 +963,42 @@ def population_contract(payload: Mapping[str, Any] | None, arm: str) -> dict[str
                 "fadvise_wall_ms": evidence.get("fadvise_wall_ms"),
                 "satisfied": bool(called and count == 1 and rc == 0),
             })
+        elif arm == "A4":
+            # The A4 claim is "every byte was synchronously consumed before any
+            # copy was timed", so the contract is about exact byte counts rather
+            # than about a flag having been set.  A warm read that got 99.99% of
+            # the file is not a warm read.
+            requested = int(evidence.get("warm_bytes_requested") or 0)
+            read = int(evidence.get("warm_bytes_read") or 0)
+            mapped = int(evidence.get("mapped_bytes") or 0)
+            contract.update({
+                "warm_read_called": bool(evidence.get("warm_read_called")),
+                "warm_primitive": evidence.get("warm_primitive"),
+                "warm_uses_mmap": evidence.get("warm_uses_mmap"),
+                "warm_scratch_bytes": evidence.get("warm_scratch_bytes"),
+                "warm_bytes_requested": requested,
+                "warm_bytes_read": read,
+                "warm_mapped_bytes": mapped,
+                "warm_complete": bool(evidence.get("warm_complete")),
+                "warm_total_ms": evidence.get("warm_total_ms"),
+                "warm_effective_gbps": evidence.get("warm_effective_gbps"),
+                "warm_block_bytes": evidence.get("warm_block_bytes"),
+                "warm_block_count": evidence.get("warm_block_count"),
+                "warm_read_calls": evidence.get("warm_read_calls"),
+                "warm_short_read_retries": evidence.get("warm_short_read_retries"),
+                "warm_eintr_retries": evidence.get("warm_eintr_retries"),
+                # Three independent facts must agree before A4 counts as run:
+                # the warm read consumed exactly what it asked for, it asked for
+                # exactly what the mapping covered, and it reported completion.
+                "satisfied": bool(
+                    evidence.get("warm_read_called")
+                    and evidence.get("warm_complete")
+                    and read > 0
+                    and read == requested
+                    and requested == mapped
+                    and evidence.get("warm_uses_mmap") is False
+                ),
+            })
         else:
             accepted = evidence.get("map_populate_accepted_by_mmap")
             contract.update({
@@ -961,11 +1013,14 @@ def population_contract(payload: Mapping[str, Any] | None, arm: str) -> dict[str
         if not contract["satisfied"]:
             contract["error"] = "arm_treatment_not_observed"
         return contract
-    # Control arms must carry no treatment at all.
+    # Control arms must carry no treatment at all. Every treatment the policy can
+    # apply is listed here, so adding a new one without adding its control-side
+    # check fails this contract rather than silently letting a warmed control pass.
     contract["satisfied"] = bool(
         observed == policy.CONTROL_ARM
         and not evidence.get("fadvise_called")
         and not evidence.get("map_populate_requested")
+        and not evidence.get("warm_read_called")
     )
     if not contract["satisfied"]:
         contract["error"] = "control_arm_carries_treatment"
@@ -1091,10 +1146,22 @@ def setup_costs(
     first_copy_ns = min(starts) if starts else None
     copy_loop_ms = (copy_ended_ns - copy_started_ns) / 1e6
     setup_ms = (setup_done_ns - generation_open_ns) / 1e6
+    # A4's warm read is its own boundary, never folded into "setup".  A fast copy
+    # loop that was paid for by a slow warm read is the exact shape this
+    # experiment must be able to see, so the two are reported separately and the
+    # sum is reported alongside them.
+    warm_ms = population.get("warm_total_ms")
     return {
         "fd_open_wall_ms": population.get("fd_open_wall_ms"),
         "fadvise_wall_ms": population.get("fadvise_wall_ms"),
         "mmap_wall_ms": population.get("mmap_wall_ms"),
+        "warm_read_ms": warm_ms,
+        "warm_complete": population.get("warm_complete"),
+        "warm_bytes_read": population.get("warm_bytes_read"),
+        "warm_complete_to_first_copy_ms": (
+            round((first_copy_ns - setup_done_ns) / 1e6, 4)
+            if (first_copy_ns and warm_ms is not None) else None
+        ),
         "plan_build_total_ms": population.get("plan_build_total_ms"),
         "generation_open_to_setup_done_ms": round(setup_ms, 4),
         "generation_open_to_first_copy_ms": (
@@ -1106,6 +1173,12 @@ def setup_costs(
             if first_copy_ns else None
         ),
         "copy_loop_wall_ms": round(copy_loop_ms, 4),
+        # Source-side total for the generation: what the arm cost to get the file
+        # ready, plus what the copies cost.  This, not copy p50, is the number
+        # that decides whether A4 is an optimisation or only a diagnostic.
+        "warm_plus_copy_loop_total_ms": (
+            round(float(warm_ms) + copy_loop_ms, 4) if warm_ms is not None else None
+        ),
         "setup_plus_copy_loop_total_ms": round(setup_ms + copy_loop_ms, 4),
         "first_copy_monotonic_ns": first_copy_ns,
     }

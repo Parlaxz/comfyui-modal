@@ -510,9 +510,10 @@ def test_prior_arms_are_unchanged_and_still_selectable():
     assert sci.arm_layout("D")["source"] == "anonymous"
     assert sci.arm_layout("C")["variants"] == ("single", "concurrent4")
     assert sci.arm_layout("D")["variants"] == ("single", "concurrent4")
-    assert sci.MAPPED_SOURCE_ARMS == ("A", "A2", "A3")
-    assert sci.POPULATION_TREATMENT_ARMS == ("A2", "A3")
-    assert set(sci.ARMS) >= {"A", "A2", "A3", "B", "C", "D"}
+    # A4 joined the mapped-source population family in the full-read follow-up.
+    assert sci.MAPPED_SOURCE_ARMS == ("A", "A2", "A3", "A4")
+    assert sci.POPULATION_TREATMENT_ARMS == ("A2", "A3", "A4")
+    assert set(sci.ARMS) >= {"A", "A2", "A3", "A4", "B", "C", "D"}
 
 
 @pytest.mark.parametrize("arm", ["A", "A2", "A3", "B", "C", "D"])
@@ -601,23 +602,26 @@ def test_b_is_still_checked_as_the_untreated_mapped_control(monkeypatch):
 
 
 def test_population_module_carries_no_import_of_the_source_owner():
+    import ast
+
     text = (ROOT / "comfymodal_runtime" / "source_population_policy.py").read_text(
         encoding="utf-8"
     )
-    # Only executable import statements matter; the module docstring explains
-    # why the constraint exists and names the module on purpose.
-    statements = [
-        line.strip() for line in text.splitlines()
-        if line.strip().startswith(("import ", "from "))
-    ]
-    assert statements == [
-        "from __future__ import annotations",
-        "import ctypes", "import os", "import time", "from typing import Any",
-    ]
-    for line in statements:
-        assert "golden_source_threads" not in line
-        assert "comfymodal_runtime" not in line
-        assert not line.startswith("from .")
+    # Parsed, not line-scanned. The module docstring explains why the constraint
+    # exists and names the module on purpose, and prose must not be able to
+    # decide whether an import exists.
+    names: list[str] = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.append(
+                "." * node.level + (node.module or "")
+            )
+    assert sorted(names) == sorted(["__future__", "ctypes", "os", "time", "typing"])
+    for name in names:
+        assert "golden_source_threads" not in name
+        assert "comfymodal_runtime" not in name
 
 
 def test_child_safe_loader_resolves_the_policy_module():

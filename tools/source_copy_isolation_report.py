@@ -269,6 +269,12 @@ def population_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     mmap_flags: Counter = Counter()
     reasons: Counter = Counter()
     errors: Counter = Counter()
+    warm_primitives: Counter = Counter()
+    warm_completed: Counter = Counter()
+    warm_bytes_requested: list[int] = []
+    warm_bytes_read: list[int] = []
+    warm_total_ms: list[float] = []
+    warm_gbps: list[float] = []
     fadvise_wall_ms: list[float] = []
     mmap_wall_ms: list[float] = []
     plan_build_ms: list[float] = []
@@ -282,6 +288,23 @@ def population_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             reasons[str(population["reason"])] += 1
         if population.get("error"):
             errors[str(population["error"])] += 1
+        if population.get("warm_read_called"):
+            warm_primitives[str(population.get("warm_primitive"))] += 1
+            warm_completed[str(bool(population.get("warm_complete")))] += 1
+            for key, sink in (
+                ("warm_bytes_requested", warm_bytes_requested),
+                ("warm_bytes_read", warm_bytes_read),
+            ):
+                value = population.get(key)
+                if isinstance(value, int):
+                    sink.append(value)
+            for key, sink in (
+                ("warm_total_ms", warm_total_ms),
+                ("warm_effective_gbps", warm_gbps),
+            ):
+                value = population.get(key)
+                if isinstance(value, (int, float)):
+                    sink.append(float(value))
         for key, sink in (
             ("fadvise_wall_ms", fadvise_wall_ms),
             ("mmap_wall_ms", mmap_wall_ms),
@@ -290,6 +313,9 @@ def population_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             value = population.get(key)
             if isinstance(value, (int, float)):
                 sink.append(float(value))
+    warm_proven = bool(warm_bytes_read) and all(
+        read == requested for read, requested in zip(warm_bytes_read, warm_bytes_requested)
+    ) and warm_completed.get("True", 0) == len(warm_bytes_read)
     return {
         "containers": len(rows),
         "arm_names": dict(arms),
@@ -298,6 +324,22 @@ def population_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "mmap_flags": dict(mmap_flags),
         "reasons": dict(reasons),
         "errors": dict(errors),
+        "warm": {
+            "containers_with_a_warm_read": len(warm_bytes_read),
+            "primitives": dict(warm_primitives),
+            "complete": dict(warm_completed),
+            # FULL_READ_PROVEN in the report: every container that claims a warm
+            # read consumed exactly the file size it declared, and said so.
+            "every_warm_read_exact": warm_proven,
+            "bytes_requested": sorted(set(warm_bytes_requested)),
+            "bytes_read": sorted(set(warm_bytes_read)),
+            "total_ms": summarize_copies(
+                [{"wall_ms": value} for value in warm_total_ms]
+            )["wall_ms"] if warm_total_ms else None,
+            "effective_gbps": summarize_copies(
+                [{"wall_ms": value} for value in warm_gbps]
+            )["wall_ms"] if warm_gbps else None,
+        },
         "fadvise_wall_ms": summarize_copies(
             [{"wall_ms": value} for value in fadvise_wall_ms]
         )["wall_ms"] if fadvise_wall_ms else None,
@@ -307,6 +349,126 @@ def population_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "plan_build_total_ms": summarize_copies(
             [{"wall_ms": value} for value in plan_build_ms]
         )["wall_ms"] if plan_build_ms else None,
+    }
+
+
+def warm_read_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The A4 warm-read distribution, pooled and per container.
+
+    The warm read is evidence in its own right: it is the first real measurement
+    of the positioned-read primitive over a whole 12.31 GB checkpoint on this
+    Volume, which is the candidate replacement source path.  It is reported as
+    blocks (one per syscall group) and as a total, because a primitive can have a
+    healthy median and still carry the pathological tail this experiment is
+    hunting.
+    """
+    blocks: list[dict[str, Any]] = []
+    totals: list[float] = []
+    gbps: list[float] = []
+    bytes_read: list[int] = []
+    bytes_requested: list[int] = []
+    calls: list[int] = []
+    retries: list[int] = []
+    per_container: list[dict[str, Any]] = []
+    for row in rows:
+        population = (row.get("report") or {}).get("population") or {}
+        if not population.get("warm_read_called"):
+            continue
+        container_blocks = [
+            dict(item) for item in (population.get("warm_blocks") or [])
+        ]
+        blocks.extend(container_blocks)
+        for key, sink in (
+            ("warm_total_ms", totals),
+            ("warm_effective_gbps", gbps),
+        ):
+            value = population.get(key)
+            if isinstance(value, (int, float)):
+                sink.append(float(value))
+        for key, sink in (
+            ("warm_bytes_read", bytes_read),
+            ("warm_bytes_requested", bytes_requested),
+            ("warm_read_calls", calls),
+            ("warm_short_read_retries", retries),
+        ):
+            value = population.get(key)
+            if isinstance(value, int):
+                sink.append(value)
+        walls = [
+            float(item["wall_ms"]) for item in container_blocks
+            if isinstance(item.get("wall_ms"), (int, float))
+        ]
+        if walls:
+            container_summary = summarize_copies([{"wall_ms": w} for w in walls])
+            per_container.append({
+                "request_id": row.get("request_id"),
+                "blocks": len(container_blocks),
+                "warm_ms": population.get("warm_total_ms"),
+                "effective_gbps": population.get("warm_effective_gbps"),
+                "wall_ms": container_summary["wall_ms"],
+                "thread_cpu_ms": summarize_copies([
+                    {"wall_ms": float(item["thread_cpu_ms"])}
+                    for item in container_blocks
+                    if isinstance(item.get("thread_cpu_ms"), (int, float))
+                ])["wall_ms"] if container_blocks else None,
+                "over_thresholds": container_summary["over_thresholds"],
+                "slowest_blocks": container_summary["slowest"],
+                # Per-container, not pooled: this is the number that decides
+                # whether the warm reads themselves carry the pathological tail.
+                "pathological_blocks": sum(
+                    1 for item in container_blocks
+                    if float(item.get("wall_ms") or 0.0) > WARM_READ_PATHOLOGICAL_MS
+                ),
+            })
+    pooled = summarize_copies(
+        [{"wall_ms": float(item["wall_ms"])} for item in blocks
+         if isinstance(item.get("wall_ms"), (int, float))]
+    )
+    total_ms = sum(totals) if totals else None
+    total_bytes = sum(bytes_read) if bytes_read else None
+    return {
+        "containers": len(per_container),
+        "block_count": len(blocks),
+        "block_bytes": (
+            blocks[0].get("requested_bytes") if blocks else None
+        ),
+        "wall_ms": pooled["wall_ms"],
+        "over_thresholds": pooled["over_thresholds"],
+        "total_ms": total_ms,
+        "bytes_read": total_bytes,
+        "bytes_requested": sum(bytes_requested) if bytes_requested else None,
+        # Pooled over containers, so a slow read shows up as low throughput
+        # rather than being divided away.
+        "effective_gbps": (
+            (total_bytes / 1e9) / (total_ms / 1e3)
+            if (total_ms and total_bytes) else None
+        ),
+        "per_container_gbps": summarize_copies(
+            [{"wall_ms": value} for value in gbps]
+        )["wall_ms"] if gbps else None,
+        "read_calls": calls,
+        "short_read_retries": retries,
+        "pathological_block_ms": WARM_READ_PATHOLOGICAL_MS,
+        "pathological_containers": sum(
+            1 for item in per_container if item["pathological_blocks"] > 0
+        ),
+        "per_container": per_container,
+        "ordinal_head": ordinal_head([
+            {"copy_ordinal": item.get("ordinal"), "wall_ms": item.get("wall_ms"),
+             "source_offset": item.get("source_offset")}
+            for item in blocks
+            if isinstance(item.get("wall_ms"), (int, float))
+        ]),
+        "offset_repeat": repeat_analysis(
+            [
+                {"source_offset": item.get("source_offset"),
+                 "wall_ms": item.get("wall_ms")}
+                for item in blocks
+                if isinstance(item.get("wall_ms"), (int, float))
+            ],
+            "source_offset",
+            containers=[str(item.get("request_id")) for item in blocks],
+        ),
     }
 
 
@@ -425,6 +587,7 @@ def build(root: Path, profile_prefix: str = PROFILE_PREFIX) -> dict[str, Any]:
                 ],
                 "pooled": deploy_pooled,
                 "setup_costs": setup_cost_evidence(deploy_rows),
+                "warm_read": warm_read_evidence(deploy_rows),
                 "pathological": is_pathological(deploy_pooled, len(deploy_rows)),
             }
         for variant in report.get("arm_layout", {}).get("variants", []):
@@ -466,6 +629,19 @@ def build(root: Path, profile_prefix: str = PROFILE_PREFIX) -> dict[str, Any]:
 # anonymous one, and Phase-1 saw the same copies run to 1460 ms.
 SLOW_FRACTION_FLOOR = 0.01
 PATHOLOGICAL_P99_MS = 100.0
+
+# A4's warm-read pathological threshold, fixed BEFORE any A4 container was run.
+#
+# The copy rule is "any single 64 MiB copy over 100 ms is pathological", because
+# a healthy 64 MiB copy is 50 ms.  A positioned read of the same 64 MiB has a very
+# different natural cost: it moves the same bytes but through the syscall and
+# page-cache path rather than through a mapped page, so its floor is higher.  At
+# 250 ms a 64 MiB read is running below 0.27 GB/s, which is the same order of
+# pathology as a 100 ms mmap copy and not something a healthy primitive does
+# occasionally.  So a warm-read block over 250 ms is what counts as pathological
+# here, and it is deliberately NOT the copy's 100 ms: using 100 ms would classify
+# a merely-slower-than-mmap primitive as broken and manufacture CASE 3.
+WARM_READ_PATHOLOGICAL_MS = 250.0
 
 
 def is_pathological(pooled: Mapping[str, Any], containers: int) -> bool:
@@ -543,6 +719,7 @@ def classify(summary: Mapping[str, Any]) -> dict[str, Any]:
 # a treatment is only credited with removing the stall, never with being slow.
 POPULATION_CONTROL_ARM = "A"
 POPULATION_ARMS_BY_TREATMENT = {"A2": "WILLNEED", "A3": "MAP_POPULATE"}
+FULLREAD_ARM = "A4"
 
 
 def pathological_containers(per_container: Sequence[Mapping[str, Any]]) -> int:
@@ -674,6 +851,163 @@ def classify_population(summary: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def classify_fullread(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """A4's question: did synchronously consuming the file fix the mapped copy?
+
+    Read off the per-deployment cohorts, because an arm name is not a deployment
+    and this decision must not be taken across two code states.  The two arms are
+    required to come from the SAME deployment fingerprint; if they do not, there
+    is no contemporaneous control and the answer is inconclusive by construction.
+
+    Per-container, never pooled-only.  The A2/A3 phase produced the exact trap
+    this guards: a treatment cleared the pooled thresholds while its own arm still
+    contained a 2.1 s copy, because one sick container in five is diluted by four
+    healthy ones.
+    """
+    arms = summary.get("arms") or {}
+    cohorts: dict[str, dict[str, Any]] = {}
+    for arm in (POPULATION_CONTROL_ARM, FULLREAD_ARM):
+        for fingerprint, cohort in sorted(
+            ((arms.get(arm) or {}).get("cohorts") or {}).items()
+        ):
+            cohorts.setdefault(arm, {})[fingerprint] = cohort
+
+    def newest(arm: str) -> dict[str, Any] | None:
+        entries = cohorts.get(arm) or {}
+        if not entries:
+            return None
+        # One cohort per arm is the expected shape; if a profile was redeployed
+        # the newest fingerprint is the contemporaneous one and the older ones
+        # stay visible in the arm's own record.
+        return entries[sorted(entries)[-1]]
+
+    control = newest(POPULATION_CONTROL_ARM)
+    treated = newest(FULLREAD_ARM)
+    result: dict[str, Any] = {
+        "arm_verdicts": {},
+        "reasons": [],
+        "full_read_proven": None,
+        "postwarm_mmap_clean": None,
+        "positioned_read_replacement_justified": "unknown",
+    }
+    if control is None or treated is None:
+        missing = [
+            name for name, cohort in (
+                (POPULATION_CONTROL_ARM, control), (FULLREAD_ARM, treated)
+            ) if cohort is None
+        ]
+        result["classification"] = "INCONCLUSIVE_CURRENT_COHORT"
+        result["reasons"].append(f"missing_cohort:{','.join(missing)}")
+        return result
+
+    control_fp = sorted(cohorts[POPULATION_CONTROL_ARM])[-1]
+    treated_fp = sorted(cohorts[FULLREAD_ARM])[-1]
+    result["contemporaneous"] = control_fp == treated_fp
+    if control_fp != treated_fp:
+        result["classification"] = "INCONCLUSIVE_CURRENT_COHORT"
+        result["reasons"].append("control_and_treatment_are_different_deployments")
+        return result
+
+    def verdict(arm: str, cohort: Mapping[str, Any]) -> dict[str, Any]:
+        pooled = cohort.get("pooled") or {}
+        wall = pooled.get("wall_ms") or {}
+        count = int(wall.get("count") or 0)
+        over_100 = int((pooled.get("over_thresholds") or {}).get(">100ms") or 0)
+        per_container = pooled.get("per_container") or []
+        return {
+            "deploy_fingerprint": sorted(cohorts[arm])[-1],
+            "profiles": cohort.get("profiles"),
+            "images": cohort.get("images"),
+            "usable_containers": cohort.get("usable_containers"),
+            "copy_count": count,
+            "p50_ms": wall.get("p50"),
+            "p90_ms": wall.get("p90"),
+            "p95_ms": wall.get("p95"),
+            "p99_ms": wall.get("p99"),
+            "max_ms": wall.get("max"),
+            "over_100ms": over_100,
+            "over_100ms_fraction": round(over_100 / count, 6) if count else None,
+            "over_250ms": (pooled.get("over_thresholds") or {}).get(">250ms"),
+            "over_500ms": (pooled.get("over_thresholds") or {}).get(">500ms"),
+            "over_1000ms": (pooled.get("over_thresholds") or {}).get(">1000ms"),
+            "pooled_pathological": cohort.get("pathological"),
+            "pathological_containers": pathological_containers(per_container),
+            "per_container": per_container,
+            "ordinal_head": pooled.get("ordinal_head"),
+            "setup_costs": cohort.get("setup_costs"),
+            "warm_read": cohort.get("warm_read"),
+        }
+
+    control_verdict = verdict(POPULATION_CONTROL_ARM, control)
+    treated_verdict = verdict(FULLREAD_ARM, treated)
+    result["arm_verdicts"] = {
+        POPULATION_CONTROL_ARM: control_verdict,
+        FULLREAD_ARM: treated_verdict,
+    }
+
+    warm = treated_verdict.get("warm_read") or {}
+    full_read_proven = bool(
+        warm.get("containers")
+        and warm.get("containers") == treated_verdict["usable_containers"]
+        and warm.get("every_warm_read_exact")
+    )
+    result["full_read_proven"] = full_read_proven
+    if not full_read_proven:
+        result["classification"] = "INCONCLUSIVE_CURRENT_COHORT"
+        result["reasons"].append("the_warm_read_was_not_proven_on_every_container")
+        return result
+
+    control_sick = control_verdict["pathological_containers"]
+    treated_sick = treated_verdict["pathological_containers"]
+    warm_sick = int(warm.get("pathological_containers") or 0)
+    result["pathological_containers"] = {
+        POPULATION_CONTROL_ARM: control_sick,
+        FULLREAD_ARM: treated_sick,
+        "A4_warm_reads": warm_sick,
+    }
+    postwarm_clean = treated_sick == 0
+    result["postwarm_mmap_clean"] = postwarm_clean
+
+    if control_sick == 0:
+        # CASE 4. The control did not reproduce the pathology, so there is nothing
+        # for the warm read to have removed, and A4 is not evidence either way.
+        result["classification"] = "INCONCLUSIVE_CURRENT_COHORT"
+        result["reasons"].append("control_did_not_reproduce_the_pathology")
+        return result
+    if postwarm_clean:
+        # CASE 1.
+        result["classification"] = "BACKING_AVAILABILITY_CONFIRMED"
+        result["reasons"].append(
+            "control_pathological_and_no_treatment_container_pathological"
+        )
+    elif warm_sick == 0:
+        # CASE 2. The source data was definitely consumed through another path and
+        # the mapped reads are still pathological, while the positioned reads
+        # themselves look healthy.  That is the evidence that would justify
+        # replacing mmap -> memmove with positioned read -> arena.
+        result["classification"] = "MMAP_PATH_CONFIRMED"
+        result["positioned_read_replacement_justified"] = "yes"
+        result["reasons"].append(
+            "mmap_still_pathological_after_a_proven_full_read_while_the_"
+            "positioned_reads_themselves_are_clean"
+        )
+    elif warm_sick < control_sick:
+        # Neither arm is clean, but the warm reads are materially healthier than
+        # the control's mapped copies.  Reporting a decisive mechanism here would
+        # over-read a small cohort.
+        result["classification"] = "MIXED"
+        result["reasons"].append(
+            "both_access_paths_show_a_tail_but_the_positioned_reads_are_fewer"
+        )
+    else:
+        # CASE 3. Both primitives suffer, so the problem is not the mmap syscall.
+        result["classification"] = "BROADER_SOURCE_BACKEND_PATHOLOGY"
+        result["reasons"].append(
+            "positioned_reads_show_the_same_pathological_tail_as_the_mapped_copies"
+        )
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="repository root of the experiment worktree")
@@ -684,6 +1018,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary = build(root, args.profile_prefix)
     summary["classification"] = classify(summary)
     summary["population_decision"] = classify_population(summary)
+    summary["fullread_decision"] = classify_fullread(summary)
     text = json.dumps(summary, indent=2, sort_keys=True)
     if args.out:
         out = Path(args.out)

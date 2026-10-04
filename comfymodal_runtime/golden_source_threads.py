@@ -1701,6 +1701,19 @@ def build_plan(message: Mapping[str, Any], *, open_source: bool) -> _ChildPlan:
                 _population_policy().confirm_mapping(True, population)
                 map_address = int(ctypes.cast(mapped, ctypes.c_void_p).value)
                 map_length = int(actual[2])
+                # A4's diagnostic step, deliberately placed AFTER the mapping is
+                # built and BEFORE any timed copy: A and A4 must share one
+                # mapping lifecycle, and the only variable is whether the backing
+                # file was definitely synchronously consumed first.  It runs here,
+                # inside build_plan, which is why the process-local gate already
+                # scopes it to the experiment's own mapping -- the real Golden
+                # source owner never passes through this call with the gate up.
+                population.update(
+                    _population_policy().full_file_read(
+                        fd, size=int(actual[2]),
+                        generation=int(message["generation"]),
+                    )
+                )
         except BaseException:
             os.close(fd)
             raise

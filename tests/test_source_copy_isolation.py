@@ -42,20 +42,20 @@ def test_arm_layout_matches_the_2x2_design():
 
 
 def test_only_the_control_is_both_mapped_and_pinned():
-    # A is the only arm that is simultaneously a mapped Volume source and the
-    # production pinned arena, which is what makes it the control.  A2 and A3 are
-    # A plus one population treatment, so they share both properties by design.
+    # A is the control that is both a mapped Volume source and the production
+    # pinned arena, which is what makes it the control.  A2, A3 and A4 are A plus
+    # one population treatment each, so they share both properties by design.
     both = [
         arm for arm in sci.ARMS
         if sci.arm_layout(arm)["source"] == "model_mmap"
         and sci.arm_layout(arm)["destination"] == "pinned_shared_arena"
     ]
-    assert both == ["A", "A2", "A3"]
-    assert sci.POPULATION_TREATMENT_ARMS == ("A2", "A3")
+    assert both == ["A", "A2", "A3", "A4"]
+    assert sci.POPULATION_TREATMENT_ARMS == ("A2", "A3", "A4")
     mapped = [arm for arm in sci.ARMS if sci.arm_layout(arm)["source"] == "model_mmap"]
-    assert mapped == ["A", "A2", "A3", "B"]
+    assert mapped == ["A", "A2", "A3", "A4", "B"]
     pinned = [arm for arm in sci.ARMS if sci.arm_layout(arm)["destination"] == "pinned_shared_arena"]
-    assert pinned == ["A", "A2", "A3", "C"]
+    assert pinned == ["A", "A2", "A3", "A4", "C"]
 
 
 def test_mapped_source_arms_use_production_concurrency_only():
