@@ -41,6 +41,7 @@ def repo_root(tmp_path: Path) -> Path:
         "clip_fast_hydration_wiring.py": b"# module G\nvalue = 7\n",
     "registry_proof_store.py": b"# module H\nvalue = 8\n",
     "golden_serial.py": b"# module I\nvalue = 9\n",
+    "golden_parallel.py": b"# module I2\nvalue = 9.5\n",
     "golden_io_process_v2.py": b"# module J\nvalue = 10\n",
     "golden_model_transport.py": b"# module K\nvalue = 11\n",
     "golden_qd_transport.py": b"# module L\nvalue = 12\n",

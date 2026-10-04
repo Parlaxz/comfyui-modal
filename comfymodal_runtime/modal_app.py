@@ -19664,6 +19664,7 @@ class ModalRuntimeEntrypoint:
             "comfymodal_runtime.clip_fast_hydration_wiring",
             "comfymodal_runtime.registry_proof_store",
             "comfymodal_runtime.golden_serial",
+            "comfymodal_runtime.golden_parallel",
             "comfymodal_runtime.golden_io_process_v2",
             "comfymodal_runtime.golden_model_transport",
             "comfymodal_runtime.golden_qd_transport",
