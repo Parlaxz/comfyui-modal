@@ -19,7 +19,7 @@
 # Arm identity is verified inside the container against the observed slot count
 # and observed preinit flag, and fails closed on disagreement.
 schema_version = 1
-name = "golden_p10_reg_b_16_preinit_h100"
+name = "golden_p1_parallel_p10_b_16_preinit_h100"
 extends = "golden_p1_parallel_c0_p8_h100"
 owner = "p10-context-slots"
 

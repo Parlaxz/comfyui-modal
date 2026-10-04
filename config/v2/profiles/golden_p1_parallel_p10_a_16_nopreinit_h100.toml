@@ -29,7 +29,7 @@
 # flag at arena construction and fails closed if they disagree, so a run cannot
 # silently be counted as arm A when the environment did not arrive.
 schema_version = 1
-name = "golden_p10_reg_a_16_nopreinit_h100"
+name = "golden_p1_parallel_p10_a_16_nopreinit_h100"
 extends = "golden_p1_parallel_c0_p8_h100"
 owner = "p10-context-slots"
 

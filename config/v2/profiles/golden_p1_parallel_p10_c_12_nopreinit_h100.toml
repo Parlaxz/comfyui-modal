@@ -20,7 +20,7 @@
 # slot_wait / all_slots_occupied / capacity-wait telemetry is a stability guard,
 # not a secondary metric.
 schema_version = 1
-name = "golden_p10_reg_c_12_nopreinit_h100"
+name = "golden_p1_parallel_p10_c_12_nopreinit_h100"
 extends = "golden_p1_parallel_c0_p8_h100"
 owner = "p10-context-slots"
 

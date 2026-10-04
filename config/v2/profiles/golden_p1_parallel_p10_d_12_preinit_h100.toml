@@ -20,7 +20,7 @@
 #       snap=False restore boundary and joined before the first CUDA caller.
 #       cudaHostRegister is unchanged and still mandatory.
 schema_version = 1
-name = "golden_p10_reg_d_12_preinit_h100"
+name = "golden_p1_parallel_p10_d_12_preinit_h100"
 extends = "golden_p1_parallel_c0_p8_h100"
 owner = "p10-context-slots"
 
