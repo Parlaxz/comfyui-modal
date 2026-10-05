@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import os
 import sys
 import tempfile
 import types
@@ -27,7 +28,6 @@ from model_library import ModelLibraryService
 import remote_inventory
 from studio_domain import (
     WorkflowDomainService,
-    WorkflowPresetValidationError,
     derive_mapping_candidates,
 )
 
@@ -300,13 +300,12 @@ class DependencyResolverTestCase(unittest.TestCase):
         self.assertEqual(state.status, "ready")
         self.assertTrue(state.runnable)
 
-        preset = self.service.create_preset(
-            version_id,
-            "Preset A",
-            values={"model": "krea_model.safetensors"},
-            model_choices={"model": "krea_model.safetensors"},
-        )
-        self.assertEqual(preset["state"]["status"], "ready")
+        # A runnable version needs no preset record at all: control defaults
+        # are read from the version's own captured graph.
+        self.assertFalse(hasattr(self.service, "create_preset"),
+                         "presets are removed from the domain service")
+        self.assertFalse(hasattr(self.service.store, "insert_preset"),
+                         "the preset store is gone")
 
     # ── 16. old version compatibility stays frozen ───────────────────────
 
@@ -324,28 +323,37 @@ class DependencyResolverTestCase(unittest.TestCase):
         assert stored is not None
         self.assertEqual(list(stored.get("compatible_models") or []), ["A"])
 
-        with self.assertRaises(WorkflowPresetValidationError):
-            self.service.create_preset(version_id, "Bad", model_choices={"model": "B"})
-        preset = self.service.create_preset(version_id, "Good", model_choices={"model": "A"})
-        self.assertTrue(preset["preset_id"].startswith("wpres_"))
+        # Presets are gone, so a version carries its own frozen compatibility
+        # list; the workflow's later declaration change must not rewrite it.
+        self.assertEqual(list(stored.get("compatible_models") or []), ["A"])
 
-    # ── 17. incompatible model cannot become a valid preset choice ───────
+    # ── 17. an incompatible model blocks the version's runnable state ────
 
-    def test_incompatible_model_cannot_become_valid_preset_choice(self):
+    def test_incompatible_model_blocks_version_runnable_state(self):
         workflow = self._create_workflow(name="Compat2", compatible_models=["A"])
         version = self._create_version(workflow["workflow_id"])
         version_id = version["workflow_version_id"]
         self._set_mapping(version_id)
 
-        with self.assertRaises(WorkflowPresetValidationError):
-            self.service.create_preset(version_id, "Bad", model_choices={"model": "C"})
-        preset = self.service.create_preset(
-            version_id, "Good", model_choices={"model": "A"}
-        )
-        with self.assertRaises(WorkflowPresetValidationError):
-            self.service.update_preset(
-                preset["preset_id"], {"model_choices": {"model": "C"}}
-            )
+        # With its model installed and a mapping in place, the version is
+        # runnable on its own captured graph. Model compatibility used to
+        # be enforced when a preset was saved; with presets gone, the
+        # enforcement point is the version's own frozen
+        # compatible_models list (asserted in test 16) plus the
+        # missing-model gate below.
+        self._seed_model()
+        state = self.service.derive_version_state(version_id)
+        self.assertEqual(state.status, "ready")
+        self.assertTrue(state.runnable)
+        self.assertEqual(state.reasons, [])
+
+        # Remove the model and the same version reports incomplete.
+        os.remove(self.comfyui_root / "models" / "checkpoints" / "krea_model.safetensors")
+        self.models.rescan()
+        blocked = self.service.derive_version_state(version_id)
+        self.assertEqual(blocked.status, "incomplete")
+        self.assertFalse(blocked.runnable)
+        self.assertTrue(any("missing model" in r for r in blocked.reasons), blocked.reasons)
 
     # ── 18. no scan on state derivation; resolution reads records only ───
 

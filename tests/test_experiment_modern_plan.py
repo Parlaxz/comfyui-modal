@@ -9,7 +9,7 @@ legacy ``resolve_and_inject_cell`` slot-path graph mutation must never be
 reused.
 
 These tests exercise the planner against a REAL temp-directory
-``WorkflowDomainService`` (workflow + immutable version + mapping + preset),
+``WorkflowDomainService`` (workflow + immutable version + mapping),
 mirroring the fixture patterns of ``test_workflow_domain.py`` /
 ``test_workflow_run_integration.py``.  The only seam patched is the domain
 service factory (``studio_workflow_run._get_domain_service``) so resolution
@@ -20,8 +20,8 @@ Coverage contract (from the orchestrator brief):
 * one cell / two cells / 40-cell deterministic order
 * same definition -> identical cell ids, order and hashes
 * workflow axis with two workflows (top-level list AND ``workflow`` axis form)
-* explicit pinned Version/Preset used verbatim
-* workflow-only latest/default resolved exactly once and frozen into cells
+* explicit pinned Version used verbatim
+* workflow-only latest Version resolved exactly once and frozen into cells
 * latest Version changing after planning does NOT substitute baked ids
 * mapped prompt (alias ``prompt`` -> ``positive_prompt``), seed,
   sampler/scheduler, model choice, width/height
@@ -36,7 +36,7 @@ Coverage contract (from the orchestrator brief):
 * pinned axis ordering: axes declared in non-default order (seed first) still
   yield a target-major, seed-innermost expansion (steps [20,20,30,30], seed
   [1,2,1,2]) with sequential positions and deterministic ids
-* stored workflow version/preset/mapping untouched by planning
+* stored workflow version/mapping untouched by planning
 * Phase C CLIP/VAE repair survives via the modern seam
 * strict ``json.dumps(..., allow_nan=False)`` durable plan
 * no legacy slot-path mutation is ever called
@@ -198,6 +198,29 @@ def mapping_payload(prompt: dict | None = None) -> dict:
     }
 
 
+def _apply_values(prompt: dict, values: dict | None) -> dict:
+    """Write ``values`` into a copy of ``prompt`` through its derived mapping.
+
+    With presets gone, a version's own executable prompt IS its default
+    configuration, so fixture values are baked into the captured graph instead
+    of being stored separately. Roles without a node/input in this fixture are
+    ignored (they were never mapped, so they had nowhere to live).
+    """
+    if not values:
+        return prompt
+    entries = mapping_payload(prompt)["entries"]
+    out = copy.deepcopy(prompt)
+    for role, value in values.items():
+        entry = entries.get(role)
+        if not entry:
+            continue
+        node = out.get(entry["node_id"])
+        if node is None:
+            continue
+        node.setdefault("inputs", {})[entry["input_name"]] = value
+    return out
+
+
 def _default_modal_options() -> dict:
     # Production is disabled everywhere so execution plans are deterministic
     # and the canonical_execution production compiler is never touched.
@@ -219,11 +242,8 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
             self.wf["workflow_id"], txt2img_prompt()
         )
         self.version_id = self.version["workflow_version_id"]
-        self.preset = self.service.create_preset(
-            self.version_id, "Preset A", values=default_values()
-        )
-        self.preset_id = self.preset["preset_id"]
-        self.service.set_default_preset(self.wf["workflow_id"], self.preset_id)
+        # Control values come from the captured version's own executable
+        # prompt; there is no separate saved configuration to create.
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -276,22 +296,19 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
         *,
         entries_tweak=None,
     ) -> dict:
-        """Full workflow + version + mapping + preset (set as default)."""
+        """Full workflow + version + mapping. ``values`` seeds the captured
+        graph's own control inputs, so the version's executable prompt carries
+        them (there is no separate saved configuration)."""
         wf = self.service.create_workflow(name)
+        prompt = _apply_values(prompt, values)
         version = self._capture_mapped(
             wf["workflow_id"], prompt, entries_tweak=entries_tweak
         )
-        preset = self.service.create_preset(
-            version["workflow_version_id"], f"{name} Preset", values=values
-        )
-        self.service.set_default_preset(wf["workflow_id"], preset["preset_id"])
         return {
             "workflow_id": wf["workflow_id"],
             "workflow": wf,
             "version_id": version["workflow_version_id"],
             "version": version,
-            "preset_id": preset["preset_id"],
-            "preset": preset,
         }
 
     def _build(self, experiment_def: dict, **kwargs) -> emp.ExperimentCellPlan:
@@ -325,9 +342,7 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
         self.assertEqual(cell.position, 0)
         self.assertEqual(cell.workflow_id, self.wf["workflow_id"])
         self.assertEqual(cell.workflow_version_id, self.version_id)
-        self.assertEqual(cell.preset_id, self.preset_id)
         self.assertEqual(cell.workflow_name, "Text2Img Workflow")
-        self.assertEqual(cell.preset_name, "Preset A")
         self.assertEqual(cell.version_number, 1)
         self.assertTrue(cell.cell_id.startswith("cell_"))
         self.assertEqual(cell.axis_values["steps"], 30)
@@ -432,14 +447,13 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
             wf_axis = cell.axis_values["workflow"]
             self.assertEqual(wf_axis["workflow_id"], wf_id)
             self.assertTrue(wf_axis["workflow_version_id"])
-            self.assertTrue(wf_axis["preset_id"])
         self._assert_all_ok(plan2)
 
-    # ── 6. explicit pinned Version/Preset ───────────────────────────────
+    # ── 6. explicit pinned Version ──────────────────────────────────────
 
-    def test_06_explicit_pinned_version_and_preset(self):
-        # Create a NEWER version (v2) and make it the latest/default so the
-        # pinned v1 + its preset are deliberately NOT the defaults.
+    def test_06_explicit_pinned_version(self):
+        # Create a NEWER version (v2) and make it the latest so the pinned v1
+        # is deliberately NOT the default.
         v2 = self._capture_mapped(self.wf["workflow_id"], txt2img_prompt(steps=25))
         self.assertNotEqual(v2["workflow_version_id"], self.version_id)
         self.assertEqual(
@@ -447,17 +461,11 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
             v2["workflow_version_id"],
             "latest now points at v2",
         )
-        preset2 = self.service.create_preset(
-            v2["workflow_version_id"], "Preset B",
-            values=default_values(txt2img_prompt(steps=25)),
-        )
-        self.service.set_default_preset(self.wf["workflow_id"], preset2["preset_id"])
 
         plan = self._build(self._defn(
             workflows=[{
                 "workflow_id": self.wf["workflow_id"],
                 "workflow_version_id": self.version_id,
-                "preset_id": self.preset_id,
             }],
             axes={"steps": [20]},
         ))
@@ -465,7 +473,6 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
         cell = plan.cells[0]
         self.assertTrue(cell.ok, cell.error)
         self.assertEqual(cell.workflow_version_id, self.version_id, "pinned version verbatim")
-        self.assertEqual(cell.preset_id, self.preset_id, "pinned preset verbatim")
         self.assertEqual(cell.version_number, 1)
         self.assertEqual(cell.axis_values["steps"], 20)
 
@@ -480,12 +487,7 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
                 cell.workflow_version_id, self.version_id,
                 "workflow-only axis bakes the latest version id",
             )
-            self.assertEqual(
-                cell.preset_id, self.preset_id,
-                "workflow-only axis bakes the default preset id",
-            )
             self.assertEqual(cell.workflow_name, "Text2Img Workflow")
-            self.assertEqual(cell.preset_name, "Preset A")
 
         # Resolution happens EXACTLY once for one distinct workflow target
         # (the per-target resolution cache is exercised by the 2 cells).
@@ -504,7 +506,6 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
                 target = call.args[0]
                 self.assertEqual(target["workflow_id"], self.wf["workflow_id"])
                 self.assertEqual(target["workflow_version_id"], None)
-                self.assertEqual(target["preset_id"], None)
                 self.assertEqual(call.args[1], self.root)
 
     # ── 8. latest Version changes after planning -> no substitution ─────
@@ -557,7 +558,7 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
         )
         workflow = cell.execution_plan_dict["workflow"]
         self.assertEqual(workflow["1"]["inputs"]["text"], "a cat wearing a hat")
-        self.assertEqual(workflow["2"]["inputs"]["text"], "negative", "preset negative kept")
+        self.assertEqual(workflow["2"]["inputs"]["text"], "negative", "untouched negative kept")
 
     # ── 10. mapped seed ─────────────────────────────────────────────────
 
@@ -590,22 +591,25 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
     # ── 12. model choice (mapping exposes model) ────────────────────────
 
     def test_12_model_choice(self):
-        # Preset declares a model_choice that WINS over its own values.
-        preset_mc = self.service.create_preset(
-            self.version_id, "Preset MC",
-            values=default_values(),
-            model_choices={"model": "flux-dev.safetensors"},
+        # The version's own graph carries the model; there is no separate
+        # saved model choice that can outrank it.
+        mc_wf = self._add_mapped_workflow(
+            "Flux Workflow",
+            _apply_values(txt2img_prompt(), {"model": "flux-dev.safetensors"}),
+            {},
         )
-        self.service.set_default_preset(self.wf["workflow_id"], preset_mc["preset_id"])
-
-        # Without a model axis the preset model_choices value is used.
-        plan = self._build(self._defn(axes={"steps": [20]}))
+        base = {
+            "experiment_id": "exp_mc",
+            "workflows": [mc_wf["workflow_id"]],
+        }
+        # Without a model axis the version's own model is used.
+        plan = self._build({**base, "axes": {"steps": [20]}})
         self.assertEqual(
             plan.cells[0].merged_values["model"], "flux-dev.safetensors"
         )
 
-        # With a model axis the override wins over model_choices.
-        plan2 = self._build(self._defn(axes={"model": ["krea_model.safetensors"]}))
+        # With a model axis the override wins over the version's default.
+        plan2 = self._build({**base, "axes": {"model": ["krea_model.safetensors"]}})
         cell = plan2.cells[0]
         self.assertTrue(cell.ok, cell.error)
         self.assertEqual(cell.controls["model"], "krea_model.safetensors")
@@ -763,13 +767,12 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
                 with self.assertRaises(emp.ExperimentDefinitionError):
                     self._build(defn)
 
-    # ── 19. stored workflow version / preset / mapping unchanged ────────
+    # ── 19. stored workflow version / mapping unchanged ──────────────
 
     def test_19_stored_workflow_version_unchanged(self):
         before = {
             "workflow": copy.deepcopy(self.service.get_workflow(self.wf["workflow_id"])),
             "version": copy.deepcopy(self.service.get_version(self.version_id)),
-            "preset": copy.deepcopy(self.service.get_preset(self.preset_id)),
             "mapping": copy.deepcopy(self.service.get_mapping(self.version_id)),
         }
         plan = self._build(self._defn(axes={"prompt": ["x", "y"], "seed": [1, 2]}))
@@ -777,10 +780,9 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
         after = {
             "workflow": self.service.get_workflow(self.wf["workflow_id"]),
             "version": self.service.get_version(self.version_id),
-            "preset": self.service.get_preset(self.preset_id),
             "mapping": self.service.get_mapping(self.version_id),
         }
-        for key in ("workflow", "version", "preset", "mapping"):
+        for key in ("workflow", "version", "mapping"):
             self.assertEqual(
                 before[key], after[key],
                 f"planning must not mutate the stored {key}",
@@ -966,9 +968,7 @@ class ExperimentModernPlanTestCase(unittest.TestCase):
         self.assertTrue(res.ok)
         self.assertEqual(res.workflow_id, self.wf["workflow_id"])
         self.assertEqual(res.workflow_version_id, self.version_id)
-        self.assertEqual(res.preset_id, self.preset_id)
         self.assertEqual(res.workflow_name, "Text2Img Workflow")
-        self.assertEqual(res.preset_name, "Preset A")
         self.assertEqual(res.version_number, 1)
         self.assertIn("seed", res.control_schema)
         self.assertTrue(res.bundle["executable_prompt"])

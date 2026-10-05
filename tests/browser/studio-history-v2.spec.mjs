@@ -29,6 +29,7 @@
 import { test, expect } from "@playwright/test";
 import { installConsoleGuard, openStudio } from "./studio-fixtures.mjs";
 import { installStudioMockApi } from "./studio-mock-api.mjs";
+import { installWorkflowsMock } from "./studio-workflows-mock.mjs";
 
 const COMFYUI_URL = process.env.COMFYUI_URL || "http://127.0.0.1:8188";
 
@@ -80,6 +81,10 @@ test.describe("History V2", () => {
       window.__COMFYMODAL_HISTORY_MODE__ = "fixture";
     });
     api = await installStudioMockApi(page);
+    // The Studio shell fetches GET /comfymodal/studio/workflows on startup.
+    // installWorkflowsMock registers a narrower route (and no catch-all), so
+    // it can sit alongside the shared mock without shadowing its handlers.
+    await installWorkflowsMock(page);
     await openStudio(page, COMFYUI_URL);
     // Clear persisted view state so a previous test's filters never leak in.
     await page.evaluate(() => localStorage.clear());
@@ -263,7 +268,9 @@ test.describe("History V2", () => {
 
       const dialog = await openGenerationDetail(page, "gen_001");
 
-      // Workflow name (with version suffix) in the Workflow section.
+      // Workflow name with version suffix in the Workflow section. The version
+      // label arrives pre-prefixed ("v3"), so this also pins that the renderer
+      // does not double the "v".
       await expect(dialog.getByText("Portrait Pro v3", { exact: true })).toBeVisible();
 
       // Params section with the fixture defaults (seed 42, steps 28).
@@ -332,8 +339,10 @@ test.describe("History V2", () => {
       expect(beforeSrc).toBeTruthy();
 
       // Open the overflow menu on output 2 (index 1) and set it as featured.
+      // The overflow menu is a body-level popover (position: fixed), so it is
+      // NOT a descendant of the dialog.
       await dialog.locator('[aria-label="Output 2 actions"]').click();
-      const menuItem = dialog.locator(".comfymodal-studio-history-v2-menu-item", { hasText: "Set as featured" });
+      const menuItem = page.locator(".comfymodal-studio-history-v2-menu-item", { hasText: "Set as featured" });
       await expect(menuItem).toBeVisible({ timeout: 5000 });
       await expect(menuItem).toBeEnabled();
       await menuItem.click();
@@ -384,7 +393,7 @@ test.describe("History V2", () => {
       await notes.fill("e2e test note");
       await dialog.getByRole("button", { name: "Save note" }).click();
       await expect(
-        dialog.locator(".comfymodal-studio-history-v2-action-note", { hasText: "Saved" })
+        dialog.getByTestId("history-v2-note-status", { hasText: "Saved" })
       ).toBeVisible({ timeout: 10000 });
 
       // Close and reopen — the fixture repository persists in memory, so the

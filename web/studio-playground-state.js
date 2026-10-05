@@ -1,4 +1,4 @@
-// Modal Studio — Playground State
+// Modal Studio ΓÇö Playground State
 //
 // Lightweight persisted selection state for Playground.
 // Persists only preset id and feature id to localStorage.
@@ -43,7 +43,7 @@ export function saveSelection(presetId, featureId) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ presetId, featureId }));
   } catch (e) {
-    // localStorage quota exceeded or unavailable — silently ignore
+    // localStorage quota exceeded or unavailable ΓÇö silently ignore
   }
 }
 
@@ -147,16 +147,16 @@ export function clearControlDraft(presetId, featureId) {
   }
 }
 
-// ── Run Result Persistence ─────────────────────────────────────────────────
+// ΓöÇΓöÇ Run Result Persistence ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Persists the last successful run identity per (presetId, featureId) pair
 // so that on reload the canvas image, metadata, and controls can be restored
 // without waiting for server-side recent runs.
 //
-// Does NOT store image blobs — only the URL reference.
+// Does NOT store image blobs ΓÇö only the URL reference.
 //
 // Key format in the results storage:
-//   "presetId::featureId" → { id, imageUrl, resolvedControls, timingStages, ... }
+//   "presetId::featureId" ΓåÆ { id, imageUrl, resolvedControls, timingStages, ... }
 
 /**
  * Save the last successful run result for a preset+feature pair.
@@ -205,7 +205,7 @@ export function saveRunResult(presetId, featureId, runData) {
 
     localStorage.setItem(RESULTS_STORAGE_KEY, JSON.stringify(store));
   } catch (e) {
-    // localStorage quota exceeded or unavailable — silently ignore
+    // localStorage quota exceeded or unavailable ΓÇö silently ignore
   }
 }
 
@@ -258,7 +258,7 @@ export function clearAllRunResults() {
   }
 }
 
-// ── Experiment Draft Persistence ──────────────────────────────────────────
+// ΓöÇΓöÇ Experiment Draft Persistence ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Persists experiment axes configuration and compare-preset selections
 // per (presetId, featureId) pair so that experiment mode state survives
@@ -270,7 +270,7 @@ export function clearAllRunResults() {
 // The draft is loaded synchronously during first render after saved selection
 // (see renderControlPanel in studio-playground.js).  It is persisted when
 // axes values/toggles, prompt-axis first value, or compare preset selection
-// changes — without requiring an experiment run.
+// changes ΓÇö without requiring an experiment run.
 
 const EXPERIMENT_DRAFT_KEY = "comfymodal.studio.experiment.draft.v1";
 
@@ -297,7 +297,7 @@ export function saveExperimentDraft(presetId, featureId, experimentAxes, compare
 
     localStorage.setItem(EXPERIMENT_DRAFT_KEY, JSON.stringify(store));
   } catch (e) {
-    // localStorage quota exceeded or unavailable — silently ignore
+    // localStorage quota exceeded or unavailable ΓÇö silently ignore
   }
 }
 
@@ -368,16 +368,16 @@ function _deepCloneObject(obj) {
   }
 }
 
-// ── Shelf Playground Persistence ──────────────────────────────────────────
+// ΓöÇΓöÇ Shelf Playground Persistence ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // The Shelf (Studio Workflow effort, leaf 1.2.2) keeps two strictly separate
 // persistence lanes:
 //
-//   1. Durable lane — normal field values + field layout. Values are keyed by
+//   1. Durable lane ΓÇö normal field values + field layout. Values are keyed by
 //      workflow+version so a reload restores exactly what the user typed;
 //      layout is keyed by workflow type (currently "t2i") so every workflow
 //      of the same type shares its card order/rows/Advanced placement.
-//   2. Local experiment draft lane — experiment-only state (selected
+//   2. Local experiment draft lane ΓÇö experiment-only state (selected
 //      workflows, axes, pills, per-workflow unique values). It lives under
 //      its own key and never overwrites the durable lane.
 //
@@ -444,7 +444,7 @@ export function saveShelfLayout(workflowType, layout) {
  * Load durably autosaved Shelf field values for a workflow+version.
  * @param {string} workflowId
  * @param {string} versionId
- * @returns {object} role → value (empty object when nothing saved)
+ * @returns {object} role ΓåÆ value (empty object when nothing saved)
  */
 export function loadShelfValues(workflowId, versionId) {
   if (!workflowId) return {};
@@ -465,7 +465,7 @@ export function loadShelfValues(workflowId, versionId) {
  * Durably autosave Shelf field values for a workflow+version.
  * @param {string} workflowId
  * @param {string} versionId
- * @param {object} values role → value
+ * @param {object} values role ΓåÆ value
  */
 export function saveShelfValues(workflowId, versionId, values) {
   if (!workflowId) return;
@@ -564,7 +564,7 @@ export function clearShelfExperimentDraft() {
   }
 }
 
-// ── Workflow Selection Persistence ─────────────────────────────────────────
+// ΓöÇΓöÇ Workflow Selection Persistence ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Persists the currently selected workflow/version/preset so the Playground
 // can restore the exact selection across page reloads, and stores a one-shot
@@ -580,22 +580,20 @@ const WORKFLOW_HANDOFF_STORAGE_KEY = "comfymodal.studio.playground.workflow-hand
  * Normalize a raw selection/handoff object into the canonical string-field
  * shape. Returns null for non-object input.
  * @param {*} raw
- * @returns {{workflowId: string, workflowVersionId: string, presetId: string, workflowName: string, presetName: string}|null}
+ * @returns {{workflowId: string, workflowVersionId: string, workflowName: string}|null}
  */
 function _sanitizeSelectionFields(raw) {
   if (!raw || typeof raw !== "object") return null;
   return {
     workflowId: typeof raw.workflowId === "string" ? raw.workflowId : "",
     workflowVersionId: typeof raw.workflowVersionId === "string" ? raw.workflowVersionId : "",
-    presetId: typeof raw.presetId === "string" ? raw.presetId : "",
     workflowName: typeof raw.workflowName === "string" ? raw.workflowName : "",
-    presetName: typeof raw.presetName === "string" ? raw.presetName : "",
   };
 }
 
 /**
  * Save the current workflow selection to localStorage.
- * @param {{workflowId?: string, workflowVersionId?: string, presetId?: string, workflowName?: string, presetName?: string}} sel
+ * @param {{workflowId?: string, workflowVersionId?: string, workflowName?: string}} sel
  */
 export function saveWorkflowSelection(sel) {
   const clean = _sanitizeSelectionFields(sel);
@@ -604,13 +602,13 @@ export function saveWorkflowSelection(sel) {
     if (typeof localStorage === "undefined") return;
     localStorage.setItem(WORKFLOW_SELECTION_STORAGE_KEY, JSON.stringify(clean));
   } catch (e) {
-    // localStorage quota exceeded or unavailable — silently ignore
+    // localStorage quota exceeded or unavailable ΓÇö silently ignore
   }
 }
 
 /**
  * Load the persisted workflow selection from localStorage.
- * @returns {{workflowId: string, workflowVersionId: string, presetId: string, workflowName: string, presetName: string}|null}
+ * @returns {{workflowId: string, workflowVersionId: string, workflowName: string}|null}
  */
 export function loadWorkflowSelection() {
   try {
@@ -655,7 +653,7 @@ export function saveWorkflowHandoff(sel) {
 /**
  * Read and remove the one-shot workflow handoff. The write is consumed
  * exactly once: the value is returned AND deleted from localStorage.
- * @returns {{workflowId: string, workflowVersionId: string, presetId: string, workflowName: string, presetName: string}|null}
+ * @returns {{workflowId: string, workflowVersionId: string, workflowName: string}|null}
  */
 export function takeWorkflowHandoff() {
   try {

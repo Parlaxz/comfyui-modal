@@ -31,6 +31,16 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WEB = path.join(ROOT, "web");
 const readWeb = (name) => fs.readFileSync(path.join(WEB, name), "utf8");
 
+/**
+ * Remove line and block comments so source-level "does not do X" assertions
+ * are not defeated by documentation that merely mentions X.
+ */
+function stripComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
+}
+
 function section(name) {
   console.log("PASS: " + name);
 }
@@ -336,7 +346,7 @@ installFetch();
 // ── Mount the real shell ──────────────────────────────────────────────────
 
 const CANONICAL_PAGES = ["playground", "history", "workflows", "backend", "settings"];
-const CANONICAL_LABELS = ["Playground", "History", "Workflows", "Backend", "Settings"];
+const CANONICAL_LABELS = ["Playground", "History", "Workflows", "Manage Modal", "Settings"];
 
 const { mountStudioShell } = await import(
   pathToFileURL(path.join(WEB, "studio-shell.js"))
@@ -451,8 +461,12 @@ const PAGE_FILES = [
 ];
 for (const banned of ["pushState", "replaceState", "hashchange", "popstate", "location.hash"]) {
   for (const file of PAGE_FILES) {
+    // Scan code, not prose: pages legitimately *document* why the hash is not
+    // a reliable routing signal, and that explanation must not read as a
+    // violation. Strip comments before the token search.
+    const code = stripComments(readWeb(file));
     assert.equal(
-      readWeb(file).includes(banned),
+      code.includes(banned),
       false,
       `${file} must not contain ${banned} (routing is owned by the shell lane)`
     );

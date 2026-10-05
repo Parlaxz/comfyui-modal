@@ -2,14 +2,12 @@
 
 Owns the business rules:
 
-* Workflows are organized (folders/tags/favorites) and identify a default
-  preset and their latest version.
+* Workflows are organized (folders/tags/favorites) and identify their latest
+  version.
 * WorkflowVersions are immutable snapshots; structural change creates a new
   version (deduplicated by canonical graph hash).
 * Exactly one Mapping per version; mappings may be edited.
-* Presets are tied to the version they were created for; they may be copied
-  forward to newer versions without mutating the originals.
-* Incomplete versions/presets are saved but unrunnable, with explicit
+* Incomplete versions are saved but unrunnable, with explicit
   reasons; ``assert_runnable`` guards any future run entry point.
 * ``0`` / ``False`` / ``0.0`` / ``""`` are valid values — only ``None`` or
   absent keys count as missing.
@@ -35,25 +33,19 @@ from .models import (
     Mapping,
     MappingAlreadyExistsError,
     MappingEntry,
-    PresetCopyError,
-    PresetState,
     VersionState,
     Workflow,
     WorkflowNotFoundError,
     WorkflowNotRunnableError,
-    WorkflowPreset,
-    WorkflowPresetNotFoundError,
-    WorkflowPresetValidationError,
+    WorkflowDomainValidationError,
     WorkflowVersion,
     WorkflowVersionNotFoundError,
     make_mapping_id,
-    make_preset_id,
     make_version_id,
     make_workflow_id,
     now_iso,
 )
 from .store import WorkflowDomainStore
-from .legacy_adapters import translate_legacy_preset
 
 # Fields a client may edit on each entity.
 _WORKFLOW_EDITABLE = {
@@ -86,6 +78,17 @@ EXPERIMENT_ONLY_FIELDS = frozenset({
     "selected_workflows", "workflow_ids", "axes", "value_pills",
     "experiment_values", "experiment_draft", "run_history", "generated_images",
 })
+
+
+def _normalize_folder_path(value: Any, *, allow_empty: bool = False) -> str:
+    if value is None and allow_empty:
+        return ""
+    if not isinstance(value, str):
+        raise WorkflowDomainValidationError("folder path must be a string")
+    path = value.strip().strip("/")[:500]
+    if not path and not allow_empty:
+        raise WorkflowDomainValidationError("folder path is required")
+    return path
 
 # Code-owned catalog/profile.  UI code may project these records into blocks,
 # but users cannot redefine their type or binding semantics.  The keys are
@@ -143,10 +146,6 @@ WORKFLOW_TYPE_PROFILES: dict[str, dict[str, tuple[str, ...]]] = {
         "required": T2I_REQUIRED_INPUTS,
         "optional": T2I_OPTIONAL_INPUTS,
     },
-}
-_PRESET_EDITABLE = {
-    "name", "description", "values", "model_choices", "lora_values",
-    "exposed_controls", "recommended_values", "favorite", "tags",
 }
 
 
@@ -210,76 +209,6 @@ class WorkflowDomainService:
             return f"invalid value {value!r} for {role!r}, must be a string"
         return None  # file/image/node: accept any non-None value
 
-    def _validate_preset_values(
-        self,
-        values: dict[str, Any],
-        mapping: Mapping,
-        *,
-        missing_required: list[str],
-        strict: bool,
-    ) -> list[str]:
-        """Validate preset values against the mapping. Returns reason list.
-
-        Unknown controls raise only when *strict*; missing required values
-        are recorded into *missing_required*.
-        """
-        reasons: list[str] = []
-        entries = mapping.entries
-        for role, value in values.items():
-            entry = entries.get(role)
-            if entry is None:
-                if strict:
-                    raise WorkflowPresetValidationError(
-                        f"unknown control {role!r}: not present in the mapping"
-                    )
-                continue
-            if value is None:
-                if entry.required and role not in missing_required:
-                    missing_required.append(role)
-                continue
-            error = self._validate_value(role, value, entry)
-            if error:
-                reasons.append(error)
-        for role, entry in entries.items():
-            if entry.required and role not in values:
-                if role not in missing_required:
-                    missing_required.append(role)
-        return reasons
-
-    def _validate_model_choices(
-        self,
-        model_choices: dict[str, Any],
-        mapping: Mapping,
-        compatible_models: list[str],
-        *,
-        as_reason: bool = False,
-    ) -> list[str]:
-        """Validate model choices against the mapping + the VERSION's frozen
-        compatible-model contract.
-
-        With ``as_reason`` (copy-forward path) mismatches become reasons
-        instead of raised errors.
-        """
-        reasons: list[str] = []
-        for role, model_name in model_choices.items():
-            entry = mapping.entries.get(role)
-            if entry is None:
-                msg = f"unknown control {role!r}: not present in the mapping"
-                if as_reason:
-                    reasons.append(msg)
-                else:
-                    raise WorkflowPresetValidationError(msg)
-                continue
-            if compatible_models and model_name not in compatible_models:
-                msg = (
-                    f"model {model_name!r} for {role!r} is not declared "
-                    f"compatible for this workflow version"
-                )
-                if as_reason:
-                    reasons.append(msg)
-                else:
-                    raise WorkflowPresetValidationError(msg)
-        return reasons
 
     @staticmethod
     def _normalize_entries(entries: dict[str, dict[str, Any]]) -> dict[str, MappingEntry]:
@@ -314,11 +243,11 @@ class WorkflowDomainService:
         **aliases: Any,
     ) -> dict[str, Any]:
         if not isinstance(name, str) or not name.strip():
-            raise WorkflowPresetValidationError("workflow name is required")
+            raise WorkflowDomainValidationError("workflow name is required")
         for key, value in aliases.items():
             canonical = WORKFLOW_CONFIG_ALIASES.get(key)
             if canonical is None:
-                raise WorkflowPresetValidationError(
+                raise WorkflowDomainValidationError(
                     f"field {key!r} is not editable on a workflow"
                 )
             if canonical == "static_graph" and static_graph is None:
@@ -336,7 +265,7 @@ class WorkflowDomainService:
             workflow_id=make_workflow_id(),
             name=name.strip()[:200],
             description=(description or "")[:2000],
-            folder=(folder or "").strip("/")[:500],
+            folder=_normalize_folder_path(folder, allow_empty=True),
             tags=list(tags or []),
             favorite=bool(favorite),
             source_url=(source_url or "")[:2000],
@@ -368,34 +297,40 @@ class WorkflowDomainService:
     def list_workflows(self) -> list[dict[str, Any]]:
         return self.store.list_workflows()
 
+    def delete_workflow(self, workflow_id: str) -> None:
+        """Delete a Workflow and all of its dependent records."""
+        if self.store.get_workflow(workflow_id) is None:
+            raise WorkflowNotFoundError(f"workflow {workflow_id!r} not found")
+        self.store.delete_workflow(workflow_id)
+
     def update_workflow(self, workflow_id: str, body: dict[str, Any]) -> dict[str, Any]:
         raw = self.store.get_workflow(workflow_id)
         if raw is None:
             raise WorkflowNotFoundError(f"workflow {workflow_id!r} not found")
         if not isinstance(body, dict):
-            raise WorkflowPresetValidationError("workflow update must be an object")
+            raise WorkflowDomainValidationError("workflow update must be an object")
         if "require_complete" in body:
-            raise WorkflowPresetValidationError("require_complete is not a saved field")
+            raise WorkflowDomainValidationError("require_complete is not a saved field")
         normalized_config = self._workflow_config_updates(raw, body)
         metadata = {key: value for key, value in body.items()
                     if key not in WORKFLOW_CONFIG_FIELDS and key not in WORKFLOW_CONFIG_ALIASES}
         workflow = Workflow.from_dict(raw)
         for key in metadata:
             if key not in _WORKFLOW_EDITABLE:
-                raise WorkflowPresetValidationError(
+                raise WorkflowDomainValidationError(
                     f"field {key!r} is not editable on a workflow"
                 )
         if "name" in metadata:
             if not isinstance(metadata["name"], str) or not metadata["name"].strip():
-                raise WorkflowPresetValidationError("workflow name is required")
+                raise WorkflowDomainValidationError("workflow name is required")
             workflow.name = metadata["name"].strip()[:200]
         if "description" in metadata:
             workflow.description = (metadata["description"] or "")[:2000]
         if "folder" in metadata:
-            workflow.folder = (metadata["folder"] or "").strip("/")[:500]
+            workflow.folder = _normalize_folder_path(metadata["folder"], allow_empty=True)
         if "tags" in metadata:
             if not isinstance(metadata["tags"], list):
-                raise WorkflowPresetValidationError("tags must be a list of strings")
+                raise WorkflowDomainValidationError("tags must be a list of strings")
             workflow.tags = [t for t in metadata["tags"] if isinstance(t, str)]
         if "favorite" in metadata:
             workflow.favorite = bool(metadata["favorite"])
@@ -405,7 +340,7 @@ class WorkflowDomainService:
             workflow.source_author = (metadata["source_author"] or "")[:500]
         if "compatible_models" in metadata:
             if not isinstance(metadata["compatible_models"], list):
-                raise WorkflowPresetValidationError(
+                raise WorkflowDomainValidationError(
                     "compatible_models must be a list of strings"
                 )
             workflow.compatible_models = [
@@ -423,19 +358,19 @@ class WorkflowDomainService:
     @staticmethod
     def _normalize_binding_map(bindings: Any) -> dict[str, dict[str, Any]]:
         if not isinstance(bindings, dict):
-            raise WorkflowPresetValidationError("bindings must be an object")
+            raise WorkflowDomainValidationError("bindings must be an object")
         normalized: dict[str, dict[str, Any]] = {}
         targets: set[tuple[str, str, str]] = set()
         for role, raw in bindings.items():
             if not isinstance(role, str) or not role.strip():
-                raise WorkflowPresetValidationError("binding roles must be non-empty strings")
+                raise WorkflowDomainValidationError("binding roles must be non-empty strings")
             canonical_role = _ROLE_ALIASES.get(role, role)
             if canonical_role not in BINDABLE_INPUT_CATALOG:
-                raise WorkflowPresetValidationError(
+                raise WorkflowDomainValidationError(
                     f"binding {role!r} is not a supported bindable input"
                 )
             if not isinstance(raw, dict):
-                raise WorkflowPresetValidationError(f"binding {role!r} must be an object")
+                raise WorkflowDomainValidationError(f"binding {role!r} must be an object")
             item = copy.deepcopy(raw)
             node_id = str(item.get("node_id") or item.get("nodeId") or "")
             input_name = str(
@@ -447,12 +382,12 @@ class WorkflowDomainService:
             )
             output_name = str(item.get("output_name") or item.get("outputName") or "")
             if not node_id or (not input_name and not output_name):
-                raise WorkflowPresetValidationError(
+                raise WorkflowDomainValidationError(
                     f"binding {role!r} must name one concrete node input/widget or output"
                 )
             target = (node_id, input_name, output_name)
             if target in targets:
-                raise WorkflowPresetValidationError(
+                raise WorkflowDomainValidationError(
                     f"binding {role!r} duplicates node/widget binding {target!r}"
                 )
             targets.add(target)
@@ -460,7 +395,7 @@ class WorkflowDomainService:
             if input_name:
                 item["input_name"] = input_name
             if canonical_role in normalized:
-                raise WorkflowPresetValidationError(
+                raise WorkflowDomainValidationError(
                     f"binding {role!r} duplicates role {canonical_role!r}"
                 )
             normalized[canonical_role] = item
@@ -472,15 +407,15 @@ class WorkflowDomainService:
     ) -> dict[str, Any]:
         workflow_type = fields.get("workflow_type", "t2i")
         if not isinstance(workflow_type, str) or not workflow_type.strip():
-            raise WorkflowPresetValidationError("workflow_type must be a non-empty string")
+            raise WorkflowDomainValidationError("workflow_type must be a non-empty string")
         workflow_type = workflow_type.strip()
         graph = fields.get("static_graph", {})
         if not isinstance(graph, dict):
-            raise WorkflowPresetValidationError("static_graph must be an object")
+            raise WorkflowDomainValidationError("static_graph must be an object")
         bindings = cls._normalize_binding_map(fields.get("bindings", {}))
         output = fields.get("output_binding", {})
         if not isinstance(output, dict):
-            raise WorkflowPresetValidationError("output_binding must be an object")
+            raise WorkflowDomainValidationError("output_binding must be an object")
         output = copy.deepcopy(output)
         if output:
             output["node_id"] = str(
@@ -490,27 +425,27 @@ class WorkflowDomainService:
                 or ""
             )
             if not output["node_id"]:
-                raise WorkflowPresetValidationError("output_binding must name a concrete node")
+                raise WorkflowDomainValidationError("output_binding must name a concrete node")
         values = fields.get("saved_values", {})
         if not isinstance(values, dict):
-            raise WorkflowPresetValidationError("saved_values must be an object")
+            raise WorkflowDomainValidationError("saved_values must be an object")
         values = copy.deepcopy(values)
         allowed = fields.get("allowed_options", {})
         if not isinstance(allowed, dict):
-            raise WorkflowPresetValidationError("allowed_options must be an object")
+            raise WorkflowDomainValidationError("allowed_options must be an object")
         allowed = copy.deepcopy(allowed)
         for role, options in allowed.items():
             if not isinstance(options, list):
-                raise WorkflowPresetValidationError(
+                raise WorkflowDomainValidationError(
                     f"allowed_options[{role!r}] must be a list"
                 )
             if role in values and values[role] is not None and values[role] not in options:
-                raise WorkflowPresetValidationError(
+                raise WorkflowDomainValidationError(
                     f"saved value for {role!r} is outside its allowed options"
                 )
         layout = fields.get("layout_profile", {})
         if not isinstance(layout, dict):
-            raise WorkflowPresetValidationError("layout_profile must be an object")
+            raise WorkflowDomainValidationError("layout_profile must be an object")
         result = {
             "static_graph": copy.deepcopy(graph),
             "bindings": bindings,
@@ -534,7 +469,7 @@ class WorkflowDomainService:
             if output.get("node_id") == "":
                 missing.append("output")
             if missing:
-                raise WorkflowPresetValidationError(
+                raise WorkflowDomainValidationError(
                     "workflow is missing required bindings: " + ", ".join(missing)
                 )
         return result
@@ -544,7 +479,7 @@ class WorkflowDomainService:
     ) -> dict[str, Any]:
         forbidden = EXPERIMENT_ONLY_FIELDS.intersection(body)
         if forbidden:
-            raise WorkflowPresetValidationError(
+            raise WorkflowDomainValidationError(
                 "experiment-only fields are not durable Workflow config: "
                 + ", ".join(sorted(forbidden))
             )
@@ -570,13 +505,13 @@ class WorkflowDomainService:
     ) -> dict[str, Any]:
         """Durably save normal Workflow content/layout; never experiment state."""
         if not isinstance(body, dict):
-            raise WorkflowPresetValidationError("workflow autosave must be an object")
+            raise WorkflowDomainValidationError("workflow autosave must be an object")
         raw = self.store.get_workflow(workflow_id)
         if raw is None:
             raise WorkflowNotFoundError(f"workflow {workflow_id!r} not found")
         fields = self._workflow_config_updates(raw, body)
         if not fields:
-            raise WorkflowPresetValidationError("autosave requires Workflow config fields")
+            raise WorkflowDomainValidationError("autosave requires Workflow config fields")
         if require_complete:
             fields = self._normalize_workflow_config(fields, require_complete=True)
         fields["updated_at"] = now_iso()
@@ -617,59 +552,32 @@ class WorkflowDomainService:
 
     def list_folders(self) -> list[str]:
         folders: set[str] = set()
+        for record in self.store.list_folders():
+            folder = record.get("path", "")
+            if not isinstance(folder, str) or not folder:
+                continue
+            parts = folder.split("/")
+            for i in range(1, len(parts) + 1):
+                folders.add("/".join(parts[:i]))
         for wf in self.store.list_workflows():
             folder = wf.get("folder", "")
-            if not folder:
+            if not isinstance(folder, str) or not folder:
                 continue
             parts = folder.split("/")
             for i in range(1, len(parts) + 1):
                 folders.add("/".join(parts[:i]))
         return sorted(folders)
 
+    def create_folder(self, path: Any) -> list[str]:
+        normalized = _normalize_folder_path(path)
+        self.store.insert_folder(normalized)
+        return self.list_folders()
+
     def list_tags(self) -> list[str]:
         tags: set[str] = set()
         for wf in self.store.list_workflows():
             tags.update(wf.get("tags") or [])
-        for preset in self.store.list_presets():
-            tags.update(preset.get("tags") or [])
         return sorted(tags)
-
-    def set_default_preset(self, workflow_id: str, preset_id: str) -> dict[str, Any]:
-        raw = self.store.get_workflow(workflow_id)
-        if raw is None:
-            raise WorkflowNotFoundError(f"workflow {workflow_id!r} not found")
-        preset = self.store.get_preset(preset_id)
-        if preset is None:
-            raise WorkflowPresetNotFoundError(f"preset {preset_id!r} not found")
-        if preset.get("workflow_id") != workflow_id:
-            raise WorkflowPresetValidationError(
-                f"preset {preset_id!r} does not belong to workflow {workflow_id!r}"
-            )
-        workflow = Workflow.from_dict(raw)
-        workflow.default_preset_id = preset_id
-        workflow.updated_at = now_iso()
-        return self.store.update_workflow(workflow)
-
-    def clear_default_preset(self, workflow_id: str) -> dict[str, Any]:
-        raw = self.store.get_workflow(workflow_id)
-        if raw is None:
-            raise WorkflowNotFoundError(f"workflow {workflow_id!r} not found")
-        workflow = Workflow.from_dict(raw)
-        workflow.default_preset_id = ""
-        workflow.updated_at = now_iso()
-        return self.store.update_workflow(workflow)
-
-    def get_default_preset(self, workflow_id: str) -> Optional[dict[str, Any]]:
-        raw = self.store.get_workflow(workflow_id)
-        if raw is None:
-            raise WorkflowNotFoundError(f"workflow {workflow_id!r} not found")
-        default_id = raw.get("default_preset_id", "")
-        if not default_id:
-            return None
-        preset = self.store.get_preset(default_id)
-        if preset is None:
-            return None
-        return self._enrich_preset(preset, raw)
 
     # ── Workflow Version (immutable) ─────────────────────────────────────
 
@@ -760,9 +668,7 @@ class WorkflowDomainService:
         graph bytes are allowed across Versions because the Mapping differs.
         Graph-hash dedupe never applies here: the revision is intentional.
 
-        The old Version, its Mapping, and its Presets remain untouched.
-        Presets can be copied forward explicitly via
-        ``copy_preset_to_version``.
+        The old Version and its Mapping remain untouched.
         """
         source = self.store.get_version(workflow_version_id)
         if source is None:
@@ -990,487 +896,13 @@ class WorkflowDomainService:
         enriched["version_state"] = self.derive_version_state(version_id).to_dict()
         return enriched
 
-    # ── Preset ───────────────────────────────────────────────────────────
-
-    def create_preset(
-        self,
-        workflow_version_id: str,
-        name: str,
-        *,
-        values: Optional[dict[str, Any]] = None,
-        model_choices: Optional[dict[str, Any]] = None,
-        lora_values: Optional[dict[str, Any]] = None,
-        exposed_controls: Optional[list[str]] = None,
-        recommended_values: Optional[dict[str, Any]] = None,
-        favorite: bool = False,
-        tags: Optional[list[str]] = None,
-        description: str = "",
-        strict: bool = True,
-    ) -> dict[str, Any]:
-        version = self.store.get_version(workflow_version_id)
-        if version is None:
-            raise WorkflowVersionNotFoundError(
-                f"workflow version {workflow_version_id!r} not found"
-            )
-        if not isinstance(name, str) or not name.strip():
-            raise WorkflowPresetValidationError("preset name is required")
-        mapping = self.store.get_mapping_for_version(workflow_version_id)
-        if mapping is None:
-            raise WorkflowPresetValidationError(
-                f"workflow version {workflow_version_id!r} has no mapping"
-            )
-        mapping_obj = Mapping.from_dict(mapping)
-        version_compat = list(version.get("compatible_models") or [])
-        workflow = self.store.get_workflow(str(version.get("workflow_id", "")))
-
-        values = values or {}
-        model_choices = model_choices or {}
-        missing_required: list[str] = []
-        reasons = self._validate_preset_values(
-            values, mapping_obj, missing_required=missing_required, strict=strict
-        )
-        reasons += self._validate_model_choices(
-            model_choices, mapping_obj, version_compat, as_reason=False
-        )
-
-        now = now_iso()
-        preset = WorkflowPreset(
-            preset_id=make_preset_id(),
-            workflow_version_id=workflow_version_id,
-            workflow_id=str(version.get("workflow_id", "")),
-            name=name.strip()[:200],
-            description=(description or "")[:2000],
-            values=dict(values),
-            model_choices=dict(model_choices),
-            lora_values=dict(lora_values or {}),
-            exposed_controls=list(exposed_controls or []),
-            recommended_values=dict(recommended_values or {}),
-            favorite=bool(favorite),
-            tags=list(tags or []),
-            created_at=now,
-            updated_at=now,
-        )
-        if reasons or missing_required:
-            preset_state = PresetState(
-                status="incomplete",
-                reasons=reasons
-                + [f"missing value for required control {r!r}" for r in missing_required],
-                runnable=False,
-            )
-        else:
-            preset_state = self.derive_preset_state(preset, version, mapping)
-        stored = self.store.insert_preset(preset)
-        enriched = self._enrich_preset(stored, workflow)
-        enriched["state"] = preset_state.to_dict()
-        return enriched
-
-    def update_preset(self, preset_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        raw = self.store.get_preset(preset_id)
-        if raw is None:
-            raise WorkflowPresetNotFoundError(f"preset {preset_id!r} not found")
-        for key in body:
-            if key not in _PRESET_EDITABLE:
-                raise WorkflowPresetValidationError(
-                    f"field {key!r} is not editable on a preset "
-                    "(workflow_version_id/workflow_id/preset_id are immutable)"
-                )
-        version = self.store.get_version(str(raw.get("workflow_version_id", "")))
-        mapping = self.store.get_mapping_for_version(str(raw.get("workflow_version_id", "")))
-        if version is None or mapping is None:
-            raise WorkflowPresetValidationError(
-                f"preset {preset_id!r} references a missing version/mapping"
-            )
-        mapping_obj = Mapping.from_dict(mapping)
-        version_compat = list(version.get("compatible_models") or [])
-        workflow_raw = self.store.get_workflow(str(raw.get("workflow_id", "")))
-
-        preset = WorkflowPreset.from_dict(raw)
-        if "name" in body:
-            if not isinstance(body["name"], str) or not body["name"].strip():
-                raise WorkflowPresetValidationError("preset name is required")
-            preset.name = body["name"].strip()[:200]
-        if "description" in body:
-            preset.description = (body["description"] or "")[:2000]
-        if "values" in body:
-            if not isinstance(body["values"], dict):
-                raise WorkflowPresetValidationError("values must be an object")
-            preset.values = dict(body["values"])
-        if "model_choices" in body:
-            if not isinstance(body["model_choices"], dict):
-                raise WorkflowPresetValidationError("model_choices must be an object")
-            preset.model_choices = dict(body["model_choices"])
-        if "lora_values" in body:
-            if not isinstance(body["lora_values"], dict):
-                raise WorkflowPresetValidationError("lora_values must be an object")
-            preset.lora_values = dict(body["lora_values"])
-        if "exposed_controls" in body:
-            if not isinstance(body["exposed_controls"], list):
-                raise WorkflowPresetValidationError(
-                    "exposed_controls must be a list"
-                )
-            preset.exposed_controls = [
-                c for c in body["exposed_controls"] if isinstance(c, str)
-            ]
-        if "recommended_values" in body:
-            if not isinstance(body["recommended_values"], dict):
-                raise WorkflowPresetValidationError(
-                    "recommended_values must be an object"
-                )
-            preset.recommended_values = dict(body["recommended_values"])
-        if "favorite" in body:
-            preset.favorite = bool(body["favorite"])
-        if "tags" in body:
-            if not isinstance(body["tags"], list):
-                raise WorkflowPresetValidationError("tags must be a list of strings")
-            preset.tags = [t for t in body["tags"] if isinstance(t, str)]
-        preset.updated_at = now_iso()
-
-        # Re-validate against the version's mapping: unknown controls and
-        # incompatible models raise; invalid/missing values are saved and
-        # surface through the derived (incomplete) state.
-        missing_required: list[str] = []
-        self._validate_preset_values(
-            preset.values, mapping_obj, missing_required=missing_required, strict=True
-        )
-        self._validate_model_choices(
-            preset.model_choices, mapping_obj, version_compat, as_reason=False
-        )
-
-        stored = self.store.update_preset(preset)
-        return self._enrich_preset(stored, workflow_raw)
-
-    def duplicate_preset(self, preset_id: str, *, name: str = "") -> dict[str, Any]:
-        """Duplicate a Preset on the SAME Version (re-validated on create)."""
-        raw = self.store.get_preset(preset_id)
-        if raw is None:
-            raise WorkflowPresetNotFoundError(f"preset {preset_id!r} not found")
-        version = self.store.get_version(str(raw.get("workflow_version_id", "")))
-        if version is None:
-            raise WorkflowPresetValidationError(
-                f"preset {preset_id!r} references a missing version"
-            )
-        if self.store.get_mapping_for_version(
-            str(raw.get("workflow_version_id", ""))
-        ) is None:
-            raise WorkflowPresetValidationError(
-                f"preset {preset_id!r} references a version without a mapping"
-            )
-        return self.create_preset(
-            str(raw.get("workflow_version_id", "")),
-            name or f"{raw.get('name', 'Untitled Preset')} (Copy)",
-            description=str(raw.get("description", "")),
-            values=dict(raw.get("values") or {}),
-            model_choices=dict(raw.get("model_choices") or {}),
-            lora_values=dict(raw.get("lora_values") or {}),
-            exposed_controls=list(raw.get("exposed_controls") or []),
-            recommended_values=dict(raw.get("recommended_values") or {}),
-            favorite=bool(raw.get("favorite", False)),
-            tags=list(raw.get("tags") or []),
-        )
-
-    def get_preset(self, preset_id: str) -> dict[str, Any]:
-        raw = self.store.get_preset(preset_id)
-        if raw is None:
-            raise WorkflowPresetNotFoundError(f"preset {preset_id!r} not found")
-        workflow = self.store.get_workflow(str(raw.get("workflow_id", "")))
-        return self._enrich_preset(raw, workflow)
-
-    def delete_preset(self, preset_id: str) -> None:
-        raw = self.store.get_preset(preset_id)
-        if raw is None:
-            raise WorkflowPresetNotFoundError(f"preset {preset_id!r} not found")
-        self.store.delete_preset(preset_id)
-        workflow = self.store.get_workflow(str(raw.get("workflow_id", "")))
-        if workflow and workflow.get("default_preset_id") == preset_id:
-            wf_obj = Workflow.from_dict(workflow)
-            wf_obj.default_preset_id = ""
-            wf_obj.updated_at = now_iso()
-            self.store.update_workflow(wf_obj)
-
-    def list_presets(self, workflow_version_id: str) -> list[dict[str, Any]]:
-        version = self.store.get_version(workflow_version_id)
-        if version is None:
-            raise WorkflowVersionNotFoundError(
-                f"workflow version {workflow_version_id!r} not found"
-            )
-        workflow = self.store.get_workflow(str(version.get("workflow_id", "")))
-        presets = [
-            p for p in self.store.list_presets()
-            if p.get("workflow_version_id") == workflow_version_id
-        ]
-        return [self._enrich_preset(p, workflow) for p in presets]
-
-    def list_presets_for_workflow(self, workflow_id: str) -> list[dict[str, Any]]:
-        versions = self.store.list_versions_for_workflow(workflow_id)
-        versions.sort(key=lambda v: int(v.get("version_number", 0)), reverse=True)
-        workflow = self.store.get_workflow(workflow_id)
-        presets = [
-            p for p in self.store.list_presets()
-            if p.get("workflow_id") == workflow_id
-        ]
-        version_rank = {v["workflow_version_id"]: i for i, v in enumerate(versions)}
-        presets.sort(key=lambda p: version_rank.get(p.get("workflow_version_id", ""), 10**9))
-        return [self._enrich_preset(p, workflow) for p in presets]
-
-    def derive_preset_state(
-        self,
-        preset: WorkflowPreset | dict[str, Any],
-        version: Optional[dict[str, Any]] = None,
-        mapping: Optional[dict[str, Any]] = None,
-        compatible_models: Optional[list[str]] = None,
-    ) -> PresetState:
-        """Derive the preset state from stored data (never persisted).
-
-        Model compatibility is validated against the VERSION's frozen
-        compatibility contract, never the mutable logical-Workflow list.
-        """
-        preset = preset if isinstance(preset, WorkflowPreset) else WorkflowPreset.from_dict(preset)
-        reasons: list[str] = []
-        if preset.dropped_controls:
-            reasons.append(
-                "mapped controls no longer present in this version: "
-                + ", ".join(preset.dropped_controls)
-            )
-        if version is None:
-            version = self.store.get_version(preset.workflow_version_id)
-        if version is None:
-            reasons.append("workflow version not found")
-        if compatible_models is None:
-            compatible_models = list((version or {}).get("compatible_models") or [])
-        if mapping is None:
-            mapping = self.store.get_mapping_for_version(preset.workflow_version_id)
-        version_state = self.derive_version_state(preset.workflow_version_id)
-        if version_state.reasons:
-            reasons.append("workflow version is incomplete: " + "; ".join(version_state.reasons))
-
-        if mapping is not None:
-            mapping_obj = Mapping.from_dict(mapping)
-            missing: list[str] = []
-            for role, entry in mapping_obj.entries.items():
-                if entry.required and (preset.values.get(role) is None):
-                    missing.append(role)
-            reasons += [f"missing value for required control {r!r}" for r in missing]
-            for role, value in preset.values.items():
-                entry = mapping_obj.entries.get(role)
-                if entry is None or value is None:
-                    continue
-                error = self._validate_value(role, value, entry)
-                if error:
-                    reasons.append(error)
-            reasons += self._validate_model_choices(
-                preset.model_choices, mapping_obj, compatible_models, as_reason=True
-            )
-        else:
-            reasons.append("workflow version has no mapping")
-
-        state = PresetState()
-        if not reasons:
-            state.status = "ready"
-            state.runnable = version_state.runnable
-        else:
-            state.status = "incomplete"
-            state.reasons = reasons
-            state.runnable = False
-        return state
-
-    # ── copy-forward ─────────────────────────────────────────────────────
-
-    def _prepare_copy(
-        self,
-        source: dict[str, Any],
-        target_version: dict[str, Any],
-    ) -> tuple[WorkflowPreset, list[str]]:
-        """Compute the copied preset + dropped controls; never writes."""
-        source_version = self.store.get_version(str(source.get("workflow_version_id", "")))
-        if source_version is None:
-            raise PresetCopyError("source preset references a missing version")
-        if source_version.get("workflow_id") != target_version.get("workflow_id"):
-            raise PresetCopyError(
-                "cannot copy preset to a version of a different workflow"
-            )
-        source_number = int(source_version.get("version_number", 0))
-        target_number = int(target_version.get("version_number", 0))
-        if target_number <= source_number:
-            raise PresetCopyError(
-                f"target version {target_number} is not newer than "
-                f"source version {source_number}"
-            )
-
-        target_mapping = self.store.get_mapping_for_version(
-            str(target_version.get("workflow_version_id", ""))
-        )
-        mapped_roles: set[str] = set()
-        if target_mapping is not None:
-            for raw in target_mapping.get("entries") or []:
-                if isinstance(raw, dict) and raw.get("semantic_role"):
-                    mapped_roles.add(str(raw["semantic_role"]))
-
-        def _keep_only(container: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-            kept: dict[str, Any] = {}
-            dropped: list[str] = []
-            for role, value in container.items():
-                if role in mapped_roles:
-                    kept[role] = copy.deepcopy(value)
-                else:
-                    dropped.append(role)
-            return kept, dropped
-
-        values, dropped_values = _keep_only(dict(source.get("values") or {}))
-        model_choices, dropped_models = _keep_only(dict(source.get("model_choices") or {}))
-        lora_values, dropped_loras = _keep_only(dict(source.get("lora_values") or {}))
-        recommended, dropped_recommended = _keep_only(
-            dict(source.get("recommended_values") or {})
-        )
-        exposed_controls = [
-            c for c in (source.get("exposed_controls") or []) if c in mapped_roles
-        ]
-        dropped = sorted(set(dropped_values + dropped_models + dropped_loras + dropped_recommended))
-
-        now = now_iso()
-        preset = WorkflowPreset(
-            preset_id=make_preset_id(),
-            workflow_version_id=str(target_version.get("workflow_version_id", "")),
-            workflow_id=str(target_version.get("workflow_id", "")),
-            name=str(source.get("name", "Untitled Preset")),
-            description=str(source.get("description", "")),
-            values=values,
-            model_choices=model_choices,
-            lora_values=lora_values,
-            exposed_controls=exposed_controls,
-            recommended_values=recommended,
-            favorite=bool(source.get("favorite", False)),
-            tags=list(source.get("tags") or []),
-            dropped_controls=dropped,
-            created_at=now,
-            updated_at=now,
-        )
-        return preset, dropped
-
-    def copy_preset_to_version(
-        self, preset_id: str, target_version_id: str
-    ) -> dict[str, Any]:
-        source = self.store.get_preset(preset_id)
-        if source is None:
-            raise WorkflowPresetNotFoundError(f"preset {preset_id!r} not found")
-        target_version = self.store.get_version(target_version_id)
-        if target_version is None:
-            raise WorkflowVersionNotFoundError(
-                f"workflow version {target_version_id!r} not found"
-            )
-        preset, dropped = self._prepare_copy(source, target_version)
-        stored = self.store.insert_preset(preset)
-        workflow = self.store.get_workflow(str(target_version.get("workflow_id", "")))
-        target_mapping = self.store.get_mapping_for_version(target_version_id)
-        state = self.derive_preset_state(stored, target_version, target_mapping)
-        enriched = self._enrich_preset(stored, workflow)
-        return {
-            "preset": enriched,
-            "dropped_controls": dropped,
-            "state": state.to_dict(),
-        }
-
-    def copy_presets_to_version(
-        self, preset_ids: list[str], target_version_id: str
-    ) -> list[dict[str, Any]]:
-        target_version = self.store.get_version(target_version_id)
-        if target_version is None:
-            raise WorkflowVersionNotFoundError(
-                f"workflow version {target_version_id!r} not found"
-            )
-        # Validate ALL copies first — nothing is written on any failure.
-        prepared: list[tuple[dict[str, Any], WorkflowPreset, list[str]]] = []
-        for preset_id in preset_ids:
-            source = self.store.get_preset(preset_id)
-            if source is None:
-                raise PresetCopyError(f"preset {preset_id!r} not found")
-            preset, dropped = self._prepare_copy(source, target_version)
-            prepared.append((source, preset, dropped))
-        results: list[dict[str, Any]] = []
-        workflow = self.store.get_workflow(str(target_version.get("workflow_id", "")))
-        target_mapping = self.store.get_mapping_for_version(target_version_id)
-        for source, preset, dropped in prepared:
-            stored = self.store.insert_preset(preset)
-            state = self.derive_preset_state(stored, target_version, target_mapping)
-            results.append({
-                "preset": self._enrich_preset(stored, workflow),
-                "dropped_controls": dropped,
-                "state": state.to_dict(),
-                "source_preset_id": source.get("preset_id"),
-            })
-        return results
-
     # ── enrichment ───────────────────────────────────────────────────────
 
     def _enrich_version(self, version: dict[str, Any]) -> dict[str, Any]:
         version_id = version.get("workflow_version_id", "")
         mapping = self.store.get_mapping_for_version(version_id)
-        preset_count = len([
-            p for p in self.store.list_presets()
-            if p.get("workflow_version_id") == version_id
-        ])
         enriched = dict(version)
         enriched["state"] = self.derive_version_state(version_id).to_dict()
         enriched["mapping_id"] = mapping.get("mapping_id") if mapping else None
         enriched["mapping"] = self._enrich_mapping(mapping) if mapping else None
-        enriched["preset_count"] = preset_count
         return enriched
-
-    def _enrich_preset(
-        self, preset: dict[str, Any], workflow: Optional[dict[str, Any]]
-    ) -> dict[str, Any]:
-        enriched = dict(preset)
-        version = self.store.get_version(str(preset.get("workflow_version_id", "")))
-        mapping = self.store.get_mapping_for_version(
-            str(preset.get("workflow_version_id", ""))
-        )
-        enriched["state"] = self.derive_preset_state(
-            enriched, version, mapping
-        ).to_dict()
-        enriched["is_default"] = (
-            bool(workflow) and workflow.get("default_preset_id") == preset.get("preset_id")
-        )
-        return enriched
-
-    # ── Legacy absorption bridge (abs-1) ─────────────────────────────────
-    # Shelf/Experiment submissions carrying unscoped legacy preset payloads
-    # (old semantic roles) enter the single durable authority HERE: the
-    # payload is translated by ``studio_domain.legacy_adapters`` (pure, no
-    # I/O, no migration) and persisted via the verified ``create_preset``
-    # path only.  Unknown roles pass through verbatim and surface through
-    # the preset state / unmapped reporting — never silently dropped.
-
-    def create_preset_from_legacy(
-        self,
-        workflow_version_id: str,
-        legacy_preset: dict[str, Any] | None,
-        *,
-        strict: bool = True,
-        name: str = "",
-        favorite: bool | None = None,
-        tags: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """Create a version-scoped preset from an unscoped legacy payload.
-
-        Inputs: ``workflow_version_id`` — the version scope (never guessed);
-          ``legacy_preset`` — unscoped legacy payload (``values`` /
-          ``model_choices`` keyed by old roles); ``strict`` — forwarded to
-          ``create_preset``; ``name``/``favorite``/``tags`` — explicit
-          overrides winning over the translated payload.
-        Outputs: the enriched preset dict, exactly as ``create_preset``
-          returns (version-scoped, canonical keys).
-        """
-        translated = translate_legacy_preset(legacy_preset)
-        preset_name = name or translated["name"]
-        return self.create_preset(
-            workflow_version_id,
-            preset_name,
-            description=translated["description"],
-            values=translated["values"],
-            model_choices=translated["model_choices"],
-            lora_values=translated["lora_values"],
-            exposed_controls=translated["exposed_controls"],
-            recommended_values=translated["recommended_values"],
-            favorite=translated["favorite"] if favorite is None else bool(favorite),
-            tags=translated["tags"] if tags is None else list(tags),
-            strict=strict,
-        )

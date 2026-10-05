@@ -32,7 +32,6 @@ STORE_FILENAMES = (
     ".studio_workflows.json",
     ".studio_workflow_versions.json",
     ".studio_workflow_mappings.json",
-    ".studio_workflow_presets.json",
 )
 
 PINNED_HASH = "ab" * 32
@@ -353,16 +352,6 @@ class PortabilityBackendTestBase(unittest.TestCase):
         assert resp.status == 200, resp.body
         return self.body(resp)["mapping"]
 
-    def create_preset(self, version_id, name="Base Preset", **extra):
-        body = {"name": name, "values": {"positive_prompt": "hi", "seed": 5}, **extra}
-        resp = self.call(
-            "POST", "/comfymodal/studio/workflows/versions/{version_id}/presets",
-            body_bytes=json.dumps(body).encode(),
-            match_info={"version_id": version_id},
-        )
-        assert resp.status == 200, resp.body
-        return self.body(resp)["preset"]
-
     def setup_mapped_version(self, name="Sample Workflow"):
         wf = self.create_workflow(name)
         version = self.capture_version(wf["workflow_id"])
@@ -376,10 +365,8 @@ class PortabilityBackendTestBase(unittest.TestCase):
             snap[name] = path.read_bytes() if path.exists() else None
         return snap
 
-    def export_bytes(self, version_id, include_presets=None):
+    def export_bytes(self, version_id):
         query = {}
-        if include_presets is not None:
-            query["include_presets"] = "1" if include_presets else "0"
         resp = self.call(
             "GET",
             "/comfymodal/studio/workflows/versions/{version_id}/export",
@@ -390,25 +377,6 @@ class PortabilityBackendTestBase(unittest.TestCase):
 
 
 class ExportTests(PortabilityBackendTestBase):
-    def test_01_include_presets_default_false(self):
-        _, version, _ = self.setup_mapped_version()
-        self.create_preset(version["workflow_version_id"])
-        resp = self.export_bytes(version["workflow_version_id"])
-        self.assertEqual(resp.status, 200)
-        manifest = json.loads(resp.body)
-        self.assertEqual(manifest["presets"], [])
-        self.assertEqual(manifest["manifest_version"], 1)
-
-    def test_02_include_presets_true(self):
-        _, version, _ = self.setup_mapped_version()
-        preset = self.create_preset(version["workflow_version_id"])
-        resp = self.export_bytes(version["workflow_version_id"], include_presets=True)
-        self.assertEqual(resp.status, 200)
-        manifest = json.loads(resp.body)
-        self.assertEqual(len(manifest["presets"]), 1)
-        self.assertEqual(manifest["presets"][0]["preset_id"], preset["preset_id"])
-        self.assertIn("is_default", manifest["presets"][0])
-
     def test_03_exact_filename_and_content_headers(self):
         wf, version, _ = self.setup_mapped_version(name="My Fancy: Workflow/Name?")
         resp = self.export_bytes(version["workflow_version_id"])
@@ -431,9 +399,8 @@ class ExportTests(PortabilityBackendTestBase):
 
     def test_05_export_is_read_only(self):
         _, version, _ = self.setup_mapped_version()
-        self.create_preset(version["workflow_version_id"])
         before = self.snapshot_stores()
-        self.export_bytes(version["workflow_version_id"], include_presets=True)
+        self.export_bytes(version["workflow_version_id"])
         self.assertEqual(self.snapshot_stores(), before)
 
     def test_06_credential_like_export_refusal(self):
@@ -487,8 +454,7 @@ class ExportTests(PortabilityBackendTestBase):
 class ImportPreviewTests(PortabilityBackendTestBase):
     def _export_manifest_bytes(self):
         _, version, _ = self.setup_mapped_version(name="Round Trip Source")
-        self.create_preset(version["workflow_version_id"])
-        resp = self.export_bytes(version["workflow_version_id"], include_presets=True)
+        resp = self.export_bytes(version["workflow_version_id"])
         return resp.body, version
 
     def test_08_valid_preview_shape(self):
@@ -507,7 +473,6 @@ class ImportPreviewTests(PortabilityBackendTestBase):
         self.assertIn("ready", payload["readiness"])
         self.assertIsNotNone(payload["portability"])
         pc.validate_report(payload["portability"])
-        self.assertEqual(payload["will_create"]["preset_count"], 1)
         self.assertTrue(payload["proposed_name"].endswith(" (imported)"))
         self.assertEqual(self.snapshot_stores(), before)
 
@@ -639,136 +604,10 @@ class ImportPreviewTests(PortabilityBackendTestBase):
 
 
 class ImportCommitTests(PortabilityBackendTestBase):
-    def _exported(self, name="Round Trip Source", presets=1):
+    def _exported(self, name="Round Trip Source"):
         wf, version, _ = self.setup_mapped_version(name=name)
-        for i in range(presets):
-            self.create_preset(
-                version["workflow_version_id"],
-                name="Preset %d" % i,
-                favorite=i == 0,
-            )
-        resp = self.export_bytes(version["workflow_version_id"], include_presets=True)
+        resp = self.export_bytes(version["workflow_version_id"])
         return resp.body, wf, version
-
-    def test_16_default_commit_imports_zero_presets(self):
-        raw, _, _ = self._exported(presets=1)
-        resp = self.call(
-            "POST", "/comfymodal/studio/workflows/import-manifest",
-            body_bytes=raw, query={"dry_run": "0"},
-        )
-        self.assertEqual(resp.status, 200)
-        payload = self.body(resp)
-        self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["preset_ids"], [])
-        presets = json.loads(
-            (Path(self.root) / ".studio_workflow_presets.json").read_text()
-        )
-        imported = [
-            p for p in presets
-            if p["workflow_version_id"] == payload["workflow_version_id"]
-        ]
-        self.assertEqual(imported, [])
-
-    def test_17_presets_imported_when_explicit(self):
-        raw, _, _ = self._exported(presets=2)
-        manifest = json.loads(raw)
-        manifest["import_presets"] = True
-        resp = self.call(
-            "POST", "/comfymodal/studio/workflows/import-manifest",
-            body_bytes=json.dumps(manifest).encode(), query={"dry_run": "0"},
-        )
-        self.assertEqual(resp.status, 200)
-        payload = self.body(resp)
-        self.assertEqual(len(payload["preset_ids"]), 2)
-        presets = json.loads(
-            (Path(self.root) / ".studio_workflow_presets.json").read_text()
-        )
-        imported = [
-            p for p in presets
-            if p["workflow_version_id"] == payload["workflow_version_id"]
-        ]
-        self.assertEqual(len(imported), 2)
-        for preset in imported:
-            self.assertTrue(str(preset["preset_id"]).startswith("wpres_"))
-
-    def test_18_default_preset_not_applied_unless_explicit(self):
-        raw, source_wf, _ = self._exported(presets=1)
-        manifest = json.loads(raw)
-        self.service.set_default_preset(
-            source_wf["workflow_id"], manifest["presets"][0]["preset_id"]
-        )
-        source_version_id = _reexport_version_id(self, source_wf)
-        refreshed = self.export_bytes(source_version_id, include_presets=True)
-        manifest = json.loads(refreshed.body)
-        self.assertIs(manifest["presets"][0]["is_default"], True)
-        manifest["import_presets"] = True
-        resp = self.call(
-            "POST", "/comfymodal/studio/workflows/import-manifest",
-            body_bytes=json.dumps(manifest).encode(), query={"dry_run": "0"},
-        )
-        payload = self.body(resp)
-        self.assertEqual(resp.status, 200, resp.body)
-        self.assertIsNone(payload["applied_default_preset_id"])
-        wf_record = json.loads(
-            (Path(self.root) / ".studio_workflows.json").read_text()
-        )[-1]
-        self.assertEqual(wf_record["default_preset_id"], "")
-
-    def test_19_default_applied_when_explicit(self):
-        raw, source_wf, _ = self._exported(presets=1)
-        manifest = json.loads(raw)
-        self.service.set_default_preset(
-            source_wf["workflow_id"], manifest["presets"][0]["preset_id"]
-        )
-        refreshed = self.export_bytes(
-            _reexport_version_id(self, source_wf), include_presets=True
-        )
-        manifest = json.loads(refreshed.body)
-        manifest["import_presets"] = True
-        manifest["apply_default_preset"] = True
-        resp = self.call(
-            "POST", "/comfymodal/studio/workflows/import-manifest",
-            body_bytes=json.dumps(manifest).encode(), query={"dry_run": "0"},
-        )
-        payload = self.body(resp)
-        self.assertEqual(resp.status, 200, resp.body)
-        self.assertIsNotNone(payload["applied_default_preset_id"])
-        wf_record = json.loads(
-            (Path(self.root) / ".studio_workflows.json").read_text()
-        )[-1]
-        self.assertEqual(wf_record["default_preset_id"], payload["applied_default_preset_id"])
-
-    def test_20_reminted_ids_never_reuse_foreign(self):
-        raw, _, _ = self._exported(presets=1)
-        manifest = json.loads(raw)
-        foreign_ids = {
-            manifest["workflow"]["workflow_id"],
-            manifest["version"]["workflow_version_id"],
-            manifest["mapping"]["mapping_id"],
-            manifest["presets"][0]["preset_id"],
-        }
-        manifest["import_presets"] = True
-        resp = self.call(
-            "POST", "/comfymodal/studio/workflows/import-manifest",
-            body_bytes=json.dumps(manifest).encode(), query={"dry_run": "0"},
-        )
-        payload = self.body(resp)
-        local_ids = {
-            payload["workflow_id"],
-            payload["workflow_version_id"],
-            payload["mapping_id"],
-            *payload["preset_ids"],
-        }
-        self.assertEqual(local_ids & foreign_ids, set())
-        for local_id in local_ids:
-            self.assertTrue(
-                local_id.startswith(("wf_", "wv_", "wm_", "wpres_")),
-                "unexpected id shape: %s" % local_id,
-            )
-        version = json.loads(
-            (Path(self.root) / ".studio_workflow_versions.json").read_text()
-        )[-1]
-        self.assertEqual(version["version_number"], 1)
 
     def test_21_provenance_structured_not_contaminating(self):
         raw, _, _ = self._exported()
@@ -810,31 +649,15 @@ def _reexport_version_id(testcase, source_wf):
 class AtomicityTests(PortabilityBackendTestBase):
     """Injected-failure rollback: all four collections byte-equal pre-state."""
 
-    def _prepared_manifest(self, preset_count=2, apply_default=False):
+    def _prepared_manifest(self):
         wf = self.create_workflow(name="Atomic Source")
         version = self.capture_version(wf["workflow_id"])
         self.set_mapping(version["workflow_version_id"])
-        for i in range(preset_count):
-            self.create_preset(version["workflow_version_id"], name="P%d" % i)
-        resp = self.export_bytes(version["workflow_version_id"], include_presets=True)
-        manifest = json.loads(resp.body)
-        manifest["import_presets"] = True
-        if apply_default:
-            self.service.set_default_preset(wf["workflow_id"], manifest["presets"][0]["preset_id"])
-            refreshed = json.loads(
-                self.export_bytes(version["workflow_version_id"], include_presets=True).body
-            )
-            refreshed["import_presets"] = True
-            refreshed["apply_default_preset"] = True
-            manifest = refreshed
-        return manifest
+        resp = self.export_bytes(version["workflow_version_id"])
+        return json.loads(resp.body)
 
     def _commit(self, manifest):
-        import_presets = bool(manifest.pop("import_presets", False))
-        apply_default = bool(manifest.pop("apply_default_preset", False))
-        return self.portability.commit_import(
-            manifest, import_presets=import_presets, apply_default_preset=apply_default
-        )
+        return self.portability.commit_import(manifest)
 
     def _assert_untouched(self, before):
         self.assertEqual(self.snapshot_stores(), before)
@@ -899,51 +722,18 @@ class AtomicityTests(PortabilityBackendTestBase):
     def test_22d_fail_at_mapping_step(self):
         self._inject_store_failure("mappings", 1, self._prepared_manifest())
 
-    def test_22e_fail_at_first_preset(self):
-        self._inject_store_failure("presets", 1, self._prepared_manifest())
-
-    def test_22f_fail_at_later_preset(self):
-        self._inject_store_failure("presets", 2, self._prepared_manifest())
-
-    def test_22g_fail_after_default_preset_staged(self):
-        manifest = self._prepared_manifest(apply_default=True)
-        before = self.snapshot_stores()
-        store = self.portability.store
-        staged = {}
-        original_build = self.portability._build_import_records
-        original_update = store.workflows.update
-
-        def wrapped_build(*a, **k):
-            records = original_build(*a, **k)
-            staged["default_preset_id"] = records["workflow"].default_preset_id
-            return records
-
-        def boom(mutator):
-            raise RuntimeError("injected-default")
-
-        self.portability._build_import_records = wrapped_build
-        store.workflows.update = boom
-        try:
-            with self.assertRaises(RuntimeError):
-                self._commit(manifest)
-        finally:
-            self.portability._build_import_records = original_build
-            store.workflows.update = original_update
-        self.assertTrue(staged.get("default_preset_id"))
-        self._assert_untouched(before)
-
     def test_22h_fail_at_final_persistence(self):
         self._inject_store_failure("workflows", 1, self._prepared_manifest())
 
     def test_22i_successful_commit_shape(self):
-        manifest = self._prepared_manifest(apply_default=True)
+        manifest = self._prepared_manifest()
         result = self._commit(manifest)
         self.assertEqual(result["status"], "ok")
-        self.assertTrue(result["applied_default_preset_id"])
         workflows = json.loads((Path(self.root) / ".studio_workflows.json").read_text())
         imported = [w for w in workflows if w["workflow_id"] == result["workflow_id"]]
         self.assertEqual(len(imported), 1)
-        self.assertEqual(imported[0]["default_preset_id"], result["applied_default_preset_id"])
+        # No preset identity is minted any more.
+        self.assertNotIn("default_preset_id", imported[0])
 
 
 class ConcurrencyTests(PortabilityBackendTestBase):
@@ -951,11 +741,9 @@ class ConcurrencyTests(PortabilityBackendTestBase):
         wf = self.create_workflow(name="Concurrent Source")
         version = self.capture_version(wf["workflow_id"])
         self.set_mapping(version["workflow_version_id"])
-        self.create_preset(version["workflow_version_id"], name="P1")
-        resp = self.export_bytes(version["workflow_version_id"], include_presets=True)
+        resp = self.export_bytes(version["workflow_version_id"])
         raw = resp.body
         manifest = json.loads(raw)
-        manifest["import_presets"] = True
 
         handler = _handler_for(
             self.stub, "POST", "/comfymodal/studio/workflows/import-manifest"
@@ -985,11 +773,9 @@ class ConcurrencyTests(PortabilityBackendTestBase):
         workflows = json.loads((Path(self.root) / ".studio_workflows.json").read_text())
         versions = json.loads((Path(self.root) / ".studio_workflow_versions.json").read_text())
         mappings = json.loads((Path(self.root) / ".studio_workflow_mappings.json").read_text())
-        presets = json.loads((Path(self.root) / ".studio_workflow_presets.json").read_text())
         self.assertEqual(len(workflows), 3)  # source + 2 imports
         self.assertEqual(len(versions), 3)
         self.assertEqual(len(mappings), 3)
-        self.assertEqual(len(presets), 3)
 
         version_ids = {v["workflow_version_id"] for v in versions}
         for mapping in mappings:
@@ -998,12 +784,6 @@ class ConcurrencyTests(PortabilityBackendTestBase):
         for payload in payloads:
             mapping = mapping_by_version[payload["workflow_version_id"]]
             self.assertEqual(mapping["mapping_id"], payload["mapping_id"])
-        for payload in payloads:
-            owned = [
-                p for p in presets
-                if p["workflow_version_id"] == payload["workflow_version_id"]
-            ]
-            self.assertEqual(len(owned), 1)
 
 
 class PortabilityReportTests(PortabilityBackendTestBase):

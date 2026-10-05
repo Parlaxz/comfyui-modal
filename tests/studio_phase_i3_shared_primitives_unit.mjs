@@ -471,12 +471,21 @@ function childrenOf(el) {
   }
   // I7 truth: the three Backend modules now import the shared primitive,
   // and Settings remains static with none.
+  //
+  // Retired: the preset/snapshot/workspace Backend page modules were deleted
+  // by the Studio preset/version collapse, so the I7 consumption pins no longer
+  // have a subject. The guard is inverted — the removed modules must stay
+  // removed, and no surviving page module may import them.
   for (const file of [
     "studio-backend-presets.js",
     "studio-backend-snapshots.js",
     "studio-backend-workspaces.js",
   ]) {
-    assert.ok(readWeb(file).includes("./studio-loading.js"), `${file} consumes the shared loading primitive (I7)`);
+    assert.equal(
+      fs.existsSync(path.join(WEB, file)),
+      false,
+      `${file} was removed by the preset/version collapse and must stay removed`
+    );
   }
   section("20. page loading sites migrated (History I4, Backend I7, Workflows/Models I6, Playground I8)");
 }

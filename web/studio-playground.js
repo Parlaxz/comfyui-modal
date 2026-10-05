@@ -1,4 +1,4 @@
-// Modal Studio â€” Playground
+// Modal Studio ├óΓé¼ΓÇ¥ Playground
 //
 // Default Studio page with left control panel and right workspace.
 // Image-edit interactions are honest disabled future-work placeholders.
@@ -11,22 +11,13 @@ import {
   renderExperimentMode,
   enhanceControlWithAxisCheckbox,
 } from "./studio-experiment-mode.js";
-import { getRuntimePresets } from "./studio-backend.js";
-import {
-  runStudioPreset,
-  getStudioRunStatus,
-  getGoldenRunProgress,
-  stopExperiment,
-  listModels,
-} from "./studio-backend-api.js";
+// Presets were removed from the codebase; the legacy preset-driven Playground
+// path below is dead and resolves to an empty preset list. It is retained only
+// until the legacy lane is deleted outright.
+import { runStudioWorkflow, getStudioRunStatus, getGoldenRunProgress, stopExperiment, listModels } from "./studio-backend-api.js";
 import { loadModalOptions } from "./studio-output-preferences.js";
 import { goldenProgressResponseAction } from "./studio-golden-progress.js";
 
-import {
-  getVisibleControlsForPreset,
-  getPresetCapabilitySummary,
-  getUnavailableControlReasons,
-} from "./studio-preset-capabilities.js";
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines, resolveSelectionResultKey } from "./studio-run-normalizer.js";
 import {
   saveSelection,
@@ -84,7 +75,7 @@ import {
   saveShelfValues,
 } from "./studio-playground-state.js";
 
-// â”€â”€ Polling helper for experiment status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Polling helper for experiment status ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 // Polls getStudioRunStatus and updates runState to reflect queued,
 // running, completed, or error states.
 //
@@ -231,7 +222,7 @@ function _startPolling(container, state, context, actions, runState) {
     try {
       data = await getStudioRunStatus(apiBase, experimentId);
     } catch (err) {
-      // Transient fetch error â€” keep current state until deadline
+      // Transient fetch error ├óΓé¼ΓÇ¥ keep current state until deadline
       var _c0 = _getRunController(state, actions);
       if (_c0 && _c0.getRunId()) return;
       if (actions && actions.setRunState) actions.setRunState({ status: "waiting", experimentId });
@@ -300,7 +291,7 @@ function _startPolling(container, state, context, actions, runState) {
     if (_ctrl && _ctrl.getRunId()) {
       // Canonical single-run path: lifecycle state is owned by the controller.
       _ctrl.applySnapshot(data, extras);
-      // Terminal reached â€” stop polling (duplicate polls are no-ops anyway).
+      // Terminal reached ├óΓé¼ΓÇ¥ stop polling (duplicate polls are no-ops anyway).
       if (_ctrl.isTerminal()) _stopPolling(state);
       return;
     }
@@ -312,7 +303,7 @@ function _startPolling(container, state, context, actions, runState) {
   if (state && state.playground) state.playground._pollTimer = pollTimer;
 }
 
-// â”€â”€ Effective Controls builder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Effective Controls builder ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Composes the full set of rendered bound controls from:
 //   1. current user edits (state.playground.controls)
@@ -330,7 +321,7 @@ function getCurrentPresetForSelection(state, presetId) {
 function hydrateControlsForSelection(state, presetId, featureId, preset) {
   if (!state.playground) return;
 
-  // A persisted draft contains explicit user edits â€” load into
+  // A persisted draft contains explicit user edits ├óΓé¼ΓÇ¥ load into
   // `state.playground.controls` (which buildEffectiveControls serialises)
   // and _hydratedControls (backward-compatible source/behavior expectations).
   const draft = presetId && featureId ? loadControlDraft(presetId, featureId) : {};
@@ -378,7 +369,7 @@ function buildEffectiveControls(state) {
 /**
  * Persist the current experiment draft (experimentAxes + compareBackendIds)
  * for the active selection if both presetId and featureId are set.
- * Safe to call on every render â€” performs a synchronous localStorage write.
+ * Safe to call on every render ├óΓé¼ΓÇ¥ performs a synchronous localStorage write.
  */
 function _saveExperimentDraftFromState(state) {
   const pg = state && state.playground;
@@ -394,7 +385,7 @@ function _saveExperimentDraftFromState(state) {
   );
 }
 
-// â”€â”€ Recent runs state management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Recent runs state management ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Reusable loader/state-owned collection of recent runs, refreshed:
 //   - on initial hydration
@@ -402,7 +393,7 @@ function _saveExperimentDraftFromState(state) {
 //   - after preset deletion if needed
 //   - when returning to Playground after History changes
 // Hydration comes from the History V2 feed (same durable authority as the
-// History page) â€” legacy feeds are no longer consulted.
+// History page) ├óΓé¼ΓÇ¥ legacy feeds are no longer consulted.
 
 let _recentRunsCache = null;
 let _recentRunsCacheKey = "";
@@ -551,7 +542,7 @@ export async function refreshRecentRuns(apiBase, outputOverride) {
       return bTime.localeCompare(aTime);
     });
 
-    // Deduplicate by ID (first occurrence of each key wins â€” newest)
+    // Deduplicate by ID (first occurrence of each key wins ├óΓé¼ΓÇ¥ newest)
     var seen = {};
     _recentRunsCache = items.filter(function (item) {
       var key = item.experimentId || item.id;
@@ -578,11 +569,11 @@ export function clearRecentRunsCache() {
   _recentRunsCacheKey = "";
 }
 
-// ── Same-run history timings fallback (Shelf single-run slice) ───────────
+// ΓöÇΓöÇ Same-run history timings fallback (Shelf single-run slice) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // When a completed single run carries no direct timings AND the History V2
 // feed has no projection for it yet (mocked + raced backends), fall back to
-// the legacy history entry for the SAME run id only — matched on the
+// the legacy history entry for the SAME run id only ΓÇö matched on the
 // experiment id already carried by the completion. Timings from any other
 // run are never borrowed, and an entry without timings (e.g. omitOutputs
 // runs) yields no fallback, so no output evidence is fabricated.
@@ -602,7 +593,7 @@ function _fetchSameRunHistoryEntry(apiBase, experimentId) {
   }).catch(function () { return null; });
 }
 
-// â”€â”€ Hydration helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Hydration helper ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Restore saved selection, fetch presets + history, validate preset,
 // restore latest completed run preview plus draft/snapshot defaults.
@@ -632,58 +623,14 @@ export async function hydratePlayground(state, context) {
   // 1. Load saved selection from localStorage
   const saved = loadSelection();
 
-  // 2. Fetch runtime presets
-  let presets = [];
-  try {
-    const { listPresets } = await import("./studio-backend-api.js");
-    presets = await listPresets(apiBase) || [];
-  } catch (e) {
-    presets = [];
-  }
-
-  // 3. Determine feature ID (saved > default)
+  // 2. No backend presets exist any more: the selected Workflow (and its
+  // current Version) is the only run identity, and the run store hydrates it.
   const featureId = (saved && saved.featureId) || "txt2img";
   if (state.playground) {
     state.playground.featureId = featureId;
+    state.playground.selectedBackendId = "";
   }
-
-  // 4. Determine preset ID (saved > empty)
-  let targetPresetId = (saved && saved.presetId) || "";
-
-  // 5. Validate preset exists
-  const presetExists = targetPresetId && presets.some(function (p) {
-    return (p.id || p.label || "") === targetPresetId;
-  });
-
-  if (!presetExists) {
-    // Invalid/deleted preset â€” try another runnable preset first
-    if (targetPresetId) {
-      const otherRunnable = presets.find(function (p) {
-        return (p.id || p.label || "") !== targetPresetId && p.status === "runnable";
-      });
-      if (otherRunnable) {
-        targetPresetId = otherRunnable.id || otherRunnable.label || "";
-        if (state.playground) {
-          state.playground.selectedBackendId = targetPresetId;
-        }
-        const resolvedSelection = resolveSelectionResultKey(state, null, {
-          presetId: targetPresetId,
-          featureId,
-        });
-        saveSelection(resolvedSelection.presetId, resolvedSelection.featureId);
-      } else {
-        clearSelection();
-        targetPresetId = "";
-        if (state.playground) {
-          state.playground.selectedBackendId = "";
-        }
-      }
-    }
-  } else {
-    if (state.playground) {
-      state.playground.selectedBackendId = targetPresetId;
-    }
-  }
+  const targetPresetId = "";
 
   const experimentDraft = loadExperimentDraft(targetPresetId, featureId);
   if (state.playground) {
@@ -722,23 +669,16 @@ export async function hydratePlayground(state, context) {
     }
   }
 
-  // 6b. Hydrate control values from persisted draft or preset snapshot defaults
-  const preset = presets.find(function (p) { return (p.id || p.label || "") === targetPresetId; });
-  if (preset) {
-    state.playground._currentPreset = preset;
-  }
-  hydrateControlsForSelection(state, targetPresetId, featureId, preset);
+  // 6b. Controls come from the selected Workflow's own version (no preset).
+  hydrateControlsForSelection(state, targetPresetId, featureId, null);
 
-  // 7. Persist the resolved selection
-  if (targetPresetId) {
-    const resolvedSelection = resolveSelectionResultKey(state, null, {
-      presetId: targetPresetId,
-      featureId,
-    });
-    saveSelection(resolvedSelection.presetId, resolvedSelection.featureId);
+  // 7. Persist the resolved feature selection (the run identity is the
+  // Workflow + Version, not a preset id).
+  if (featureId) {
+    saveSelection("", featureId);
   }
 
-  // 8. Kick off the modern workflow selector init (idempotent â€” it is also
+  // 8. Kick off the modern workflow selector init (idempotent ├óΓé¼ΓÇ¥ it is also
   // started from renderControlPanel; this covers hydration-only renders).
   try {
     initWorkflowRun(state, context);
@@ -747,13 +687,13 @@ export async function hydratePlayground(state, context) {
   }
 }
 
-// â”€â”€ Main Playground renderer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Main Playground renderer ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 export function renderPlayground(state, context) {
   const container = el("div", { class: "comfymodal-studio-playground" });
 
   // Phase I8: accessible page heading. The Playground has no visible title
-  // by design, so this is a visually-hidden h2 (clip pattern — never
+  // by design, so this is a visually-hidden h2 (clip pattern ΓÇö never
   // display:none) directly under the shell h1. Card/run labels are NOT
   // promoted to headings.
   container.appendChild(el("h2", {
@@ -762,16 +702,16 @@ export function renderPlayground(state, context) {
     style: "position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;",
   }));
 
-  // â”€â”€ Scoped tracker lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Scoped tracker lifecycle ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   // Studio progress is driven by a scoped tracker (per-run), NOT the
   // global shared tracker. This prevents unrelated ComfyUI executions
   // from driving the Studio progress UI.
   //
-  // Scoped trackers are created in doRunSubmit (single runs) and in the
+  // Scoped trackers are created in _modernRunSubmit (single runs) and in the
   // experiment run handlers, then disposed on terminal states.
   // The _scopedTracker reference in state.playground is managed there.
   //
-  // Not subscribed for progress UI updates â€” only scoped trackers drive
+  // Not subscribed for progress UI updates ├óΓé¼ΓÇ¥ only scoped trackers drive
   // the Studio progress panel to avoid unrelated ComfyUI executions
   // interfering.
 
@@ -849,7 +789,7 @@ function _createResizeHandle(leftPanel) {
   return handle;
 }
 
-// â”€â”€ Left Control Panel (preset-driven) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Left Control Panel (preset-driven) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function renderControlPanel(state, context) {
   const panel = el("div", { class: "comfymodal-studio-control-panel", "data-testid": "control-panel" });
@@ -912,17 +852,8 @@ function renderControlPanel(state, context) {
     panel.appendChild(expBlock);
   }
 
-  // â”€â”€ Backend Selector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Shelf flow (a modern Workflow is selected): no Backend/Preset UI.
-  // The Shelf owns field cards and the shared picker owns switching.
-  // The legacy preset lane keeps this UI when no Workflow is selected.
-  if (!_isModernRunSelected(state)) {
-    panel.appendChild(renderControlGroup("Backend", renderBackendSelector(state, actions, context)));
-  }
-
-  // â”€â”€ Workflow Selector (modern workflow-driven runs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Separate container rendered after the legacy selector row so legacy
-  // test-ids/order stay intact. Empty-state only until a workflow is chosen.
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Workflow Selector (modern workflow-driven runs) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
+  // Empty-state only until a workflow is chosen.
   panel.appendChild(renderWorkflowSelector(state, context, actions));
 
   // Shelf field cards (Studio Workflow effort, leaf 1.2.2): bound field
@@ -932,167 +863,8 @@ function renderControlPanel(state, context) {
     panel.appendChild(renderShelfSection(state, context, actions));
   }
 
-  // â”€â”€ Preset-driven Controls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  const controlsContainer = el("div", { class: "comfymodal-studio-controls", "data-testid": "controls-container" });
-  // Phase I8: section-level loading uses the shared primitive (legal DOM
-  // container — it is fully replaced once capabilities resolve).
-  controlsContainer.appendChild(renderLoadingState({
-    label: "Loading preset capabilities…",
-    size: "inline",
-    testid: "playground-capabilities-loading",
-  }));
 
-  const selectedPresetId = state.playground && state.playground.selectedBackendId;
-  if (selectedPresetId) {
-    const currentPreset = getCurrentPresetForSelection(state, selectedPresetId);
-    if (currentPreset) {
-      hydrateControlsForSelection(state, selectedPresetId, currentFeatureId, currentPreset);
-    }
-  } else {
-    state.playground._hydratedControls = {};
-  }
-
-  // Async load presets to derive capabilities
-  getRuntimePresets({ apiBase }).then((presets) => {
-    if (!controlsContainer.isConnected) return;
-    while (controlsContainer.firstChild) controlsContainer.removeChild(controlsContainer.firstChild);
-
-    const preset = (presets || []).find((p) => (p.id || p.label || "") === selectedPresetId);
-
-    if (preset) {
-      state.playground._currentPreset = preset;
-    }
-
-    if (!selectedPresetId || !preset) {
-      // No preset selected â€” prompt to select one
-      const noPresetMsg = el("div", {
-        class: "comfymodal-studio-card",
-        style: "padding:12px;text-align:center;",
-      }, [
-        el("p", {
-          text: "Select a Backend Preset to see controls.",
-          style: "font-size:11px;color:#888;margin:0 0 8px;",
-        }),
-        el("a", {
-          text: "Open Backend to create presets",
-          style: "font-size:11px;color:var(--color-accent);cursor:pointer;",
-          onclick: (e) => {
-            e.preventDefault();
-            if (actions && actions.navigateToBackendTab) actions.navigateToBackendTab();
-          },
-        }),
-      ]);
-      controlsContainer.appendChild(noPresetMsg);
-      return;
-    }
-
-    // Feature compatibility check
-    const compat = preset.compatibleFeatures || [];
-    if (!compat.includes(currentFeatureId)) {
-      controlsContainer.appendChild(el("p", {
-        text: `Selected preset does not support "${currentFeatureId}".`,
-        style: "font-size:11px;color:#fbbf24;padding:8px;",
-      }));
-      return;
-    }
-
-    // Derive visible controls from capabilities + bindings
-    const visibleControlIds = getVisibleControlsForPreset(preset, currentFeatureId);
-    const summary = getPresetCapabilitySummary(preset, currentFeatureId);
-    const reasons = getUnavailableControlReasons(preset, currentFeatureId);
-
-    // If feature is a placeholder (object_remove/replace), show honest disabled state
-    if (currentSpec.isPlaceholder) {
-      const placeholderMsg = el("div", { class: "comfymodal-studio-placeholder-notice" }, [
-        el("p", {
-          text: currentSpec.placeholderReason || "This feature is not implemented yet.",
-          style: "color:var(--color-text-muted);font-size:var(--font-size-sm);font-style:italic;",
-        }),
-      ]);
-      controlsContainer.appendChild(placeholderMsg);
-    }
-
-    // Render visible controls
-    visibleControlIds.forEach((ctrlId) => {
-      const def = CONTROL_DEFS[ctrlId];
-      if (!def) return;
-
-      // Instruction is only visible for placeholder features (object_remove/object_replace)
-      if (ctrlId === "instruction" && !currentSpec.isPlaceholder) return;
-
-      const isBound = summary.requiredBindings.some((r) => r.key === ctrlId && r.bound)
-        || summary.optionalBindings.some((o) => o.key === ctrlId && o.bound);
-
-      // Check if this control is in the preset's nodeBindings
-      const hasBinding = !!(preset.nodeBindings && preset.nodeBindings[ctrlId] && preset.nodeBindings[ctrlId].nodeId);
-      const hasResolvedSchema = !!(
-        preset.controlSchemas
-        && preset.controlSchemas[ctrlId]
-        && preset.controlSchemas[ctrlId].schemaResolved
-      );
-
-      const controlRow = renderControl(def, state, actions, preset);
-
-      // Disable the control if it's a required binding not yet bound
-      if (!isBound && !hasBinding && !hasResolvedSchema) {
-        controlRow.style.opacity = "0.5";
-        const reason = reasons[ctrlId] || "Requires node binding";
-        const reasonEl = el("p", {
-          text: `\u26a0 ${reason}`,
-          style: "font-size:9px;color:#fbbf24;margin:2px 0 0;",
-        });
-        controlRow.appendChild(reasonEl);
-      }
-
-      // In experiment mode, add axis checkbox for eligible controls
-      if (isExperiment && def.experimentEligible) {
-        const checkboxWrapper = enhanceControlWithAxisCheckbox(controlRow, ctrlId, state, actions);
-        if (checkboxWrapper && controlRow.firstChild) {
-          controlRow.insertBefore(checkboxWrapper, controlRow.firstChild);
-        }
-        const axisData = state.playground && state.playground.experimentAxes && state.playground.experimentAxes[ctrlId];
-        const eligibleAxes = (state.playground && state.playground._eligibleAxes) || [];
-        if (axisData && axisData.enabled && eligibleAxes.includes(ctrlId)) {
-          const originalInput = controlRow.querySelector('[data-testid="input-' + ctrlId + '"]');
-          if (originalInput) originalInput.remove();
-        }
-      }
-
-      controlsContainer.appendChild(controlRow);
-    });
-
-    // If no visible controls (shouldn't normally happen), show a message
-    if (visibleControlIds.length === 0 && !currentSpec.isPlaceholder) {
-      controlsContainer.appendChild(el("p", {
-        text: "No controls available for this preset+feature combination.",
-        style: "font-size:11px;color:#888;padding:8px;font-style:italic;",
-      }));
-    }
-  }).catch(() => {
-    if (!controlsContainer.isConnected) return;
-    while (controlsContainer.firstChild) controlsContainer.removeChild(controlsContainer.firstChild);
-    controlsContainer.appendChild(el("p", {
-      text: "Could not load preset data.",
-      style: "font-size:11px;color:#f87171;padding:8px;",
-    }));
-  }).then(() => {
-    if (!panel.isConnected) return;
-    const pg = state.playground;
-    if (pg && pg._controlPanelScrollRestorePending && pg._controlPanelScrollTop != null) {
-      panel.scrollTop = pg._controlPanelScrollTop;
-      if (panel.scrollTop === pg._controlPanelScrollTop) {
-        pg._controlPanelScrollRestorePending = false;
-      }
-    }
-  });
-
-  // Shelf flow: the Shelf owns the bound fields, so the legacy
-  // preset-driven controls stay out of this flow entirely.
-  if (!_isModernRunSelected(state)) {
-    panel.appendChild(controlsContainer);
-  }
-
-  // â”€â”€ Run Button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Run Button ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   panel.appendChild(renderRunButton(state, context, actions));
 
   // Reset to defaults link
@@ -1109,7 +881,7 @@ function renderControlPanel(state, context) {
   return panel;
 }
 
-// â”€â”€ Actions builder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Actions builder ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function buildActions(state, context) {
   return {
@@ -1149,7 +921,7 @@ function buildActions(state, context) {
       hydrateControlsForSelection(state, presetId, featureId, currentPreset);
       // Clear stale run state so Run button re-enables
       if (state.playground) state.playground.runState = null;
-      // Dispose scoped tracker â€” switching features invalidates current run
+      // Dispose scoped tracker ├óΓé¼ΓÇ¥ switching features invalidates current run
       _disposeScopedTracker(state);
       // Persist selection
       saveSelection(selectionKey.presetId, selectionKey.featureId);
@@ -1194,7 +966,7 @@ function buildActions(state, context) {
       hydrateControlsForSelection(state, backendId, state.playground.featureId, currentPreset);
       // Clear stale run state so Run button re-enables
       if (state.playground) state.playground.runState = null;
-      // Dispose scoped tracker â€” switching backends invalidates current run
+      // Dispose scoped tracker ├óΓé¼ΓÇ¥ switching backends invalidates current run
       _disposeScopedTracker(state);
       // Persist selection
       saveSelection(selectionKey.presetId, selectionKey.featureId);
@@ -1207,7 +979,7 @@ function buildActions(state, context) {
       state.playground.controls[ctrlId] = value;
       if (ctrlId === 'prompt' && state.playground.experimentAxes && state.playground.experimentAxes.prompt && state.playground.experimentAxes.prompt.enabled && state.playground.experimentAxes.prompt.values && state.playground.experimentAxes.prompt.values.length > 0) {
         state.playground.experimentAxes.prompt.values[0] = value;
-        // Persist experiment draft â€” prompt-axis first value changed
+        // Persist experiment draft ├óΓé¼ΓÇ¥ prompt-axis first value changed
         _saveExperimentDraftFromState(state);
       }
       const presetId = state.playground.selectedBackendId;
@@ -1272,7 +1044,7 @@ function buildActions(state, context) {
       } else {
         delete state.playground.experimentAxes[ctrlId];
       }
-      // Persist experiment draft â€” axes toggles are a persistence trigger
+      // Persist experiment draft ├óΓé¼ΓÇ¥ axes toggles are a persistence trigger
       _saveExperimentDraftFromState(state);
       if (context && context.setPage) {
         context.setPage("playground");
@@ -1296,10 +1068,10 @@ function buildActions(state, context) {
         if (!state.playground.controls) state.playground.controls = {};
         state.playground.controls.prompt = state.playground.experimentAxes[ctrlId].values[0];
       }
-      // Persist experiment draft â€” axis values changed
+      // Persist experiment draft ├óΓé¼ΓÇ¥ axis values changed
       _saveExperimentDraftFromState(state);
       // Re-render when value count changes (add/remove), but NOT on every
-      // keystroke â€” that would thrash the UI during text input.
+      // keystroke ├óΓé¼ΓÇ¥ that would thrash the UI during text input.
       if (values.length !== prevLen && context && context.setPage) {
         context.setPage("playground");
       }
@@ -1328,16 +1100,16 @@ function buildActions(state, context) {
           delete state.playground.runState._localStartTime;
           delete state.playground.runState._cancelling;
         }
-        // Clean up captured running config â€” a new run will re-capture
+        // Clean up captured running config ├óΓé¼ΓÇ¥ a new run will re-capture
         if (state.playground) delete state.playground._runningExperimentConfig;
         _disposeScopedTracker(state);
       }
 
       if (runState && newStatus === "completed" && prevStatus !== "completed") {
-        // A new run completed — the Shelf output is fresh again: clear the
+        // A new run completed ΓÇö the Shelf output is fresh again: clear the
         // stale mark set by Workflow switching.
         if (state.playground) state.playground._shelfStaleOutput = false;
-        // A new run completed â€” re-enable the carousel synchronously so
+        // A new run completed ├óΓé¼ΓÇ¥ re-enable the carousel synchronously so
         // subsequent re-renders and page loads show recent runs again.
         // Done BEFORE the async refresh so the flag does not persist and
         // suppress the hydrated output on the next render.
@@ -1382,7 +1154,7 @@ function buildActions(state, context) {
           }
           if (matched) {
             state.playground._selectedRun = matched;
-            // Never nullify lastRunOutput â€” primaryOutput has already been set.
+            // Never nullify lastRunOutput ├óΓé¼ΓÇ¥ primaryOutput has already been set.
             // Only overwrite if the matched run carries a valid imageUrl.
             if (matched.imageUrl) {
               state.playground.lastRunOutput = matched.imageUrl;
@@ -1393,9 +1165,9 @@ function buildActions(state, context) {
             if (context && context.setPage) context.setPage("playground");
           }
           if (!matched && experimentId) {
-            // V2 has no projection for this run yet — assemble the finalized
+            // V2 has no projection for this run yet ΓÇö assemble the finalized
             // run from the SAME run's history entry so its canonical timings
-            // still reach the timing card (stages → summary → duration).
+            // still reach the timing card (stages ΓåÆ summary ΓåÆ duration).
             // Canvas evidence is untouched: lastRunOutput stays on the
             // polled primaryOutput, never fabricated from history data.
             _fetchSameRunHistoryEntry(apiBase, experimentId).then(function (entry) {
@@ -1422,7 +1194,7 @@ function buildActions(state, context) {
           // Note: setCarouselCleared was already called synchronously above
         });
       } else if (!runState) {
-        // Clearing runState â€” preserve lastRunOutput and _selectedRun so
+        // Clearing runState ├óΓé¼ΓÇ¥ preserve lastRunOutput and _selectedRun so
         // prior result stays visible until new submission enters flight.
         // Also clear captured running config since the run is abandoned.
         if (state.playground) delete state.playground._runningExperimentConfig;
@@ -1435,7 +1207,7 @@ function buildActions(state, context) {
   };
 }
 
-// â”€â”€ Control Group wrapper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Control Group wrapper ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function renderControlGroup(labelText, inputEl) {
   const group = el("div", { class: "comfymodal-studio-control-group" });
@@ -1447,110 +1219,13 @@ function renderControlGroup(labelText, inputEl) {
   return group;
 }
 
-// â”€â”€ Backend Selector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Backend Selector ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Loads runtime presets from the Studio backend abstraction (getRuntimePresets).
 // Filters by feature compatibility when appropriate.
 // In empty state, links to the Backend tab (H10: no Legacy Setup funnels).
 
-function renderBackendSelector(state, actions, context) {
-  const container = el("div", { class: "comfymodal-studio-backend-selector", "data-testid": "backend-selector" });
-
-  const select = el("select", {
-    class: "comfymodal-input comfymodal-studio-select",
-    "data-testid": "backend-select",
-  });
-  select.addEventListener("mousedown", () => {
-    if (state.playground) state.playground._backendSelectInteracting = true;
-  });
-  select.addEventListener("focus", () => {
-    if (state.playground) state.playground._backendSelectInteracting = true;
-  });
-  select.addEventListener("blur", () => {
-    if (state.playground) state.playground._backendSelectInteracting = false;
-  });
-  const loadingOpt = el("option", { value: "", text: "Loading backends…", disabled: true, selected: true });
-  select.appendChild(loadingOpt);
-  select.disabled = true;
-  container.appendChild(select);
-
-    // Async load presets through the Studio abstraction (runtime selectors only)
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  getRuntimePresets({ apiBase }).then((backends) => {
-    if (!select.isConnected) return;
-    while (select.firstChild) select.removeChild(select.firstChild);
-
-    if (!backends || backends.length === 0) {
-      // Empty state: show disabled select + link to Backend tab
-      const emptyOpt = el("option", { value: "", text: "No backends available", disabled: true, selected: true });
-      select.appendChild(emptyOpt);
-      select.disabled = true;
-
-      // Remove any existing empty message and add fresh one linking to Backend tab
-      const existingMsg = container.querySelector(".comfymodal-studio-backend-empty-msg");
-      if (existingMsg) existingMsg.remove();
-
-      // Phase I8: ordinary no-selection empty state via the shared primitive
-      // (copy supplied here; the cleanup marker class is preserved).
-      const backendLink = el("a", {
-        text: "Go to Backend tab to add backends.",
-        style: "color:var(--color-accent);cursor:pointer;",
-        onclick: (e) => {
-          e.preventDefault();
-          if (actions && actions.navigateToBackendTab) actions.navigateToBackendTab();
-        },
-      });
-      const emptyMsg = renderEmptyState({
-        title: "No backends configured.",
-        action: backendLink,
-        testid: "playground-backend-empty",
-      });
-      emptyMsg.classList.add("comfymodal-studio-backend-empty-msg");
-      container.appendChild(emptyMsg);
-      return;
-    }
-
-    // Populate select with loaded backends
-    select.disabled = false;
-    const placeholderOpt = el("option", { value: "", text: "Select a backend…", disabled: true, selected: true });
-    select.appendChild(placeholderOpt);
-
-    const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
-    backends.forEach((b) => {
-      const compat = b.compatibleFeatures || [];
-      // Show all backends; compatibility is advisory
-      const opt = el("option", { value: b.id || b.label || "", text: b.label || b.id || "Unknown" });
-      if (compat.length > 0 && !compat.includes(currentFeatureId)) {
-        opt.style.opacity = "0.5";
-        opt.title = `Not tested with ${currentFeatureId}`;
-      }
-      select.appendChild(opt);
-    });
-
-    // Set current selection from state
-    const currentId = state.playground && state.playground.selectedBackendId;
-    if (currentId) {
-      select.value = currentId;
-    }
-
-    // Wire change handler to update state
-    select.addEventListener("change", () => {
-      if (actions && actions.setBackend) {
-        actions.setBackend(select.value);
-      }
-    });
-  }).catch(() => {
-    if (!select.isConnected) return;
-    while (select.firstChild) select.removeChild(select.firstChild);
-    const errOpt = el("option", { value: "", text: "Could not load backends", disabled: true, selected: true });
-    select.appendChild(errOpt);
-    select.disabled = true;
-  });
-
-  return container;
-}
-
-// â”€â”€ Workflow Run Selector (modern workflow-driven runs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Workflow Run Selector (modern workflow-driven runs) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Renders a Workflow / Version / Preset selector backed by the frozen
 // web/studio-workflow-run.js logic module. When a workflow+version is
@@ -1566,62 +1241,50 @@ function renderBackendSelector(state, actions, context) {
 let _workflowModelLibraryCache = null;
 let _workflowModelLibraryCacheKey = "";
 
+/**
+ * Load the model inventory the run gate needs, once per apiBase.
+ *
+ * Compatibility is a server-owned answer, but the browser still needs the
+ * inventory to know WHICH model the selected version actually references.
+ * Failures degrade to an empty inventory: model compatibility then falls back
+ * to the version's own dependency metadata, and an unknown model never blocks
+ * a run on a catalogue miss alone.
+ *
+ * Must never throw ΓÇö it is awaited inside the Workflow-change handler, and a
+ * rejection there would strand the run store mid-selection.
+ */
+async function _loadWorkflowModelLibrary(state, apiBase) {
+  const pg = state && state.playground;
+  if (!pg) return [];
+  const base = apiBase || "/comfymodal";
+  if (_workflowModelLibraryCacheKey !== base || !_workflowModelLibraryCache) {
+    let records = [];
+    try {
+      const data = await listModels(base);
+      if (data && data.status !== "error" && Array.isArray(data.models)) {
+        records = data.models;
+      }
+    } catch (e) {
+      records = [];
+    }
+    _workflowModelLibraryCache = records;
+    _workflowModelLibraryCacheKey = base;
+  }
+  pg._workflowModelLibrary = _workflowModelLibraryCache;
+  return _workflowModelLibraryCache;
+}
+
 function _isModernRunSelected(state) {
   const store = state && state.playground && state.playground._workflowRun;
   return !!(store && store.workflowId && store.workflowVersionId);
 }
 
 function _workflowOptionLabel(w) {
-  const name = (w && w.name) ? w.name : "Unnamed workflow";
-  if (w && w.version_count != null) {
-    return name + " (" + w.version_count + " version" + (w.version_count === 1 ? "" : "s") + ")";
-  }
-  if (w && w.latest_version_number != null) {
-    return name + " (v" + w.latest_version_number + ")";
-  }
-  return name;
+  // A workflow has one current version, so the chooser shows just the name.
+  // Version counts/numbers are internal history, not a choice to offer here.
+  return (w && w.name) ? w.name : "Unnamed workflow";
 }
 
-function _workflowVersionOptionLabel(v) {
-  const label = "v" + (v && v.version_number != null ? v.version_number : "?");
-  const created = (v && v.created_at) ? _workflowShortDate(v.created_at) : "";
-  return created ? label + " \u00b7 " + created : label;
-}
-
-function _workflowShortDate(iso) {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return String(iso);
-  try {
-    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
-  } catch (e) {
-    return String(iso);
-  }
-}
-
-async function _loadWorkflowModelLibrary(state, apiBase) {
-  try {
-    if (_workflowModelLibraryCacheKey === apiBase && _workflowModelLibraryCache) {
-      if (state && state.playground) state.playground._workflowModelLibrary = _workflowModelLibraryCache;
-      return _workflowModelLibraryCache;
-    }
-    const data = await listModels(apiBase);
-    const records = (data && Array.isArray(data.models)) ? data.models : [];
-    _workflowModelLibraryCache = records;
-    _workflowModelLibraryCacheKey = apiBase;
-    if (state && state.playground) state.playground._workflowModelLibrary = records;
-    return records;
-  } catch (e) {
-    if (state && state.playground) state.playground._workflowModelLibrary = [];
-    return [];
-  }
-}
-
-/**
- * True when the selected workflow/version declares a non-empty model
- * compatibility contract. With no declared contract every enum model is
- * treated as compatible (no suffix, no gating).
- */
 function _workflowHasModelContract(store) {
   const ctx = store && store.runContext;
   if (!ctx) return false;
@@ -1679,7 +1342,7 @@ function workflowGatingInfo(store, wf, state) {
   if (store.statusLine) return { text: store.statusLine, color: "#d9a441" };
   if (store.status === "error") return { text: store.error || "Load error", color: "#f87171" };
   if (!store.workflowId) return { text: "Select a workflow", color: "" };
-  if (!store.workflowVersionId) return { text: "Select a version", color: "" };
+  if (!store.workflowVersionId) return { text: "Select a Workflow", color: "" };
   if (store.status === "loading" || !wf || !store.runContext) {
     return { text: store.status === "loading" ? "Loading\u2026" : "Loading workflow\u2026", color: "" };
   }
@@ -1717,74 +1380,6 @@ function _workflowSelectEl(state, actions, context) {
   return select;
 }
 
-function _workflowVersionSelectEl(state, actions, context) {
-  // The Shelf runs the Workflow's current version. Internal immutable
-  // revisions are retained for compatibility and provenance but are not
-  // selectable here.
-  const store = state && state.playground && state.playground._workflowRun;
-  if (!store || !store.workflowId) {
-    return el("span", {
-      class: "comfymodal-input comfymodal-studio-select",
-      "data-testid": "workflow-version-selector",
-      text: "No workflow selected",
-    });
-  }
-  const versions = store.versions || [];
-  const workflow = (store.library || []).find(
-    (w) => String(w.workflow_id) === String(store.workflowId)
-  );
-  // An explicit Workflows/admin compatibility handoff is a deterministic
-  // replay path and may intentionally pin an immutable historical revision.
-  const handoffVersion = store.handoff && store.handoff.workflowVersionId
-    ? versions.find((v) => String(v.workflow_version_id) === String(store.handoff.workflowVersionId))
-    : null;
-  const current = handoffVersion || versions.find(
-    (v) => String(v.workflow_version_id) === String(workflow && workflow.latest_version_id)
-  ) || versions
-    .filter((v) => v && v.workflow_version_id)
-    .slice()
-    .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0];
-  if (!current) {
-    return el("span", {
-      class: "comfymodal-input comfymodal-studio-select",
-      "data-testid": "workflow-version-selector",
-      text: "No version",
-    });
-  }
-  return el("span", {
-    class: "comfymodal-input comfymodal-studio-select",
-    "data-testid": "workflow-version-selector",
-    "data-version-id": String(current.workflow_version_id),
-    text: _workflowVersionOptionLabel(current),
-  });
-}
-
-function _workflowPresetSelectEl(state, actions, context) {
-  const store = state && state.playground && state.playground._workflowRun;
-  const select = el("select", {
-    class: "comfymodal-input comfymodal-studio-select",
-    "data-testid": "workflow-preset-selector",
-  });
-  if (!store || !store.workflowVersionId) {
-    select.appendChild(el("option", { value: "", text: "No version selected", disabled: true, selected: true }));
-    select.disabled = true;
-    return select;
-  }
-  const placeholder = el("option", { value: "", text: "Select a preset\u2026", disabled: true });
-  if (!store.presetId) placeholder.selected = true;
-  select.appendChild(placeholder);
-  (store.presets || []).forEach((p) => {
-    const opt = el("option", { value: String(p.preset_id), text: p.name || "Unnamed preset" });
-    if (store.presetId && String(store.presetId) === String(p.preset_id)) opt.selected = true;
-    select.appendChild(opt);
-  });
-  select.disabled = !store.workflowVersionId || (store.presets || []).length === 0;
-  select.addEventListener("change", () => {
-    _handlePresetChange(state, context, actions, select.value);
-  });
-  return select;
-}
-
 function _workflowGatingLineEl(state, wf, context) {
   const store = state && state.playground && state.playground._workflowRun;
   const info = workflowGatingInfo(store, wf, state);
@@ -1811,159 +1406,6 @@ function _workflowGatingLineEl(state, wf, context) {
   return line;
 }
 
-function _workflowControlRow(entry, schemaEntry, store, wf, state, actions, context, compat) {
-  const role = entry.semantic_role;
-  const group = el("div", {
-    class: "comfymodal-studio-control-group",
-    "data-testid": "workflow-control-" + role,
-  });
-  group.appendChild(el("label", { class: "comfymodal-studio-control-label", text: role }));
-
-  const current = (store.controlValues && typeof store.controlValues === "object") ? store.controlValues : {};
-  const hasValue = Object.prototype.hasOwnProperty.call(current, role);
-  const value = hasValue ? current[role] : undefined;
-  const kind = schemaEntry.control_kind || "string";
-  const enumOptions = Array.isArray(schemaEntry.enum_options) ? schemaEntry.enum_options : [];
-  const hasEnums = enumOptions.length > 0;
-  // With no declared compatibility contract every enum model is treated as
-  // compatible (no suffix, no gating).
-  const hasModelContract = _workflowHasModelContract(store);
-
-  // DOMâ†’store round-trip: preserve falsy values verbatim. Number inputs only
-  // convert to Number when the schema kind is integer/float; selects produce
-  // the exact option string (including "" if an option is empty string).
-  function commit(rawValue) {
-    store.setControlValue(role, rawValue);
-    const schema = wf.getControlSchema(store);
-    const validation = wf.validateMappedValues(store.controlValues || {}, schema);
-    store.setControlValues(validation.values);
-    const reasons = validation.errors && validation.errors.length
-      ? validation.errors.map((e) => e.message)
-      : [];
-    // Known incompatible models must not silently execute: mirror the reason
-    // in the store so every gating consumer sees it.
-    const incompatible = _selectedIncompatibleModel(store, wf, compat);
-    if (incompatible) {
-      reasons.push("model '" + incompatible + "' is not compatible with this workflow version");
-    }
-    store.setReasons(reasons);
-    _syncWorkflowGating(state, context, actions);
-  }
-
-  let input = null;
-
-  if (kind === "enum" || hasEnums) {
-    input = el("select", {
-      class: "comfymodal-input comfymodal-studio-select",
-      "data-testid": "workflow-input-" + role,
-    });
-    enumOptions.forEach((opt) => {
-      let text = String(opt);
-      if (hasModelContract && compat && compat.byFilename && Object.prototype.hasOwnProperty.call(compat.byFilename, String(opt))) {
-        const c = compat.byFilename[String(opt)];
-        if (c && c.compatible === false) {
-          text = String(opt) + " (incompatible)";
-        } else if (c && c.installed === false) {
-          text = String(opt) + " (missing)";
-        }
-      }
-      const option = el("option", { value: String(opt), text: text });
-      if (value !== undefined && String(value) === String(opt)) option.selected = true;
-      input.appendChild(option);
-    });
-    input.addEventListener("change", () => commit(input.value));
-  } else if (kind === "boolean") {
-    input = el("input", {
-      type: "checkbox",
-      class: "comfymodal-input comfymodal-studio-checkbox",
-      "data-testid": "workflow-input-" + role,
-    });
-    input.checked = value === true || value === 1 || value === "1" || value === "true";
-    input.addEventListener("change", () => commit(input.checked));
-  } else if (kind === "integer") {
-    input = el("input", {
-      type: "number",
-      step: "1",
-      min: schemaEntry.minimum != null ? String(schemaEntry.minimum) : "",
-      max: schemaEntry.maximum != null ? String(schemaEntry.maximum) : "",
-      class: "comfymodal-input comfymodal-studio-number-input",
-      value: value !== undefined && value !== null ? String(value) : "",
-      "data-testid": "workflow-input-" + role,
-    });
-    input.addEventListener("input", () => {
-      const raw = input.value;
-      const parsed = parseInt(raw, 10);
-      commit(raw === "" || Number.isNaN(parsed) ? raw : parsed);
-    });
-  } else if (kind === "number") {
-    input = el("input", {
-      type: "number",
-      step: schemaEntry.step != null ? String(schemaEntry.step) : "any",
-      min: schemaEntry.minimum != null ? String(schemaEntry.minimum) : "",
-      max: schemaEntry.maximum != null ? String(schemaEntry.maximum) : "",
-      class: "comfymodal-input comfymodal-studio-number-input",
-      value: value !== undefined && value !== null ? String(value) : "",
-      "data-testid": "workflow-input-" + role,
-    });
-    input.addEventListener("input", () => {
-      const raw = input.value;
-      const parsed = parseFloat(raw);
-      commit(raw === "" || Number.isNaN(parsed) ? raw : parsed);
-    });
-  } else if (kind === "multiline") {
-    input = el("textarea", {
-      class: "comfymodal-input comfymodal-studio-textarea",
-      value: value !== undefined && value !== null ? String(value) : "",
-      "data-testid": "workflow-input-" + role,
-    });
-    input.addEventListener("input", () => commit(input.value));
-  } else if (kind === "file" || kind === "image") {
-    // Read-only display of the current filename (upload is out of scope);
-    // the value stays whatever the preset/graph declared.
-    input = el("input", {
-      type: "text",
-      class: "comfymodal-input comfymodal-studio-text-input",
-      value: value !== undefined && value !== null ? String(value) : "",
-      disabled: true,
-      title: "File selection is out of scope — the current value comes from the preset/graph.",
-      "data-testid": "workflow-input-" + role,
-    });
-    group.appendChild(el("span", {
-      class: "comfymodal-studio-control-note",
-      text: "File selection is out of scope — value preserved from preset/graph.",
-      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);",
-    }));
-  } else {
-    input = el("input", {
-      type: "text",
-      class: "comfymodal-input comfymodal-studio-text-input",
-      value: value !== undefined && value !== null ? String(value) : "",
-      "data-testid": "workflow-input-" + role,
-    });
-    input.addEventListener("input", () => commit(input.value));
-  }
-
-  if (input) group.appendChild(input);
-  return group;
-}
-
-function _renderWorkflowMappedControls(container, state, context, actions) {
-  while (container.firstChild) container.removeChild(container.firstChild);
-  const store = state && state.playground && state.playground._workflowRun;
-  const wf = state && state.playground && state.playground._workflowRunModule;
-  if (!store || !wf || !store.runContext || !store.runContext.mapping) return;
-  const entries = Array.isArray(store.runContext.mapping.entries) ? store.runContext.mapping.entries : [];
-  const schema = wf.getControlSchema(store);
-  const modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
-  const compat = wf.modelCompatibility(store, modelRecords);
-  entries.forEach((entry) => {
-    const role = entry && entry.semantic_role;
-    if (!role || !Object.prototype.hasOwnProperty.call(schema, role)) return;
-    const row = _workflowControlRow(entry, schema[role], store, wf, state, actions, context, compat);
-    if (row) container.appendChild(row);
-  });
-}
-
 function _populateWorkflowSelector(container, state, context, actions) {
   while (container.firstChild) container.removeChild(container.firstChild);
   try { _populateWorkflowSelectorInner(container, state, context, actions); } catch (e) {
@@ -1983,8 +1425,6 @@ function _populateWorkflowSelectorInner(container, state, context, actions) {
   const wf = state && state.playground && state.playground._workflowRunModule;
 
   container.appendChild(_workflowSelectEl(state, actions, context));
-  container.appendChild(_workflowVersionSelectEl(state, actions, context));
-  container.appendChild(_workflowPresetSelectEl(state, actions, context));
   container.appendChild(_workflowGatingLineEl(state, wf, context));
 
   if (store && store.handoff) {
@@ -1996,17 +1436,13 @@ function _populateWorkflowSelectorInner(container, state, context, actions) {
     }));
   }
   if (store && store.handoffError) {
-    container.appendChild(el("div", {
+container.appendChild(el("div", {
       "data-testid": "workflow-handoff-error",
       class: "comfymodal-studio-empty-state",
       text: store.handoffError,
       style: "font-size:var(--font-size-xs);color:#f87171;margin-top:4px;",
     }));
   }
-
-  const controlsBox = el("div", { "data-testid": "workflow-mapped-controls" });
-  _renderWorkflowMappedControls(controlsBox, state, context, actions);
-  container.appendChild(controlsBox);
 }
 
 function _rerenderWorkflowSection(state, context, actions, opts) {
@@ -2015,7 +1451,7 @@ function _rerenderWorkflowSection(state, context, actions, opts) {
   // Shelf: normalize an array-shaped control_schema (as served by the
   // deterministic workflow mock) into the role-keyed object the frozen
   // run-context contract uses (real backend serves a dict). No-op when the
-  // schema is already an object — every downstream consumer (mapped
+  // schema is already an object ΓÇö every downstream consumer (mapped
   // controls, gating, validation, run payload, Shelf) reads it through
   // getControlSchema, so one normalization point fixes them uniformly.
   _normalizeShelfControlSchema(state);
@@ -2068,7 +1504,7 @@ function renderWorkflowSelector(state, context, actions) {
   return container;
 }
 
-// â”€â”€ Workflow run init / selection flows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Workflow run init / selection flows ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function _peekWorkflowHandoff(wf) {
   try {
@@ -2141,9 +1577,7 @@ function _failWorkflowHandoff(wf, store, error) {
   store.setReasons([error]);
   store.setWorkflowId("");
   store.setVersionId("");
-  store.setPresetId("");
   store.setWorkflowName("");
-  store.setPresetName("");
   store.setRunContext(null);
   store.controlValues = {};
   store.setStatus("idle");
@@ -2155,7 +1589,7 @@ function _failWorkflowHandoff(wf, store, error) {
 
 async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  const missing = "Requested workflow/version/preset no longer available";
+  const missing = "Requested workflow/version no longer available";
 
   const wfRes = await wf.selectWorkflow(apiBase, store, handoff.workflowId);
   if (!wfRes.ok) {
@@ -2174,19 +1608,6 @@ async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff
       return;
     }
   }
-  if (handoff.presetId) {
-    const presetExists = (store.presets || []).some((p) => String(p.preset_id) === String(handoff.presetId));
-    if (!presetExists) {
-      _failWorkflowHandoff(wf, store, missing);
-      return;
-    }
-    const preRes = await wf.selectPreset(apiBase, store, handoff.presetId);
-    if (!preRes.ok) {
-      _failWorkflowHandoff(wf, store, preRes.error || missing);
-      return;
-    }
-  }
-
   // Consume + validate the one-shot handoff against the now-loaded data.
   const h = wf.resolveHandoffSelection(store);
   if (!h || !h.ok) {
@@ -2198,9 +1619,7 @@ async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff
   wf.saveWorkflowSelection({
     workflowId: store.workflowId,
     workflowVersionId: store.workflowVersionId,
-    presetId: store.presetId,
     workflowName: store.workflowName || "",
-    presetName: store.presetName || "",
   });
   _loadPersistedSelectionResult(state, store, null, context);
 }
@@ -2221,39 +1640,28 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
     wf.clearWorkflowSelection();
     return;
   }
-  // Ordinary Shelf restore always follows the Workflow's current pointer.
-  // An old saved id is not an implicit historical replay path: there is no
-  // user-facing chooser that could recover from being pinned to it.
-  const versions = store.versions || [];
-  const target = versions.find(
-    (v) => String(v.workflow_version_id) === String(workflow.latest_version_id)
-  ) || versions
-    .filter((v) => v && v.workflow_version_id)
-    .slice()
-    .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0];
-  if (!target) {
-    store.statusLine = "Workflow has no current version";
-    store.setVersionId("");
-    store.setPresetId("");
-    store.setPresetName("");
-    store.controlValues = {};
-    store.setStatus("ready");
-    store.setReasons(["Workflow has no current version"]);
-    return;
-  }
-  const verRes = await wf.selectVersion(apiBase, store, target.workflow_version_id);
-  if (!verRes.ok) {
-    store.statusLine = verRes.error || "Workflow current version is unavailable";
-    return;
-  }
-  if (saved.presetId) {
-    const presetExists = (store.presets || []).some((p) => String(p.preset_id) === String(saved.presetId));
-    if (presetExists) {
-      const preRes = await wf.selectPreset(apiBase, store, saved.presetId);
-      if (!preRes.ok) {
-        store.statusLine = preRes.error || "Requested preset no longer available";
-        return;
-      }
+  if (saved.workflowVersionId) {
+    // A workflow has one version, so a restored id is a hint, not a choice.
+    // Snap to whatever the workflow's latest is now rather than failing when
+    // the saved version is gone: the run context is version-agnostic to the
+    // user, who has no way to pick a different one any more.
+    const wanted = String(saved.workflowVersionId);
+    const versions = store.versions || [];
+    const target =
+      versions.find((v) => String(v.workflow_version_id) === wanted)
+      || versions[versions.length - 1];
+    if (!target) {
+      store.statusLine = "Requested version no longer available";
+      store.setVersionId("");
+      store.controlValues = {};
+      store.setStatus("ready");
+      store.setReasons(["Requested version no longer available"]);
+      return;
+    }
+    const verRes = await wf.selectVersion(apiBase, store, target.workflow_version_id);
+    if (!verRes.ok) {
+      store.statusLine = verRes.error || "Requested version no longer available";
+      return;
     }
   }
   await _loadWorkflowModelLibrary(state, apiBase);
@@ -2279,9 +1687,7 @@ async function _handleWorkflowChange(state, context, actions, workflowId) {
     wf.saveWorkflowSelection({
       workflowId: store.workflowId,
       workflowVersionId: store.workflowVersionId,
-      presetId: store.presetId,
       workflowName: store.workflowName || "",
-      presetName: store.presetName || "",
     });
     _loadPersistedSelectionResult(state, store, null, context);
   }
@@ -2289,27 +1695,7 @@ async function _handleWorkflowChange(state, context, actions, workflowId) {
   _rerenderWorkflowSection(state, context, actions, { applySaved: true });
 }
 
-async function _handlePresetChange(state, context, actions, presetId) {
-  const store = state && state.playground && state.playground._workflowRun;
-  const wf = state && state.playground && state.playground._workflowRunModule;
-  if (!store || !wf) return;
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  store.handoffError = null;
-  const result = await wf.selectPreset(apiBase, store, presetId || "");
-  if (result && result.ok) {
-    wf.saveWorkflowSelection({
-      workflowId: store.workflowId,
-      workflowVersionId: store.workflowVersionId,
-      presetId: store.presetId,
-      workflowName: store.workflowName || "",
-      presetName: store.presetName || "",
-    });
-    _loadPersistedSelectionResult(state, store, null, context);
-  }
-  _rerenderWorkflowSection(state, context, actions);
-}
-
-// â”€â”€ Run button gating (modern mode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Run button gating (modern mode) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function _remoteGoldenSelected() {
   // A selected Golden profile executes on the deployed Modal container, so the
@@ -2362,7 +1748,7 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
     btn.disabled = true;
     btn.textContent = "Run";
     btn.title = reasons.length ? reasons.join("; ") : "Not runnable";
-    // See above â€” no competing legacy onclick while gated in modern mode.
+    // See above ├óΓé¼ΓÇ¥ no competing legacy onclick while gated in modern mode.
     btn.onclick = null;
     if (reason && reasons.length) {
       reason.appendChild(el("p", {
@@ -2404,7 +1790,7 @@ function _syncRunButtonGating(state, context, actions) {
   _applyModernRunButtonState(state, context, actions, btn, reason);
 }
 
-// â”€â”€ Modern run submission â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Modern run submission ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 async function _modernRunSubmit(state, context, actions, btn, requestId) {
   const store = state && state.playground && state.playground._workflowRun;
@@ -2468,11 +1854,11 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   const schema = wf.getControlSchema(store);
 
   ctrl.mark("validation_start");
-  const presetObj = (store.presets || []).find(function (p) {
-    return String(p.preset_id) === String(store.presetId || "");
-  }) || null;
-  const merged = wf.mergePresetAndOverrides(presetObj, store.controlValues || {}, schema);
-  const directSelection = resolveSelectionResultKey(state, store);
+  const merged = wf.mergeDefaultsAndOverrides(
+    wf.defaultValuesFromContext(store),
+    store.controlValues || {},
+    schema,
+  );
   ctrl.mark("validation_end");
   if (merged.errors && merged.errors.length) {
     ctrl.applyLocalError(merged.errors[0].message);
@@ -2506,7 +1892,7 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
 
   ctrl.mark("http_invoked");
   _startGoldenProgressPolling(state, context, requestId, ctrl);
-  const result = await runStudioPreset(apiBase, payload);
+  const result = await runStudioWorkflow(apiBase, payload);
   ctrl.mark("backend_ack");
 
   if (result && result.status === "ok") {
@@ -2516,12 +1902,12 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
       _handleDirectRunResult({ ...result, direct_run: true }, state, context, actions, merged.values, directSelection);
       return;
     }
-    // â”€â”€ Direct run: result is already completed, no polling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Direct run: result is already completed, no polling ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
     if (_handleDirectRunResult(result, state, context, actions, merged.values, directSelection)) {
       _stopGoldenProgressPolling(state, requestId);
       return;
     }
-    // â”€â”€ Scheduler path: submission, start polling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Scheduler path: submission, start polling ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
     var _inlineSteps = merged.values && merged.values.steps;
     if (ctrl) {
       ctrl.setBackendIds(result.runId || result.experimentId, result.experimentId);
@@ -2546,7 +1932,7 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   }
 }
 
-// â”€â”€ Info Hint helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Info Hint helper ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Creates a compact info icon with a hover/focus tooltip to replace bulky
 // visible description paragraphs under headings and section labels.
@@ -2569,7 +1955,7 @@ export function createInfoHint(text, options) {
     role: "tooltip",
     "aria-label": text,
   });
-  hint.textContent = "\u24d8";  // â“˜ circled info icon
+  hint.textContent = "\u24d8";  // ├óΓÇ£╦£ circled info icon
 
   const tooltip = el("span", {
     class: "comfymodal-studio-tooltip",
@@ -2588,7 +1974,7 @@ export function createInfoHint(text, options) {
   return hint;
 }
 
-// â”€â”€ Render a single control â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Render a single control ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Schema-driven rendering: if the preset carries a controlSchemas entry for
 // this control ID, the schema's ``kind`` field (from the backend graph) takes
@@ -2630,7 +2016,7 @@ function renderControl(def, state, actions, preset) {
 
   let input;
 
-  // â”€â”€ Schema-kind dispatch (backend truth) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Schema-kind dispatch (backend truth) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   if (schemaKind === "enum") {
     // Enum: render as <select> with options from the schema
     const options = schema.options || [];
@@ -2656,7 +2042,7 @@ function renderControl(def, state, actions, preset) {
       class: "comfymodal-input comfymodal-studio-checkbox",
       "data-testid": `input-${def.id}`,
     });
-    // Preserve falsy zero/false â€” only truly missing treated as default
+    // Preserve falsy zero/false ├óΓé¼ΓÇ¥ only truly missing treated as default
     const isChecked = value === true || value === 1 || value === "1" || value === "true";
     input.checked = isChecked;
     input.addEventListener("change", () => {
@@ -2715,7 +2101,7 @@ function renderControl(def, state, actions, preset) {
     });
   }
 
-  // â”€â”€ Static CONTROL_DEFS type dispatch (fallback) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Static CONTROL_DEFS type dispatch (fallback) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   if (!input) {
     if (def.type === "textarea") {
       var tareaClass = "comfymodal-input comfymodal-studio-textarea";
@@ -2760,7 +2146,7 @@ function renderControl(def, state, actions, preset) {
           value: value != null ? String(value) : "",
           disabled: true,
           "data-testid": `input-${def.id}`,
-          title: "Schema options unavailable — value preserved from saved defaults",
+          title: "Schema options unavailable ΓÇö value preserved from saved defaults",
         });
         const note = el("span", {
           class: "comfymodal-studio-control-note",
@@ -2815,7 +2201,7 @@ function renderControl(def, state, actions, preset) {
 
   if (input) group.appendChild(input);
 
-  // â”€â”€ Steps: Use Recommended (N) button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Steps: Use Recommended (N) button ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   // Preset/workflow-backed recommendation (shared with the Steps axis
   // editor).  Hidden when no trustworthy source exists; disabled when
   // the current value already matches the recommendation.
@@ -2855,16 +2241,16 @@ function renderControl(def, state, actions, preset) {
   return group;
 }
 
-// â”€â”€ Run Button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Run Button ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
-// â”€â”€ Single-run submit helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Single-run submit helper ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Immediately submits a single run using visible controls.
 // Deduplicated from the inline handler in renderRunButton so that
 // completed/error state can re-submit in a single click.
 
 function _disposeScopedTracker(state) {
-  // Note: does NOT clean _localElapsedTimer â€” the local timer is owned by
+  // Note: does NOT clean _localElapsedTimer ├óΓé¼ΓÇ¥ the local timer is owned by
   // _startLocalElapsedTimer which handles cleanup and re-creation across
   // new-run boundaries. Terminal cleanup is done by setRunState.
 
@@ -2875,7 +2261,7 @@ function _disposeScopedTracker(state) {
   if (state.playground) state.playground._scopedTracker = null;
 }
 
-// â”€â”€ Canonical run controller (single lifecycle authority) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Canonical run controller (single lifecycle authority) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 // Lazily created once per page; beginRun() on every Run click allocates a
 // fresh canonical runId. The canonical store drives runState via a pure
 // projection; legacy lifecycle fields are outputs, never independent inputs.
@@ -2944,7 +2330,7 @@ function _startLocalElapsedTimer(state, context) {
       return;
     }
     _rs2.elapsedMs = Date.now() - _localStart;
-    // DOM-targeted elapsed update â€” avoids full page teardown on every tick
+    // DOM-targeted elapsed update ├óΓé¼ΓÇ¥ avoids full page teardown on every tick
     var elapsedEl = document.querySelector('[data-testid="progress-elapsed"]');
     if (elapsedEl) {
       elapsedEl.textContent = "Elapsed: " + _formatDuration(_rs2.elapsedMs);
@@ -2992,7 +2378,7 @@ function validateControls(controls, preset) {
 }
 
 /**
- * Handle a direct-run completed result â€” no polling or journal needed.
+ * Handle a direct-run completed result ├óΓé¼ΓÇ¥ no polling or journal needed.
  * Returns true when the result was a direct_run and was handled,
  * false when the caller should fall through to the scheduler/polling path.
  */
@@ -3081,137 +2467,6 @@ function _handleDirectRunResult(result, state, context, actions, controls, calle
     });
   }
   return true;
-}
-
-async function doRunSubmit(state, context, actions, clickedBtn) {
-  // T0: request identity origin (literal first line, before any workflow prep)
-  const requestId = crypto.randomUUID();
-  const ui_run_triggered_wall_unix_ms = Date.now();
-  const ui_run_triggered_perf_ms = performance.now();
-  const browser_time_origin_ms = performance.timeOrigin;
-  const requestOriginInfo = {
-    request_id: requestId,
-    trigger_source: "playground_run",
-    ui_run_triggered_wall_unix_ms: ui_run_triggered_wall_unix_ms,
-    ui_run_triggered_perf_ms: ui_run_triggered_perf_ms,
-    browser_time_origin_ms: browser_time_origin_ms,
-  };
-
-  // â”€â”€ Modern workflow mode: never fall back to the legacy preset path â”€â”€
-  // Prefer the actually-clicked button; fall back to the visible primary
-  // run button (never an unscoped first-match that could be hidden/stale).
-  if (_isModernRunSelected(state)) {
-    var _modernBtn = clickedBtn || _resolvePrimaryRunButton();
-    await _modernRunSubmit(state, context, actions, _modernBtn, requestId);
-    return;
-  }
-
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  var ctrl = _getRunController(state, actions);
-  if (!ctrl) return;
-  ctrl.beginRun(undefined, requestId);
-  ctrl.mark("submit_entered");
-  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
-  const selectedId = state.playground && state.playground.selectedBackendId;
-  if (!selectedId) return;
-
-  const { listPresets } = await import("./studio-backend-api.js");
-  ctrl.mark("build_start");
-  const presets = await listPresets(apiBase) || [];
-  const preset = presets.find(function (p) { return (p.id || p.label || "") === selectedId; });
-  if (!preset) return;
-  ctrl.mark("build_end");
-
-  const controls = buildEffectiveControls(state, preset, currentFeatureId);
-  const directSelection = resolveSelectionResultKey(state, null, {
-    presetId: preset.id || selectedId,
-    featureId: currentFeatureId,
-  });
-
-  ctrl.mark("validation_start");
-  const validationError = validateControls(controls, preset);
-  ctrl.mark("validation_end");
-  if (validationError) {
-    ctrl.applyLocalError(validationError);
-    return;
-  }
-  const modalOptions = await buildStudioModalOptions(apiBase);
-
-  // Clear previous output so canvas shows live progress immediately
-  if (state.playground) {
-    state.playground.lastRunOutput = null;
-    state.playground._selectedRun = null;
-  }
-  // Put determinate sampler fields into running state BEFORE remote call
-  var _runSteps = controls.steps;
-  var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
-  if (state.playground && state.playground.runState) delete state.playground.runState._localStartTime;
-  // Start local elapsed timer immediately on press
-  _startLocalElapsedTimer(state, context);
-
-  // Capture client-side timestamps at press time (top-level `trace` for server)
-  const t0_perf_ms = performance.now();
-  const t0_now = Date.now();
-
-  ctrl.mark("http_invoked");
-  const legacyPayload = {
-    presetId: preset.id || selectedId,
-    featureId: currentFeatureId,
-    controls: controls,
-    modal_options: modalOptions,
-    request_origin: requestOriginInfo,
-    metadata: {
-      source: "studio_playground",
-    },
-    trace: {
-      t0_perf_ms: t0_perf_ms,
-      t0_perf_now_ms: t0_now,
-      t0_client_press_ms: t0_now,
-      request_id: requestId,
-    },
-  };
-  legacyPayload.request_id = requestId;
-  legacyPayload.profile_name = loadGoldenProfileSelection() || modalOptions.golden_profile || null;
-  _startGoldenProgressPolling(state, context, requestId, ctrl);
-  const result = await runStudioPreset(apiBase, legacyPayload);
-  ctrl.mark("backend_ack");
-
-  if (result && result.status === "ok") {
-    if (_isGoldenTerminalResult(result, requestId)) {
-      _stopGoldenProgressPolling(state, requestId);
-      ctrl.applyGoldenPostTerminal();
-      _handleDirectRunResult({ ...result, direct_run: true }, state, context, actions, controls, directSelection);
-      return;
-    }
-    // â”€â”€ Direct run: result is already completed, no polling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if (_handleDirectRunResult(result, state, context, actions, controls, directSelection)) {
-      _stopGoldenProgressPolling(state, requestId);
-      return;
-    }
-
-    // â”€â”€ Scheduler path: result is a submission, start polling â”€â”€â”€â”€â”€â”€â”€
-    // Derive initial sampler maximum from submitted steps control
-    var _submittedSteps = controls.steps;
-    ctrl.setBackendIds(result.runId || result.experimentId, result.experimentId);
-    ctrl.applySubmission({
-      experimentId: result.experimentId || result.runId || "",
-      samplerMaximum: (_submittedSteps != null && Number(_submittedSteps) > 0) ? Number(_submittedSteps) : 0,
-    });
-    ctrl.attachEventSource((context && context.comfyApi) || (context && context.api));
-
-    // Restart local elapsed timer; preserves original _localStartTime
-    _startLocalElapsedTimer(state, context);
-  } else {
-    _stopGoldenProgressPolling(state, requestId);
-    const errMsg = (result && result.message) || "Run failed.";
-    if (result && result.error_code) {
-      console.error("[Studio run] execution failed", {
-        error_code: result.error_code,
-        error: result.error || null,
-      });
-    }
-    ctrl.applyLocalError(errMsg);
-  }
 }
 
 function renderRunButton(state, context, actions) {
@@ -3353,11 +2608,11 @@ function renderRunButton(state, context, actions) {
       messageEl.appendChild(viewLink);
     }
     // Single click: immediately submit another run using visible settings.
-    // Prioritize doRunSubmit so prior image/metadata stays visible until
+    // Prioritize _modernRunSubmit so prior image/metadata stays visible until
     // the new submission enters flight (setRunState("running") clears the
     // completed state and triggers re-render).
     btn.onclick = function () {
-      doRunSubmit(state, context, actions, btn);
+      _modernRunSubmit(state, context, actions, btn);
     };
     return container;
   }
@@ -3390,7 +2645,7 @@ function renderRunButton(state, context, actions) {
     reason.appendChild(dismissBtn);
     // Retry button re-uses the Run button's existing onclick setup
     btn.onclick = function () {
-      doRunSubmit(state, context, actions, btn);
+      _modernRunSubmit(state, context, actions, btn);
     };
     return container;
   }
@@ -3407,207 +2662,23 @@ function renderRunButton(state, context, actions) {
     msgEl.textContent = _canceled ? "Run canceled." : "Run interrupted.";
     reason.appendChild(msgEl);
     btn.onclick = function () {
-      doRunSubmit(state, context, actions, btn);
+      _modernRunSubmit(state, context, actions, btn);
     };
     return container;
   }
 
-  // Async-load presets to determine runnability
-  getRuntimePresets({ apiBase }).then((presets) => {
-    if (!container.isConnected) return;
+  // Gating is driven entirely by the modern workflow run store: there are
+  // no backend presets to load, so no async preset fetch and no legacy
+  // fallback branch.
+  if (container.isConnected) {
     while (reason.firstChild) reason.removeChild(reason.firstChild);
-
-    // Modern workflow mode: gating is driven by the workflow run store.
-    // Never fall back to the legacy preset path when a workflow is selected.
-    if (_isModernRunSelected(state)) {
-      _applyModernRunButtonState(state, context, actions, btn, reason);
-      return;
-    }
-
-    if (!presets || presets.length === 0) {
-      btn.disabled = true;
-      btn.title = "No backend presets configured";
-
-      const p1 = el("p", {
-        text: "No backend presets configured. ",
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      });
-      const link = el("a", {
-        text: "Go to Backend tab",
-        style: "font-size:var(--font-size-sm);color:var(--color-accent);cursor:pointer;",
-        onclick: (e) => {
-          e.preventDefault();
-          actions.navigateToBackendTab();
-        },
-      });
-      reason.appendChild(p1);
-      reason.appendChild(link);
-      reason.appendChild(document.createTextNode(" to create presets."));
-      return;
-    }
-
-    // â”€â”€ Single run mode (also used in experiment mode, since experiment
-    //     mode has its own dedicated "Run Experiment" button) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    const selectedId = state.playground && state.playground.selectedBackendId;
-    if (!selectedId) {
-      btn.disabled = true;
-      btn.title = "Select a backend preset";
-      reason.appendChild(el("p", {
-        text: "Select or create a Backend Preset.",
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      }));
-      return;
-    }
-
-    const preset = presets.find((p) => (p.id || p.label || "") === selectedId);
-    if (!preset) {
-      btn.disabled = true;
-      btn.title = "Selected preset not found";
-      reason.appendChild(el("p", {
-        text: "Selected preset is no longer available.",
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      }));
-      return;
-    }
-
-    const presetRunnable = preset.status === "runnable";
-    const featureCompat = (preset.compatibleFeatures || []).includes(currentFeatureId);
-    let disabledReason = "";
-
-    if (preset.archived) {
-      disabledReason = "This preset is archived.";
-    } else if (!featureCompat) {
-      disabledReason = `This preset does not support "${currentFeatureId}".`;
-    } else if (!presetRunnable && preset.disabledReason) {
-      disabledReason = preset.disabledReason;
-    } else if (!presetRunnable) {
-      disabledReason = "This preset is not runnable.";
-    }
-
-    if (disabledReason) {
-      btn.disabled = true;
-      btn.title = disabledReason;
-      reason.appendChild(el("p", {
-        text: disabledReason,
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      }));
-    } else {
-      btn.disabled = false;
-      btn.title = "";
-      btn.onclick = async () => {
-        btn.disabled = true;
-        btn.textContent = "Running\u2026";
-        var ctrl = _getRunController(state, actions);
-        var requestId = (typeof crypto !== "undefined" && crypto.randomUUID)
-          ? crypto.randomUUID()
-          : "studio-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
-
-        // Build controls early so sampler fields are available for running state
-        if (ctrl) ctrl.mark("build_start");
-        const controls = buildEffectiveControls(state);
-        const directSelection = resolveSelectionResultKey(state, null, {
-          presetId: preset.id || selectedId,
-          featureId: currentFeatureId,
-        });
-        if (ctrl) ctrl.mark("build_end");
-
-        // Clear previous output so canvas shows live progress immediately
-        state.playground.lastRunOutput = null;
-        state.playground._selectedRun = null;
-
-        // Put determinate sampler fields into running state BEFORE remote call
-        var _runSteps = controls.steps;
-        var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
-        if (ctrl) ctrl.beginRun({ samplerMaximum: _runMaxSteps }, requestId);
-        // Start local elapsed timer immediately on press
-        _startLocalElapsedTimer(state, context);
-
-        const validationError = validateControls(controls, preset);
-        if (validationError) {
-          btn.disabled = false;
-          btn.textContent = "Run";
-          if (ctrl) ctrl.applyLocalError(validationError);
-          return;
-        }
-        const modalOptions = await buildStudioModalOptions(apiBase);
-
-        // Capture client-side timestamps at press time (top-level `trace` for server)
-        var t0_perf_ms = performance.now();
-        var t0_now = Date.now();
-
-        if (ctrl) ctrl.mark("http_invoked");
-        const legacyPayload = {
-          presetId: preset.id || selectedId,
-          featureId: currentFeatureId,
-          controls: controls,
-          modal_options: modalOptions,
-          metadata: {
-            source: "studio_playground",
-          },
-          trace: {
-            t0_perf_ms: t0_perf_ms,
-            t0_perf_now_ms: t0_now,
-            t0_client_press_ms: t0_now,
-            request_id: requestId,
-          },
-        };
-        legacyPayload.request_id = requestId;
-        legacyPayload.profile_name = loadGoldenProfileSelection() || modalOptions.golden_profile || null;
-        if (ctrl) _startGoldenProgressPolling(state, context, requestId, ctrl);
-        const result = await runStudioPreset(apiBase, legacyPayload);
-        if (ctrl) ctrl.mark("backend_ack");
-
-        if (result && result.status === "ok") {
-          if (_isGoldenTerminalResult(result, requestId)) {
-            _stopGoldenProgressPolling(state, requestId);
-            if (ctrl) ctrl.applyGoldenPostTerminal();
-            _handleDirectRunResult({ ...result, direct_run: true }, state, context, actions, controls, directSelection);
-            return;
-          }
-          // â”€â”€ Direct run: result is already completed, no polling â”€â”€
-          if (_handleDirectRunResult(result, state, context, actions, controls, directSelection)) {
-            _stopGoldenProgressPolling(state, requestId);
-            return;
-          }
-
-          // â”€â”€ Scheduler path: submission, start polling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-          var _inlineSteps = controls.steps;
-          if (ctrl) {
-            ctrl.setBackendIds(result.runId || result.experimentId, result.experimentId);
-            ctrl.applySubmission({
-              experimentId: result.experimentId || result.runId || "",
-              samplerMaximum: (_inlineSteps != null && Number(_inlineSteps) > 0) ? Number(_inlineSteps) : 0,
-            });
-            ctrl.attachEventSource((context && context.comfyApi) || (context && context.api));
-          }
-
-          // Restart local elapsed timer; preserves original _localStartTime
-          _startLocalElapsedTimer(state, context);
-        } else {
-          _stopGoldenProgressPolling(state, requestId);
-          const errMsg = (result && result.message) || "Run failed.";
-          if (ctrl) ctrl.applyLocalError(errMsg);
-        }
-      };
-    }
-  }).catch(() => {
-    if (!container.isConnected) return;
-    if (_isModernRunSelected(state)) {
-      while (reason.firstChild) reason.removeChild(reason.firstChild);
-      _applyModernRunButtonState(state, context, actions, btn, reason);
-      return;
-    }
-    while (reason.firstChild) reason.removeChild(reason.firstChild);
-    reason.appendChild(el("p", {
-      text: "Could not load presets.",
-      style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-    }));
-  });
+    _applyModernRunButtonState(state, context, actions, btn, reason);
+  }
 
   return container;
 }
 
-// â”€â”€ Progress Section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Progress Section ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Displays shared progress state: overall bar, current stage/node, sampler
 // step progress, completed/total nodes, elapsed time, queue/startup state,
@@ -3730,8 +2801,8 @@ function _goldenStageTimingText(stage) {
   const start = stage && stage.started ? (stage.started.entryMonotonicNs ?? stage.started.entryWallNs) : null;
   const terminal = stage && (stage.completed || stage.failed);
   const end = terminal ? (terminal.endMonotonicNs ?? terminal.endWallNs) : null;
-  return "start: " + _formatGoldenNs(start) + " · end: " + _formatGoldenNs(end)
-    + " · " + _formatGoldenTiming(stage && stage.durationMs);
+  return "start: " + _formatGoldenNs(start) + " ┬╖ end: " + _formatGoldenNs(end)
+    + " ┬╖ " + _formatGoldenTiming(stage && stage.durationMs);
 }
 
 function _appendGoldenProgress(section, runState) {
@@ -3746,7 +2817,7 @@ function _appendGoldenProgress(section, runState) {
     list.appendChild(el("div", {
       "data-testid": "progress-golden-stage-row",
       "data-stage": stage.stage,
-      text: stage.stage + " — " + phaseText + " · " + _goldenStageTimingText(stage),
+      text: stage.stage + " ΓÇö " + phaseText + " ┬╖ " + _goldenStageTimingText(stage),
       style: stage.phase === "failed" ? "color:var(--color-danger,#f87171);" : "color:#aaa;",
     }));
   });
@@ -3760,12 +2831,12 @@ function _appendGoldenProgress(section, runState) {
   }
 }
 
-// â”€â”€ Legacy Experiment grid viewport â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Legacy Experiment grid viewport ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 // Retired in Wave D: filmstrip experiments now open History V2 detail.
 
 function _formatDuration(ms) {
   if (ms == null) return "0ms";
-  // Safe numeric conversion â€” never call .toFixed on a non-number
+  // Safe numeric conversion ├óΓé¼ΓÇ¥ never call .toFixed on a non-number
   if (typeof ms !== "number") {
     ms = Number(ms);
     if (isNaN(ms)) return "0ms";
@@ -3777,7 +2848,7 @@ function _formatDuration(ms) {
   return m + "m " + s.toFixed(0) + "s";
 }
 
-// â”€â”€ DOM Progress Patch (avoids full page teardown for frequent updates) â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ DOM Progress Patch (avoids full page teardown for frequent updates) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function _domPatchProgress(state) {
   var rs = state.playground && state.playground.runState;
@@ -3854,7 +2925,7 @@ function _domPatchProgress(state) {
       stageList.appendChild(el("div", {
         "data-testid": "progress-golden-stage-row",
         "data-stage": stage.stage,
-        text: stage.stage + " — " + stage.phase + " · " + _goldenStageTimingText(stage),
+        text: stage.stage + " ΓÇö " + stage.phase + " ┬╖ " + _goldenStageTimingText(stage),
         style: stage.phase === "failed" ? "color:var(--color-danger,#f87171);" : "color:#aaa;",
       }));
     });
@@ -3870,7 +2941,7 @@ function _domPatchProgress(state) {
   }
 }
 
-// â”€â”€ Favorite Star â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Favorite Star ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function renderFavoriteStar(nr, actions, apiBase) {
   var isFav = nr.favorite;
@@ -3912,7 +2983,7 @@ function renderFavoriteStar(nr, actions, apiBase) {
 
     var writePromise;
     if (nr._historyKind) {
-      // History V2 record â€” durable annotation authority
+      // History V2 record ├óΓé¼ΓÇ¥ durable annotation authority
       writePromise = _getRecentRunsRepo(apiBase).then(function (repo) {
         return repo.setFavorite(nr.id, newFav);
       });
@@ -3932,7 +3003,7 @@ function renderFavoriteStar(nr, actions, apiBase) {
   return star;
 }
 
-// â”€â”€ Note Editor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Note Editor ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function renderNoteEditor(nr, actions, apiBase) {
   var container = el("div", {
@@ -4009,7 +3080,7 @@ function renderNoteEditor(nr, actions, apiBase) {
     var noteValue = textarea.value;
     var writePromise;
     if (nr._historyKind) {
-      // History V2 record â€” durable annotation authority
+      // History V2 record ├óΓé¼ΓÇ¥ durable annotation authority
       writePromise = _getRecentRunsRepo(apiBase).then(function (repo) {
         return repo.setNote(nr.id, noteValue);
       });
@@ -4054,11 +3125,11 @@ function renderNoteEditor(nr, actions, apiBase) {
   return container;
 }
 
-// â”€â”€ Right Workspace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Right Workspace ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function renderWorkspace(state, context) {
   // Shelf: the right-side workspace is the single result panel (output
-  // canvas, progress, metadata, recent filmstrip) — never a movable card.
+  // canvas, progress, metadata, recent filmstrip) ΓÇö never a movable card.
   const workspace = el("div", { class: "comfymodal-studio-workspace", "data-testid": "workspace", "data-shelf-output-panel": "true" });
 
   // Feature tabs
@@ -4079,7 +3150,7 @@ function renderWorkspace(state, context) {
   return workspace;
 }
 
-// â”€â”€ Feature Tabs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Feature Tabs ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function renderFeatureTabs(state, context) {
   const tabs = el("div", { class: "comfymodal-studio-feature-tabs", "data-testid": "feature-tabs" });
@@ -4104,7 +3175,7 @@ function renderFeatureTabs(state, context) {
   return tabs;
 }
 
-// â”€â”€ Canvas â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Canvas ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function renderCanvas(state, context) {
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
@@ -4122,14 +3193,14 @@ function renderCanvas(state, context) {
     canvas.classList.add("is-stale");
     canvas.appendChild(el("p", {
       "data-testid": "shelf-stale-note",
-      text: "Output from the previous Workflow — run to refresh.",
+      text: "Output from the previous Workflow ΓÇö run to refresh.",
       style: "font-size:var(--font-size-xs);color:#d9a441;margin:0 0 6px;",
     }));
   }
   if (currentSpec && currentSpec.isPlaceholder) {
     // Honest disabled placeholder for image-edit features
     const placeholderMsg = el("div", { class: "comfymodal-studio-placeholder-notice", style: "text-align:center;padding:40px 20px;" }, [
-      el("p", { text: `${currentSpec.label} — Not Implemented`, style: "font-weight:var(--font-weight-semibold);margin-bottom:8px;" }),
+      el("p", { text: `${currentSpec.label} ΓÇö Not Implemented`, style: "font-weight:var(--font-weight-semibold);margin-bottom:8px;" }),
       el("p", { text: currentSpec.placeholderReason || "This feature is not available in this release.", style: "font-size:var(--font-size-sm);color:var(--color-text-muted);" }),
     ]);
     canvas.appendChild(placeholderMsg);
@@ -4191,7 +3262,7 @@ function renderLiveReturnControl(state, context) {
   return overlay;
 }
 
-// â”€â”€ Metadata Section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Metadata Section ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Compact metadata section tied to the selected canvas run with summary
 // and collapsible advanced details.
@@ -4207,7 +3278,7 @@ function renderMetadataSection(state, context) {
 
   const selectedRun = state.playground && state.playground._selectedRun;
   if (!selectedRun) {
-    // No run selected â€” show only when a canvas result exists
+    // No run selected ├óΓé¼ΓÇ¥ show only when a canvas result exists
     return section;
   }
 
@@ -4216,7 +3287,7 @@ function renderMetadataSection(state, context) {
   const rqc = nr.requestedControls || {};
   const isFailed = nr.status === "error" || nr.status === "failed";
 
-  // â”€â”€ Summary block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Summary block ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   const summary = el("div", { class: "comfymodal-studio-metadata-summary" });
 
   // Status
@@ -4276,11 +3347,11 @@ function renderMetadataSection(state, context) {
 
   section.appendChild(summary);
 
-  // â”€â”€ Save Output (single-output backend action) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Save Output (single-output backend action) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   // Button visibility follows the record's saved state; the request
   // targets only the selected (primary) output.
   if (nr._historyKind === "generation") {
-    // History V2 record â€” export through the repository by asset id
+    // History V2 record ├óΓé¼ΓÇ¥ export through the repository by asset id
     var _feat = nr.featuredOutput || {};
     var _assetId = _feat.previewAssetId || _feat.originalAssetId || _feat.assetId || "";
     if (_assetId && _feat.exportState !== "exported" && !nr.outputSaved) {
@@ -4358,7 +3429,7 @@ function renderMetadataSection(state, context) {
   }
   }
 
-  // â”€â”€ Timing Summary Card â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Timing Summary Card ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   if (nr.timingStages && nr.timingStages.length > 0) {
     var timingCard = el("div", {
       class: "comfymodal-studio-timing-card",
@@ -4417,7 +3488,7 @@ function renderMetadataSection(state, context) {
     }));
   }
 
-  // â”€â”€ Key generation settings (using shared normalizer) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Key generation settings (using shared normalizer) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   var normalizedSettings = normalizeGenerationSettings(rc, rqc);
   var settingsRow = el("div", { class: "comfymodal-studio-metadata-settings" });
   var genSettings = [];
@@ -4468,7 +3539,7 @@ function renderMetadataSection(state, context) {
     }));
   }
 
-  // â”€â”€ Collapsible toggles (Note | Advanced) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Collapsible toggles (Note | Advanced) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   const togglesRow = el("div", {
     style: "display:flex;gap:12px;margin-top:4px;",
   });
@@ -4508,7 +3579,7 @@ function renderMetadataSection(state, context) {
   togglesRow.appendChild(advancedToggle);
   section.appendChild(togglesRow);
 
-  // â”€â”€ Note panel (collapsible) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Note panel (collapsible) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   const notePanel = el("div", {
     class: "comfymodal-studio-metadata-note-panel",
     style: "display:none;",
@@ -4516,7 +3587,7 @@ function renderMetadataSection(state, context) {
   notePanel.appendChild(renderNoteEditor(nr, actions, apiBase));
   section.appendChild(notePanel);
 
-  // â”€â”€ Advanced panel (collapsible) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Advanced panel (collapsible) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   const advancedPanel = el("div", {
     class: "comfymodal-studio-metadata-advanced",
     style: "display:none;font-size:10px;color:#666;",
@@ -4529,7 +3600,7 @@ function renderMetadataSection(state, context) {
   if (nr.experimentId) advancedItems.push({ label: "Experiment ID", value: nr.experimentId });
   if (nr.snapshotId) advancedItems.push({ label: "Snapshot ID", value: nr.snapshotId });
 
-  // Full timings â€” keep raw JSON accessible in advanced diagnostics
+  // Full timings ├óΓé¼ΓÇ¥ keep raw JSON accessible in advanced diagnostics
   if (nr.durationMs != null) advancedItems.push({ label: "Duration (ms)", value: String(nr.durationMs) });
   if (nr.rawTiming && Object.keys(nr.rawTiming).length > 0) {
     advancedItems.push({ label: "Raw Timings", value: JSON.stringify(nr.rawTiming) });
@@ -4581,7 +3652,7 @@ function renderMetadataSection(state, context) {
       advancedItems.push({ label: "Backend Sources", value: JSON.stringify(diag.backendTimingSources).substring(0, 200) + (JSON.stringify(diag.backendTimingSources).length > 200 ? "\u2026" : "") });
     }
 
-    // Waterfall summary (serialized v2 report) â€” same display text as
+    // Waterfall summary (serialized v2 report) ├óΓé¼ΓÇ¥ same display text as
     // History's Diagnostics panel via the shared buildWaterfallLines helper.
     // Absent (no rows) for legacy records without a waterfall.
     if (diag.waterfall) {
@@ -4633,16 +3704,16 @@ function renderMetadataSection(state, context) {
   return section;
 }
 
-// â”€â”€ Carousel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Carousel ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
 // Image carousel of thumbnails from recent image-producing runs.
 // Clicking a thumbnail updates the main canvas output.
 // Only image-producing runs are shown.
 
-// ── Carousel accessible naming (Phase I8) ─────────────────────────────────
+// ΓöÇΓöÇ Carousel accessible naming (Phase I8) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Every filmstrip button needs a distinguishable accessible name built from
-// stable run context — preset label, truthful status, wall-clock time — and
+// stable run context ΓÇö preset label, truthful status, wall-clock time ΓÇö and
 // a short id tail ONLY when two visible items would otherwise share an
 // identical name. Long ids are never dumped into the label.
 
@@ -4707,7 +3778,7 @@ function renderFilmstrip(state, context) {
   if (isCarouselCleared()) {
     // Guard against stale cache from any other code path
     clearRecentRunsCache();
-    // Phase I8: user-cleared is an ordinary empty state — shared primitive.
+    // Phase I8: user-cleared is an ordinary empty state ΓÇö shared primitive.
     carousel.appendChild(renderEmptyState({
       title: "Recent runs cleared.",
       detail: "Submit a new run to see results here.",
@@ -4717,19 +3788,19 @@ function renderFilmstrip(state, context) {
   }
 
   if (recentRuns == null) {
-    // Phase I8: loading is NOT an empty state — shared loading primitive.
+    // Phase I8: loading is NOT an empty state ΓÇö shared loading primitive.
     carousel.appendChild(renderLoadingState({
-      label: "Loading recent runs…",
+      label: "Loading recent runsΓÇª",
       size: "inline",
       testid: "playground-recent-runs-loading",
     }));
 
-    // Async fetch fills cache â€” on next render it will show
+    // Async fetch fills cache ├óΓé¼ΓÇ¥ on next render it will show
     refreshRecentRuns(apiBase).then(function () {
       if (carousel.isConnected) rerender();
     });
   } else {
-    // â”€â”€ Hidden state: show reveal bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Hidden state: show reveal bar ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
     if (state.playground && state.playground._carouselHidden) {
       const revealBtn = el("button", {
         type: "button",
@@ -4746,7 +3817,7 @@ function renderFilmstrip(state, context) {
       return carousel;
     }
 
-    // â”€â”€ Empty state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Empty state ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
     if (recentRuns.length === 0) {
       // Phase I8: shared generic empty-state primitive.
       carousel.appendChild(renderEmptyState({
@@ -4756,7 +3827,7 @@ function renderFilmstrip(state, context) {
       return carousel;
     }
 
-    // â”€â”€ Header row with actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Header row with actions ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
     const header = el("div", { class: "comfymodal-studio-carousel-header" });
     header.appendChild(el("span", {
       class: "comfymodal-studio-carousel-header-label",
@@ -4765,7 +3836,7 @@ function renderFilmstrip(state, context) {
 
     const actions = el("div", { class: "comfymodal-studio-carousel-actions" });
 
-    // Clear button â€” removes all cached and persisted runs
+    // Clear button ├óΓé¼ΓÇ¥ removes all cached and persisted runs
     actions.appendChild(el("button", {
       type: "button",
       class: "comfymodal-studio-carousel-btn danger",
@@ -4779,7 +3850,7 @@ function renderFilmstrip(state, context) {
       },
     }));
 
-    // Close button â€” hides the carousel (per-session)
+    // Close button ├óΓé¼ΓÇ¥ hides the carousel (per-session)
     actions.appendChild(el("button", {
       type: "button",
       class: "comfymodal-studio-carousel-btn close-btn",
@@ -4822,11 +3893,11 @@ function renderFilmstrip(state, context) {
         "data-expid": isExperiment ? nr.experimentId : "",
         onclick: function () {
           if (isExperiment && nr.experimentId) {
-            // H13: open the durable History V2 owner â€” never the legacy grid.
+            // H13: open the durable History V2 owner ├óΓé¼ΓÇ¥ never the legacy grid.
             requestHistoryRecordFocus(nr.experimentId, "experiment");
             if (context && context.setPage) context.setPage("history");
           } else if (imageUrl && state.playground) {
-            // Ordinary run â€” update canvas with this run's output
+            // Ordinary run ├óΓé¼ΓÇ¥ update canvas with this run's output
             state.playground.lastRunOutput = imageUrl;
             state.playground._selectedRun = nr;
             rerender();
@@ -4872,7 +3943,7 @@ function renderFilmstrip(state, context) {
   return carousel;
 }
 
-// ── Shelf Playground (Studio Workflow effort, leaf 1.2.2) ────────────────
+// ΓöÇΓöÇ Shelf Playground (Studio Workflow effort, leaf 1.2.2) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Normalize an array-shaped run-context control_schema into the role-keyed
 // object form (see _rerenderWorkflowSection). No-op for object schemas.
 // When values were derived while the schema was an array they carry pure
@@ -4907,28 +3978,6 @@ function _normalizeShelfControlSchema(state) {
       repaired[k] = values[k];
     }
   });
-  if (store.presetId && Array.isArray(store.presets)) {
-    var preset = null;
-    for (var i = 0; i < store.presets.length; i++) {
-      if (String(store.presets[i].preset_id) === String(store.presetId)) { preset = store.presets[i]; break; }
-    }
-    var fromPreset = {};
-    if (preset) {
-      if (preset.values && typeof preset.values === "object") {
-        for (var vk in preset.values) {
-          if (Object.prototype.hasOwnProperty.call(preset.values, vk)) fromPreset[vk] = preset.values[vk];
-        }
-      }
-      if (preset.model_choices && typeof preset.model_choices === "object") {
-        for (var mk in preset.model_choices) {
-          if (Object.prototype.hasOwnProperty.call(preset.model_choices, mk)) fromPreset[mk] = preset.model_choices[mk];
-        }
-      }
-    }
-    Object.keys(fromPreset).forEach(function (r) {
-      if (Object.prototype.hasOwnProperty.call(obj, r)) repaired[r] = fromPreset[r];
-    });
-  }
   store.controlValues = repaired;
 }
 
@@ -4942,12 +3991,18 @@ function _normalizeShelfControlSchema(state) {
 //   (web/studio-workflow-picker.js) with a reuse-values prompt; the old
 //   output is marked stale until a new run completes.
 // - Field renderers come from web/studio-field-blocks.js and role names
-//   from web/studio-bindable-inputs.js — no duplicated catalog here.
+//   from web/studio-bindable-inputs.js ΓÇö no duplicated catalog here.
 // - Normal field values + layout autosave durably (studio-playground-state
 //   Shelf lane); experiment-only state lives in the separate local draft
 //   lane and never overwrites Workflow values.
 
 var _SHELF_TYPE = "t2i";
+
+// Mapped roles that are deliberately NOT rendered as Shelf fields. These are
+// model-loader inputs: the files are chosen in the Model Library and already
+// flow through the version's executable prompt, so an editable field here only
+// invited a second, conflicting place to change the model stack.
+var _SHELF_HIDDEN_ROLES = ["model_unet", "clip", "vae", "model", "model_clip", "model_vae"];
 var _SHELF_SAVE_DELAY_MS = 300;
 
 function _shelfStore(state) {
@@ -4974,6 +4029,10 @@ function _shelfEntries(state) {
     if (!e || typeof e !== "object") return false;
     var role = e.semantic_role || e.input_name || "";
     if (!role || role === "output") return false;
+    // Model-loader roles are not editable knobs: the model/CLIP/VAE files are
+    // chosen in the Model Library and already flow through the version's
+    // executable prompt. Rendering them here just invited conflicting edits.
+    if (_SHELF_HIDDEN_ROLES.indexOf(role) !== -1) return false;
     return true;
   }) : [];
 }
@@ -4983,7 +4042,7 @@ function _shelfRoleOf(entry) {
 }
 
 // Catalog-owned role name. Unknown schema roles fall back to the mapping
-// display_name (backend truth) — never a second hardcoded name table.
+// display_name (backend truth) ΓÇö never a second hardcoded name table.
 function _shelfDisplayName(role, entry) {
   var catalog = role && BINDABLE_INPUTS[role];
   if (catalog) return catalog.name;
@@ -5012,7 +4071,7 @@ function _shelfEntryFor(entries, role) {
   return null;
 }
 
-// Mapping control_kind → fixed field-block kind (studio-field-blocks.js).
+// Mapping control_kind ΓåÆ fixed field-block kind (studio-field-blocks.js).
 function _shelfBlockKind(entry) {
   var kind = entry && entry.control_kind;
   if (kind === "multiline") return "multiline";
@@ -5054,7 +4113,7 @@ function _shelfRenderInput(role, entry, value, onChange) {
         class: "comfymodal-input comfymodal-studio-text-input",
         value: value !== undefined && value !== null ? String(value) : "",
         disabled: true,
-        title: "File selection is out of scope — value preserved from preset/graph.",
+        title: "File selection is out of scope ΓÇö value preserved from preset/graph.",
         "data-testid": testid,
       });
       return ro;
@@ -5106,7 +4165,7 @@ function _paintShelfAutosaved() {
   } catch (e) { /* label fallback above */ }
   Array.prototype.forEach.call(document.querySelectorAll('[data-testid="shelf-autosaved"]'), function (node) {
     node.textContent = label;
-    node.title = "Field layout and values save automatically — no Save button needed.";
+    node.title = "Field layout and values save automatically ΓÇö no Save button needed.";
   });
   var pg = null;
   try {
@@ -5131,7 +4190,7 @@ function _flushShelfSave(state) {
 }
 
 // Restore durably autosaved values for the current selection. Only
-// schema-known roles are applied, then re-validated — never invents keys.
+// schema-known roles are applied, then re-validated ΓÇö never invents keys.
 function _applyShelfSavedValues(state) {
   var ready = _shelfReady(state);
   if (!ready) return;
@@ -5357,7 +4416,7 @@ function _populateShelfSection(section, state, context, actions) {
     section.appendChild(el("p", {
       class: "comfymodal-studio-control-note",
       "data-testid": "shelf-empty",
-      text: "Select a Workflow and Version to see Shelf fields.",
+      text: "Select a Workflow to see its fields.",
     }));
     return;
   }
@@ -5379,13 +4438,13 @@ function _populateShelfSection(section, state, context, actions) {
     _openShelfPickerDialog(state, context, actions);
   });
   head.appendChild(switchBtn);
-  // Subtle autosaved indicator — layout and values persist automatically,
+  // Subtle autosaved indicator ΓÇö layout and values persist automatically,
   // so the Shelf never renders a Save button.
   head.appendChild(el("span", {
     class: "comfymodal-studio-shelf-autosaved",
     "data-testid": "shelf-autosaved",
     text: "Autosaved",
-    title: "Field layout and values save automatically — no Save button needed.",
+    title: "Field layout and values save automatically ΓÇö no Save button needed.",
   }));
   section.appendChild(head);
 
@@ -5394,7 +4453,7 @@ function _populateShelfSection(section, state, context, actions) {
     section.appendChild(el("p", {
       class: "comfymodal-studio-control-note",
       "data-testid": "shelf-unmapped",
-      text: "This Workflow version has no mapped fields yet.",
+      text: "This Workflow has no mapped fields yet.",
     }));
     return;
   }
@@ -5520,7 +4579,7 @@ function _syncShelfLegacyVisibility(state) {
   if (controls && controls.isConnected) controls.remove();
 }
 
-// ── Shelf Workflow switching (shared picker + reuse prompt) ─────────────
+// ΓöÇΓöÇ Shelf Workflow switching (shared picker + reuse prompt) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 function _closeShelfDialog() {
   var existing = document.querySelector('[data-testid="shelf-picker-dialog"]');
@@ -5592,7 +4651,7 @@ async function _confirmShelfSwitch(state, context, actions, nextId) {
     var mod = await import("./studio-backend-api.js");
     var ctxRes = await mod.getWorkflowRunContext(apiBase, nextId);
     var rawSchema = (ctxRes && ctxRes.control_schema) || {};
-    // Array-shaped (mock) or role-keyed (backend) — accept both.
+    // Array-shaped (mock) or role-keyed (backend) ΓÇö accept both.
     nextRoles = Array.isArray(rawSchema)
       ? rawSchema.map(function (e) { return (e && (e.semantic_role || e.input_name)) || ""; }).filter(Boolean)
       : Object.keys(rawSchema);
@@ -5611,7 +4670,7 @@ async function _confirmShelfSwitch(state, context, actions, nextId) {
   dialog.appendChild(el("p", {
     text: matching.length
       ? "Reuse " + matching.length + " matching field value(s) from the current Workflow?"
-      : "No matching fields — load the new Workflow defaults?",
+      : "No matching fields ΓÇö load the new Workflow defaults?",
   }));
   var yes = el("button", {
     type: "button",
@@ -5673,9 +4732,7 @@ async function _performShelfSwitch(state, context, actions, nextId, reuse) {
     wf.saveWorkflowSelection({
       workflowId: store.workflowId,
       workflowVersionId: store.workflowVersionId,
-      presetId: store.presetId,
       workflowName: store.workflowName || "",
-      presetName: store.presetName || "",
     });
   }
   // Old output stays visible but stale until a new run completes.

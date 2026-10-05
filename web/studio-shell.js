@@ -35,7 +35,7 @@ const PAGES = {
   playground: { label: "Playground", render: renderPlayground },
   history:    { label: "History",    render: renderHistoryV2 },
   workflows:  { label: "Workflows",  render: renderWorkflows },
-  backend:    { label: "Backend",    render: renderBackend },
+  backend:    { label: "Manage Modal", render: renderBackend },
   settings:   { label: "Settings",   render: renderSettings },
 };
 
@@ -138,6 +138,11 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
       ...context,
       setPage,
       clearRouteFocus,
+      // Pages route through the shell's single authority so no page writes
+      // history itself. Use this for deep links that carry a focus identity
+      // (e.g. Settings → Manage Modal → Workspaces); plain page switches
+      // should use setPage, which drops any previous focus.
+      applyRoute,
     };
     const capturedGen = gen;
     pageContext.setPage = function staleGuardedSetPage(nextPage) {

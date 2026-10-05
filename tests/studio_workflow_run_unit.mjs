@@ -16,7 +16,7 @@ import {
   createWorkflowRunStore,
   defaultValuesFromContext,
   validateMappedValues,
-  mergePresetAndOverrides,
+  mergeDefaultsAndOverrides,
   resolveRunnable,
   buildRunPayload,
   modelCompatibility,
@@ -175,14 +175,11 @@ function makeSelectedStore(ctx = makeRunContext()) {
   store.setWorkflowId(ctx.workflow.workflow_id);
   store.setWorkflowName(ctx.workflow.name);
   store.setVersionId(ctx.version.workflow_version_id);
-  store.setPresetId(ctx.default_preset.preset_id);
-  store.setPresetName(ctx.default_preset.name);
   store.setLibrary([ctx.workflow]);
   store.setVersions([ctx.version]);
-  store.setPresets([ctx.default_preset]);
   store.setRunContext(ctx);
   store.setStatus("ready");
-  store.controlValues = defaultValuesFromContext(store, ctx.default_preset);
+  store.controlValues = defaultValuesFromContext(store);
   return store;
 }
 
@@ -193,12 +190,12 @@ function makeSelectedStore(ctx = makeRunContext()) {
   const store = makeSelectedStore(ctx);
   const defaults = store.controlValues;
 
-  // Preset values win over graph defaults.
-  assert.equal(defaults.prompt, "preset A prompt", "preset prompt wins over graph text");
-  assert.equal(defaults.seed, 111, "preset seed wins over graph seed 0");
-  assert.equal(defaults.steps, 25, "preset steps win over graph steps 20");
+  // Defaults read verbatim from the version's own captured graph.
+  assert.equal(defaults.prompt, "hello world", "graph prompt read verbatim");
+  assert.equal(defaults.seed, 0, "graph seed read verbatim (0 preserved)");
+  assert.equal(defaults.steps, 20, "steps read verbatim from graph");
 
-  // Graph defaults read verbatim from executable_prompt when not in preset.
+  // Every value comes from the graph, verbatim.
   assert.equal(defaults.cfg, 7.0, "cfg read verbatim from graph (float)");
   assert.equal(defaults.sampler, "euler", "sampler read verbatim from graph");
   assert.equal(defaults.scheduler, "normal", "scheduler read verbatim from graph");
@@ -208,18 +205,12 @@ function makeSelectedStore(ctx = makeRunContext()) {
   assert.equal(defaults.negative_prompt, "negative", "negative_prompt read verbatim from graph");
   assert.equal(defaults.model, "sd15_v2.safetensors", "model_choice wins for the model role");
 
-  // 0 preserved: graph seed 0 is kept when no preset value (0 not dropped).
-  const noSeedPreset = {
-    preset_id: "wpres_b", workflow_version_id: "wv1_latest", name: "Preset B",
-    values: { prompt: "preset B prompt", steps: 30 },
-    model_choices: { model: "sd15_v2.safetensors" },
-  };
-  const ctxB = makeRunContext({ default_preset: noSeedPreset });
+  // 0 preserved: graph seed 0 is kept (0 not dropped).
   const storeB = createWorkflowRunStore();
-  storeB.setRunContext(ctxB);
-  const defaultsB = defaultValuesFromContext(storeB, noSeedPreset);
+  storeB.setRunContext(makeRunContext());
+  const defaultsB = defaultValuesFromContext(storeB);
   assert.equal(defaultsB.seed, 0, "graph seed 0 is preserved as 0, not undefined");
-  assert.equal(defaultsB.steps, 30, "preset steps still applied");
+  assert.equal(defaultsB.steps, 20, "graph steps applied");
 
   // false preserved for boolean (graph value false).
   assert.equal(defaults.bool_toggle, false, "boolean graph value false preserved");
@@ -229,7 +220,7 @@ function makeSelectedStore(ctx = makeRunContext()) {
   emptyPromptCtx.version.executable_prompt["6"].inputs.text = "";
   const storeEmpty = createWorkflowRunStore();
   storeEmpty.setRunContext(emptyPromptCtx);
-  const defaultsEmpty = defaultValuesFromContext(storeEmpty, null);
+  const defaultsEmpty = defaultValuesFromContext(storeEmpty);
   assert.equal(defaultsEmpty.prompt, "", "empty string prompt preserved verbatim");
 
   // enum → enum_options[0] when neither preset nor graph defines a value.
@@ -304,44 +295,41 @@ function makeSelectedStore(ctx = makeRunContext()) {
   section("2. validateMappedValues");
 }
 
-// ── 3. mergePresetAndOverrides ───────────────────────────────────────────
+// ── 3. mergeDefaultsAndOverrides ─────────────────────────────────────────
 
 {
   const schema = getControlSchema(makeSelectedStore());
-  const preset = {
-    preset_id: "wpres_a", workflow_version_id: "wv1_latest", name: "Preset A",
-    values: { prompt: "from preset", seed: 111, steps: 25 },
-    model_choices: { model: "krea_model.safetensors" },
+  // Defaults come from the version's own captured graph, not a preset.
+  const defaults = {
+    prompt: "from graph", seed: 111, steps: 25,
+    model: "krea_model.safetensors",
   };
 
-  // Preset values applied.
-  const merged = mergePresetAndOverrides(preset, {}, schema);
-  assert.equal(merged.values.prompt, "from preset");
+  const merged = mergeDefaultsAndOverrides(defaults, {}, schema);
+  assert.equal(merged.values.prompt, "from graph");
   assert.equal(merged.values.seed, 111);
   assert.equal(merged.values.steps, 25);
+  assert.equal(merged.values.model, "krea_model.safetensors");
 
-  // model_choices applied for the model role (overrides plain values).
-  assert.equal(merged.values.model, "krea_model.safetensors", "model_choice wins over values");
-
-  // Override wins over preset.
-  const overridden = mergePresetAndOverrides(preset, { seed: 999, steps: 40 }, schema);
+  // Override wins over the graph default.
+  const overridden = mergeDefaultsAndOverrides(defaults, { seed: 999, steps: 40 }, schema);
   assert.equal(overridden.values.seed, 999, "override seed wins");
   assert.equal(overridden.values.steps, 40, "override steps wins");
-  assert.equal(overridden.values.prompt, "from preset", "unoverridden preset value kept");
+  assert.equal(overridden.values.prompt, "from graph", "unoverridden default kept");
 
   // Errors surfaced.
-  const bad = mergePresetAndOverrides(preset, { steps: 0 }, schema);
+  const bad = mergeDefaultsAndOverrides(defaults, { steps: 0 }, schema);
   assert.ok(bad.errors.some((e) => e.field === "steps" && /must be >= 1/.test(e.message)),
     "invalid override error surfaced");
 
   // Verbatim falsy preservation through merge.
-  const falsy = mergePresetAndOverrides({ values: { seed: 0, cfg: 0.0, bool_toggle: false } }, {}, schema);
+  const falsy = mergeDefaultsAndOverrides({ seed: 0, cfg: 0.0, bool_toggle: false }, {}, schema);
   assert.equal(falsy.values.seed, 0);
   assert.equal(falsy.values.cfg, 0.0);
   assert.equal(falsy.values.bool_toggle, false);
   assert.equal(falsy.errors.some((e) => ["seed", "cfg", "bool_toggle"].includes(e.field)), false,
-    "falsy preset values are valid (only completeness errors remain)");
-  section("3. mergePresetAndOverrides");
+    "falsy graph values are valid (only completeness errors remain)");
+  section("3. mergeDefaultsAndOverrides");
 }
 
 // ── 4. resolveRunnable ───────────────────────────────────────────────────
@@ -364,18 +352,10 @@ function makeSelectedStore(ctx = makeRunContext()) {
   storeBad.setRunContext(unrunnableCtx);
   storeBad.setWorkflowId("wf_text2img");
   storeBad.setVersionId("wv1_latest");
-  storeBad.setPresetId("wpres_a");
   storeBad.setStatus("ready");
   const r2 = resolveRunnable(storeBad);
   assert.equal(r2.runnable, false);
   assert.ok(r2.reasons.includes("missing custom node 'X'"), "backend reason passed through verbatim");
-
-  // false when no preset selected.
-  const noPreset = makeSelectedStore();
-  noPreset.setPresetId("");
-  const r3 = resolveRunnable(noPreset);
-  assert.equal(r3.runnable, false);
-  assert.ok(r3.reasons.includes("no preset selected for version"));
 
   // false when control validation errors.
   const badControl = makeSelectedStore();
@@ -404,12 +384,11 @@ function makeSelectedStore(ctx = makeRunContext()) {
   // Exact top-level keys.
   assert.deepEqual(
     Object.keys(payload).sort(),
-    ["controls", "featureId", "metadata", "modal_options", "preset_id", "trace", "workflow_id", "workflow_version_id"],
-    "payload carries exactly the 8 contract keys"
+    ["controls", "featureId", "metadata", "modal_options", "trace", "workflow_id", "workflow_version_id"],
+    "payload carries exactly the 7 contract keys"
   );
   assert.equal(payload.workflow_id, "wf_text2img");
   assert.equal(payload.workflow_version_id, "wv1_latest");
-  assert.equal(payload.preset_id, "wpres_a");
   assert.equal(payload.featureId, "txt2img");
   assert.deepEqual(payload.modal_options, { execution_mode: "v2" });
   assert.deepEqual(payload.trace, { t0_perf_ms: 1 });
@@ -423,13 +402,13 @@ function makeSelectedStore(ctx = makeRunContext()) {
   assert.ok(payload.controls.prompt, "controls carries prompt");
   assert.equal(payload.controls.seed, 7, "override value lands in controls");
 
-  // Metadata carries source + all 5 identity keys.
+  // Metadata carries source + workflow identity (no preset identity exists).
   assert.equal(payload.metadata.source, "studio_playground");
   assert.equal(payload.metadata.workflow_id, "wf_text2img");
   assert.equal(payload.metadata.workflow_version_id, "wv1_latest");
-  assert.equal(payload.metadata.preset_id, "wpres_a");
   assert.equal(payload.metadata.workflow_name, "Text2Img Workflow");
-  assert.equal(payload.metadata.preset_name, "Preset A");
+  assert.equal("preset_id" in payload.metadata, false, "no preset identity in metadata");
+  assert.equal("preset_name" in payload.metadata, false, "no preset name in metadata");
   assert.equal(payload.metadata.workflow_hash, ctx.version.graph_hash, "workflow_hash = graph_hash");
   section("5. buildRunPayload");
 }
@@ -489,30 +468,24 @@ function makeSelectedStore(ctx = makeRunContext()) {
   saveWorkflowSelection({
     workflowId: "wf_text2img",
     workflowVersionId: "wv1_old",
-    presetId: "wpres_b",
     workflowName: "Text2Img Workflow",
-    presetName: "Preset B",
   });
   const loaded = loadWorkflowSelection();
   assert.deepEqual(loaded, {
     workflowId: "wf_text2img",
     workflowVersionId: "wv1_old",
-    presetId: "wpres_b",
     workflowName: "Text2Img Workflow",
-    presetName: "Preset B",
   });
   clearWorkflowSelection();
   assert.equal(loadWorkflowSelection(), null, "cleared selection loads as null");
 
   // One-shot handoff: returns once, second call null.
-  saveWorkflowHandoff({ workflowId: "wf_text2img", workflowVersionId: "wv1_old", presetId: "wpres_a" });
+  saveWorkflowHandoff({ workflowId: "wf_text2img", workflowVersionId: "wv1_old" });
   const handoff1 = takeWorkflowHandoff();
   assert.deepEqual(handoff1, {
     workflowId: "wf_text2img",
     workflowVersionId: "wv1_old",
-    presetId: "wpres_a",
     workflowName: "",
-    presetName: "",
   });
   assert.equal(takeWorkflowHandoff(), null, "handoff consumed exactly once");
   section("7. persistence + handoff");
@@ -528,33 +501,21 @@ function makeSelectedStore(ctx = makeRunContext()) {
   store.setVersions([ctx.version, {
     workflow_version_id: "wv1_old", version_number: 1, created_at: "2025-01-01T00:00:00.000Z",
   }]);
-  store.setPresets([ctx.default_preset, {
-    preset_id: "wpres_b", workflow_version_id: "wv1_latest", name: "Preset B",
-  }]);
-
   // Valid handoff → ok and applied.
-  saveWorkflowHandoff({ workflowId: "wf_text2img", workflowVersionId: "wv1_old", presetId: "wpres_b" });
+  saveWorkflowHandoff({ workflowId: "wf_text2img", workflowVersionId: "wv1_old" });
   const ok = resolveHandoffSelection(store);
   assert.equal(ok.ok, true);
   assert.equal(store.workflowId, "wf_text2img");
   assert.equal(store.workflowVersionId, "wv1_old");
-  assert.equal(store.presetId, "wpres_b");
   assert.ok(store.handoff, "store keeps the consumed handoff for the notice");
 
   // Missing version → error, no substitution.
   store.setVersionId("wv1_latest");
-  store.setPresetId("wpres_a");
-  saveWorkflowHandoff({ workflowId: "wf_text2img", workflowVersionId: "wv_ghost", presetId: "wpres_a" });
+  saveWorkflowHandoff({ workflowId: "wf_text2img", workflowVersionId: "wv_ghost" });
   const bad = resolveHandoffSelection(store);
   assert.equal(bad.ok, false);
   assert.ok(bad.error, "error message present");
   assert.equal(store.workflowVersionId, "wv1_latest", "no version substitution on failure");
-  assert.equal(store.presetId, "wpres_a", "no preset substitution on failure");
-
-  // Missing preset → error.
-  saveWorkflowHandoff({ workflowId: "wf_text2img", workflowVersionId: "wv1_old", presetId: "wpres_ghost" });
-  const badPreset = resolveHandoffSelection(store);
-  assert.equal(badPreset.ok, false);
 
   // No handoff at all → clean error.
   const none = resolveHandoffSelection(store);
@@ -746,8 +707,8 @@ function g12Report() {
 
 {
   assert.equal(portabilityEndpointPath("wv 1/x"), "/studio/workflows/versions/wv%201%2Fx/portability");
-  assert.equal(exportManifestEndpointPath("wv1", false), "/studio/workflows/versions/wv1/export?include_presets=0");
-  assert.equal(exportManifestEndpointPath("wv1", true), "/studio/workflows/versions/wv1/export?include_presets=1");
+  // Presets no longer exist, so manifest export takes no preset flag.
+  assert.equal(exportManifestEndpointPath("wv1"), "/studio/workflows/versions/wv1/export");
   assert.equal(importManifestQuery(true), "?dry_run=1");
   assert.equal(importManifestQuery(false), "?dry_run=0");
   section("12. endpoint construction");

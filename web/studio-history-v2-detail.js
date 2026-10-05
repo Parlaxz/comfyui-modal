@@ -453,7 +453,14 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       "aria-label": "Note for this generation",
     });
     textarea.value = record.note || "";
-    const statusEl = el("span", { class: "comfymodal-studio-history-v2-action-note" });
+    const statusEl = el("span", {
+      class: "comfymodal-studio-history-v2-action-note",
+      // The download/export/generate statuses carry testids; the note-save
+      // status needs one too so it can be targeted without colliding with
+      // the other three elements that share this class.
+      "data-testid": "history-v2-note-status",
+      role: "status",
+    });
     const saveBtn = el("button", {
       class: "comfymodal-secondary-btn",
       type: "button",
@@ -1185,11 +1192,15 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       runLine,
     ]));
 
-    // 2. Workflow + preset
-    const wf = (record.workflow || "") + (record.workflowVersion ? " v" + record.workflowVersion : "");
+    // 2. Workflow
+    // Version labels arrive both bare ("3") and pre-prefixed ("v3"), so the
+    // "v" is normalized here instead of blindly prepended (which rendered
+    // "vv3").
+    const rawVersion = record.workflowVersion ? String(record.workflowVersion).trim() : "";
+    const versionLabel = rawVersion ? (/^v/i.test(rawVersion) ? rawVersion : "v" + rawVersion) : "";
+    const wf = (record.workflow || "") + (versionLabel ? " " + versionLabel : "");
     appendIfPresent(col, _section("Workflow", [
       _row("Workflow", wf),
-      _row("Preset", record.preset),
     ]));
 
     // 3. Parameters

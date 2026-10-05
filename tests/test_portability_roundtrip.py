@@ -8,7 +8,7 @@ Version
   → Export again
 
 Asserts canonical ``graph_json`` / ``api_prompt_json`` / executable-prompt /
-graph-hash equality, Mapping + Preset semantic equality under reminted ids,
+graph-hash equality, and Mapping semantic equality under reminted ids,
 and manifest identity stability excluding allowed provenance/time metadata.
 No live ComfyUI required.
 """
@@ -65,7 +65,6 @@ class ExactRoundTripTests(unittest.TestCase):
             ".studio_workflows.json",
             ".studio_workflow_versions.json",
             ".studio_workflow_mappings.json",
-            ".studio_workflow_presets.json",
         ):
             path = Path(self.root) / name
             snap[name] = path.read_bytes() if path.exists() else None
@@ -89,25 +88,10 @@ class ExactRoundTripTests(unittest.TestCase):
             entries=MAPPING_BODY["entries"],
             output_node_id=MAPPING_BODY["output_node_id"],
         )
-        preset_a = self.service.create_preset(
-            version["workflow_version_id"],
-            "Quality",
-            description="quality preset",
-            values={"positive_prompt": "a cat", "seed": 7},
-            exposed_controls=["positive_prompt", "seed"],
-            favorite=True,
-            tags=["quality"],
-        )
-        preset_b = self.service.create_preset(
-            version["workflow_version_id"],
-            "Draft",
-            values={"positive_prompt": "draft", "seed": 1},
-        )
-        self.service.set_default_preset(wf["workflow_id"], preset_a["preset_id"])
-        return wf, version, [preset_a, preset_b]
+        return wf, version, []
 
     def _export(self, version_id):
-        result = self.portability.export_manifest(version_id, include_presets=True)
+        result = self.portability.export_manifest(version_id)
         return result["manifest"], result["filename"]
 
     def _remap_ids(self, manifest, id_map):
@@ -124,29 +108,11 @@ class ExactRoundTripTests(unittest.TestCase):
         out["version"]["created_at"] = id_map["created_at"]
         out["mapping"]["mapping_id"] = id_map["wm"]
         out["mapping"]["workflow_version_id"] = id_map["wv"]
-        for preset in out["presets"]:
-            preset["preset_id"] = id_map["presets"][preset["preset_id"]]
-            preset["workflow_version_id"] = id_map["wv"]
-            preset["workflow_id"] = id_map["wf"]
-            preset.pop("created_at", None)
-            preset.pop("updated_at", None)
-        # Preset list order is not semantic (ids are random); compare by name.
-        out["presets"] = sorted(out["presets"], key=lambda p: p.get("name", ""))
         return out
 
-    @staticmethod
-    def _semantic_preset(preset):
-        return {
-            k: preset.get(k)
-            for k in (
-                "name", "description", "values", "model_choices", "lora_values",
-                "exposed_controls", "recommended_values", "favorite", "tags",
-                "dropped_controls", "is_default",
-            )
-        }
 
     def test_full_round_trip_is_exact(self):
-        wf, version, presets = self._build_source()
+        wf, version, _ = self._build_source()
         vid = version["workflow_version_id"]
 
         # ── Export #1 (read-only) ──────────────────────────────────────
@@ -160,16 +126,11 @@ class ExactRoundTripTests(unittest.TestCase):
         preview = self.portability.preview_import(copy.deepcopy(m1))
         self.assertEqual(preview["status"], "preview")
         self.assertTrue(preview["valid"])
-        self.assertEqual(preview["will_create"]["preset_count"], 2)
         self.assertEqual(self._snapshot(), before)
 
         # ── Committed import ───────────────────────────────────────────
-        commit = self.portability.commit_import(
-            copy.deepcopy(m1), import_presets=True, apply_default_preset=True
-        )
+        commit = self.portability.commit_import(copy.deepcopy(m1))
         self.assertEqual(commit["status"], "ok")
-        self.assertEqual(len(commit["preset_ids"]), 2)
-        self.assertTrue(commit["applied_default_preset_id"])
 
         imported_wf_id = commit["workflow_id"]
         imported_versions = self.service.store.list_versions_for_workflow(imported_wf_id)
@@ -183,11 +144,9 @@ class ExactRoundTripTests(unittest.TestCase):
             imported_wf_id,
             imported_vid,
             commit["mapping_id"],
-            *commit["preset_ids"],
         }
         foreign_ids = {
             wf["workflow_id"], vid,
-            presets[0]["preset_id"], presets[1]["preset_id"],
         }
         self.assertEqual(local_ids & foreign_ids, set())
 
@@ -220,30 +179,8 @@ class ExactRoundTripTests(unittest.TestCase):
             canonical(map1["entries"]), canonical(map2["entries"])
         )
 
-        # Presets semantically equal under reminted ids.
-        sem1 = sorted(
-            (canonical(self._semantic_preset(p)) for p in m1["presets"])
-        )
-        sem2 = sorted(
-            (canonical(self._semantic_preset(p)) for p in m2["presets"])
-        )
-        self.assertEqual(sem1, sem2)
-        defaults1 = [p for p in m1["presets"] if p.get("is_default")]
-        defaults2 = [p for p in m2["presets"] if p.get("is_default")]
-        self.assertEqual(len(defaults1), 1)
-        self.assertEqual(len(defaults2), 1)
-        self.assertEqual(defaults1[0]["name"], defaults2[0]["name"])
 
         # Manifest identity stable excluding allowed provenance/time deltas.
-        sorted_pairs = sorted(
-            zip(
-                sorted(m1["presets"], key=lambda p: p["name"]),
-                sorted(m2["presets"], key=lambda p: p["name"]),
-            ),
-            key=lambda pair: pair[0]["name"],
-        )
-        identity_presets = {p1["preset_id"]: p1["preset_id"] for p1, _ in sorted_pairs}
-        reminted_presets = {p2["preset_id"]: p1["preset_id"] for p1, p2 in sorted_pairs}
         base_map = {
             "wf": m1["workflow"]["workflow_id"],
             "wv": m1["workflow"]["version_id"],
@@ -251,8 +188,8 @@ class ExactRoundTripTests(unittest.TestCase):
             "created_at": m1["version"].get("created_at"),
             "name": m1["workflow"]["display"]["name"],
         }
-        n1 = self._remap_ids(m1, {**base_map, "presets": identity_presets})
-        n2 = self._remap_ids(m2, {**base_map, "presets": reminted_presets})
+        n1 = self._remap_ids(m1, base_map)
+        n2 = self._remap_ids(m2, base_map)
         self.assertEqual(
             manifest_codec.manifest_hash(n1, include_metadata=False),
             manifest_codec.manifest_hash(n2, include_metadata=False),
@@ -276,8 +213,8 @@ class ExactRoundTripTests(unittest.TestCase):
     def test_double_import_creates_two_independent_workflows(self):
         wf, version, _ = self._build_source()
         m1, _ = self._export(version["workflow_version_id"])
-        first = self.portability.commit_import(copy.deepcopy(m1), import_presets=True)
-        second = self.portability.commit_import(copy.deepcopy(m1), import_presets=True)
+        first = self.portability.commit_import(copy.deepcopy(m1))
+        second = self.portability.commit_import(copy.deepcopy(m1))
         self.assertNotEqual(first["workflow_id"], second["workflow_id"])
         self.assertNotEqual(first["workflow_version_id"], second["workflow_version_id"])
         self.assertNotEqual(first["mapping_id"], second["mapping_id"])

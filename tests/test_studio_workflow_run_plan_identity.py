@@ -52,7 +52,7 @@ import studio_workflow_run as swr
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan
 from studio_domain import (
     WorkflowDomainService,
-    WorkflowPresetValidationError,
+    WorkflowDomainValidationError,
     derive_mapping_candidates,
 )
 from workflow_metadata import prompt_sha256
@@ -256,11 +256,9 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
         self.wf = self.service.create_workflow("Text2Img Workflow")
         self.version = self._capture_mapped(self.wf["workflow_id"])
         self.version_id = self.version["workflow_version_id"]
-        self.preset = self.service.create_preset(
-            self.version_id, "Preset A", values=default_values()
-        )
-        self.preset_id = self.preset["preset_id"]
-        self.service.set_default_preset(self.wf["workflow_id"], self.preset_id)
+        # No preset exists: the version's own executable prompt supplies the
+        # control defaults, so the run identity carries no preset.
+        self.preset_id = ""
         self.addCleanup(self._tmp.cleanup)
 
     def tearDown(self) -> None:
@@ -296,28 +294,23 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
     def _bundle(self) -> dict:
         with self._service_patcher():
             return swr.resolve_workflow_run_bundle(
-                self.wf["workflow_id"], self.version_id, self.preset_id, self.root
+                self.wf["workflow_id"], self.version_id, self.root
             )
 
     def _clip_repair_bundle(self) -> dict:
         wf = self.service.create_workflow("Clip Repair Workflow")
         version = self._capture_mapped(wf["workflow_id"], clip_repair_prompt())
-        preset = self.service.create_preset(
-            version["workflow_version_id"], "Preset C",
-            values=clip_repair_values(),
-        )
-        self.service.set_default_preset(wf["workflow_id"], preset["preset_id"])
         with self._service_patcher():
             bundle = swr.resolve_workflow_run_bundle(
                 wf["workflow_id"], version["workflow_version_id"],
-                preset["preset_id"], self.root,
+                self.root,
             )
         self.assertEqual(bundle["status"], "ok")
         return bundle
 
     def _merged_values(self, bundle: dict, overrides: dict | None = None) -> dict:
         merged = swr.merge_workflow_controls(
-            bundle["preset"], overrides or {}, bundle["control_schema"]
+            bundle.get("defaults") or {}, overrides or {}, bundle["control_schema"]
         )
         self.assertEqual(merged["errors"], [])
         return merged["values"]
@@ -430,9 +423,10 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
         self.assertEqual(
             meta["workflow_version_id"], bundle["version"]["workflow_version_id"]
         )
-        self.assertEqual(meta["preset_id"], bundle["preset"]["preset_id"])
+        # No preset exists any more: identity is carried by the version alone.
+        self.assertEqual(meta["preset_id"], "")
         self.assertEqual(meta["workflow_name"], bundle["workflow"]["name"])
-        self.assertEqual(meta["preset_name"], bundle["preset"]["name"])
+        self.assertEqual(meta["preset_name"], "")
         self.assertEqual(meta["workflow_hash"], canonical_meta["workflow_hash"])
         # Modern identity: NO legacy studio keys are ever reintroduced.
         for legacy_key in ("studio_preset_id", "studio_snapshot_id", "studio_preset_label"):
@@ -734,7 +728,7 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
                 "allowed_options": {"seed": [0, 1]},
             },
         )
-        with self.assertRaises(WorkflowPresetValidationError) as ctx:
+        with self.assertRaises(WorkflowDomainValidationError) as ctx:
             restarted.autosave_workflow(
                 workflow["workflow_id"], {"experiment_draft": {"axes": ["seed"]}}
             )

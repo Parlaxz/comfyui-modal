@@ -17,7 +17,7 @@ from collections import namedtuple
 from collections.abc import Mapping
 from pathlib import Path
 import traceback as _traceback
-from typing import Any, Sequence
+from typing import Any
 import importlib
 
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,8 +37,6 @@ from comfymodal_runtime.publication_policy import (
     CUSTOM_NODES_VOLUME_NAME as _CUSTOM_NODES_VOLUME_NAME,
 )
 from tools.v2_control.custom_nodes import publish_or_skip
-from tools.v2_control.errors import LockHeldError, LockStaleError
-from tools.v2_control.locking import DeployLock
 
 _local_exact_prefill = env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", default=True)
 print(f"[exact_prefill.local] enabled={int(_local_exact_prefill)} source=env")
@@ -1002,8 +1000,6 @@ _deploy_status = {"state": "idle", "message": ""}
 _last_successful_model_stack: dict = {}
 _latest_benchmark_workflow: dict = {}
 _download_progress: dict = {}
-_studio_custom_node_sync_status: dict[str, dict[str, Any]] = {}
-_studio_custom_node_sync_status_lock = threading.Lock()
 
 _RESULT_ROUTE = os.environ.get("COMFYMODAL_RESULT_ROUTE", "legacy").strip().lower()
 if _RESULT_ROUTE not in ("legacy", "direct"):
@@ -3273,11 +3269,32 @@ async def _execute_job(item: tuple, item_id: int):
 
 
 def _build_custom_nodes_archive(cn_root: str) -> bytes:
-    """Compatibility wrapper around the canonical publication archive builder."""
-    from tools.v2_control.custom_nodes import prepare_publication
+    import io
+    import tarfile
 
-    _identity, archive, _files = prepare_publication(cn_root)
-    return archive
+    def tar_filter(tarinfo):
+        if tarinfo.issym() or tarinfo.islnk():
+            return None
+        if _is_excluded_publication_path(tarinfo.name):
+            return None
+        return tarinfo
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        allowed = set(_iter_syncable_custom_node_dirs(cn_root))
+        for node_dir in (sorted(os.listdir(cn_root)) if os.path.isdir(cn_root) else []):
+            node_path = os.path.join(cn_root, node_dir)
+            if not os.path.isdir(node_path) or os.path.islink(node_path):
+                continue
+            reason = _custom_node_filter_reason(node_dir, node_path) or "production_custom_node"
+            print(
+                f"[comfyui-modal.custom_node_filter] action={'allow' if node_dir in allowed else 'deny'} "
+                f"name={node_dir} reason={reason}",
+                flush=True,
+            )
+        for node_dir in _iter_syncable_custom_node_dirs(cn_root):
+            tar.add(os.path.join(cn_root, node_dir), arcname=node_dir, filter=tar_filter)
+    return buf.getvalue()
 
 
 async def _sync_custom_nodes_and_maybe_deploy(cn_root: str, workspace: dict) -> dict:
@@ -3306,40 +3323,6 @@ async def _sync_custom_nodes_and_maybe_deploy(cn_root: str, workspace: dict) -> 
         result.setdefault("message", "Custom nodes synced to Modal.")
 
     return result
-
-
-def _acquire_studio_publication_lock() -> DeployLock:
-    """Acquire the repo deploy lock without waiting on another publisher.
-
-    The lock file is shared with v2ctl on this checkout.  A proven stale lock
-    is recovered automatically only under the existing bounded policy (dead
-    same-host pid or foreign host older than six hours); a fresh lock is
-    reported to the route instead of being silently replaced.
-    """
-    lock = DeployLock(Path(_NODE_DIR) / ".v2ctl" / "deploy.lock")
-    kwargs = {
-        "owner": "studio-custom-node-publication",
-        "target": _CUSTOM_NODES_VOLUME_NAME,
-        "profile": "studio_custom_nodes",
-    }
-    try:
-        lock.acquire(**kwargs, auto_recover=True)
-    except LockStaleError:
-        # DeployLock deliberately requires explicit force for stale locks.
-        # Studio can recover one only after re-checking the evidence, so a
-        # crashed publisher cannot wedge this route forever.
-        status = lock.status()
-        if status is None or not lock.is_stale(status):
-            raise LockHeldError(
-                "Studio custom-node publication lock changed while checking staleness; "
-                "refusing to replace it"
-            )
-        print(
-            "[custom_nodes.publish] recovering proven stale deploy lock for Studio "
-            f"owner={status.get('owner')} pid={status.get('pid')} host={status.get('host')}"
-        )
-        lock.acquire(**kwargs, force=True)
-    return lock
 
 
 async def _publish_custom_nodes_or_skip(cn_root: str, workspace: dict) -> dict:
@@ -3406,191 +3389,6 @@ async def _publish_custom_nodes_or_skip(cn_root: str, workspace: dict) -> dict:
                 "verified_publication": False,
             },
         }
-
-
-def _studio_custom_node_delivery_mode() -> str:
-    mode = os.environ.get("COMFYMODAL_CUSTOM_NODE_DELIVERY", "image").strip().lower()
-    return mode if mode in {"image", "volume"} else "image"
-
-
-def _studio_sync_status(sync_id: str) -> dict[str, Any] | None:
-    with _studio_custom_node_sync_status_lock:
-        status = _studio_custom_node_sync_status.get(sync_id)
-        return dict(status) if status is not None else None
-
-
-def _set_studio_sync_status(sync_id: str, **updates: Any) -> None:
-    with _studio_custom_node_sync_status_lock:
-        current = _studio_custom_node_sync_status.setdefault(sync_id, {"sync_id": sync_id})
-        current.update(updates)
-
-
-def _run_studio_custom_node_sync(
-    sync_id: str,
-    operation: str,
-    cn_root: str,
-    workspace: dict,
-    publication_lock: DeployLock | None,
-    expected_dependencies: list[str],
-) -> None:
-    _set_studio_sync_status(sync_id, state="running", status="running")
-    try:
-        if operation == "publish":
-            result = asyncio.run(_publish_custom_nodes_or_skip(cn_root, workspace))
-            publication = result.get("publication", {}) if isinstance(result, dict) else {}
-            reason = publication.get("reason")
-            if reason == "destructive_custom_node_publication_blocked":
-                _set_studio_sync_status(
-                    sync_id,
-                    state="blocked",
-                    status="blocked",
-                    outcome="destructive_publication_blocked",
-                    message="Publication refused: it would remove previously-published custom-node content.",
-                    result=result,
-                )
-            elif isinstance(result, dict) and result.get("status") == "ok":
-                _set_studio_sync_status(
-                    sync_id,
-                    state="completed",
-                    status="completed",
-                    outcome="published",
-                    message=result.get("message", "Custom nodes published."),
-                    result=result,
-                )
-            else:
-                _set_studio_sync_status(
-                    sync_id,
-                    state="error",
-                    status="error",
-                    outcome="publication_failed",
-                    message=(result or {}).get("message", "Custom-node publication failed."),
-                    result=result,
-                )
-            return
-
-        # Deliberate dependency rebuilds use the existing deploy worker.  Do
-        # not duplicate Modal invocation or make the fast publication path
-        # implicitly rebuild an image.
-        fingerprint = _build_custom_node_fingerprint(cn_root)
-        deploy = _start_background_deploy(
-            workspace=workspace,
-            custom_nodes_fingerprint=fingerprint,
-            reason="studio_custom_node_dependency_rebuild",
-        )
-        if not deploy.get("started"):
-            _set_studio_sync_status(
-                sync_id,
-                state="refused",
-                status="refused",
-                outcome="deploy_already_running",
-                message="Dependency rebuild refused: a deploy is already running.",
-            )
-            return
-        while _deploy_status.get("state") in {"deploying", "starting"}:
-            time.sleep(0.25)
-        deploy_status = dict(_deploy_status)
-        if deploy_status.get("state") == "error":
-            _set_studio_sync_status(
-                sync_id,
-                state="error",
-                status="error",
-                outcome="dependency_rebuild_failed",
-                message=deploy_status.get("message", "Dependency rebuild failed."),
-                deploy=deploy_status,
-            )
-        else:
-            _set_studio_sync_status(
-                sync_id,
-                state="completed",
-                status="completed",
-                outcome="dependency_rebuilt",
-                message="Dependency rebuild deploy completed.",
-                deploy=deploy_status,
-            )
-    except Exception as exc:
-        _log.exception("Studio custom-node sync failed")
-        _set_studio_sync_status(
-            sync_id,
-            state="error",
-            status="error",
-            outcome="operation_failed",
-            message=str(exc),
-        )
-    finally:
-        _set_studio_sync_status(sync_id, dependencies_changed=list(expected_dependencies))
-        if publication_lock is not None:
-            try:
-                publication_lock.release()
-            except Exception:
-                _log.exception("Studio custom-node publication lock release failed")
-
-
-def _start_studio_custom_node_sync(operation: str, expected_dependencies: Sequence[str]) -> dict[str, Any]:
-    sync_id = str(uuid.uuid4())
-    dependencies = [str(item) for item in expected_dependencies]
-    base = {
-        "sync_id": sync_id,
-        "operation": operation,
-        "delivery_mode": _studio_custom_node_delivery_mode(),
-        "state": "queued",
-        "status": "started",
-        "dependencies_changed": dependencies,
-        "poll_url": f"/comfymodal/studio/custom-nodes/sync/status/{sync_id}",
-    }
-    if base["delivery_mode"] == "image":
-        base.update({
-            "state": "completed",
-            "status": "completed",
-            "outcome": "not_applicable",
-            "message": (
-                "Custom nodes ship with the deploy image; nothing needs pushing."
-                if operation == "publish"
-                else "Custom nodes ship with the deploy image; dependency rebuild is part of deploy."
-            ),
-        })
-        _set_studio_sync_status(sync_id, **base)
-        return base
-    workspace = _active_workspace()
-    cn_root = os.path.join(_COMFYUI_ROOT, "custom_nodes")
-    if workspace is None:
-        base.update({
-            "state": "refused", "status": "refused", "outcome": "no_workspace",
-            "message": "Custom-node operation refused: no active workspace configured.",
-            "_http_status": 400,
-        })
-        _set_studio_sync_status(
-            sync_id, **{key: value for key, value in base.items() if key != "_http_status"}
-        )
-        return base
-    publication_lock = None
-    if operation == "publish":
-        try:
-            publication_lock = _acquire_studio_publication_lock()
-        except (LockHeldError, LockStaleError) as exc:
-            base.update({
-                "state": "refused", "status": "refused", "outcome": "lock_held",
-                "message": f"Custom-node publication refused: deploy lock is held: {exc}",
-                "_http_status": 409,
-            })
-            _set_studio_sync_status(
-                sync_id, **{key: value for key, value in base.items() if key != "_http_status"}
-            )
-            return base
-    _set_studio_sync_status(sync_id, **base)
-    thread = threading.Thread(
-        target=_run_studio_custom_node_sync,
-        kwargs={
-            "sync_id": sync_id,
-            "operation": operation,
-            "cn_root": cn_root,
-            "workspace": workspace,
-            "publication_lock": publication_lock,
-            "expected_dependencies": dependencies,
-        },
-        daemon=True,
-    )
-    thread.start()
-    return base
 
 
 def _manifest_entry_from_install(url: str, folder: str, filename: str) -> dict:
@@ -5444,24 +5242,11 @@ if _server:
             return web.json_response({"status": "error", "message": "No active workspace configured"}, status=400)
 
         try:
-            publication_lock = _acquire_studio_publication_lock()
-        except (LockHeldError, LockStaleError) as exc:
-            return web.json_response(
-                {
-                    "status": "error",
-                    "message": f"Custom node publication refused: deploy lock is held or stale: {exc}",
-                },
-                status=409,
-            )
-        try:
-            try:
-                result = await _sync_custom_nodes_and_maybe_deploy(cn_root, workspace)
-                publication = result.get("publication") or {}
-                if result.get("status") == "ok" and publication.get("verified_publication"):
-                    from remote_inventory import invalidate as _invalidate_remote_inventory
-                    _invalidate_remote_inventory()
-            finally:
-                publication_lock.release()
+            result = await _sync_custom_nodes_and_maybe_deploy(cn_root, workspace)
+            publication = result.get("publication") or {}
+            if result.get("status") == "ok" and publication.get("verified_publication"):
+                from remote_inventory import invalidate as _invalidate_remote_inventory
+                _invalidate_remote_inventory()
             return web.json_response(result, status=200 if result.get("status") == "ok" else 500)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -7147,13 +6932,7 @@ if _server:
     register_workflow_routes(_server, _NODE_DIR, resolver=_dependency_resolver)
     from model_library_routes import register_model_library_routes
     register_model_library_routes(
-        _server,
-        _NODE_DIR,
-        _COMFYUI_ROOT,
-        resolver=_dependency_resolver,
-        custom_node_sync_start=_start_studio_custom_node_sync,
-        custom_node_sync_status=_studio_sync_status,
-        custom_node_delivery_mode=_studio_custom_node_delivery_mode,
+        _server, _NODE_DIR, _COMFYUI_ROOT, resolver=_dependency_resolver
     )
 
     # — Studio Backends (legacy compatibility / import-only) —
@@ -7274,65 +7053,6 @@ if _server:
         }, status=409)
 
     # ── Studio run / experiment routes ─────────────────────────────────
-    @_server.routes.get("/comfymodal/studio/golden/profiles")
-    async def studio_golden_profiles(request: web.Request) -> web.Response:
-        """Return the config-owned, read-only Golden profile catalog."""
-        try:
-            from tools.v2_control.profile_catalog import catalog_golden_profiles
-
-            profiles = catalog_golden_profiles()
-            projected = [profile.to_dict() for profile in profiles]
-            ready = [profile.name for profile in profiles if profile.deployed]
-            default_profile = ready[0] if len(ready) == 1 else None
-            return web.json_response({
-                "status": "ok",
-                "defaultProfile": default_profile,
-                "profiles": projected,
-            })
-        except Exception as exc:
-            _log.warning("Golden profile catalog failed closed: %s", exc)
-            return web.json_response({
-                "status": "ok",
-                "defaultProfile": None,
-                "profiles": [],
-            })
-
-    @_server.routes.get("/comfymodal/studio/run-progress/{request_id}")
-    async def studio_run_progress(request: web.Request) -> web.Response:
-        """Poll bounded in-memory Golden events using the caller cursor."""
-        try:
-            raw_cursor = request.query.get("cursor", "0")
-            if not str(raw_cursor).isdigit():
-                raise ValueError("cursor must be a non-negative integer")
-            cursor = int(raw_cursor)
-            from studio_golden_run import EVENT_STORE, GoldenRunError
-
-            result = EVENT_STORE.read(request.match_info["request_id"], cursor)
-            return web.json_response(result)
-        except KeyError:
-            return web.json_response({
-                "status": "error",
-                "message": "unknown or expired request_id",
-            }, status=404)
-        except GoldenRunError as exc:
-            return web.json_response({
-                "status": "error",
-                "message": "unknown or expired request_id",
-            }, status=404)
-        except ValueError as exc:
-            return web.json_response({
-                "status": "error",
-                "message": str(exc),
-            }, status=400)
-        except Exception as exc:
-            # The store validates request IDs with Golden's path containment
-            # rules; malformed IDs are not allowed to become a lookup oracle.
-            _log.warning("Golden progress lookup failed: %s", exc)
-            return web.json_response({
-                "status": "error",
-                "message": "unknown or expired request_id",
-            }, status=404)
-
     @_server.routes.post("/comfymodal/studio/run")
     async def studio_run(request: web.Request) -> web.Response:
         """Execute a single Studio preset run.
@@ -7397,83 +7117,6 @@ if _server:
             or (body or {}).get("workflowVersionId")
             or ""
         ).strip()
-
-        # An explicit Golden profile is the only opt-in to the bounded direct
-        # lane.  Its target and resources are config-owned; the browser may
-        # still provide the selected workflow and its validated controls.
-        # Accept both spellings, matching the existing presetId/preset_id and
-        # workflow_id/workflowId convention.  The Studio frontend sends
-        # ``profile_name``; without this the request silently fell through to
-        # the local lane and was refused by the host-local dependency gate.
-        _golden_profile = str(
-            (body or {}).get("profile")
-            or (body or {}).get("profile_name")
-            or ""
-        ).strip()
-        if _golden_profile:
-            try:
-                import asyncio as _studio_asyncio
-                from studio_golden_run import (
-                    browser_override_error,
-                    run_golden_workflow,
-                )
-                _override_error = browser_override_error(body or {})
-                if _override_error:
-                    return web.json_response({
-                        "status": "error",
-                        "error_code": "GOLDEN_BROWSER_OVERRIDE_REJECTED",
-                        "message": _override_error,
-                    }, status=400)
-                if not _workflow_version_id:
-                    return web.json_response({
-                        "status": "error",
-                        "error_code": "GOLDEN_WORKFLOW_REQUIRED",
-                        "message": "workflow_version_id is required for a Golden Studio run",
-                    }, status=400)
-                _golden_request_id = str(
-                    (body or {}).get("request_id")
-                    or (body or {}).get("requestId")
-                    or ""
-                ).strip()
-                if not _golden_request_id:
-                    return web.json_response({
-                        "status": "error",
-                        "error_code": "GOLDEN_REQUEST_ID_REQUIRED",
-                        "message": "request_id is required for Golden progress polling",
-                    }, status=400)
-                result = await _studio_asyncio.wait_for(
-                    run_golden_workflow(
-                        workflow_id=str(
-                            (body or {}).get("workflow_id")
-                            or (body or {}).get("workflowId")
-                            or ""
-                        ),
-                        version_id=_workflow_version_id,
-                        preset_id=str(
-                            (body or {}).get("preset_id")
-                            or (body or {}).get("presetId")
-                            or ""
-                        ),
-                        controls=controls,
-                        request_id=_golden_request_id,
-                        node_dir=_NODE_DIR,
-                        profile_name=_golden_profile,
-                        workspace=_studio_ws,
-                    ),
-                    timeout=600.0,
-                )
-                return web.json_response(
-                    result,
-                    status=200 if result.get("status") == "ok" else 400,
-                )
-            except Exception as exc:
-                _log.exception("Studio Golden workflow run error")
-                return web.json_response({
-                    "status": "error",
-                    "error_code": "STUDIO_GOLDEN_RUN_ERROR",
-                    "message": str(exc)[:500],
-                }, status=400)
-
         if _workflow_version_id:
             import asyncio as _studio_asyncio
             try:

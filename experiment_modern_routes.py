@@ -430,7 +430,7 @@ def _persisted_cell_plans(detail: Any) -> list[dict[str, Any]]:
     The persisted definition carries every ``CellPlan.to_dict()`` frozen at
     acceptance; these are the exact plans normal execution dispatches, so
     reconstruction reuses them verbatim (no planner re-run, no mutable
-    Workflow/Preset resolution).
+    Workflow/version resolution).
 
     Fail-closed: returns ``[]`` (reconstruction unavailable) for any
     malformed or partial persisted state — a non-list ``cells``, duplicate /
@@ -607,8 +607,8 @@ def _build_status_detail(repo: HistoryV2Repository, experiment_id: str) -> Optio
     """Flat durable status projection (§11.2).
 
     Cell identity/status come from the repository-derived cell rows
-    (``current_attempt`` tie-break, terminal-first-wins).  Workflow/version/
-    preset identity comes from the durable definition plan (the authoritative
+    (``current_attempt`` tie-break, terminal-first-wins).  Workflow/version
+    identity comes from the durable definition plan (the authoritative
     fixed-matrix index) because the current Generation insert does not carry
     those fields correctly.  No ``partial``, no client inference, no heavy
     immutable request in the polling payload.
@@ -635,7 +635,6 @@ def _build_status_detail(repo: HistoryV2Repository, experiment_id: str) -> Optio
     active_attempt_ids: list[str] = []
     workflow_ids: set[str] = set()
     workflow_version_ids: set[str] = set()
-    preset_ids: set[str] = set()
     for cell in cells:  # fixed position order
         canonical = _canonical_cell_status(cell)
         counts[canonical] += 1
@@ -662,15 +661,12 @@ def _build_status_detail(repo: HistoryV2Repository, experiment_id: str) -> Optio
         workflow_version_id = str(
             plan.get("workflow_version_id") or gen_dict.get("workflow_version_id") or ""
         )
-        preset_id = str(plan.get("preset_id") or "")
         if active is not None:
             active_attempt_ids.append(active.run_id)
         if workflow_id:
             workflow_ids.add(workflow_id)
         if workflow_version_id:
             workflow_version_ids.add(workflow_version_id)
-        if preset_id:
-            preset_ids.add(preset_id)
         cell_records.append({
             "cell_id": cell.cell_id,
             "position": cell.position,
@@ -679,9 +675,7 @@ def _build_status_detail(repo: HistoryV2Repository, experiment_id: str) -> Optio
             "generation_id": cell.generation_id,
             "workflow_id": workflow_id,
             "workflow_version_id": workflow_version_id,
-            "preset_id": preset_id,
             "workflow_name": str(plan.get("workflow_name") or ""),
-            "preset_name": str(plan.get("preset_name") or ""),
             "axis_labels": dict(cell.axis_labels or {}),
             "axis_values": axis_values,
             "axes": axis_names,
@@ -701,7 +695,6 @@ def _build_status_detail(repo: HistoryV2Repository, experiment_id: str) -> Optio
         "active_attempt_ids": active_attempt_ids,
         "workflow_ids": sorted(workflow_ids),
         "workflow_version_ids": sorted(workflow_version_ids),
-        "preset_ids": sorted(preset_ids),
         "cells": cell_records,
     }
 
@@ -804,7 +797,7 @@ def _cell_specs_from_plan(cell_plan: Any, experiment_id: str) -> list[dict[str, 
     """Map every ``CellPlan.to_dict()`` to a ``create_modern_matrix`` spec.
 
     The repository seam now consumes the planner's ``CellPlan.to_dict()``
-    shape verbatim: it freezes generation/workflow/version/preset identity,
+    shape verbatim: it freezes generation/workflow/version identity,
     stores the exact executable request snapshot fields (§4.2), and derives a
     terminal ``failed`` first attempt for a planning-invalid cell (spec
     ``error``/``error_code``) while valid cells get one queued first attempt.

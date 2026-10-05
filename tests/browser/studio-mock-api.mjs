@@ -2,7 +2,7 @@
 //
 // Installs a Playwright page.route interceptor that replaces the
 // /comfymodal/ backend with an in-memory mock.  Supports both
-// snapshot/preset CRUD and experiment/run-history lifecycle.
+// run, experiment and run-history lifecycle.
 //
 // Usage:
 //   import { installStudioMockApi } from "./studio-mock-api.mjs";
@@ -74,8 +74,6 @@ function _compilePattern(pattern) {
  *   state: object,
  *   lastRunRequest: object|null,
  *   lastExperimentRequest: object|null,
- *   activePresets: function(): Array,
- *   activeSnapshots: function(): Array,
  *   reset: function(): void,
  *   failNext: function(method:string, pattern:string): void,
  *   setExperimentBehavior: function(id:string, opts:object): void,
@@ -94,7 +92,10 @@ export async function installStudioMockApi(page, options = {}) {
     saveRequests: [], // { run_id, output_index } from POST /run-history/:id/save
     configPost: null, // last POST /comfymodal/config body (Settings page)
     profileLevel: "off", // in-memory /comfymodal/profile/level stored value
-    goldenProfile: "golden_p1_parallel_c0_p8_h100",
+    // Level the current process is actually running. A POST updates only
+    // profileLevel; effectiveProfileLevel lags until restart, which is what
+    // the Settings restart banner reports on.
+    effectiveProfileLevel: "off",
   };
 
   let lastRunRequest = null;
@@ -134,213 +135,9 @@ export async function installStudioMockApi(page, options = {}) {
   // Each handler receives (route, url, body, params) and returns
   // { status, contentType, body } or a Promise thereof.
 
-  /** GET /comfymodal/studio/snapshots/:id */
-  async function snapshotDetail(route, url, body, params) {
-    const s = state.snapshots.get(params.id);
-    if (!s || s.archived) return _error("Snapshot not found", 404);
-    return _json({ status: "ok", snapshot: { ...s } });
-  }
-
-  /** GET /comfymodal/studio/snapshots */
-  async function listSnapshots(route, url, body, params) {
-    const includeArchived = url.searchParams.get("includeArchived") === "1";
-    const snapshots = [];
-    for (const s of state.snapshots.values()) {
-      if (!includeArchived && s.archived) continue;
-      snapshots.push({ ...s });
-    }
-    return _json({ status: "ok", snapshots });
-  }
-
-  /** POST /comfymodal/studio/snapshots */
-  async function createSnapshot(route, url, body) {
-    const id = _makeSnapshotId();
-    const now = _now();
-    const compatibleFeatures = Array.isArray(body?.compatibleFeatures)
-      ? body.compatibleFeatures
-      : ["txt2img"];
-    const entry = {
-      id,
-      name: body?.name || "Untitled Snapshot",
-      description: body?.description || "",
-      createdAt: now,
-      updatedAt: now,
-      compatibleFeatures,
-      graphJson: body?.graphJson || null,
-      apiPromptJson: body?.apiPromptJson || null,
-      nodeBindings: body?.nodeBindings || {},
-      outputNodeId: body?.outputNodeId || "",
-      modelSummary: body?.modelSummary || "",
-      source: body?.source || "manual",
-      controlSchemas: body?.controlSchemas || {},
-      archived: false,
-      status: "runnable",
-      featureStatus: Object.fromEntries(
-        compatibleFeatures.map((fid) => [fid, { status: "runnable", reason: "" }])
-      ),
-      disabledReason: "",
-    };
-    state.snapshots.set(id, entry);
-    return _json({ status: "ok", snapshot: { ...entry } });
-  }
-
-  /** PATCH /comfymodal/studio/snapshots/:id */
-  async function updateSnapshot(route, url, body, params) {
-    const s = state.snapshots.get(params.id);
-    if (!s) return _error("Snapshot not found", 404);
-    if (body.name !== undefined) s.name = String(body.name).slice(0, 200);
-    if (body.description !== undefined) s.description = String(body.description).slice(0, 2000);
-    if (body.compatibleFeatures !== undefined && Array.isArray(body.compatibleFeatures)) {
-      s.compatibleFeatures = body.compatibleFeatures;
-      s.featureStatus = Object.fromEntries(
-        body.compatibleFeatures.map((fid) => [fid, { status: "runnable", reason: "" }])
-      );
-    }
-    if (body.graphJson !== undefined) s.graphJson = body.graphJson;
-    if (body.apiPromptJson !== undefined) s.apiPromptJson = body.apiPromptJson;
-    if (body.nodeBindings !== undefined && typeof body.nodeBindings === "object") {
-      s.nodeBindings = body.nodeBindings;
-    }
-    if (body.outputNodeId !== undefined) s.outputNodeId = String(body.outputNodeId);
-    if (body.modelSummary !== undefined) s.modelSummary = String(body.modelSummary).trim();
-    if (body.controlSchemas !== undefined && typeof body.controlSchemas === "object") {
-      s.controlSchemas = body.controlSchemas;
-    }
-    if (body.archived !== undefined) s.archived = Boolean(body.archived);
-    s.updatedAt = _now();
-    return _json({ status: "ok", snapshot: { ...s } });
-  }
-
-  /** DELETE /comfymodal/studio/snapshots/:id (archive) */
-  async function deleteSnapshot(route, url, body, params) {
-    const s = state.snapshots.get(params.id);
-    if (!s) return _error("Snapshot not found", 404);
-    s.archived = true;
-    s.updatedAt = _now();
-    return _json({ status: "ok" });
-  }
-
-  /** GET /comfymodal/studio/presets/:id */
-  async function presetDetail(route, url, body, params) {
-    const p = state.presets.get(params.id);
-    if (!p || p.archived) return _error("Preset not found", 404);
-    const sid = p.snapshotId || "";
-    const snap = sid ? state.snapshots.get(sid) : null;
-    return _json({
-      status: "ok",
-      preset: {
-        ...p,
-        nodeBindings: snap?.nodeBindings || {},
-        outputNodeId: snap?.outputNodeId || "",
-        featureStatus: snap?.featureStatus || {},
-        hasApiPromptJson: Boolean(snap?.apiPromptJson),
-        hasGraphJson: Boolean(snap?.graphJson),
-        snapshotSummary: snap
-          ? {
-              name: snap.name || "",
-              status: snap.status || "",
-              compatibleFeatures: snap.compatibleFeatures || [],
-              modelSummary: snap.modelSummary || "",
-              source: snap.source || "",
-            }
-          : {},
-        controlSchemas: snap?.controlSchemas || {},
-        defaults: p.defaults || {},
-      },
-    });
-  }
-
-  /** GET /comfymodal/studio/presets */
-  async function listPresets(route, url, body, params) {
-    const includeArchived = url.searchParams.get("includeArchived") === "1";
-    const presets = [];
-    for (const p of state.presets.values()) {
-      if (!includeArchived && p.archived) continue;
-      // Enrich with snapshot-backed runtime fields
-      const sid = p.snapshotId || "";
-      const snap = sid ? state.snapshots.get(sid) : null;
-      presets.push({
-        ...p,
-        nodeBindings: snap?.nodeBindings || {},
-        outputNodeId: snap?.outputNodeId || "",
-        featureStatus: snap?.featureStatus || {},
-        hasApiPromptJson: Boolean(snap?.apiPromptJson),
-        hasGraphJson: Boolean(snap?.graphJson),
-        snapshotSummary: snap
-          ? {
-              name: snap.name || "",
-              status: snap.status || "",
-              compatibleFeatures: snap.compatibleFeatures || [],
-              modelSummary: snap.modelSummary || "",
-              source: snap.source || "",
-            }
-          : {},
-        controlSchemas: snap?.controlSchemas || {},
-        defaults: p.defaults || {},
-      });
-    }
-    return _json({ status: "ok", presets });
-  }
-
-  /** POST /comfymodal/studio/presets */
-  async function createPreset(route, url, body) {
-    const id = _makePresetId();
-    const now = _now();
-    const compatibleFeatures = Array.isArray(body?.compatibleFeatures)
-      ? body.compatibleFeatures
-      : ["txt2img"];
-    const entry = {
-      id,
-      label: body?.label || body?.name || "Untitled Preset",
-      description: body?.description || "",
-      snapshotId: body?.snapshotId || "",
-      compatibleFeatures,
-      defaults: body?.defaults || {},
-      sourceType: body?.sourceType || "manual",
-      sourceId: body?.sourceId || "",
-      archived: false,
-      createdAt: now,
-      updatedAt: now,
-      status: "runnable",
-      disabledReason: "",
-    };
-    state.presets.set(id, entry);
-    return _json({ status: "ok", preset: { ...entry } });
-  }
-
-  /** PATCH /comfymodal/studio/presets/:id */
-  async function updatePreset(route, url, body, params) {
-    const p = state.presets.get(params.id);
-    if (!p) return _error("Preset not found", 404);
-    if (body.label !== undefined) p.label = String(body.label).slice(0, 200);
-    if (body.description !== undefined) p.description = String(body.description).slice(0, 2000);
-    if (body.snapshotId !== undefined) p.snapshotId = String(body.snapshotId);
-    if (body.compatibleFeatures !== undefined && Array.isArray(body.compatibleFeatures)) {
-      p.compatibleFeatures = body.compatibleFeatures;
-    }
-    if (body.defaults !== undefined && typeof body.defaults === "object") {
-      p.defaults = body.defaults;
-    }
-    if (body.sourceType !== undefined) p.sourceType = String(body.sourceType);
-    if (body.sourceId !== undefined) p.sourceId = String(body.sourceId);
-    if (body.archived !== undefined) p.archived = Boolean(body.archived);
-    p.updatedAt = _now();
-    return _json({ status: "ok", preset: { ...p } });
-  }
-
-  /** DELETE /comfymodal/studio/presets/:id (archive) */
-  async function deletePreset(route, url, body, params) {
-    const p = state.presets.get(params.id);
-    if (!p) return _error("Preset not found", 404);
-    p.archived = true;
-    p.updatedAt = _now();
-    return _json({ status: "ok" });
-  }
-
   /** POST /comfymodal/studio/run */
   async function studioRun(route, url, body) {
     lastRunRequest = body;
-    if (options.runDelayMs) await new Promise((resolve) => setTimeout(resolve, options.runDelayMs));
     const expId = _makeExperimentId();
     const runId = _makeRunId();
 
@@ -408,55 +205,8 @@ export async function installStudioMockApi(page, options = {}) {
       status: "ok",
       runId,
       experimentId: expId,
-      request_id: body?.request_id || "",
-      terminal: true,
-      direct_run: true,
-      output_paths: ["studio_output_final.png"],
-      timings: { end_to_end_total_ms: 120, golden_clip_load_ms: 40 },
       message: "Run started",
     });
-  }
-
-  async function listGoldenProfiles() {
-    return _json({
-      status: "ok",
-      defaultProfile: "golden_p1_parallel_c0_p8_h100",
-      profiles: [
-        {
-          name: "golden_p1_parallel_c0_p8_h100",
-          owner: "production-008",
-          target: { app: "batch-c0-p8-h100", class: "ModalRuntimeEntrypointV2", method: "run_golden_parallel_stream" },
-          resources: { gpu: "h100!", cpu: 12, memory_mb: 24576 },
-          deployed: true,
-        },
-        {
-          name: "golden_p1_parallel_c0_p8_h100_pending",
-          owner: "production-008",
-          target: { app: "batch-c0-p8-h100", class: "ModalRuntimeEntrypointV2", method: "run_golden_parallel_stream" },
-          resources: { gpu: "h100!", cpu: 12, memory_mb: 24576 },
-          deployed: false,
-        },
-      ],
-    });
-  }
-
-  async function goldenRunProgress(route, url, body, params) {
-    const cursor = parseInt(url.searchParams.get("cursor") || "0", 10);
-    const requestId = params.request_id;
-    if (cursor === 0) {
-      return _json({ status: "ok", request_id: requestId, cursor: 1, terminal: false, events: [
-        { schema: "golden_stage_event_v1", type: "golden_stage", request_id: requestId, sequence: 1, stage: "golden_clip_load", phase: "started", entry_wall_ns: 1000000000, entry_monotonic_ns: 1000000000, end_wall_ns: null, end_monotonic_ns: null, ok: null, error: null },
-      ] });
-    }
-    if (cursor === 1) {
-      return _json({ status: "ok", request_id: requestId, cursor: 3, terminal: false, events: [
-        { schema: "golden_stage_event_v1", type: "golden_stage", request_id: requestId, sequence: 2, stage: "golden_clip_load", phase: "completed", entry_wall_ns: 1000000000, entry_monotonic_ns: 1000000000, end_wall_ns: 1040000000, end_monotonic_ns: 1040000000, ok: true, error: null },
-        { schema: "golden_stage_event_v1", type: "golden_stage", request_id: requestId, sequence: 3, stage: "golden_decode", phase: "started", entry_wall_ns: 1050000000, entry_monotonic_ns: 1050000000, end_wall_ns: null, end_monotonic_ns: null, ok: null, error: null },
-      ] });
-    }
-    return _json({ status: "ok", request_id: requestId, cursor: 4, terminal: true, events: [
-      { schema: "golden_stage_event_v1", type: "golden_stage", request_id: requestId, sequence: 4, stage: "golden_decode", phase: "completed", entry_wall_ns: 1050000000, entry_monotonic_ns: 1050000000, end_wall_ns: 1120000000, end_monotonic_ns: 1120000000, ok: true, error: null },
-    ] });
   }
 
   /** POST /comfymodal/studio/experiment */
@@ -983,11 +733,6 @@ export async function installStudioMockApi(page, options = {}) {
     return _json({ status: "ok", backends: [] });
   }
 
-  /** GET /comfymodal/studio/models — empty model catalog for workflow pickers. */
-  async function listStudioModels(route, url) {
-    return _json({ status: "ok", models: [] });
-  }
-
   /**
    * Config endpoint — the real backend returns Modal/ComfyUI settings.
    * The Playground does not read this directly; it is called during
@@ -1000,7 +745,6 @@ export async function installStudioMockApi(page, options = {}) {
       gpu: "mock-gpu",
       deploy_state: "deployed",
       frontend_version: "0.1.0",
-      golden_profile: state.goldenProfile,
     });
   }
 
@@ -1022,7 +766,6 @@ export async function installStudioMockApi(page, options = {}) {
       gpu: "rtx-pro-6000",
       deploy_state: "deployed",
       frontend_version: "0.1.0",
-      golden_profile: state.goldenProfile,
       // Execution engine options
       execution_mode: "v2",
       available_execution_modes: [
@@ -1049,7 +792,6 @@ export async function installStudioMockApi(page, options = {}) {
   /** POST /comfymodal/config — record the last posted body and acknowledge. */
   async function saveSettingsConfig(route, url, body) {
     state.configPost = body || null;
-    if (body && typeof body.golden_profile === "string") state.goldenProfile = body.golden_profile;
     return _json({ status: "ok" });
   }
 
@@ -1058,11 +800,14 @@ export async function installStudioMockApi(page, options = {}) {
     return _json({
       status: "ok",
       level: state.profileLevel,
-      effective: state.profileLevel,
+      effective: state.effectiveProfileLevel,
     });
   }
 
-  /** POST /comfymodal/profile/level — persist the requested level. */
+  /**
+   * POST /comfymodal/profile/level — persist the requested level. The running
+   * process keeps its old level until restart, so `effective` is unchanged.
+   */
   async function saveProfileLevel(route, url, body) {
     if (body && typeof body.level === "string") {
       state.profileLevel = body.level;
@@ -1120,23 +865,11 @@ export async function installStudioMockApi(page, options = {}) {
 
   const routeEntries = [
     // Snapshots (detail before list so :id never shadows list)
-    ["GET", "/comfymodal/studio/snapshots/:id", snapshotDetail],
-    ["GET", "/comfymodal/studio/snapshots", listSnapshots],
-    ["POST", "/comfymodal/studio/snapshots", createSnapshot],
-    ["PATCH", "/comfymodal/studio/snapshots/:id", updateSnapshot],
-    ["DELETE", "/comfymodal/studio/snapshots/:id", deleteSnapshot],
 
     // Presets (detail before list)
-    ["GET", "/comfymodal/studio/presets/:id", presetDetail],
-    ["GET", "/comfymodal/studio/presets", listPresets],
-    ["POST", "/comfymodal/studio/presets", createPreset],
-    ["PATCH", "/comfymodal/studio/presets/:id", updatePreset],
-    ["DELETE", "/comfymodal/studio/presets/:id", deletePreset],
 
     // Studio run & experiment
     ["POST", "/comfymodal/studio/run", studioRun],
-    ["GET", "/comfymodal/studio/golden/profiles", listGoldenProfiles],
-    ["GET", "/comfymodal/studio/run-progress/:request_id", goldenRunProgress],
     ["POST", "/comfymodal/studio/experiment", studioExperiment],
 
     // Experiment detail (poll-based lifecycle) & stop-now
@@ -1159,9 +892,6 @@ export async function installStudioMockApi(page, options = {}) {
 
     // Backend discovery (returns empty — Playground uses presets instead)
     ["GET", "/comfymodal/studio/backends", listBackends],
-
-    // Model library used by the workflow preset editor's model pickers.
-    ["GET", "/comfymodal/studio/models", listStudioModels],
 
     // Remote model-volume inventory (wizard Dependencies overlay).
     ["GET", "/comfymodal/models", listRemoteModelsMock],
@@ -1283,18 +1013,10 @@ export async function installStudioMockApi(page, options = {}) {
       return lastExperimentRequest;
     },
 
-    activePresets() {
-      return [...state.presets.values()].filter((p) => !p.archived);
-    },
 
-    activeSnapshots() {
-      return [...state.snapshots.values()].filter((s) => !s.archived);
-    },
 
     /** Reset all state */
     reset() {
-      state.snapshots.clear();
-      state.presets.clear();
       state.experiments.clear();
       state.history.length = 0;
       state.calls.length = 0;
@@ -1303,7 +1025,6 @@ export async function installStudioMockApi(page, options = {}) {
       state.saveRequests.length = 0;
       state.configPost = null;
       state.profileLevel = "off";
-      state.goldenProfile = "golden_p1_parallel_c0_p8_h100";
       lastRunRequest = null;
       lastExperimentRequest = null;
       failQueue.length = 0;

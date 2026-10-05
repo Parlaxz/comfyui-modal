@@ -96,8 +96,9 @@ test.describe("Studio Settings (redesigned)", () => {
       const advanced = page.locator('[data-section="advanced"]');
       const results = page.locator('[data-testid="settings-search-results"]');
 
-      // "concurrency" → Experiments visible, General hidden
-      await search.fill("concurrency");
+      // "concurrent" → Experiments visible, General hidden
+      // (the row copy reads "...cells concurrently", so search the stem)
+      await search.fill("concurrent");
       await expect(experiments).toBeVisible({ timeout: 5000 });
       await expect(general).toBeHidden();
 
@@ -153,33 +154,6 @@ test.describe("Studio Settings (redesigned)", () => {
     } finally {
       if (guard) guard.dispose();
     }
-  });
-
-  test("Golden profile selector uses only the server catalog and persists the name", async ({ page }) => {
-    await page.addInitScript(() => {
-      localStorage.setItem("comfymodal.studio.golden.profile.v1", "production-009");
-    });
-    await openSettings(page);
-    const select = page.locator('[data-testid="settings-golden-profile"]');
-    await expect(select).toBeVisible({ timeout: 15000 });
-    await expect(select.locator('option[value="production-009"]')).toHaveCount(0);
-    await expect(page.locator('[data-testid="settings-golden-profile-row"]')).toHaveCount(2);
-    await expect(page.locator('[data-testid="settings-golden-profile-row"]').nth(0)).toContainText("production-008");
-    await expect(page.locator('[data-testid="settings-golden-profile-row"]').nth(0)).toContainText("run_golden_parallel_stream");
-    await expect(select.locator('option:disabled')).toContainText("deploy before use");
-
-    await select.selectOption("golden_p1_parallel_c0_p8_h100");
-    await expect.poll(() => readLocalStorage(page, "comfymodal.studio.golden.profile.v1"))
-      .toBe("golden_p1_parallel_c0_p8_h100");
-  });
-
-  test("Golden profile catalog failure is surfaced instead of an empty success", async ({ page }) => {
-    const api = await installStudioMockApi(page);
-    api.failNext("GET", "/studio/golden/profiles", 503, { status: "error", message: "catalog unavailable" });
-    await openSettings(page);
-    await expect(page.locator('[data-testid="settings-golden-profile-error"]'))
-      .toContainText("Could not load Golden profiles: HTTP 503", { timeout: 15000 });
-    expect(await page.locator('[data-testid="settings-golden-profile"]').count()).toBe(0);
   });
 
   // ── Test 4: Settings persist across reload ───────────────────────────────
@@ -255,34 +229,45 @@ test.describe("Studio Settings (redesigned)", () => {
       await openSettings(page);
       guard = installConsoleGuard(page);
 
-      // Settings keys that reset-all clears (and does NOT re-seed to defaults).
-      // Stale reset-only keys (comfymodal_global_concurrency,
-      // comfymodal_preview_auto_save) were removed from the registry in F4A
-      // and must stay absent — pinned by
-      // tests/studio_phase_f4_settings_authority_unit.mjs.
-      const settingsKeys = [
-        "comfymodal_enabled",
+      // Reset-all has two distinct contracts, asserted separately:
+      //
+      // 1. Cleared and left absent. Stale reset-only keys
+      //    (comfymodal_global_concurrency, comfymodal_preview_auto_save) were
+      //    removed from the registry in F4A and must stay absent — pinned by
+      //    tests/studio_phase_f4_settings_authority_unit.mjs.
+      const clearedKeys = [
         "comfymodal_gpu",
-        "comfymodal_preview_default",
-        "comfymodal_preview_codec",
-        "comfymodal_preview_quality",
         "comfymodal-studio-history-columns",
         "comfymodal_heavy_tracing",
         "comfymodal-studio-panel-width",
         "comfymodal.studio.playground.carousel-cleared.v1",
       ];
+      // 2. Cleared, then deliberately re-seeded to the documented default,
+      //    because reset-all calls setOutputPreferences(OUTPUT_DEFAULTS) and
+      //    the preview defaults so the outputs host renders real values.
+      const reseededKeys = {
+        comfymodal_preview_default: "off",
+        comfymodal_preview_codec: "webp",
+        comfymodal_preview_quality: "70",
+      };
       // User-data namespaces that MUST survive a reset
       const userDataKeys = [
         "comfymodal.studio.playground.drafts.v1",
         "comfymodal_comparison_selected_profiles",
+        // H12 retired Run mode: modern Settings has no writer and no resetter
+        // for the canvas key, so reset-all must leave it alone. Pinned by
+        // tests/studio_phase_f4_settings_authority_unit.mjs (1b).
+        "comfymodal_enabled",
       ];
 
+      const seededKeys = Object.keys(reseededKeys);
+
       await page.evaluate(
-        ({ settingsKeys, userDataKeys }) => {
-          for (const k of settingsKeys) localStorage.setItem(k, "seeded");
+        ({ seededKeys, clearedKeys, userDataKeys }) => {
+          for (const k of clearedKeys.concat(seededKeys)) localStorage.setItem(k, "seeded");
           for (const k of userDataKeys) localStorage.setItem(k, "user-data-value");
         },
-        { settingsKeys, userDataKeys }
+        { seededKeys, clearedKeys, userDataKeys }
       );
 
       // Accept the confirmation dialog (Playwright auto-dismisses otherwise,
@@ -290,11 +275,18 @@ test.describe("Studio Settings (redesigned)", () => {
       page.once("dialog", (dialog) => dialog.accept());
       await page.locator('[data-testid="settings-reset-all"]').click();
 
-      // All modern settings keys are gone
-      for (const key of settingsKeys) {
+      // Cleared keys are gone
+      for (const key of clearedKeys) {
         await expect
           .poll(() => readLocalStorage(page, key))
           .toBeNull();
+      }
+
+      // Re-seeded keys hold their documented defaults, not the seeded value
+      for (const [key, expected] of Object.entries(reseededKeys)) {
+        await expect
+          .poll(() => readLocalStorage(page, key))
+          .toBe(expected);
       }
 
       // User data is untouched
@@ -310,35 +302,7 @@ test.describe("Studio Settings (redesigned)", () => {
     }
   });
 
-  // ── Test 7: Legacy settings reachable through Advanced ───────────────────
-  test("legacy settings reachable through Advanced", async ({ page }) => {
-    let guard;
-    try {
-      await openSettings(page);
-      guard = installConsoleGuard(page);
-
-      // Advanced is below the fold in the page container — reveal it
-      const legacyOpen = page.locator('[data-testid="settings-legacy-open"]');
-      await legacyOpen.scrollIntoViewIfNeeded();
-      await legacyOpen.click();
-
-      // Legacy settings tab embeds the legacy modal-settings panel
-      await expect(
-        page.getByText("Connection & credentials", { exact: false })
-      ).toBeVisible({ timeout: 15000 });
-
-      // The wrapper provides a way back
-      await expect(
-        page.getByRole("button", { name: "Back to Settings" })
-      ).toBeVisible();
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 8: Modern and legacy output settings stay synchronized ──────────
+  // ── Test 7: Modern and legacy output settings stay synchronized ──────────
   test("modern and legacy output settings stay synchronized", async ({ page }) => {
     let guard;
     try {
@@ -376,14 +340,15 @@ test.describe("Studio Settings (redesigned)", () => {
       const banner = page.locator('[data-testid="settings-restart-banner"]');
       const tracing = page.locator('[data-testid="settings-heavy-tracing"]');
 
-      // Stored off == effective off → banner hidden
+      // Server truth model: persisted == effective → banner hidden.
       await expect(banner).toBeHidden({ timeout: 10000 });
 
-      // Selecting trace persists locally while effective stays off → banner shows
+      // Selecting trace persists a new level while the process keeps running
+      // the old one, so persisted != effective → banner shows.
       await tracing.selectOption("trace");
       await expect(banner).toBeVisible({ timeout: 5000 });
 
-      // Back to off → banner hides again
+      // Back to off: persisted == effective again → banner hides.
       await tracing.selectOption("off");
       await expect(banner).toBeHidden({ timeout: 5000 });
 

@@ -70,21 +70,22 @@ function portraitIds(wfMock) {
   const wf = wfMock.getWorkflow("Portrait Pro");
   expect(wf).toBeTruthy();
   const versions = wfMock.getVersions(wf.workflow_id);
-  const current = versions.find((v) => String(v.workflow_version_id) === String(wf.latest_version_id));
-  expect(current).toBeTruthy();
-  return { workflowId: wf.workflow_id, current: current.workflow_version_id };
+  const v1 = versions.find((v) => v.version_number === 1);
+  expect(v1).toBeTruthy();
+  return { workflowId: wf.workflow_id, v1: v1.workflow_version_id };
 }
 
-async function selectPortraitCurrent(page, wfMock) {
+async function selectPortraitV1(page, wfMock) {
   const ids = portraitIds(wfMock);
   const wfSelect = page.locator('[data-testid="workflow-selector"]');
   await expect(wfSelect.locator(`option[value="${ids.workflowId}"]`)).toHaveCount(1, { timeout: 15000 });
   await wfSelect.selectOption(ids.workflowId);
-  await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 15000 });
-  const versionField = page.locator('[data-testid="workflow-version-selector"]');
-  await expect(versionField.locator("option")).toHaveCount(0);
-  await expect(versionField).toHaveAttribute("data-version-id", ids.current);
+  // The Shelf is the single field editor: selecting a Workflow is all that is
+  // needed, and `shelf-fields` only renders once mapped fields are loaded.
   await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('[data-testid="shelf-fields"]')).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('[data-testid="workflow-mapped-controls"]')).toHaveCount(0);
+  await expect(page.locator('[data-testid="workflow-version-selector"]')).toHaveCount(0);
   await expect(page.locator('[data-testid="workflow-run-gating"]')).toContainText("Ready to run", { timeout: 15000 });
   return ids;
 }
@@ -154,7 +155,7 @@ test.describe("Studio Shelf Experiment", () => {
     const guard = installConsoleGuard(page);
 
     try {
-      await selectPortraitCurrent(page, wfMock);
+      await selectPortraitV1(page, wfMock);
 
       // Axis selectors exist only in experiment mode.
       expect(await page.locator('[data-testid="shelf-exp-panel"]').count()).toBe(0);
@@ -182,7 +183,7 @@ test.describe("Studio Shelf Experiment", () => {
     await openStudio(page, COMFYUI_URL);
     await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
 
-    const ids = await selectPortraitCurrent(page, wfMock);
+    const ids = await selectPortraitV1(page, wfMock);
     const subset = await createSubsetWorkflow(page);
     await enableExperiment(page);
 
@@ -222,7 +223,7 @@ test.describe("Studio Shelf Experiment", () => {
     await openStudio(page, COMFYUI_URL);
     await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
 
-    await selectPortraitCurrent(page, wfMock);
+    await selectPortraitV1(page, wfMock);
     await enableExperiment(page);
 
     // Activate the seed axis (integer field).
@@ -319,7 +320,7 @@ test.describe("Studio Shelf Experiment", () => {
     const guard = installConsoleGuard(page);
 
     try {
-      await selectPortraitCurrent(page, wfMock);
+      await selectPortraitV1(page, wfMock);
       const subset = await createSubsetWorkflow(page);
       await enableExperiment(page);
       await compareWithSubset(page, subset.workflowId);
@@ -328,6 +329,8 @@ test.describe("Studio Shelf Experiment", () => {
       const runBtn = page.locator('[data-testid="shelf-exp-run-btn"]');
       await expect(runBtn).toBeDisabled({ timeout: 10000 });
       await page.locator('[data-testid="shelf-axis-seed"]').click();
+      // Enabling the axis seeds one value from the version's graph default;
+      // the second is added explicitly.
       await page.locator('[data-testid="shelf-axis-input-seed"]').fill("222");
       await page.locator('[data-testid="shelf-axis-input-seed"]').press("Enter");
 
@@ -366,7 +369,7 @@ test.describe("Studio Shelf Experiment", () => {
     const guard = installConsoleGuard(page);
 
     try {
-      await selectPortraitCurrent(page, wfMock);
+      await selectPortraitV1(page, wfMock);
       await enableExperiment(page);
 
       // Open + close the many-mode picker without confirming.

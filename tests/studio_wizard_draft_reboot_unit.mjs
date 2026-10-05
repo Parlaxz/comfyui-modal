@@ -296,7 +296,7 @@ section("13. default reboot probes poll /system_stats then /manager/version");
 
 // ── 14. Consumer wiring pins (source is the contract) ─────────────────────
 
-const wizardSource = readWeb("studio-preset-wizard.js");
+const wizardSource = readWeb("studio-workflow-setup-wizard.js");
 const workflowsSource = readWeb("studio-workflows.js");
 
 assert.ok(wizardSource.includes("managerRebootAndWait"), "wizard uses the bounded reboot-and-wait helper");
