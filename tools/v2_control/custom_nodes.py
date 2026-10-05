@@ -70,7 +70,6 @@ class PackagePublicationManifest:
     path_list: tuple[str, ...]
     path_digest: str
     source_root: str = ""
-    generation: str = ""
     first_party: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -83,7 +82,6 @@ class PackagePublicationManifest:
             "path_list": list(self.path_list),
             "path_digest": self.path_digest,
             "source_root": self.source_root,
-            "generation": self.generation or self.content_digest,
             "first_party": self.first_party,
         }
 
@@ -100,11 +98,6 @@ class CustomNodeSourceIdentity:
     source_generation: str = ""
     source_root: str = ""
     package_manifests: tuple[PackagePublicationManifest, ...] = ()
-
-    @property
-    def generation(self) -> str:
-        """Compatibility view; publication code uses content_generation."""
-        return self.content_generation
 
     @property
     def manifest(self) -> tuple[dict[str, Any], ...]:
@@ -148,11 +141,6 @@ class PublicationReceipt:
     package_manifests: tuple[dict[str, Any], ...] = ()
     destructive_override: bool = False
     destructive_delta: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def generation(self) -> str:
-        """Compatibility view; receipt identity is content_generation."""
-        return self.content_generation
 
     @property
     def bytes(self) -> int:
@@ -270,8 +258,6 @@ class PublicationReceipt:
             raise ReceiptError("schema_mismatch")
         if receipt.state != "verified":
             raise ReceiptError("publication_incomplete")
-        if "generation" in raw and raw["generation"] != receipt.content_generation:
-            raise ReceiptError("schema_mismatch")
         if not all(isinstance(getattr(receipt, name), str) and getattr(receipt, name)
                    for name in ("content_generation", "volume_name", "manifest_digest", "publisher",
                                 "ownership_marker", "integrity_digest")):
@@ -419,7 +405,6 @@ def _package_manifests(
             path_list=paths,
             path_digest=_path_digest(paths),
             source_root=str(root_path),
-            generation=content_digest,
             first_party=_is_first_party_package(root_path, name),
         ))
     return tuple(result)
@@ -746,10 +731,6 @@ def _content_generation_from_record(data: bytes) -> str | None:
     value = raw.get("content_generation")
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         return None
-    # A compatibility echo is harmless only when it cannot disagree with the
-    # canonical field.  Schema-1 generation-only records are rejected above.
-    if "generation" in raw and raw.get("generation") != value:
-        return None
     return value.strip()
 
 
@@ -1037,7 +1018,6 @@ async def publish_or_skip(
         if isinstance(result_value, str)
         and result_value
         and result_value == result_value.strip()
-        and ("generation" not in result or result.get("generation") == result_value)
         else ""
     )
     # Read the committed record directly.  Host-side Modal Volume.read_file is

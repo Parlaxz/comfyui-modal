@@ -225,7 +225,6 @@ def test_new_populated_package_passes(tmp_path):
     assert manifest["path_list"] == ["ext-a/a.py"]
     assert manifest["path_digest"]
     assert manifest["source_root"]
-    assert manifest["generation"] == manifest["content_digest"]
 
 
 # (7) malformed special-file tree stays fatal (existing contract retained).
