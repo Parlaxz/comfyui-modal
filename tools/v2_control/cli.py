@@ -1468,7 +1468,14 @@ def _verify_publisher_after_bootstrap(
     *,
     probe: Any | None = None,
 ) -> dict[str, object]:
-    """Require app/Function presence and a version advance after bootstrap."""
+    """Require the publisher app and its Function to exist after bootstrap.
+
+    A version advance is deliberately NOT required. Modal's numeric version
+    counter is not evidence that an app was updated -- it can advance for
+    unrelated reasons, fail to advance when a deploy succeeded, and reset when
+    Modal renumbers its history. App and Function existence is the actual
+    question, and it is answered directly.
+    """
     assert_workspace_binding_current(repo_root, binding)
     after = run_publisher_preflight(
         repo_root,
@@ -1478,12 +1485,6 @@ def _verify_publisher_after_bootstrap(
         ),
         probe=probe,
     )
-    before_version = before.get("PUBLISHER_VERSION_BEFORE")
-    after_version = after.get("PUBLISHER_VERSION_BEFORE")
-    if not isinstance(before_version, int) or not isinstance(after_version, int):
-        raise GateError("publisher bootstrap version proof is unavailable")
-    if after_version <= before_version:
-        raise GateError("publisher bootstrap did not advance deployment version")
     if not after["PUBLISHER_EXISTS"] or not after["PUBLISHER_FUNCTION_EXISTS"]:
         raise GateError("publisher bootstrap did not verify app and Function")
     return after
@@ -3500,37 +3501,21 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
                 f"command={command}"
             )
             preflight = None
-            if workspace_binding is not None:
-                preflight = run_publisher_preflight(repo_root, workspace_binding)
-                pre_version = preflight.get("PUBLISHER_VERSION_BEFORE")
-                if (
-                    preflight.get("PUBLICATION_DECISION") == "invalid"
-                    and not (
-                        preflight.get("PUBLISHER_EXISTS") is True
-                        and preflight.get("PUBLISHER_FUNCTION_EXISTS") is True
-                        and type(pre_version) is int
-                    )
-                ):
-                    raise GateError(
-                        "publisher bootstrap preflight is unknown/invalid; "
-                        "refusing to bootstrap on uncertain lookup state"
-                    )
-                if preflight.get("PUBLICATION_DECISION") == "invalid":
-                    print(
-                        "[v2ctl.publisher-bootstrap] publisher authority is known "
-                        "but content generation is absent; redeploying publisher "
-                        "before the separate publication proof"
-                    )
-            else:
-                pre_version = _app_version_number(publisher_app_name)
-            if not isinstance(pre_version, int):
-                print(
-                    "ERROR: unable to establish the publisher app's pre-deploy "
-                    "version; refusing to invoke the backend",
-                    file=sys.stderr,
-                )
-                return 1
-
+            # Publication correctness is decided by the backend result plus
+            # whether the publisher app and its Function exist afterwards -- not
+            # by Modal's numeric version counter.
+            #
+            # This block used to refuse to invoke the backend without a readable
+            # pre-deploy version, and then reject a successful bootstrap whose
+            # post-deploy version had not advanced. That made a Modal-side
+            # counter the authority on whether an app exists, which is the same
+            # fragility that made the deployment receipt unusable when a version
+            # history reset. It also refused to act on an "invalid" preflight
+            # lookup, i.e. it distrusted its own probe rather than verifying the
+            # thing it actually needed.
+            #
+            # deploy_id remains the deployment authority. Here the only question
+            # is whether the publisher became usable.
             if workspace_binding is not None:
                 assert_workspace_binding_current(repo_root, workspace_binding)
             result = _make_backend_runner(repo_root, env_builder, workspace_binding).run(
@@ -3541,40 +3526,18 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
                 capture=True,
                 invocation_id=invocation_id,
             )
-            post_version = (
-                _checked_version_probe(repo_root, publisher_app_name, workspace_binding)
-                if workspace_binding is not None
-                else _app_version_number(publisher_app_name)
-            )
-            if post_version is None:
-                print(
-                    "ERROR: unable to establish the publisher app's post-deploy "
-                    "version; refusing to treat this bootstrap as valid",
-                    file=sys.stderr,
-                )
-                return 1
-            if post_version <= pre_version:
-                _print_backend_diagnostic(result, env)
-                print(
-                    "ERROR: publisher bootstrap reported success but the app's "
-                    "deployment version did NOT advance; refusing to treat it "
-                    "as valid",
-                    file=sys.stderr,
-                )
-                return 1
-            if workspace_binding is not None:
-                postflight = run_publisher_preflight(repo_root, workspace_binding)
-                if not postflight["PUBLISHER_EXISTS"] or not postflight["PUBLISHER_FUNCTION_EXISTS"]:
-                    raise GateError(
-                        "publisher bootstrap did not verify app and required Function"
-                    )
             if not result.ok():
                 _print_backend_diagnostic(result, env)
                 return result.exit_code if result.exit_code else 1
-            print(
-                f"[v2ctl.publisher-bootstrap] exit={result.exit_code} "
-                f"version={pre_version}->{post_version}"
-            )
+            if workspace_binding is not None:
+                postflight = run_publisher_preflight(repo_root, workspace_binding)
+                if not postflight["PUBLISHER_EXISTS"] or not postflight[
+                    "PUBLISHER_FUNCTION_EXISTS"
+                ]:
+                    raise GateError(
+                        "publisher bootstrap did not verify app and required Function"
+                    )
+            print(f"[v2ctl.publisher-bootstrap] exit={result.exit_code}")
             return 0
         finally:
             lock.release()
@@ -3746,27 +3709,23 @@ def cmd_deploy(args, repo_root: Path) -> int:
             print(
                 f"[v2ctl.deploy] fingerprint={deploy_identity.deploy_fingerprint}"
             )
-            # ── Deploy-version-advance verification (E29 root-cause fix) ──
-            # Capture the app's highest deployment version BEFORE the deploy
-            # so a post-deploy comparison can prove a NEW version appeared
-            # (a "version deployed recently" check falsely passes when a
-            # deploy right after a prior one no-ops).
-            # Every deploy, including public Golden deploys, must prove that
-            # the target app received a new deployment version.  A successful
-            # backend exit alone can also represent a no-op deploy.
-            verify_version = True
+            # Modal's numeric version is probed only as diagnostic navigation
+            # metadata. It is deliberately NOT a gate: requiring a readable
+            # pre-deploy version, and then failing when the post-deploy version
+            # did not advance, made a Modal-side counter the authority on whether
+            # the app was actually updated.
+            #
+            # That check was aimed at a no-op deploy -- the client exiting 0
+            # while the app was unchanged. deploy_id catches that strictly
+            # better: a no-op leaves the previous deployment serving, so the run
+            # reports the old deploy_id and acceptance rejects it as a mismatch.
+            # A version counter can only approximate that, and it fails outright
+            # whenever Modal resets or renumbers its history.
             _pre_version = (
                 _checked_version_probe(repo_root, config.target.app, workspace_binding)
                 if workspace_binding is not None
                 else _app_version_number(config.target.app)
             )
-            if _pre_version is None:
-                print(
-                    "ERROR: unable to establish the app's pre-deploy version; "
-                    "refusing to invoke the backend",
-                    file=sys.stderr,
-                )
-                return 1
             result = _make_backend_runner(repo_root, env_builder, workspace_binding).run(
                 spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
                 invocation_id=invocation_id)
@@ -3801,46 +3760,25 @@ def cmd_deploy(args, repo_root: Path) -> int:
                     pass
                 return result.exit_code if result.exit_code else 1
             # ── Deploy-version-advance verification (E29 root-cause fix) ────
-            # A Modal client can exit 0 while the app was NOT actually updated
-            # (Windows charmap crash, cached no-op).  Verify the app's
-            # deployment version ADVANCED during this deploy; if it did not,
-            # the deploy must be treated as a failure — never exit 0 on a
-            # deploy that left the app unchanged.
+            # Recorded for navigation only; see the pre-deploy note above.
             _post_version = (
                 _checked_version_probe(repo_root, config.target.app, workspace_binding)
                 if workspace_binding is not None
                 else _app_version_number(config.target.app)
             )
-            if _post_version is None:
-                try:
-                    manifest.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            if _post_version is not None and _pre_version is not None:
                 print(
-                    "ERROR: unable to establish the app's post-deploy version; "
-                    "refusing to treat this deploy as valid.",
-                    file=sys.stderr,
+                    f"[v2ctl.deploy] modal_version {_pre_version}->{_post_version}"
+                    f" (diagnostic; correctness is decided by deploy_id)"
                 )
-                return 1
-            if verify_version and _post_version <= _pre_version:
-                try:
-                    manifest.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                print(
-                    "ERROR: deploy reported success but the app's deployment "
-                    "version did NOT advance — the deployed code was NOT "
-                    "updated. Refusing to treat this deploy as valid.",
-                    file=sys.stderr,
-                )
-                return 1
             if native_golden:
                 # A real backend writer always creates the manifest.  Keep
                 # compatibility with injected runner tests that return a
                 # sentinel path without materializing a ledger file.
                 if manifest.is_file():
                     receipt = _write_golden_deployment_receipt(
-                        repo_root, config, env, deploy_identity, _post_version,
+                        repo_root, config, env, deploy_identity,
+                        _post_version if isinstance(_post_version, int) else 0,
                         manifest, None,
                         source_probe_expected,
                     )
