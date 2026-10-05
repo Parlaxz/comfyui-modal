@@ -7139,6 +7139,27 @@ if _server:
                     _golden_node_dir = _server.PromptServer.instance.node_directory
                 except Exception:
                     _golden_node_dir = os.getcwd()
+                # A profile that was never deployed cannot run. Rather than
+                # failing with "no matching deployment receipt", start the
+                # deploy and tell the user, so a forgotten deploy self-heals.
+                _golden_record = _golden_deploy_record(_golden_profile)
+                if _golden_record is not None and not _golden_record.get("deployed"):
+                    _golden_job = await _start_golden_deploy_job(
+                        _golden_profile, _golden_record
+                    )
+                    return web.json_response(
+                        {
+                            "status": "deploying",
+                            "message": (
+                                "You forgot to deploy. Deploying "
+                                + _golden_profile
+                                + " now; run again when it finishes."
+                            ),
+                            "profile": _golden_profile,
+                            "deploy": _golden_job,
+                        },
+                        status=202,
+                    )
                 return web.json_response(
                     await _studio_asyncio.wait_for(
                         run_golden_workflow(
@@ -7769,3 +7790,56 @@ except Exception as _cmfm_node_registration_error:  # pragma: no cover
         "[comfyui-modal] ComfyModalProduction node registration skipped: "
         f"{_cmfm_node_registration_error}"
     )
+
+
+async def _start_golden_deploy_job(profile_name, record=None):
+    """Start an asynchronous v2ctl deploy for one Golden profile.
+
+    Shared by the Settings Deploy button and by studio_run's auto-deploy, so a
+    forgotten deploy behaves identically whichever path notices it. Returns the
+    job record; never raises for an unknown profile (callers check first).
+    """
+    if record is None:
+        record = _golden_deploy_record(profile_name)
+    if record is None:
+        return None
+    existing = _golden_deploy_jobs.get(profile_name)
+    if existing is not None and existing["state"] == "running":
+        return existing
+
+    import asyncio
+    import sys
+
+    async def _run():
+        job = _golden_deploy_jobs[profile_name]
+        job["state"] = "running"
+        app = str((record.get("target") or {}).get("app") or "")
+        argv = [sys.executable, "-m", "tools.v2ctl", "--profile", profile_name, "deploy"]
+        if app:
+            argv += ["--app", app]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(Path(__file__).parent),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await proc.communicate()
+            job["exit_code"] = proc.returncode
+            job["output"] = (out or b"").decode("utf-8", "replace")[-4000:]
+            job["state"] = "done" if proc.returncode == 0 else "failed"
+        except Exception as exc:  # pragma: no cover - defensive
+            job["state"] = "failed"
+            job["output"] = "%s: %s" % (type(exc).__name__, exc)
+        job["deployed"] = bool((_golden_deploy_record(profile_name) or {}).get("deployed"))
+
+    _golden_deploy_jobs[profile_name] = {
+        "id": "%s-%d" % (profile_name, time.time_ns()),
+        "profile": profile_name,
+        "app": str((record.get("target") or {}).get("app") or ""),
+        "state": "running",
+        "started_at": time.time_ns(),
+        "deployed": record.get("deployed"),
+    }
+    asyncio.get_running_loop().create_task(_run())
+    return _golden_deploy_jobs[profile_name]
