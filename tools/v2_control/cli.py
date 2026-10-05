@@ -27,6 +27,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from comfymodal_runtime import deploy_identity
 from comfymodal_runtime.contracts import DEPLOYMENT_HASH_NAMESPACE
 from comfymodal_runtime.publication_policy import (
     CUSTOM_NODES_PUBLISHER_APP_NAME,
@@ -328,6 +329,47 @@ def _new_invocation_id() -> str:
     return uuid.uuid4().hex
 
 
+def compute_deploy_id(config: config_mod.ResolvedConfig) -> str:
+    """The one identity that says which deployment served a request.
+
+    Derived from the shipped source revision, the resolved deploy-time
+    configuration, the target class/method, and the deployment-relevant resource
+    shape. Request-only settings and local/diagnostic noise are excluded, so the
+    same deployment always yields the same id.
+
+    This is computed here at deploy construction and baked into the class
+    environment; the runtime freezes it at import and reports it per request, so
+    a stale snapshot or a wrong deployment is caught by comparing the expected id
+    with the one the executing interpreter reports.
+    """
+    resources: dict[str, object] = {}
+    resolved = getattr(config, "resources", None)
+    for field in ("gpu", "cpu", "memory_mb", "timeout_s"):
+        value = getattr(resolved, field, None)
+        if value is not None:
+            resources[field] = value
+    deploy_flags = getattr(config, "deploy_flags", None)
+    resolved_config: dict[str, object] = {}
+    if isinstance(deploy_flags, dict):
+        resolved_config = {
+            str(name): getattr(flag, "value", flag) for name, flag in deploy_flags.items()
+        }
+    elif isinstance(deploy_flags, (list, tuple)):
+        resolved_config = {str(name): "" for name in deploy_flags}
+
+    target = config.target
+    return deploy_identity.compute_deploy_id(
+        source_revision=str(getattr(config.git, "head", "") or ""),
+        resolved_config=resolved_config,
+        target={
+            "app": target.app,
+            "class": target.class_name,
+            "method": getattr(target, "method", "") or "",
+        },
+        resources=resources,
+    )
+
+
 def _canonical_metadata_env(
     config: config_mod.ResolvedConfig,
     fingerprints: fp_mod.FingerprintEngine,
@@ -341,6 +383,9 @@ def _canonical_metadata_env(
         "COMFYMODAL_V2CTL_DEPLOYMENT_HASH": fingerprints.deploy_fingerprint(),
         "COMFYMODAL_V2CTL_RUN_FINGERPRINT": fingerprints.run_fingerprint(),
         "COMFYMODAL_V2CTL_DEPLOYMENT_HASH_NAMESPACE": DEPLOYMENT_HASH_NAMESPACE,
+        # The authoritative deployment identity. The runtime reads this once at
+        # import and reports it with every Golden request.
+        deploy_identity.DEPLOY_ID_ENV: compute_deploy_id(config),
     }
 
 

@@ -23,6 +23,7 @@ This module exists separately from ``modal_app`` for two reasons:
 
 from __future__ import annotations
 
+from . import deploy_identity as _deploy
 from . import source_identity as _identity
 
 #: Declared boundary order. Emission follows this, not dict insertion order.
@@ -67,6 +68,12 @@ def emit_envelope(request_id: str) -> None:
 
     Pops the marks so a long-lived container cannot accumulate them. An unknown
     or already-emitted ``request_id`` is a safe no-op.
+
+    The line also carries ``deploy_id``, read from the value frozen at import by
+    :mod:`comfymodal_runtime.deploy_identity`. That is the authoritative
+    same-request statement of which deployment ran: a container restored from an
+    older snapshot reports the older id, which the caller compares against the
+    deployment it intended to run.
     """
     marks = ENVELOPE.pop(request_id, None)
     if not marks:
@@ -80,7 +87,13 @@ def emit_envelope(request_id: str) -> None:
         delta = "" if base is None else " delta_ms=%.3f" % ((value - base) / 1e6)
         parts.append("%s=%d%s" % (key, value, delta))
     print(
-        "[v2.golden.envelope] request_id=%s executed_source_sha256=%s %s"
-        % (request_id, executed_source_sha256(), " ".join(parts)),
+        "[v2.golden.envelope] request_id=%s deploy_id=%s "
+        "executed_source_sha256=%s %s"
+        % (
+            request_id,
+            _deploy.deploy_id(),
+            executed_source_sha256(),
+            " ".join(parts),
+        ),
         flush=True,
     )

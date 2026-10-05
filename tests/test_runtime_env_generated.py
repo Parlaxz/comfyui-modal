@@ -130,13 +130,29 @@ def test_generated_env_matches_pre_refactor_contract(scenario, contract):
     old = contract["scenarios"][scenario]
     # The contract also contains keys the runtime sets explicitly outside the
     # schema; compare the schema's share against the old contract exactly.
-    comparable = {k: v for k, v in old.items() if k not in _explicit_keys(contract)}
-    new = _schema_env(SCENARIOS[scenario])
+    added = _added_after_contract()
+    comparable = {
+        k: v for k, v in old.items() if k not in _explicit_keys(contract)
+    }
+    new = {
+        k: v for k, v in _schema_env(SCENARIOS[scenario]).items() if k not in added
+    }
 
     assert sorted(set(new) - set(comparable)) == [], "projection added keys"
     assert sorted(set(comparable) - set(new)) == [], "projection dropped keys"
     differing = {k: (comparable[k], new[k]) for k in comparable if comparable[k] != new[k]}
     assert differing == {}, "projection changed values: %r" % differing
+
+
+def _added_after_contract():
+    """Keys added to the schema after the pre-refactor contract was captured.
+
+    COMFYMODAL_V2_DEPLOY_ID arrived with the single deploy_id. It is a deliberate
+    addition rather than drift, so the differential excludes exactly that key
+    instead of being weakened.
+    """
+    added = {"COMFYMODAL_V2_DEPLOY_ID"}
+    return added & set(config_schema.runtime_env_fields())
 
 
 def _explicit_keys(contract):
@@ -152,7 +168,7 @@ def _explicit_keys(contract):
 
 
 def test_projection_covers_every_contract_key_except_the_explicit_ones(contract):
-    projected = set(config_schema.runtime_env_fields())
+    projected = set(config_schema.runtime_env_fields()) - _added_after_contract()
     old = set(contract["scenarios"]["defaults"])
     assert projected == old - _explicit_keys(contract)
     assert _explicit_keys(contract), "expected some explicitly-set keys"

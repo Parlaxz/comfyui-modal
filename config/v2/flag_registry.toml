@@ -2371,3 +2371,13 @@ change_requires = "run"
 runtime_exposed = false
 owner = "e29"
 description = "Volume-read benchmark run count."
+
+[[flag]]
+name = "COMFYMODAL_V2_DEPLOY_ID"
+type = "string"
+default = ""
+consumed_at = "module_import"
+change_requires = "deploy"
+runtime_exposed = true
+owner = "v2ctl"
+description = "Identity of the deployment that is being created, baked into the Modal class environment at deploy time and frozen by the runtime at import. The Golden request reports it so a stale snapshot or wrong deployment is rejected by comparing the expected id with the one the executing interpreter reports."
