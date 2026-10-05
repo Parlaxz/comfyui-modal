@@ -144,12 +144,12 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 name = "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE"
 type = "enum"
 default = "fresh"
+enum_values = ["fresh", "whole", "epoch"]
 consumed_at = "request"
 change_requires = "run"
 runtime_exposed = true
 owner = "testing9-c0-mmap"
 description = "TESTING9-only C0 mmap lifecycle diagnostic; fresh is the current exact-window control, whole keeps one mapping per model/path, and epoch uses aligned approximately 1 GiB mappings."
-enum_values = ["fresh", "whole", "epoch"]
 
 [[flag]]
 name = "COMFYMODAL_GOLDEN_C0_READER_GATE"
@@ -185,12 +185,12 @@ description = "Observation-only deep cudaHostRegister identity, mapping, proc-st
 name = "COMFYMODAL_GOLDEN_C0_REGISTRATION_ORDER"
 type = "enum"
 default = "overlap"
+enum_values = ["overlap", "register_first"]
 consumed_at = "restore"
 change_requires = "deploy"
 runtime_exposed = true
 owner = "c0-registration-investigation"
 description = "Diagnostic-only registration ordering arm; overlap preserves Popen-before-register and register_first registers before child startup."
-enum_values = ["overlap", "register_first"]
 
 [[flag]]
 name = "COMFYMODAL_GOLDEN_C0_SHM_POPULATE"
@@ -269,17 +269,18 @@ description = "Overlap weightless CLIP skeleton construction with the selected C
 name = "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE"
 type = "enum"
 default = "serial"
+enum_values = ["serial", "overlap"]
 consumed_at = "method_entry"
 change_requires = "deploy"
 runtime_exposed = true
 owner = "golden-parallel"
 description = "Schedule CLIP forward and UNET load serially or in the bounded parallel overlap window."
-enum_values = ["serial", "overlap"]
 
 [[flag]]
 name = "COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME"
 type = "string"
 default = "one_shot_events"
+enum_values = ["reuse", "one_shot_events"]
 consumed_at = "request"
 change_requires = "deploy"
 runtime_exposed = true
@@ -366,6 +367,7 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 name = "COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING"
 type = "string"
 default = "posix"
+enum_values = ["posix", "sysv"]
 consumed_at = "module_import"
 change_requires = "deploy"
 runtime_exposed = true
@@ -396,6 +398,7 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 name = "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE"
 type = "string"
 default = "preadv"
+enum_values = ["preadv", "mmap_fresh"]
 consumed_at = "module_import"
 change_requires = "deploy"
 runtime_exposed = true
@@ -406,6 +409,7 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 name = "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY"
 type = "string"
 default = "qd4_32"
+enum_values = ["qd4_32", "qd2_128", "qd4_64"]
 consumed_at = "module_import"
 change_requires = "deploy"
 runtime_exposed = true
@@ -476,6 +480,7 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 name = "COMFYMODAL_GOLDEN_QD2_TELEMETRY"
 type = "string"
 default = "light"
+enum_values = ["light", "heavy_current"]
 consumed_at = "module_import"
 change_requires = "deploy"
 runtime_exposed = true
@@ -507,12 +512,12 @@ description = "Suppress the stock RES4LYF beta sampler's module-local gc.collect
 name = "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE"
 type = "enum"
 default = "serial"
+enum_values = ["serial", "overlap"]
 consumed_at = "method_entry"
 change_requires = "deploy"
 runtime_exposed = true
 owner = "golden-parallel"
 description = "Schedule sampling and VAE load serially or in the bounded parallel overlap window."
-enum_values = ["serial", "overlap"]
 
 [[flag]]
 name = "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES"
@@ -584,6 +589,7 @@ description = "TESTING9-only deployment gate for the isolated process/thread/sha
 name = "COMFYMODAL_PRELOAD_MODE"
 type = "string"
 default = "clip_only"
+enum_values = ["off", "clip_only", "unet_only", "unet_vae_only", "vae", "default", "sequential", "workers_1", "workers_2", "async_no_wait", "budgeted_1500ms"]
 consumed_at = "request"
 change_requires = "deploy"
 runtime_exposed = true
@@ -775,7 +781,7 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 
 [[flag]]
 name = "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MB"
-type = "bool"
+type = "int"
 default = "0"
 consumed_at = "request"
 change_requires = "deploy"
@@ -785,7 +791,7 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 
 [[flag]]
 name = "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MS"
-type = "bool"
+type = "int"
 default = "0"
 consumed_at = "request"
 change_requires = "deploy"
@@ -971,12 +977,12 @@ max = 4096
 name = "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY"
 type = "enum"
 default = "restore_earliest"
+enum_values = ["restore_earliest", "after_restore_sensitive_phase", "after_cuda_restore", "method_entry", "clean_lane_post_restore"]
 consumed_at = "restore"
 change_requires = "deploy"
 runtime_exposed = true
 owner = "e30"
 description = "E30 CLIP reader launch policy (the reader never chooses; the caller passes it)."
-enum_values = ["restore_earliest", "after_restore_sensitive_phase", "after_cuda_restore", "method_entry", "clean_lane_post_restore"]
 
 [[flag]]
 name = "COMFYMODAL_V2_CLIP_QD_QD"
@@ -1177,12 +1183,12 @@ description = "Enable the E37 fail-closed plan/cache/ledger/source proof validat
 name = "COMFYMODAL_V2_ENV_PROFILE"
 type = "enum"
 default = "inherit"
+enum_values = ["production", "diagnostic", "inherit"]
 consumed_at = "restore"
 change_requires = "deploy"
 runtime_exposed = true
 owner = "v2-core"
 description = "Runtime environment profile baked at deploy time. Default reconciled to the value deployments actually emit."
-enum_values = ["production", "diagnostic", "inherit"]
 
 [[flag]]
 name = "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"
@@ -1208,12 +1214,12 @@ description = "Idle seconds before eviction during restore."
 name = "COMFYMODAL_V2_EVICT_RETAIN_ROLE"
 type = "enum"
 default = "none"
+enum_values = ["none", "clip", "unet", "clip_vae"]
 consumed_at = "restore"
 change_requires = "deploy"
 runtime_exposed = false
 owner = "e29"
 description = "Role retained in the CPU snapshot after eviction (case-sensitive: none|clip|unet|clip_vae)."
-enum_values = ["none", "clip", "unet", "clip_vae"]
 
 [[flag]]
 name = "COMFYMODAL_V2_EXACT_CACHE_PERSIST"
@@ -1237,7 +1243,7 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 
 [[flag]]
 name = "COMFYMODAL_V2_EXECUTION_UNET_H2D_DELAY_MS"
-type = "bool"
+type = "int"
 default = "0"
 consumed_at = "module_import"
 change_requires = "deploy"
@@ -1499,7 +1505,7 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 [[flag]]
 name = "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET"
 type = "bool"
-default = "1"
+default = "0"
 consumed_at = "restore"
 change_requires = "deploy"
 runtime_exposed = false
@@ -1603,12 +1609,12 @@ max = 6
 name = "COMFYMODAL_V2_PREFILL_LANES"
 type = "enum"
 default = "critical"
+enum_values = ["none", "critical", "full"]
 consumed_at = "restore"
 change_requires = "deploy"
 runtime_exposed = true
 owner = "e29"
 description = "Prefill lane policy (critical is production)."
-enum_values = ["none", "critical", "full"]
 
 [[flag]]
 name = "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET"
@@ -1884,12 +1890,12 @@ description = "Thread policy selector (TBASE is production)."
 name = "COMFYMODAL_V2_UNET_ACTIVATION_MODE"
 type = "enum"
 default = "late"
+enum_values = ["late", "clip_encode_start", "clip_gpu_ready"]
 consumed_at = "restore"
 change_requires = "deploy"
 runtime_exposed = true
 owner = "v2-core"
 description = "When the UNET is activated relative to the request."
-enum_values = ["late", "sampling_end"]
 
 [[flag]]
 name = "COMFYMODAL_V2_UNET_BACKING_VERIFY"
@@ -1975,7 +1981,7 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 
 [[flag]]
 name = "COMFYMODAL_V2_UNET_META_DIRECT"
-type = "string"
+type = "bool"
 default = ""
 consumed_at = "method_entry"
 change_requires = "deploy"
@@ -2057,12 +2063,12 @@ description = "Migrated from the handwritten _runtime_env passthrough list; defa
 name = "COMFYMODAL_V2_VAE_ACTIVATION_MODE"
 type = "enum"
 default = "late"
+enum_values = ["late", "sampling_end", "sampling_first_step"]
 consumed_at = "restore"
 change_requires = "deploy"
 runtime_exposed = true
 owner = "v2-core"
 description = "When the VAE is activated relative to the request."
-enum_values = ["late", "sampling_end"]
 
 [[flag]]
 name = "COMFYMODAL_V2_VAE_EARLY_START_MS"
@@ -2080,17 +2086,18 @@ max = 1000
 name = "COMFYMODAL_V2_VAE_POLICY"
 type = "enum"
 default = "v1"
+enum_values = ["v0", "v1"]
 consumed_at = "restore"
 change_requires = "deploy"
 runtime_exposed = true
 owner = "v2-core"
 description = "VAE memory/restore policy (v1 is production)."
-enum_values = ["v0", "v1"]
 
 [[flag]]
 name = "COMFYMODAL_V2_VAE_PREFETCH_MODE"
 type = "string"
 default = "off"
+enum_values = ["off", "on", "auto"]
 consumed_at = "request"
 change_requires = "deploy"
 runtime_exposed = true
@@ -2381,3 +2388,167 @@ change_requires = "deploy"
 runtime_exposed = true
 owner = "v2ctl"
 description = "Identity of the deployment that is being created, baked into the Modal class environment at deploy time and frozen by the runtime at import. The Golden request reports it so a stale snapshot or wrong deployment is rejected by comparing the expected id with the one the executing interpreter reports."
+
+
+[[flag]]
+name = "COMFYMODAL_ACTUAL_LOAD_MODE"
+type = "enum"
+default = "clip_vae_only"
+enum_values = ["off", "clip_vae_only", "unet_only", "unet_vae_only"]
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Actual model-load role selector."
+
+[[flag]]
+name = "COMFYMODAL_DEFER_VAE_ACTUAL_LOAD_DURING_RBG_UNET"
+type = "bool"
+default = "1"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Defer VAE load while background UNET runs."
+
+[[flag]]
+name = "COMFYMODAL_DEFER_VAE_INCLUDING_PRODUCTION_UNET"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Defer VAE including the production UNET path."
+
+[[flag]]
+name = "COMFYMODAL_ENABLE_WARMUP"
+type = "bool"
+default = "1"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Enable runtime warmup."
+
+[[flag]]
+name = "COMFYMODAL_EXECUTION_BACKEND"
+type = "string"
+default = "in_process"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Execution backend selector."
+
+[[flag]]
+name = "COMFYMODAL_FASTPATH_V21621"
+type = "bool"
+default = "1"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Enable the v2.16.21 cold-start fast path."
+
+[[flag]]
+name = "COMFYMODAL_FASTPATH_V21621_BACKGROUND_UNET"
+type = "bool"
+default = "1"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Enable the fast-path background UNET arm."
+
+[[flag]]
+name = "COMFYMODAL_FASTPATH_V21621_CLIP_LOAD_ONLY"
+type = "bool"
+default = "1"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Use load-only behavior for fast-path CLIP."
+
+[[flag]]
+name = "COMFYMODAL_FASTPATH_V21621_CLIP_READ_BYTES"
+type = "bool"
+default = "1"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Use byte reads for fast-path CLIP."
+
+[[flag]]
+name = "COMFYMODAL_FUSE_READ_GOVERNOR"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Enable the FUSE read governor."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_PREADV_SICKNESS_DIAG"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Diagnostic-only clustered C0 preadv-sickness selector: ON instruments every child production preadv with an outstanding-read registry and runs an independent 500ms watchdog that captures a passive snapshot before a bounded, fresh-FD active probe matrix against pre-registered CLIP/UNET control offsets. Default OFF preserves the exact C0 persistent-FD preadv control; never changes QD, geometry, SHM, H2D, adoption, fallback, or validation. Evidence-only, never promoted."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_PRIVATE_SPLIT_IO"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Diagnostic-only C0 source/destination split selector: ON stages each fill in one reusable private buffer per source worker (thread or mmap reader process) and then copies into the existing leased SHM slot, exposing split source-read vs private->SHM timings. Default OFF reproduces the exact direct source->SHM path with no private buffers. Evidence-only; requires C0 streaming and never changes geometry, FD lifecycle, H2D, or adoption."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_SOURCE_VOLUME_V1"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Distinct C0 direct Volume V1 treatment selector: ON replaces only the child's byte producer with a VolumeGetFile2 ranged read streamed 8 MiB-block-by-block into the leased SHM slot, with no preadv fallback. Default OFF preserves the exact C0 preadv control. Requires the C0 streaming arm; geometry, worker pool, IPC, SHM, H2D, and adoption are unchanged."
+
+[[flag]]
+name = "COMFYMODAL_RESTORE_DIRECT_CLIP_POLICY"
+type = "enum"
+default = "auto"
+enum_values = ["auto", "off", "load_only", "load_and_encode"]
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Direct restore CLIP policy."
+
+[[flag]]
+name = "COMFYMODAL_SAFETENSORS_READ_MODE"
+type = "enum"
+default = "normal"
+enum_values = ["auto", "normal", "read_bytes"]
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "Safetensors read strategy."
+
+[[flag]]
+name = "COMFYMODAL_V2_UNET_STAGING_CHUNK_MB"
+type = "int"
+default = "512"
+consumed_at = "method_entry"
+change_requires = "deploy"
+runtime_exposed = false
+owner = "v2-core"
+description = "UNET staging chunk size in MiB."

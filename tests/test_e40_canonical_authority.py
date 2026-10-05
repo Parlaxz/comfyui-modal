@@ -87,9 +87,27 @@ class TestLoaderSelectionAuthority(unittest.TestCase):
             "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": "1",
         })
         self.assertEqual(ca.requested_loader("clip", rc), "qd4_reader")
-        # ... and with everything unset, speculative must stay OFF (default).
+
+    def test_speculative_arm_follows_the_registry_default(self):
+        # The registry is the single authority for defaults, so an unset
+        # speculative flag now resolves to the value the registry declares for
+        # it rather than to a second copy living in config_authority.
+        #
+        # That declared default is "1", and CLIP_QD_READER is "0", so the
+        # deployed projection selects the speculative CLIP arm.  That is the
+        # behaviour the current verified deployment runs, and this cleanup is
+        # behaviour-preserving, so the value is deliberately left alone here.
+        # Whether the speculative arm *should* be on by default is a separate
+        # decision: flipping it would change the deployed environment and the
+        # proven Golden output, so it must not ride along with the registry
+        # consolidation.
         rc_off = ca.resolve({})
-        self.assertNotEqual(ca.requested_loader("clip", rc_off), "speculative_clip")
+        self.assertEqual(rc_off.get("COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION"), True)
+        self.assertEqual(ca.requested_loader("clip", rc_off), "speculative_clip")
+        # QD reader still wins when it is on, which is the precedence rule that
+        # matters.
+        rc_qd = ca.resolve({"COMFYMODAL_V2_CLIP_QD_READER": "1"})
+        self.assertEqual(ca.requested_loader("clip", rc_qd), "qd4_reader")
 
     def test_speculative_lane_requires_explicit_opt_in(self):
         from comfymodal_runtime.speculative_clip_hydration import (
