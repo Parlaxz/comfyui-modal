@@ -15,17 +15,16 @@ from __future__ import annotations
 
 import pytest
 
-# Imported at module scope, not inside the test bodies: modal_app is ~24k
-# lines and pulls in torch, so a function-level import charged its full cost to
-# one test's CALL phase and blew the 2s FAST_UNIT budget on import time alone.
-# Collection is excluded from the budget, and this matches the pattern already
-# used by test_runtime_env_forwarding.py, test_modal_app_identity.py, etc.
-from comfymodal_runtime import modal_app as m
-
 pytestmark = pytest.mark.fast_unit
 
 
 def test_envelope_marks_are_ordered_and_delta_is_monotonic(capsys):
+    from comfymodal_runtime import modal_app as m
+
+    # Importing modal_app prints container-startup noise; drain it so the
+    # assertions below only see what the emitter itself produces.
+    capsys.readouterr()
+
     m._GOLDEN_ENVELOPE.clear()
     m._emit_golden_envelope("no-such-request")  # must be a safe no-op
     assert capsys.readouterr().out == ""
@@ -63,6 +62,8 @@ def test_envelope_marks_are_ordered_and_delta_is_monotonic(capsys):
 
 def test_envelope_emits_partial_marks_without_inventing_them(capsys):
     """A missing boundary is omitted; it is never fabricated as zero."""
+    from comfymodal_runtime import modal_app as m
+
     base = 5_000_000_000
     m._GOLDEN_ENVELOPE["req-2"] = {
         "method_entry_mono_ns": base,
@@ -77,6 +78,8 @@ def test_envelope_emits_partial_marks_without_inventing_them(capsys):
 
 def test_envelope_table_is_bounded():
     """The mark table must not grow without bound in a long-lived container."""
+    from comfymodal_runtime import modal_app as m
+
     m._GOLDEN_ENVELOPE.clear()
     for i in range(m._GOLDEN_ENVELOPE_MAX + 25):
         m._GOLDEN_ENVELOPE["req-%d" % i] = {"method_entry_mono_ns": i}
