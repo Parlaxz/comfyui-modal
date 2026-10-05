@@ -7386,7 +7386,7 @@ if _server:
             job = _golden_deploy_jobs[name]
             job["state"] = "running"
             app = str((record.get("target") or {}).get("app") or "")
-            argv = [sys.executable, "-m", "tools.v2ctl", "--profile", name, "deploy"]
+            argv = [sys.executable, os.path.join("tools", "v2ctl.py"), "--profile", name, "deploy"]
             if app:
                 argv += ["--app", app]
             try:
@@ -7814,7 +7814,7 @@ async def _start_golden_deploy_job(profile_name, record=None):
         job = _golden_deploy_jobs[profile_name]
         job["state"] = "running"
         app = str((record.get("target") or {}).get("app") or "")
-        argv = [sys.executable, "-m", "tools.v2ctl", "--profile", profile_name, "deploy"]
+        argv = [sys.executable, os.path.join("tools", "v2ctl.py"), "--profile", profile_name, "deploy"]
         if app:
             argv += ["--app", app]
         try:
