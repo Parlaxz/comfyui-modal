@@ -2792,6 +2792,25 @@ function renderProgressSection(state, context) {
         style: "font-size:10px;color:#aaa;",
         text: "Stage: " + terminalLabel,
       }));
+      // The terminal branch must build the same bar skeleton the live branch
+      // does. _appendGoldenProgress only fills segments when a
+      // progress-bar-segments container already exists, so without this the
+      // annotated bar vanished the moment the run finished - exactly when the
+      // finished stage breakdown matters most.
+      section.appendChild(el("div", {
+        class: "comfymodal-studio-progress-bar",
+        "data-testid": "progress-bar",
+      }, [
+        el("div", {
+          class: "comfymodal-studio-progress-fill",
+          "data-testid": "progress-bar-fill",
+          style: "width:100%;",
+        }),
+        el("div", {
+          class: "comfymodal-studio-progress-segments",
+          "data-testid": "progress-bar-segments",
+        }),
+      ]));
       _appendGoldenProgress(section, runState);
     }
     return section;
