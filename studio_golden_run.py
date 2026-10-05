@@ -305,14 +305,16 @@ async def run_golden_workflow(
         resolve_workflow_run_bundle,
     )
 
+    # The Studio preset collapse removed preset_id and
+    # allow_remote_execution from this seam; control defaults now come from
+    # the version's own executable_prompt via bundle["defaults"].
     bundle = resolve_workflow_run_bundle(
-            workflow_id, version_id, preset_id, node_dir,
-            allow_remote_execution=True,
-        )
+        workflow_id, version_id, node_dir,
+    )
     if bundle.get("status") != "ok":
         return bundle
     merged = merge_workflow_controls(
-        bundle["preset"], dict(controls or {}), bundle["control_schema"],
+        bundle["defaults"], dict(controls or {}), bundle["control_schema"],
     )
     if merged["errors"]:
         return {
