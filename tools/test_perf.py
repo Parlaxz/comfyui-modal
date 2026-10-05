@@ -1,7 +1,7 @@
 """Run pytest with a small, permanent RX9P-T slow-test diagnostic guard.
 
 The wrapper keeps the normal pytest command line intact while adding phase
-timings and a hard wall clock.  It is intentionally stdlib-only apart from
+timings and a stall watchdog.  It is intentionally stdlib-only apart from
 pytest itself (which is the command being run)::
 
     python tools/test_perf.py tests/test_production_baseline.py::test_name
@@ -18,12 +18,20 @@ Heavy-local verification::
     pytest -m heavy_local
 
 ``--fast`` sets ``COMFYUI_MODAL_LIGHTWEIGHT_TEST=1`` and fails when any
-measured test exceeds the FAST_UNIT budget (two seconds by default).  Stack
-requests are sent periodically and shortly before the hard timeout.  On
-Windows this uses CTRL_BREAK only when faulthandler signal registration
-succeeds; otherwise the child uses faulthandler's periodic dump fallback.
-On POSIX it uses SIGUSR1.  Stack output is kept in the command output rather
-than creating diagnostic artifacts.
+measured test exceeds the FAST_UNIT budget (two seconds by default).
+
+``--timeout`` is an *inactivity* budget, not a cap on total suite wall.  The
+deadline resets whenever the child emits output, so a broad selection of
+hundreds of individually-fast tests may run for far longer than the timeout
+while still being killed promptly if it genuinely stalls.  This matches the
+intent stated below the budget check: a broad suite must not be rejected
+solely because its tests add up to more than the per-test budget.
+
+Stack requests are sent periodically and at the moment the inactivity
+watchdog fires.  On Windows this uses CTRL_BREAK only when faulthandler
+signal registration succeeds; otherwise the child uses faulthandler's
+periodic dump fallback.  On POSIX it uses SIGUSR1.  Stack output is kept in
+the command output rather than creating diagnostic artifacts.
 """
 
 from __future__ import annotations
@@ -375,32 +383,95 @@ def _watch_stacks(
     interval: float,
     stop: threading.Event,
 ) -> None:
-    """Send periodic and pre-timeout stack requests while pytest is running."""
+    """Send periodic stack requests while pytest is running.
+
+    No absolute deadline is used any more: the parent's inactivity watchdog
+    owns the kill decision and requests a stack itself at that point. A
+    long-but-progressing suite must not be interrupted by a fixed wall clock.
+    """
     interval = max(interval, 0.1)
-    # A very short timeout can fire before pytest has imported this plugin.
-    # CTRL_BREAK is then treated as an ordinary console interrupt on Windows
-    # instead of a faulthandler request.  Let the parent own those short hard
-    # deadlines and request the stack at the deadline itself.
-    warning_at = (
-        started + max(timeout - min(0.5, timeout / 4), 0.0)
-        if timeout >= 2.0
-        else float("inf")
-    )
     next_periodic = started + interval
-    timeout_sent = False
     while not stop.is_set() and proc.poll() is None:
         now = _clock()
-        if not timeout_sent and now >= warning_at:
-            _request_stack(proc, "timeout-warning")
-            timeout_sent = True
         if now >= next_periodic:
             _request_stack(proc, "periodic")
             next_periodic += interval
-        wait_for = min(
-            max(next_periodic - now, 0.01),
-            max(warning_at - now, 0.01) if not timeout_sent else interval,
-        )
-        stop.wait(wait_for)
+        stop.wait(max(min(next_periodic - now, interval), 0.01))
+
+
+def _drain_progress(stdout: Any, on_progress: Any) -> bytes:
+    """Read whatever pytest has emitted so far without blocking on EOF.
+
+    Progress is measured in bytes actually produced by the child. The plugin
+    prints one ``RX9P_T_PHASE`` record per SETUP/CALL/TEARDOWN and a dot per
+    test, so a suite that keeps working keeps growing this buffer even when an
+    individual test is slow. A suite that hangs stops producing bytes, which is
+    exactly the signal the inactivity watchdog needs.
+    """
+    chunks: list[bytes] = []
+    while True:
+        try:
+            chunk = os.read(stdout.fileno(), 65536)
+        except (OSError, ValueError):
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+        on_progress(len(chunk))
+    return b"".join(chunks)
+
+
+def _communicate_with_inactivity_watchdog(
+    proc: subprocess.Popen[bytes], inactivity_timeout: float
+) -> tuple[bytes, bool]:
+    """Wait for pytest, killing it only after ``inactivity_timeout`` of silence.
+
+    The previous implementation used ``proc.communicate(timeout=...)``, which
+    capped the *whole suite* at 15 seconds and killed it mid-run even while
+    hundreds of individually-fast tests were still passing. That contradicted
+    this file's own stated intent that "a broad suite is not rejected solely
+    because its tests add up to more than the per-test budget".
+
+    ``--timeout`` is therefore reinterpreted as an *inactivity* budget: the
+    deadline resets every time the child produces output. It now detects a
+    stall or hang, and no longer fails legitimate aggregate progress.
+    """
+    assert proc.stdout is not None
+    collected: list[bytes] = []
+    state = {"last_progress": _clock()}
+
+    def _note_progress(_amount: int) -> None:
+        state["last_progress"] = _clock()
+
+    def reader() -> None:
+        collected.append(_drain_progress(proc.stdout, _note_progress))
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+
+    timed_out = False
+    while True:
+        if proc.poll() is not None:
+            break
+        if _clock() - float(state["last_progress"]) >= inactivity_timeout:
+            timed_out = True
+            _request_stack(proc, "inactivity-timeout")
+            proc.kill()
+            break
+        time.sleep(0.05)
+
+    thread.join(timeout=5.0)
+    try:
+        tail = proc.stdout.read() or b""
+    except (OSError, ValueError):
+        tail = b""
+    output = b"".join(collected) + tail
+    if timed_out:
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            pass
+    return output, timed_out
 
 
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -417,8 +488,15 @@ def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--timeout", type=float, default=15.0, metavar="SECONDS",
-        help="hard wall timeout for the pytest subprocess (default: 15)",
+        "--timeout",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help=(
+            "inactivity budget: kill pytest only after this long with no "
+            "collection/phase progress. It is NOT a cap on total suite wall; a "
+            "broad suite of individually-fast tests may legitimately run longer."
+        ),
     )
     parser.add_argument(
         "--fast", action="store_true",
@@ -472,7 +550,11 @@ def _print_summary(
         flush=True,
     )
     if timed_out:
-        print(f"FAILURE: hard timeout exceeded ({total_wall:.3f}s)", flush=True)
+        print(
+            f"FAILURE: inactivity timeout exceeded "
+            f"({total_wall:.3f}s wall, no pytest progress)",
+            flush=True,
+        )
     if budget_exceeded:
         print(
             f"FAILURE: FAST_UNIT budget exceeded "
@@ -537,18 +619,9 @@ def main(argv: list[str] | None = None) -> int:
     watcher.start()
 
     timed_out = False
-    try:
-        output, _ = proc.communicate(timeout=args.timeout)
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        _request_stack(proc, "timeout")
-        proc.kill()
-        output, _ = proc.communicate()
-        if exc.output:
-            output = exc.output + (output or b"")
-    finally:
-        stop.set()
-        watcher.join(timeout=1.0)
+    output, timed_out = _communicate_with_inactivity_watchdog(proc, args.timeout)
+    stop.set()
+    watcher.join(timeout=1.0)
 
     if output:
         sys.stdout.buffer.write(output)
