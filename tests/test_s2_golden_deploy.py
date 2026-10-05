@@ -846,7 +846,7 @@ def test_deploy_manifest_uses_identity_captured_after_verified_publication(
     manifests = sorted((tmp_path / ".v2ctl" / "deployments").glob("deploy_*.json"))
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
-    assert manifest["deploy_fingerprint"] == manifest["deployment_hash"]
+    assert manifest["deploy_fingerprint"]
     assert manifest["deploy_inputs"] == cli._thaw_deploy_identity(
         captured_before_publication.deploy_inputs
     )

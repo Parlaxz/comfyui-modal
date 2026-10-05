@@ -260,9 +260,10 @@ def inject_provenance_hook_doc() -> str:
         "# Notes:\n"
         "# - prefixes are the first 8 hex chars of the sha256 fingerprints\n"
         "# - never dump the full environment or any secret values\n"
-        "# - keep this line stable; validators (StructuralValidator) accept\n"
-        "#   request_id/correlation_id and the v2ctl_config proof line from\n"
-        "#   backend stdout"
+        "# - keep this line stable; validators (StructuralValidator) take\n"
+        "#   request_id/correlation_id from backend stdout. Everything else on\n"
+        "#   it, including any v2ctl_config field, is diagnostic only -- the\n"
+        "#   line is not accepted as proof of deployment identity."
     )
 
 

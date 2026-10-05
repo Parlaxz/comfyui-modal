@@ -203,7 +203,6 @@ class TestGoldenNamespace:
                 **base,
                 "profile": "golden_p1",
                 "deploy_fingerprint": "s1-fingerprint",
-                "deployment_hash": "s1-fingerprint",
                 "deploy_inputs": {
                     "target": {
                         "app": "batch-s1-cache-e1",
@@ -219,7 +218,6 @@ class TestGoldenNamespace:
                 **base,
                 "profile": "golden_p1",
                 "deploy_fingerprint": "ra5-fingerprint",
-                "deployment_hash": "ra5-fingerprint",
                 "target": {
                     "app": "batch-ra5-attention-shootout",
                     "class": "ModalRuntimeEntrypointV2",

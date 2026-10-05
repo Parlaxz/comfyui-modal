@@ -374,7 +374,6 @@ def _canonical_metadata_env(
         "COMFYMODAL_V2CTL_PROFILE": str(config.profile_name),
         "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT": fingerprints.profile_config_fingerprint(),
         "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT": fingerprints.deploy_fingerprint(),
-        "COMFYMODAL_V2CTL_DEPLOYMENT_HASH": fingerprints.deploy_fingerprint(),
         "COMFYMODAL_V2CTL_RUN_FINGERPRINT": fingerprints.run_fingerprint(),
         "COMFYMODAL_V2CTL_DEPLOYMENT_HASH_NAMESPACE": DEPLOYMENT_HASH_NAMESPACE,
         # The authoritative deployment identity. The runtime reads this once at
@@ -1483,7 +1482,10 @@ def _print_golden_predeploy_card(
     print(f"PUBLISHER_VERSION={preflight.get('PUBLISHER_VERSION')}")
     print(f"LOCAL_CONTENT_GENERATION={preflight.get('LOCAL_CONTENT_GENERATION', '')}")
     print(f"REMOTE_CONTENT_GENERATION={preflight.get('REMOTE_CONTENT_GENERATION') or '(none)'}")
-    print(f"PUBLICATION_DECISION={preflight.get('PUBLICATION_DECISION', 'invalid')}")
+    print(
+        f"PUBLICATION_DECISION="
+        f"{preflight.get('PUBLICATION_DECISION') or 'unknown'}"
+    )
     print(f"DEPLOY_LOCK={lock_state}")
     print(
         "READY_FOR_CONSUMER_DEPLOY="
@@ -1622,7 +1624,6 @@ def _receipt_effective_env(
     for name, value in receipt.effective_environment.items():
         bound[name] = str(value)
     bound["COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"] = receipt.deploy_fingerprint
-    bound["COMFYMODAL_V2CTL_DEPLOYMENT_HASH"] = receipt.deploy_fingerprint
     bound["COMFYMODAL_V2CTL_PROFILE"] = receipt.profile
     resources = receipt.deployment_identity.get("resources", {})
     if isinstance(resources, dict):
@@ -1738,7 +1739,6 @@ def _apply_deploy_identity_to_env(
         identity.profile_config_fingerprint
     )
     env["COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"] = identity.deploy_fingerprint
-    env["COMFYMODAL_V2CTL_DEPLOYMENT_HASH"] = identity.deploy_fingerprint
 
 
 def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
@@ -1767,7 +1767,6 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
         "schema_version": SCHEMA_VERSION,
         "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
         "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
-        "deployment_hash": deploy_fp,
         "created_at": _utcnow_iso(),
         "profile": config.profile_name,
         "owner": config.owner,
@@ -1989,12 +1988,16 @@ def _write_golden_deployment_receipt(
 def _validate_deployment_manifest(manifest: object) -> dict | None:
     """Return a trustworthy current deployment manifest, otherwise ``None``.
 
-    Schema 2 has two spellings for the same deployment identity because the
-    latter is the compatibility field used by the control plane.  Treat both
-    as required and equal: accepting either one independently would allow a
-    persisted manifest to claim a different deployment from the one v2ctl
-    compares before a run.  Older schema-1 records remain stale and are not
-    promoted to current state.
+    One field, one spelling: ``deploy_fingerprint`` is the deterministic
+    deploy-input hash and the component that ``deploy_id`` is computed over.
+    The manifest used to also persist it as ``deployment_hash`` and validation
+    required the two to be present and equal. Both were written from the same
+    value, so that comparison could only ever fail if one field had been edited
+    by hand -- it was duplicate storage of a single value, not a second
+    deployment identity. ``deploy_id`` is the acceptance authority;
+    ``deploy_fingerprint`` is an input to it.
+
+    Schema-1 records remain stale and are not promoted to current state.
     """
     if not isinstance(manifest, dict):
         return None
@@ -2005,14 +2008,10 @@ def _validate_deployment_manifest(manifest: object) -> dict | None:
     if manifest.get("fingerprint_algorithm") != FINGERPRINT_ALGORITHM:
         return None
 
-    deployment_hash = manifest.get("deployment_hash")
     deploy_fingerprint = manifest.get("deploy_fingerprint")
     if not (
-        isinstance(deployment_hash, str)
-        and deployment_hash.strip()
-        and isinstance(deploy_fingerprint, str)
+        isinstance(deploy_fingerprint, str)
         and deploy_fingerprint.strip()
-        and deployment_hash == deploy_fingerprint
     ):
         return None
     return manifest
@@ -2174,7 +2173,6 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
         "schema_version": SCHEMA_VERSION,
         "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
         "fingerprint_algorithm": FINGERPRINT_ALGORITHM,
-        "deployment_hash": deploy_fp,
         "created_at": _utcnow_iso(),
         "profile": config.profile_name,
         "owner": config.owner,
@@ -2383,9 +2381,11 @@ def cmd_golden_status(args, repo_root: Path) -> int:
         # capture-guard namespace.
         guard_deployment_info = {}
         if matching_manifest is not None:
+            # deploy_fingerprint is the single deploy-identity spelling in the
+            # manifest; deployment_combined_hash is the guard's name for it.
             guard_deployment_info = {
                 "deployment_combined_hash": matching_manifest.get(
-                    "deployment_hash", ""
+                    "deploy_fingerprint", ""
                 ),
                 "deploy_fingerprint": matching_manifest.get(
                     "deploy_fingerprint", ""
