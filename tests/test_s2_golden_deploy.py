@@ -166,36 +166,6 @@ def test_exact_trusted_skip_does_not_call_compatibility_publisher(tmp_path):
     assert calls == []
 
 
-@pytest.mark.parametrize("receipt_state", ["missing", "stale", "malformed"])
-def test_generation_match_recovers_receipt_without_republishing(tmp_path, monkeypatch, receipt_state):
-    root = _root(tmp_path)
-    identity, _archive, _files = prepare_publication(root)
-    volume = FakeVolume()
-    _generation_record(volume, identity)
-    if receipt_state == "stale":
-        stale = PublicationReceipt.create(identity, volume.name)
-        values = dict(stale.__dict__)
-        values["manifest_digest"] = "stale-manifest"
-        volume.files[RECEIPT_PATH] = PublicationReceipt(**values).to_bytes()
-    elif receipt_state == "malformed":
-        volume.files[RECEIPT_PATH] = b"not-json"
-
-    monkeypatch.setattr(
-        "tools.v2_control.custom_nodes.build_archive",
-        lambda _files: (_ for _ in ()).throw(AssertionError("archive built")),
-    )
-
-    async def publisher(_archive):
-        raise AssertionError("publisher resolved")
-
-    decision = __import__("asyncio").run(publish_or_skip(
-        root, volume_name=volume.name, volume=volume, publisher=publisher,
-    ))
-    assert decision.action == "recovered"
-    assert decision.reason == "receipt_only_generation_match"
-    assert decision.receipt is not None
-
-
 def test_exact_trusted_skip_does_not_build_archive(tmp_path, monkeypatch):
     root = _root(tmp_path)
     identity, _archive, _files = prepare_publication(root)
@@ -432,7 +402,7 @@ def test_fallback_generation_matches_canonical_remote_hash(tmp_path):
     identity = build_source_identity(root, semantic_files=files)
     from comfymodal_runtime.publication_policy import compute_publication_generation
 
-    assert identity.generation == compute_publication_generation(root)
+    assert identity.content_generation == compute_publication_generation(root)
 
 
 def test_archive_generation_matches_remote_generation_helper(tmp_path):
@@ -445,7 +415,7 @@ def test_archive_generation_matches_remote_generation_helper(tmp_path):
     from comfymodal_runtime.publication_policy import compute_publication_generation
 
     assert compute_publication_generation(root) == compute_publication_generation(extracted)
-    assert identity.generation == compute_publication_generation(extracted)
+    assert identity.content_generation == compute_publication_generation(extracted)
 
 
 @pytest.mark.parametrize("reason", [
@@ -551,7 +521,7 @@ def test_identity_provider_and_semantic_walk_are_single_pass(tmp_path):
 
     files = collect_semantic_files(root)
     identity = build_source_identity(root, semantic_files=files, identity_provider=provider)
-    assert identity.generation == identity.manifest_digest
+    assert identity.content_generation == identity.manifest_digest
     assert identity.source_generation == "s1-adapter-generation"
     assert len(calls) == 1
 
@@ -566,7 +536,7 @@ def test_changed_json_does_not_recover_from_narrow_generation_record(tmp_path):
     narrow_generation = compute_custom_node_hash([root])
     config.write_text('{"mode": "two"}\n', encoding="utf-8")
     identity = build_source_identity(root)
-    assert narrow_generation != identity.generation
+    assert narrow_generation != identity.content_generation
 
     volume = FakeVolume()
     volume.files[GENERATION_RECORD_PATH] = json.dumps({

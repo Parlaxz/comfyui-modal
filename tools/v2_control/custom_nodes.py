@@ -915,7 +915,6 @@ async def publish_or_skip(
             volume = await asyncio.to_thread(factory, volume_name)
             if inspect.isawaitable(volume):
                 volume = await volume
-    volume_refresh_ok = True
     verified_previous: PublicationReceipt | None = None
     try:
         volume = await _refresh_volume_async(volume)
@@ -927,42 +926,9 @@ async def publish_or_skip(
         decision = PublicationDecision("publish", str(exc), identity)
     except Exception:
         # A refresh/read failure must never become an exact skip.
-        volume_refresh_ok = False
         decision = PublicationDecision("publish", "volume_readback_failed", identity)
     if decision.skip:
         return decision
-
-    # A content publication can succeed while its receipt write is lost (or a
-    # previous receipt can become stale).  The content-generation record is
-    # written by
-    # the remote publisher before its content commit and is therefore the
-    # authoritative, tiny proof that the Volume already contains this exact
-    # source content generation.  Recovering only the receipt avoids rebuilding and
-    # re-uploading content.  Any read/parse ambiguity returns None and remains
-    # on the normal fail-closed publication path.
-    content_generation_matches = (
-        volume_refresh_ok
-        and not repair_requested
-        and await _content_generation_readback_async(volume) == identity.content_generation
-    )
-    if content_generation_matches:
-        recovered = PublicationReceipt.create(identity, volume_name)
-        try:
-            await write_receipt_async(volume, recovered)
-            trusted = evaluate_receipt(
-                await read_receipt_async(volume, volume_name=volume_name), identity,
-                volume_name=volume_name,
-            )
-        except Exception:
-            return PublicationDecision(
-                "publish", "receipt_recovery_failed", identity,
-            )
-        if trusted is not None and trusted.skip:
-            return PublicationDecision(
-                "recovered", "receipt_only_generation_match", identity,
-                trusted.receipt,
-            )
-        return PublicationDecision("publish", "receipt_recovery_failed", identity)
 
     # Destructive-publication guard: compare the candidate identity against
     # the last verified remote receipt BEFORE any remote deletion/replacement

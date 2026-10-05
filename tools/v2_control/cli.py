@@ -3270,7 +3270,7 @@ def _publish_golden_custom_nodes(
         print(
             "[custom_nodes.publish] decision=skip_exact "
             f"reason={decision.reason} "
-            f"generation={decision.identity.generation[:12]} "
+            f"generation={decision.identity.content_generation[:12]} "
             f"schema={custom_nodes_mod.RECEIPT_SCHEMA_VERSION} "
             f"policy={custom_nodes_mod.PACKAGING_POLICY_VERSION}"
         )
@@ -3289,9 +3289,7 @@ def _publish_golden_custom_nodes(
             "to explicitly permit removal of previously-published external "
             "package files; remote generation is unchanged"
         )
-    if decision.action not in {"published", "recovered"} or (
-        decision.action == "published" and decision.reason != "published_verified"
-    ):
+    if decision.action != "published" or decision.reason != "published_verified":
         result = getattr(decision, "result", None)
         if isinstance(result, dict):
             identity = getattr(decision, "identity", None)
@@ -3340,7 +3338,7 @@ def _publish_golden_custom_nodes(
     print(
         f"[custom_nodes.publish] decision={decision.action} "
         f"reason={_safe_public_value(decision.reason, secrets) or 'unknown'} "
-        f"generation={decision.identity.generation[:12]} "
+        f"generation={decision.identity.content_generation[:12]} "
         f"schema={custom_nodes_mod.RECEIPT_SCHEMA_VERSION} "
         f"policy={custom_nodes_mod.PACKAGING_POLICY_VERSION}"
     )
@@ -3587,7 +3585,7 @@ def cmd_publish_custom_nodes(args, repo_root: Path) -> int:
             f"[v2ctl.publish-custom-nodes] action={action or ('skip' if skipped else 'unknown')} "
             f"reason={reason or 'unknown'} generation={generation[:16] or '(none)'}"
         )
-        if skipped or action in {"published", "recovered", "skip"}:
+        if skipped or action in {"published", "skip"}:
             return 0
         return 1
     except (V2CtlError, OSError, RuntimeError, ValueError) as exc:

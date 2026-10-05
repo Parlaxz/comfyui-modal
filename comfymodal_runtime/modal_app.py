@@ -10946,8 +10946,15 @@ class ModalRuntimeEntrypoint:
                     if not isinstance(_dp_baked_mft, dict):
                         _dp_baked_mft = {}
                     _dp_baked_gen = str(_dp_baked_mft.get("production_custom_node_generation", "") or "")
-                    _dp_observed_gen = str(getattr(state, "custom_node_generation", "") or "")
-                    _dp_gen_ok = bool(_dp_baked_gen and _dp_observed_gen and _dp_baked_gen == _dp_observed_gen)
+                    # DIAGNOSTIC ONLY.  Whether the Volume's published custom-node
+                    # bundle equals the required bundle is already established
+                    # directly before consumer deployment: publication compares
+                    # the required content_generation against the receipt and the
+                    # post-publish Volume readback, and a mismatch blocks the
+                    # deploy.  Predicting the same fact here from the baked
+                    # manifest and re-asserting it as proof-completeness was a
+                    # second, indirect authority over the same question, so it is
+                    # no longer computed and no longer gates anything.
                     _dp_dep_hash = str(_V2_DEPLOYMENT_COMBINED_HASH or "")
                     if not _dp_dep_hash:
                         _dp_dep_hash = str(getattr(state, "deployment_combined_hash", "") or "")
@@ -11011,10 +11018,6 @@ class ModalRuntimeEntrypoint:
                     _dp_missing = []
                     if not _dp_dep_hash:
                         _dp_missing.append("deployment_hash_unavailable")
-                    if not _dp_baked_gen:
-                        _dp_missing.append("baked_generation_unavailable")
-                    if not _dp_gen_ok:
-                        _dp_missing.append("generation_mismatch")
                     if not _dp_reg_fp:
                         _dp_missing.append("registry_fingerprint_unavailable")
                     _dp_manifest_classes = (
@@ -11032,14 +11035,13 @@ class ModalRuntimeEntrypoint:
                     if not _dp_dep_identity:
                         _dp_missing.append("dependency_identity_unavailable")
                     _dp_complete = bool(
-                        _dp_dep_hash and _dp_baked_gen and _dp_gen_ok and _dp_reg_fp
+                        _dp_dep_hash and _dp_reg_fp
                         and _dp_manifest_complete and _dp_dep_identity
                     )
                     _dp_proof = {
                         "schema_version": DEPLOYMENT_PROOF_SCHEMA_VERSION,
                         "deployment_combined_hash": _dp_dep_hash,
                         "custom_nodes_generation": _dp_baked_gen,
-                        "generation_matches_observed": _dp_gen_ok,
                         "registry_fingerprint": _dp_reg_fp,
                         "registry_manifest": _dp_reg_manifest,
                         "registry_manifest_error": _dp_reg_manifest_error,
@@ -11061,7 +11063,7 @@ class ModalRuntimeEntrypoint:
                         f"complete={_dp_complete} reason={_dp_proof['invalid_reason'] or 'ok'} "
                         f"dep_hash={_dp_dep_hash[:16] if _dp_dep_hash else '<empty>'} "
                         f"baked_gen={_dp_baked_gen[:16] if _dp_baked_gen else '<empty>'} "
-                        f"gen_ok={int(_dp_gen_ok)} reg_fp={bool(_dp_reg_fp)} "
+                        f"reg_fp={bool(_dp_reg_fp)} "
                         f"dep_identity={bool(_dp_dep_identity)} repair_mode={_dp_repair_mode or 'n/a'} "
                         f"manifest_error={_dp_manifest_error_diag or 'none'}",
                         flush=True,
