@@ -7073,6 +7073,92 @@ if _server:
         preset_id = (body or {}).get("presetId", "").strip()
         feature_id = (body or {}).get("featureId", "").strip()
         controls = (body or {}).get("controls", {}) or {}
+        _golden_profile = str(
+            (body or {}).get("profile")
+            or (body or {}).get("profile_name")
+            or ""
+        ).strip()
+        if _golden_profile:
+            # Golden runs execute on the deployed Modal app named by the selected
+            # profile. This dispatch was lost in the Studio preset refactor
+            # (f3954638): studio_run fell through to the generic prompt path,
+            # which takes its target from COMFYMODAL_V2_APP_NAME (default
+            # "stable-modal-comfy-v2-shadow", environment "main") instead of the
+            # profile's own app and workspace.
+            try:
+                import asyncio as _studio_asyncio
+                from studio_golden_run import (
+                    browser_override_error,
+                    run_golden_workflow,
+                )
+
+                _override_error = browser_override_error(body or {})
+                if _override_error:
+                    return web.json_response(
+                        {
+                            "status": "error",
+                            "error_code": "GOLDEN_BROWSER_OVERRIDE_REJECTED",
+                            "message": _override_error,
+                        },
+                        status=400,
+                    )
+                _golden_version_id = str(
+                    (body or {}).get("workflow_version_id")
+                    or (body or {}).get("workflowVersionId")
+                    or ""
+                ).strip()
+                if not _golden_version_id:
+                    return web.json_response(
+                        {
+                            "status": "error",
+                            "error_code": "GOLDEN_WORKFLOW_REQUIRED",
+                            "message": (
+                                "workflow_version_id is required for a Golden Studio run"
+                            ),
+                        },
+                        status=400,
+                    )
+                _golden_request_id = str(
+                    (body or {}).get("request_id")
+                    or (body or {}).get("requestId")
+                    or ""
+                ).strip()
+                if not _golden_request_id:
+                    return web.json_response(
+                        {
+                            "status": "error",
+                            "error_code": "GOLDEN_REQUEST_ID_REQUIRED",
+                            "message": (
+                                "request_id is required for Golden progress polling"
+                            ),
+                        },
+                        status=400,
+                    )
+                _golden_node_dir = ""
+                try:
+                    _golden_node_dir = _server.PromptServer.instance.node_directory
+                except Exception:
+                    _golden_node_dir = os.getcwd()
+                return web.json_response(
+                    await _studio_asyncio.wait_for(
+                        run_golden_workflow(
+                            workflow_id=str((body or {}).get("workflow_id") or ""),
+                            version_id=_golden_version_id,
+                            preset_id=str((body or {}).get("preset_id") or ""),
+                            controls=controls,
+                            request_id=_golden_request_id,
+                            node_dir=_golden_node_dir,
+                            profile_name=_golden_profile,
+                        ),
+                        timeout=1800,
+                    )
+                )
+            except Exception as _golden_dispatch_error:
+                _log.warning("Golden Studio dispatch failed: %s", _golden_dispatch_error)
+                return web.json_response(
+                    {"status": "error", "message": str(_golden_dispatch_error)},
+                    status=500,
+                )
 
         # Extract browser-side trace context.  Primary source is the
         # top-level "trace" dict sent by newer Studio frontends.
