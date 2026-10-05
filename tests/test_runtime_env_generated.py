@@ -131,8 +131,12 @@ def test_generated_env_matches_pre_refactor_contract(scenario, contract):
     # The contract also contains keys the runtime sets explicitly outside the
     # schema; compare the schema's share against the old contract exactly.
     added = _added_after_contract()
+    # Hoisted out of the comprehension: _explicit_keys() re-reads and re-parses
+    # the registry TOML on every call, so calling it in the filter ran it once
+    # per contract key -- ~180 parses, ~1.6s per scenario.
+    explicit = _explicit_keys(contract)
     comparable = {
-        k: v for k, v in old.items() if k not in _explicit_keys(contract)
+        k: v for k, v in old.items() if k not in explicit
     }
     new = {
         k: v for k, v in _schema_env(SCENARIOS[scenario]).items() if k not in added
