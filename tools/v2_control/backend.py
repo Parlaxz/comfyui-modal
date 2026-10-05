@@ -45,7 +45,6 @@ from .environment import (
     V2CTL_WORKSPACE_LABEL_ENV,
 )
 from .errors import BackendError, ProvenanceError
-from .provenance import read_provenance_sibling
 
 _OUTPUT_DIR_RE = re.compile(
     r"[Oo]utput[ _]?dir[=: ]+(?:\"([^\"]+)\"|'([^']+)'|(\S+))"
@@ -920,37 +919,16 @@ class BackendRunner:
         def identity_with_provenance(path: Path, data: dict) -> dict[str, str | None]:
             """Resolve a run's identity from its embedded data and sibling.
 
-            Runtime artifacts may predate embedded v2ctl identity.  A sibling
-            written for this exact artifact is authoritative when its optional
-            digest is valid; an invalid sibling must not be allowed to replace
-            identity that is already embedded in the artifact.
+            Runtime identity comes from the artifact itself.
+
+            A provenance *sibling* used to be read here and overlaid on top,
+            guarded by a digest of the artifact it sat next to. That was one
+            local file vouching for another, and it existed because older
+            artifacts did not embed their own identity. The canonical run record
+            now carries this directly, so the sidecar is gone: there is nothing
+            left for it to prove.
             """
-            ident = identity(data)
-            provenance = read_provenance_sibling(path)
-            if provenance is None:
-                return ident
-
-            if provenance.artifact_sha256:
-                try:
-                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                except OSError:
-                    return ident
-                expected_digest = provenance.artifact_sha256.strip().lower()
-                if expected_digest.startswith("sha256:"):
-                    expected_digest = expected_digest[len("sha256:"):]
-                if expected_digest != digest:
-                    return ident
-
-            sibling_identity = {
-                "invocation_id": provenance.v2ctl_invocation_id,
-                "profile": provenance.profile,
-                "profile_config_fingerprint": provenance.profile_config_fingerprint,
-                "request_id": provenance.request_id,
-            }
-            for key, value in sibling_identity.items():
-                if value is not None and str(value).strip():
-                    ident[key] = str(value).strip()
-            return ident
+            return identity(data)
 
         for directory in candidate_dirs:
             try:

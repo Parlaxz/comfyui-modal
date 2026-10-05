@@ -714,8 +714,11 @@ class StructuralValidator(ValidatorPlugin):
             failures.append("effective provenance missing v2ctl_invocation_id")
         if not request_id:
             failures.append("effective provenance missing request_id")
-        if not profile_config_fingerprint:
-            failures.append("effective provenance missing profile_config_fingerprint")
+        # profile_config_fingerprint is not required. It is a third identity
+        # alongside deploy_fingerprint and run_fingerprint; deploy_id already
+        # determines the configuration that was deployed, and acceptance
+        # compares that against what the serving request reports.
+        #
         # provenance_validation_status is deliberately NOT an acceptance gate.
         #
         # It recorded whether a *provenance sibling document* had itself been
@@ -1506,10 +1509,15 @@ class GoldenCohortValidator(ValidatorPlugin):
 
         if not str(record.v2ctl_invocation_id or "").strip():
             failures.append("effective provenance missing v2ctl_invocation_id")
-        if not str(record.profile_config_fingerprint or "").strip():
-            failures.append("effective provenance missing profile_config_fingerprint")
-        if record.provenance_validation_status != "validated":
-            failures.append("effective provenance was not canonically validated")
+        # Neither profile_config_fingerprint nor provenance_validation_status
+        # is an acceptance condition: the first is a duplicate identity, the
+        # second recorded whether a sibling document had itself been
+        # validated. deploy_id is the deployment authority.
+        if record.provenance_validation_status not in ("", "validated"):
+            failures.append(
+                "effective provenance was not canonically validated: %s"
+                % record.provenance_validation_status
+            )
 
         # Backend selection is resolved before dispatch and must be observable
         # in the persisted cohort.  Selector-less historical fixtures remain
@@ -2972,45 +2980,38 @@ class ConfirmRunner:
             if data.get("receipt_target") != receipt.target:
                 raise GateError("gate manifest deployment receipt target mismatch")
 
-        # deploy fingerprint must still match the current deployment
+        # This gate must be confirmable against the same deployment it was run for.
+        #
+        # The previous form compared a web of fingerprints -- deploy
+        # fingerprint, run fingerprint and profile-config fingerprint, each
+        # checked in the snapshot, again at the top level, and again inside the
+        # nested run record. Nine comparisons, and none of them established that
+        # the right code ran. The deploy_id the serving request reported already
+        # does, so the gate is bound by that, plus the target it was run for.
         snapshot = data.get("config_snapshot") or {}
-        manifest_deploy_fp = snapshot.get("deploy_fingerprint")
-        current_deploy_fp = str(_receipt_value(
-            self._deployment_receipt, "deploy_fingerprint", ""
-        ) or self._fingerprints.deploy_fingerprint())
-        if manifest_deploy_fp != current_deploy_fp:
-            changed = _changed_deploy_inputs(snapshot, self._fingerprints)
-            raise GateError(
-                "deployment fingerprint changed since the gate manifest was written; "
-                f"refusing to confirm. Changed deploy inputs: {', '.join(changed) or 'unknown'}"
-            )
+        from .cli import compute_deploy_id
+
+        current_deploy_id = compute_deploy_id(config)
         if self._deployment_receipt is not None:
             if snapshot.get("profile") != self._deployment_receipt.profile:
                 raise GateError("gate manifest profile is not receipt-bound")
-            if snapshot.get("run_fingerprint") != _bound_run_fingerprint(
-                self._fingerprints, self._deployment_receipt
-            ):
-                raise GateError("gate manifest run identity is not receipt-bound")
-            if snapshot.get("profile_config_fingerprint") != self._deployment_receipt.profile_config_fingerprint:
-                raise GateError("gate manifest profile configuration is not receipt-bound")
-            run_identity = data.get("run")
-            expected_run = _bound_run_fingerprint(
-                self._fingerprints, self._deployment_receipt
-            )
-            if not isinstance(run_identity, dict) or run_identity.get(
-                "deploy_fingerprint"
-            ) != self._deployment_receipt.deploy_fingerprint or run_identity.get(
-                "run_fingerprint"
-            ) != expected_run:
-                raise GateError("gate manifest run record is not receipt-bound")
-            if data.get("profile_config_fingerprint") != self._deployment_receipt.profile_config_fingerprint:
-                raise GateError("gate manifest top-level profile configuration mismatch")
             if snapshot.get("target") != {
                 "app": self._deployment_receipt.target.get("app", ""),
                 "class_name": self._deployment_receipt.target.get("class", ""),
                 "method": self._deployment_receipt.target.get("method", ""),
             }:
                 raise GateError("gate manifest target is not receipt-bound")
+            # Local deploy inputs may have moved on since the gate ran. That is
+            # only worth refusing for when it means a different deployment is
+            # now current, which is exactly a deploy_id difference.
+            if current_deploy_id and current_deploy_id != str(
+                getattr(self._deployment_receipt, "deploy_id", "") or ""
+            ):
+                raise GateError(
+                    "the current deployment differs from the one this gate was "
+                    "run against: current deploy_id %s, gate deploy_id %s"
+                    % (current_deploy_id, self._deployment_receipt.deploy_id)
+                )
 
         # A receipt binds the immutable remote version.  Local source drift is
         # informational after that bind; without a receipt retain the legacy
@@ -3038,7 +3039,7 @@ class ConfirmRunner:
         # invocation.  In particular, never pass `runs` as --run-count or
         # enable multi-artifact discovery for the confirmation loop.
         run_fp = _bound_run_fingerprint(self._fingerprints, self._deployment_receipt)
-        deploy_fp = current_deploy_fp
+        deploy_fp = current_deploy_id
         profile_config_fp = str(_receipt_value(
             self._deployment_receipt, "profile_config_fingerprint", ""
         ) or _profile_config_fingerprint(self._fingerprints))

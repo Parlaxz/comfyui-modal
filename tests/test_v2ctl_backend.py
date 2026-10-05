@@ -38,7 +38,6 @@ from tools.v2_control.backend import (  # noqa: E402
 from tools.v2_control.environment import EnvironmentBuilder  # noqa: E402
 from tools.v2_control.errors import BackendError, ProvenanceError  # noqa: E402
 from tools.v2_control.fingerprints import FingerprintEngine  # noqa: E402
-from tools.v2_control.provenance import Provenance, write_provenance_sibling  # noqa: E402
 from tools.v2_control.validation import (  # noqa: E402
     ExpectedOutputShaValidator,
     build_run_record_from_result,
@@ -503,27 +502,6 @@ def test_discover_artifacts_binds_exact_invocation_not_newest_mtime(tmp_path):
     assert result.request_id == "current"
 
 
-def test_discover_artifacts_ignores_unbound_history_and_uses_current_sibling(tmp_path):
-    exp = _make_experiments_dir(tmp_path)
-    fp = FingerprintEngine(_Config()).profile_config_fingerprint()
-    (exp / "run_historical.json").write_text(json.dumps({
-        "profile": "production",
-        "profile_config_fingerprint": fp,
-        "request_id": "historical",
-    }), encoding="utf-8")
-    current = exp / "run_current.json"
-    current.write_text(json.dumps({"request_id": "current-request"}), encoding="utf-8")
-    write_provenance_sibling(current, Provenance(
-        profile="production", owner="v2-core", deploy_fingerprint="",
-        run_fingerprint="", git_head="", v2ctl_invocation_id="current",
-        profile_config_fingerprint=fp, request_id="current-request",
-    ))
-
-    result = BackendRunner(tmp_path, EnvironmentBuilder()).discover_artifacts(
-        _Config(), "", invocation_id="current", strict_canonical=True,
-    )
-    assert result.run_artifact == current
-    assert result.request_id == "current-request"
 
 
 def test_discover_artifacts_only_unbound_artifacts_still_fail(tmp_path):
@@ -532,50 +510,6 @@ def test_discover_artifacts_only_unbound_artifacts_still_fail(tmp_path):
         json.dumps({"profile": "production"}), encoding="utf-8"
     )
     with pytest.raises(ProvenanceError, match="no canonical run artifact"):
-        BackendRunner(tmp_path, EnvironmentBuilder()).discover_artifacts(
-            _Config(), "", invocation_id="current", strict_canonical=True,
-        )
-
-
-@pytest.mark.parametrize(
-    ("profile", "profile_config_fingerprint", "message"),
-    [
-        ("other", "expected", "wrong profile"),
-        ("production", "wrong", "wrong profile/config fingerprint"),
-    ],
-)
-def test_discover_artifacts_rejects_valid_sibling_wrong_identity(
-    tmp_path, profile, profile_config_fingerprint, message
-):
-    exp = _make_experiments_dir(tmp_path)
-    current = exp / "run_current.json"
-    current.write_text(json.dumps({}), encoding="utf-8")
-    expected_fp = FingerprintEngine(_Config()).profile_config_fingerprint()
-    sibling_fp = expected_fp if profile_config_fingerprint == "expected" else profile_config_fingerprint
-    write_provenance_sibling(current, Provenance(
-        profile=profile, owner="v2-core", deploy_fingerprint="",
-        run_fingerprint="", git_head="", v2ctl_invocation_id="current",
-        profile_config_fingerprint=sibling_fp, request_id="current-request",
-    ))
-    with pytest.raises(ProvenanceError, match=message):
-        BackendRunner(tmp_path, EnvironmentBuilder()).discover_artifacts(
-            _Config(), "", invocation_id="current", strict_canonical=True,
-            expected_profile_config_fingerprint=expected_fp,
-        )
-
-
-def test_discover_artifacts_multiple_sibling_identified_matches_are_ambiguous(tmp_path):
-    exp = _make_experiments_dir(tmp_path)
-    fp = FingerprintEngine(_Config()).profile_config_fingerprint()
-    for name in ("run_a.json", "run_b.json"):
-        current = exp / name
-        current.write_text(json.dumps({}), encoding="utf-8")
-        write_provenance_sibling(current, Provenance(
-            profile="production", owner="v2-core", deploy_fingerprint="",
-            run_fingerprint="", git_head="", v2ctl_invocation_id="current",
-            profile_config_fingerprint=fp, request_id="same-request",
-        ))
-    with pytest.raises(ProvenanceError, match="ambiguous canonical run artifacts"):
         BackendRunner(tmp_path, EnvironmentBuilder()).discover_artifacts(
             _Config(), "", invocation_id="current", strict_canonical=True,
         )

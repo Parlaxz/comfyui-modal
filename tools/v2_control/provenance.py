@@ -75,9 +75,9 @@ class Provenance:
     golden_arm: str = ""
     cpu_qd2_prefetch: bool = False
     artifact_path: str = ""
-    # Optional integrity metadata.  It is populated by
-    # write_provenance_sibling after the artifact's final bytes exist; it is
-    # intentionally not embedded in the artifact itself.
+    # Digest of the artifact this provenance describes. Diagnostic: it lets a
+    # reader confirm the artifact has not changed since the record was written.
+    # It is not an acceptance condition.
     artifact_sha256: str | None = None
 
     def to_dict(self) -> dict:
@@ -214,50 +214,8 @@ def build_provenance(
     )
 
 
-def write_provenance_sibling(artifact: Path, provenance: Provenance) -> Path:
-    """Write ``<artifact>.v2ctl-provenance.json`` next to the artifact.
-
-    The canonical path and optional integrity digest are finalized here, after
-    the artifact bytes have been written.  This keeps ``artifact_sha256`` out
-    of the artifact's own JSON and avoids an impossible embedded self-hash.
-    NEVER modifies the artifact itself.  Returns the sibling path.
-    """
-    artifact = Path(artifact)
-    sibling = artifact.with_name(artifact.name + ".v2ctl-provenance.json")
-    sibling.parent.mkdir(parents=True, exist_ok=True)
-    digest: str | None = None
-    if artifact.is_file():
-        hasher = hashlib.sha256()
-        with artifact.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1 << 20), b""):
-                hasher.update(chunk)
-        digest = hasher.hexdigest()
-    finalized = replace(
-        provenance,
-        artifact_path=str(artifact.resolve()),
-        artifact_sha256=digest,
-    )
-    sibling.write_text(finalized.to_json() + "\n", encoding="utf-8")
-    LOG.info("provenance sibling written: %s", sibling)
-    return sibling
 
 
-def read_provenance_sibling(artifact: Path) -> Provenance | None:
-    """Read back the sibling provenance file; None when missing/corrupt."""
-    artifact = Path(artifact)
-    sibling = artifact.with_name(artifact.name + ".v2ctl-provenance.json")
-    try:
-        raw = sibling.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        data = json.loads(raw)
-    except (ValueError, TypeError):
-        LOG.warning("provenance sibling %s is corrupt", sibling)
-        return None
-    if not isinstance(data, dict):
-        return None
-    return Provenance.from_dict(data)
 
 
 def inject_provenance_hook_doc() -> str:

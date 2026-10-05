@@ -1681,11 +1681,9 @@ def _require_receipt_workspace(
     identity = receipt.deployment_identity
     workspace = str(identity.get("modal_workspace", ""))
     environment = str(identity.get("modal_environment", ""))
-    if not workspace and not receipt.modal_destination and not (
-        receipt.manifest_path or receipt.effective_config or receipt.s4_identity
-    ):
-        # Compatibility-only pre-P1 receipt object used by old unit doubles;
-        # strict persisted receipts are rejected by DeploymentReceipt.validate.
+    if not workspace and not receipt.modal_destination:
+        # A receipt must always carry its workspace binding; validate() enforces
+        # that. Nothing here is a compatibility path for older records.
         return
     if workspace != binding.workspace_id or environment != binding.environment:
         raise GateError(
@@ -1989,7 +1987,6 @@ def _write_golden_deployment_receipt(
                 "memory_mb": int(config.resources.memory_mb),
             },
         },
-        source_probe={"expected": expected_source},
         profile_config_fingerprint=deploy_identity.profile_config_fingerprint,
         manifest_path=str(manifest_path),
         effective_config={
@@ -2288,12 +2285,6 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
             "receipt_profile": deployment_receipt.profile,
             "receipt_target": dict(deployment_receipt.target),
             "receipt_deploy_fingerprint": deployment_receipt.deploy_fingerprint,
-            "receipt_source_probe_expected": deployment_receipt.source_probe.get("expected"),
-            "receipt_manifest_path": deployment_receipt.manifest_path,
-            "receipt_manifest_digest": deployment_receipt.manifest_digest,
-            "source_probe_evidence_path": str(receipt_mod.source_probe_evidence_path(
-                repo_root, deployment_receipt
-            )),
         })
     if provenance is not None:
         manifest["provenance"] = provenance.to_dict()
@@ -4130,10 +4121,7 @@ def cmd_run(args, repo_root: Path) -> int:
             deployment_receipt=bound_receipt,
         )
         if result.artifacts.run_artifact is not None:
-            try:
-                prov_mod.write_provenance_sibling(result.artifacts.run_artifact, provenance)
-            except OSError:
-                pass
+            pass
         print(f"[v2ctl.run] exit={result.exit_code} manifest={run_manifest}")
         if is_experiment_profile(config):
             evidence_identity = {
@@ -4323,10 +4311,6 @@ def cmd_gate(args, repo_root: Path) -> int:
                 ),
                 request_id=result.run.request_id if result.run is not None else "",
             )
-            try:
-                prov_mod.write_provenance_sibling(result.run.artifacts.run_artifact, provenance)
-            except OSError:
-                pass
         return 0 if result.valid else 1
     except (V2CtlError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -12,8 +12,6 @@ from comfymodal_runtime.experiment_result_store import (
 )
 from tools.v2_control.provenance import (
     Provenance,
-    read_provenance_sibling,
-    write_provenance_sibling,
 )
 
 
@@ -156,36 +154,6 @@ def test_save_experiment_run_writes_identity_to_real_json(tmp_path) -> None:
     assert "artifact_sha256" not in persisted
 
 
-def test_writer_sidecar_readback_preserves_exact_identity(tmp_path) -> None:
-    record = _build_identity_record(
-        {"request_id": "request-sidecar-001", "output_sha": "output-sha-001"},
-        "2026-08-20T12:02:30+00:00",
-    )
-    path = save_experiment_run(record, output_dir=tmp_path / "runs")
-    persisted = json.loads(path.read_text(encoding="utf-8"))
-
-    provenance = Provenance(
-        profile=_IDENTITY["profile"],
-        owner="v2-core",
-        deploy_fingerprint=_IDENTITY["deploy_fingerprint"],
-        run_fingerprint=_IDENTITY["run_fingerprint"],
-        git_head="",
-        v2ctl_invocation_id=_IDENTITY["v2ctl_invocation_id"],
-        profile_config_fingerprint=_IDENTITY["profile_config_fingerprint"],
-        request_id=persisted["request_id"],
-    )
-    write_provenance_sibling(path, provenance)
-    restored = read_provenance_sibling(path)
-
-    assert restored is not None
-    for key, value in _IDENTITY.items():
-        assert persisted[key] == value
-        assert getattr(restored, key) == value
-    assert persisted["request_id"] == restored.request_id == "request-sidecar-001"
-    assert persisted["artifact_path"] == restored.artifact_path == str(path.resolve())
-    assert persisted["output_sha"] == "output-sha-001"
-    assert "artifact_sha256" not in persisted
-    assert restored.artifact_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_campaign_manifest_preserves_invocation_profile_identity(tmp_path) -> None:

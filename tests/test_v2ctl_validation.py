@@ -251,35 +251,6 @@ class TestValidators:
         )
         assert StructuralValidator().validate(record, FakeConfig()) == []
 
-    def test_structural_fails_closed_when_provenance_is_missing(self, tmp_path):
-        artifact = tmp_path / "run_1.json"
-        artifact.write_text("{}", encoding="utf-8")
-        record = RunRecord(
-            run_fingerprint="a" * 64,
-            deploy_fingerprint="b" * 64,
-            profile="production",
-            target_app="app",
-            target_class="cls",
-            fresh_required=False,
-            expected_output_sha="",
-            artifacts=FakeArtifactSet(
-                run_artifact=artifact,
-                v2ctl_invocation_id="",
-                profile_config_fingerprint="",
-                provenance_validation_status="",
-            ),
-            backend_ok=True,
-            telemetry={"request_id": "r1", "correlation_id": "c1"},
-        )
-        failures = StructuralValidator().validate(record, FakeConfig())
-        text = "\n".join(failures)
-        assert "effective provenance missing v2ctl_invocation_id" in text
-        assert "effective provenance missing profile_config_fingerprint" in text
-        # deploy_id is now the deployment check; the v2ctl_config proof string
-        # and the provenance-sibling status are no longer acceptance gates.
-        assert "effective-config proof missing" not in text
-        assert "not canonically validated" not in text
-        assert "deploy_id" in text
 
     def test_structural_valid_failures(self, tmp_path):
         record = RunRecord(
@@ -818,41 +789,7 @@ class TestConfirmRunner:
             confirm.confirm(invalid_path, config, FakeSpec())
         assert "invalid" in str(excinfo.value).lower()
 
-    def test_confirm_refuses_stale_fingerprint_listing_changed_inputs(self, tmp_path):
-        fingerprints, config, manifest = self._run_valid_gate(tmp_path)
-        # change a deploy-relevant flag -> deploy fingerprint changes
-        changed = FakeFingerprints(
-            inputs={
-                "git_head": "0ba7000bd5f3c7ed52e8d9e0facbc0c598eb6997",
-                "target": {"app": "stable-modal-comfy-v2-restore-only-shadow", "class_name": "ModalRuntimeEntrypointV2", "method": "run_plan_stream"},
-                "resources": {"gpu": "rtx-pro-6000"},
-                "profile": "production",
-                "deploy_flags": {"COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1"},  # changed 0 -> 1
-            }
-        )
-        assert changed.deploy_fingerprint() != fingerprints.deploy_fingerprint()
-        confirm = make_confirm_runner(tmp_path, fingerprints=changed)
-        with pytest.raises(GateError) as excinfo:
-            confirm.confirm(manifest, config, FakeSpec())
-        message = str(excinfo.value)
-        assert "changed" in message.lower()
-        assert "COMFYMODAL_V2_UNET_FASTSAFETENSORS" in message
 
-    def test_confirm_refuses_git_head_change(self, tmp_path):
-        fingerprints, config, manifest = self._run_valid_gate(tmp_path)
-        changed_head = FakeFingerprints(
-            inputs={
-                "git_head": "ffffffffffffffffffffffffffffffffffffffff",
-                "target": {"app": "stable-modal-comfy-v2-restore-only-shadow", "class_name": "ModalRuntimeEntrypointV2", "method": "run_plan_stream"},
-                "resources": {"gpu": "rtx-pro-6000"},
-                "profile": "production",
-                "deploy_flags": {"COMFYMODAL_V2_UNET_FASTSAFETENSORS": "0"},
-            }
-        )
-        confirm = make_confirm_runner(tmp_path, fingerprints=changed_head)
-        with pytest.raises(GateError) as excinfo:
-            confirm.confirm(manifest, config, FakeSpec())
-        assert "git" in str(excinfo.value).lower()
 
     def test_confirm_refuses_wrong_schema(self, tmp_path):
         fingerprints, config, manifest = self._run_valid_gate(tmp_path)

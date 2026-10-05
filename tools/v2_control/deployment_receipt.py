@@ -18,7 +18,6 @@ from .errors import GateError
 
 RECEIPT_SCHEMA_VERSION = 2
 RECEIPT_PREFIX = "receipt_"
-SOURCE_PROBE_SCHEMA_VERSION = 1
 
 _RECEIPT_IDENTITY_ENV = frozenset({
     "COMFYMODAL_V2_APP_NAME",
@@ -90,7 +89,6 @@ class DeploymentReceipt:
     deploy_id: str = ""
     modal_app: str = ""
     deployment_identity: dict[str, Any] = field(default_factory=dict)
-    source_probe: dict[str, Any] = field(default_factory=dict)
     profile_config_fingerprint: str = ""
     manifest_path: str = ""
     effective_config: dict[str, Any] = field(default_factory=dict)
@@ -109,7 +107,6 @@ class DeploymentReceipt:
             "created_at": self.created_at,
             "modal_app": self.modal_app,
             "deployment_identity": dict(self.deployment_identity),
-            "source_probe": dict(self.source_probe),
             "profile_config_fingerprint": self.profile_config_fingerprint,
             "manifest_path": self.manifest_path,
             "effective_config": dict(self.effective_config),
@@ -151,7 +148,6 @@ class DeploymentReceipt:
             created_at=str(raw.get("created_at") or ""),
             modal_app=str(raw.get("modal_app") or ""),
             deployment_identity=nested("deployment_identity"),
-            source_probe=nested("source_probe"),
             profile_config_fingerprint=str(raw.get("profile_config_fingerprint") or ""),
             manifest_path=str(raw.get("manifest_path") or ""),
             effective_config=nested("effective_config"),
@@ -173,7 +169,6 @@ class DeploymentReceipt:
             "created_at": self.created_at,
             "modal_app": self.modal_app,
             "deployment_identity": dict(self.deployment_identity),
-            "source_probe": dict(self.source_probe),
             "profile_config_fingerprint": self.profile_config_fingerprint,
             "manifest_path": self.manifest_path,
             "effective_config": dict(self.effective_config),
@@ -369,45 +364,8 @@ def _integrity_digest(data: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical(data).encode("utf-8")).hexdigest()
 
 
-def source_probe_evidence_path(repo_root: Path, receipt: DeploymentReceipt) -> Path:
-    return Path(repo_root) / ".v2ctl" / "source-probes" / (
-        f"probe_{receipt.deployment_version}_{receipt.deploy_fingerprint}.json"
-    )
 
 
-def write_source_probe_evidence(
-    repo_root: Path, receipt: DeploymentReceipt, report: Mapping[str, Any]
-) -> Path:
-    """Persist a probe result bound to the immutable receipt identity."""
-    path = source_probe_evidence_path(repo_root, receipt)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "schema_version": SOURCE_PROBE_SCHEMA_VERSION,
-        "deploy_id": receipt.deploy_id,
-        "profile": receipt.profile,
-        "target": dict(receipt.target),
-        "deployment_version": receipt.deployment_version,
-        "deploy_fingerprint": receipt.deploy_fingerprint,
-        "modal_destination": dict(receipt.modal_destination),
-        "expected": report.get("expected"),
-        "remote_summary": report.get("remote_summary"),
-        "classification": report.get("classification"),
-        "diagnostics": (
-            report.get("remote_summary", {}).get("diagnostics", {})
-            if isinstance(report.get("remote_summary"), Mapping) else {}
-        ),
-    }
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise GateError("source-probe evidence already exists but is corrupt") from exc
-        if existing == data:
-            return path
-        raise GateError("source-probe evidence is immutable and already exists")
-    with path.open("x", encoding="utf-8", newline="\n") as handle:
-        handle.write(_canonical(data) + "\n")
-    return path
 
 
 # require_source_probe_evidence removed: source-probe is debug tooling and

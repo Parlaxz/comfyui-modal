@@ -1,9 +1,12 @@
 """Tests for tools/v2_control/provenance.py (design section 13).
 
 Covers contract section 21 provenance coverage: to_json/from_dict round-trip,
-sibling write/read (artifact itself never modified), fingerprint_line format,
-redacted environment (never contains secrets), build_provenance wiring, and
-the deferred hook doc.
+fingerprint_line format, redacted environment (never contains secrets),
+build_provenance wiring, and the deferred hook doc.
+
+The provenance *sibling* -- a sidecar written next to an artifact to attest to
+it -- has been deleted. Identity lives in the canonical run record instead, so
+there is no second local file whose purpose is to prove another.
 """
 
 from __future__ import annotations
@@ -17,8 +20,6 @@ from tools.v2_control.provenance import (
     Provenance,
     build_provenance,
     inject_provenance_hook_doc,
-    read_provenance_sibling,
-    write_provenance_sibling,
 )
 
 from tests.v2ctl_fakes import FakeConfig, FakeFlag
@@ -89,43 +90,6 @@ class TestFingerprintLine:
         )
         assert provenance.fingerprint_line() == "[v2ctl.config] deploy=abc run=def profile=e29-tracer"
 
-
-class TestSiblingPersistence:
-    def test_write_and_read_round_trip(self, tmp_path):
-        artifact = tmp_path / "run_0001_production.json"
-        artifact_bytes = b'{"hello":"world"}'
-        artifact.write_bytes(artifact_bytes)
-        provenance = make_provenance()
-        sibling = write_provenance_sibling(artifact, provenance)
-        assert sibling.name == "run_0001_production.json.v2ctl-provenance.json"
-        assert sibling.is_file()
-        restored = read_provenance_sibling(artifact)
-        assert restored is not None
-        assert restored.profile == provenance.profile
-        assert restored.v2ctl_invocation_id == provenance.v2ctl_invocation_id
-        assert restored.profile_config_fingerprint == provenance.profile_config_fingerprint
-        assert restored.deploy_fingerprint == provenance.deploy_fingerprint
-        assert restored.run_fingerprint == provenance.run_fingerprint
-        assert restored.request_id == provenance.request_id
-        assert restored.artifact_path == str(artifact.resolve())
-        assert restored.artifact_sha256 == hashlib.sha256(artifact_bytes).hexdigest()
-
-    def test_artifact_never_modified(self, tmp_path):
-        artifact = tmp_path / "run_1.json"
-        original_bytes = b'{"untouched": true}'
-        artifact.write_bytes(original_bytes)
-        write_provenance_sibling(artifact, make_provenance())
-        assert artifact.read_bytes() == original_bytes
-
-    def test_read_missing_returns_none(self, tmp_path):
-        assert read_provenance_sibling(tmp_path / "missing.json") is None
-
-    def test_read_corrupt_returns_none(self, tmp_path):
-        artifact = tmp_path / "run_1.json"
-        artifact.write_text("{}", encoding="utf-8")
-        sibling = tmp_path / "run_1.json.v2ctl-provenance.json"
-        sibling.write_text("{not json", encoding="utf-8")
-        assert read_provenance_sibling(artifact) is None
 
 
 class TestBuildProvenance:
