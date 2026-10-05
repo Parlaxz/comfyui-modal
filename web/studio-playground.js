@@ -3277,25 +3277,21 @@ function renderCanvas(state, context) {
     var _openPreview = function () {
       var _prevFocus = document.activeElement;
       var _run = (state.playground && state.playground._selectedRun) || null;
-      var _meta = (_run && _run.extra) || {};
-      var _previewSections = [];
-      if (_run && _run.prompt) {
-        _previewSections.push({ label: "Prompt", value: _run.prompt });
-      }
-      if (_run && _run.negativePrompt) {
-        _previewSections.push({ label: "Negative prompt", value: _run.negativePrompt });
-      }
-      _previewSections.push({
-        label: "Output",
-        value: (_run && _run.outputPath) || outputUrl,
-      });
-      var _timings = (_run && _run.timings) || {};
-      if (_run && _run.durationMs != null) {
-        _previewSections.push({
-          label: "Duration",
-          value: _formatDuration(_run.durationMs),
-        });
-      }
+      // opts.sections takes DOM Nodes appended verbatim, not {label, value}
+      // descriptors - plain objects throw on appendChild.
+      var _sectionEl = function (label, value) {
+        if (value == null || value === "") return null;
+        return el("div", { style: "margin-top:6px;" }, [
+          el("div", { style: "color:#888;font-size:10px;text-transform:uppercase;", text: label }),
+          el("div", { style: "color:#e5e5e5;word-break:break-word;white-space:pre-wrap;", text: String(value) }),
+        ]);
+      };
+      var _previewSections = [
+        _sectionEl("Prompt", _run && _run.prompt),
+        _sectionEl("Negative prompt", _run && _run.negativePrompt),
+        _sectionEl("Output", (_run && _run.outputPath) || outputUrl),
+        _sectionEl("Duration", _run && _run.durationMs != null ? _formatDuration(_run.durationMs) : null),
+      ].filter(Boolean);
       var _preview;
       try {
         // opts.sideColumn is an ELEMENT the overlay styles and appends, not a
