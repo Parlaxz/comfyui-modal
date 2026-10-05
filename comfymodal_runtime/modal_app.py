@@ -23542,6 +23542,17 @@ class ModalRuntimeEntrypoint:
             self._golden_execution_active = True
             golden_call_start_wall_ns = time.time_ns()
             golden_call_start_mono_ns = time.monotonic_ns()
+            # Seed this request's call-envelope marks and bind the live dict.
+            # The envelope is keyed by request id and emitted after the stream
+            # drains; every later mark writes through this same object.
+            _envelope = _GOLDEN_ENVELOPE.setdefault(normalized_request_id, {})
+            # The Modal method-entry baseline lives on the instance when the
+            # wrapper recorded it.  When it is absent, emit_envelope still prints
+            # the absolute marks and simply omits the deltas, so it is never
+            # invented here.
+            _entry_mono_ns = getattr(self, "_method_entry_mono_ns", None)
+            if isinstance(_entry_mono_ns, int):
+                _envelope["method_entry_mono_ns"] = _entry_mono_ns
             _envelope["golden_call_start_mono_ns"] = golden_call_start_mono_ns
             try:
                 # VizTracer/Kineto must begin and end on this same async

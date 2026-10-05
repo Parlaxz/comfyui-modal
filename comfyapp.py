@@ -8419,6 +8419,20 @@ def _first_party_source_file_map() -> dict[str, Path]:
     for source in sorted(runtime_root.rglob("*.py")):
         if "__pycache__" not in source.parts:
             files[source.relative_to(source_root).as_posix()] = source
+
+    # The flag registry is the single configuration authority, and
+    # comfymodal_runtime.config_schema parses it while the container imports --
+    # _runtime_env() projects it into the deployed environment before any
+    # function runs.  It is therefore the one non-Python file the runtime mount
+    # must carry; without it every fresh app dies at import with
+    # FileNotFoundError on config/v2/flag_registry.toml.
+    #
+    # Only the registry travels.  config/v2/modal_target.toml is host-side
+    # deployment destination and has no meaning inside the container.
+    registry = source_root / "config" / "v2" / "flag_registry.toml"
+    if not registry.is_file():
+        raise FileNotFoundError(f"configuration authority is missing: {registry}")
+    files["config/v2/flag_registry.toml"] = registry
     return files
 
 

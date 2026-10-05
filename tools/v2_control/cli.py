@@ -2241,9 +2241,6 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
     if deployment_receipt is not None:
         manifest.update({
             "deployment_receipt_path": deployment_receipt.receipt_path,
-            "deployment_receipt_integrity_digest": deployment_receipt.to_dict()[
-                "integrity_digest"
-            ],
             "deployment_version": deployment_receipt.deployment_version,
             "receipt_profile": deployment_receipt.profile,
             "receipt_target": dict(deployment_receipt.target),

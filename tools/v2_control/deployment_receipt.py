@@ -360,13 +360,5 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _integrity_digest(data: Mapping[str, Any]) -> str:
-    return hashlib.sha256(_canonical(data).encode("utf-8")).hexdigest()
-
-
-
-
-
-
 # require_source_probe_evidence removed: source-probe is debug tooling and
 # no longer gates a run. See test_source_probe_is_debug_only.py.
