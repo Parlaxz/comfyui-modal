@@ -1899,11 +1899,18 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
     if (_isGoldenTerminalResult(result, requestId)) {
       _stopGoldenProgressPolling(state, requestId);
       ctrl.applyGoldenPostTerminal();
-      _handleDirectRunResult({ ...result, direct_run: true }, state, context, actions, merged.values, directSelection);
+      // No caller selection exists in this scope: both call sites referenced an
+      // undeclared `directSelection`, which threw a ReferenceError before the
+      // result was ever rendered. _handleDirectRunResult takes callerSelection
+      // as an OPTIONAL fallback - it resolves the selection key itself from
+      // state and only consults this for presetId/featureId, each of which
+      // already prefers the result's own meta. Passing null keeps that
+      // resolution authoritative.
+      _handleDirectRunResult({ ...result, direct_run: true }, state, context, actions, merged.values, null);
       return;
     }
     // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Direct run: result is already completed, no polling ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
-    if (_handleDirectRunResult(result, state, context, actions, merged.values, directSelection)) {
+    if (_handleDirectRunResult(result, state, context, actions, merged.values, null)) {
       _stopGoldenProgressPolling(state, requestId);
       return;
     }
