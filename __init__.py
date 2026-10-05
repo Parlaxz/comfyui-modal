@@ -7134,11 +7134,11 @@ if _server:
                         },
                         status=400,
                     )
-                _golden_node_dir = ""
-                try:
-                    _golden_node_dir = _server.PromptServer.instance.node_directory
-                except Exception:
-                    _golden_node_dir = os.getcwd()
+                # Use the same store root the workflow routes register with
+                # (_NODE_DIR). Passing ComfyUI's node_directory here pointed
+                # the domain lookup at a different store, so every workflow
+                # came back "not found".
+                _golden_node_dir = _NODE_DIR
                 # A profile that was never deployed cannot run. Rather than
                 # failing with "no matching deployment receipt", start the
                 # deploy and tell the user, so a forgotten deploy self-heals.
