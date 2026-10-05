@@ -51,6 +51,12 @@ import {
   adaptSnapshot,
   adaptDirectResult,
 } from "./studio-run-adapters.js";
+import {
+  applyGoldenProgressPage,
+  createGoldenProgressState,
+  goldenProgressSnapshot,
+  markGoldenPostTerminal,
+} from "./studio-golden-progress.js";
 
 // ── Timing marks (Task 8: run-click instrumentation) ────────────────────
 
@@ -141,6 +147,26 @@ export function createPlaygroundRunController() {
 
   let _marks = [];
   let _lastExtras = {};
+
+  // ── Golden stage progress ──────────────────────────
+  // The Golden cursor stream is NOT a lifecycle terminal: output
+  // materialization and the History V2 commit happen after the last stage, so
+  // the POST/run result stays authoritative for completion. This state is
+  // therefore kept beside the canonical run rather than inside the run model,
+  // and must never decide terminality on its own.
+  let _goldenProgress = null;
+
+  function _ensureGoldenProgress(requestId) {
+    if (_goldenProgress && requestId != null && String(requestId) !== _goldenProgress.requestId) {
+      _goldenProgress = null;
+    }
+    if (!_goldenProgress) {
+      _goldenProgress = createGoldenProgressState(
+        requestId != null ? requestId : _requestId
+      );
+    }
+    return _goldenProgress;
+  }
 
   // Event source handles (for detach)
   let _sourceApi = null;
@@ -278,6 +304,7 @@ export function createPlaygroundRunController() {
       _lastSnapshotSig = null;
       _lastExtras = {};
       _marks = [];
+      _goldenProgress = null;
       mark("run_click");
       if (extras && typeof extras === "object") {
         _lastExtras = { ...extras };
@@ -297,6 +324,48 @@ export function createPlaygroundRunController() {
 
     /** Record a timing mark (idempotent by name). */
     mark,
+
+    /**
+     * Apply one Golden stage cursor page.
+     *
+     * Presentation only. This must never throw into the run lifecycle: the
+     * POST result is authoritative for completion, so a progress-rendering
+     * problem cannot be allowed to abort result rendering downstream.
+     */
+    applyGoldenProgress(page) {
+      try {
+        if (!page || typeof page !== "object") return this;
+        applyGoldenProgressPage(_ensureGoldenProgress(page.request_id), page);
+        _notify(_runId ? store.getRun(_runId) : undefined, _lastExtras);
+      } catch (e) { /* progress display must not break the run */ }
+      return this;
+    },
+
+    /** Reserve the final percentage point for the authoritative POST result. */
+    applyGoldenPostTerminal() {
+      try {
+        if (_goldenProgress) {
+          markGoldenPostTerminal(_goldenProgress);
+          _notify(_runId ? store.getRun(_runId) : undefined, _lastExtras);
+        }
+      } catch (e) { /* progress display must not break the run */ }
+      return this;
+    },
+
+    /** Surface a Golden progress-stream failure without ending the run. */
+    setGoldenProgressError(message) {
+      try {
+        const state = _ensureGoldenProgress(null);
+        state.error = message != null ? String(message) : "Golden progress failed";
+        _notify(_runId ? store.getRun(_runId) : undefined, _lastExtras);
+      } catch (e) { /* progress display must not break the run */ }
+      return this;
+    },
+
+    /** Current Golden stage snapshot, or null when the run is not a Golden run. */
+    getGoldenProgress() {
+      return goldenProgressSnapshot(_goldenProgress);
+    },
 
     /** Attach backend identity after the submission response. */
     setBackendIds(backendRunId, experimentId) {
