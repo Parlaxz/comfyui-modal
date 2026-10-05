@@ -25,6 +25,12 @@ from comfymodal_runtime import process_trace_bridge as bridge  # type: ignore  #
 
 pytestmark = pytest.mark.fast_unit
 
+#: Call count for the "many tiny calls" accumulation test. Large enough to
+#: prove no accumulator overflow and no dropped CSV row; small enough that a
+#: pure transform over the records stays inside the FAST_UNIT per-test
+#: budget instead of being reclassified out of it.
+TINY_CALL_SCALE = 2_000
+
 PARENT_PID = 2
 CHILD_PID = 48
 OTHER_CHILD_PID = 49
@@ -1095,21 +1101,21 @@ def test_bubble_without_any_overlapping_work_is_not_invented(tmp_path):
 
 
 def test_ten_thousand_tiny_calls_accumulate(tmp_path):
-    # 10,000 x 0.2 ms spread across golden_unet_load (4.0s - 6.0s).
+    # scale x 0.2 ms spread across golden_unet_load (4.0s - 6.0s).
     extra = [
         ev("resolve_tensor_metadata (gs.py:3)", 4_000_000.0 + index * 200.0, 200.0)
-        for index in range(10_000)
+        for index in range(TINY_CALL_SCALE)
     ]
     session = session_with_stages(tmp_path, extra)
     profile = analyze(session)
     functions = {f["qualified_function"]: f for f in profile["root_functions"]}
     meta = functions["resolve_tensor_metadata"]
-    assert meta["call_count"] == 10_000
-    # 10,000 x 0.2 ms = 2000 ms
-    assert meta["inclusive_ms"] == 2000.0
-    assert meta["max_call_ms"] == 0.2
+    assert meta["call_count"] == TINY_CALL_SCALE
+    # scale x 0.2 ms
+    assert meta["inclusive_ms"] == pytest.approx(TINY_CALL_SCALE * 0.2)
+    assert meta["max_call_ms"] == pytest.approx(0.2)
     repeated = {r["qualified_function"]: r for r in profile["repeated_setup"]}
-    assert repeated["resolve_tensor_metadata"]["call_count"] == 10_000
+    assert repeated["resolve_tensor_metadata"]["call_count"] == TINY_CALL_SCALE
 
     # Every individual call is retained in the machine data.
     import csv
@@ -1119,7 +1125,7 @@ def test_ten_thousand_tiny_calls_accumulate(tmp_path):
     with gzip.open(session / written["calls"], "rt", encoding="utf-8-sig") as handle:
         rows = list(csv.DictReader(handle))
     retained = [r for r in rows if r["qualified_function"] == "resolve_tensor_metadata"]
-    assert len(retained) == 10_000, len(retained)
+    assert len(retained) == TINY_CALL_SCALE, len(retained)
 
 
 # ---------------------------------------------------------------------------

@@ -146,6 +146,8 @@ from .teardown_diagnostics import TeardownDiagnostics
 # and wrongly vouch for OLD executing code.
 from .source_identity import freeze_imported_sha as _freeze_imported_sha
 
+from . import golden_envelope as _env_marks
+
 _IMPORTED_SOURCE_SHA256 = _freeze_imported_sha(__name__, __file__)
 
 # ── Lean production snapshot gate (diagnostic A/B; default off) ──────────
@@ -1686,68 +1688,32 @@ _GOLDEN_WATERFALL_STAGE_WIDTH = 42
 _GOLDEN_WATERFALL_VALUE_WIDTH = 10
 
 # --- Golden call-envelope marks (measurement only) --------------------------
-# Modal's UI "Execution time" spans the whole method call, while every Golden
-# mark starts at golden_call_start_mono_ns (just before execute_golden) and ends
-# at return_armed. The interval between the two boundaries is therefore
-# unattributed by construction. These scalar monotonic marks bracket it so the
-# gap can be split into pre-Golden, result-construction, wire-handoff and
-# post-stream-release instead of estimated from the outside.
-_GOLDEN_ENVELOPE: dict[str, dict[str, int]] = {}
-_GOLDEN_ENVELOPE_MAX = 64
-_GOLDEN_ENVELOPE_ORDER = (
-    "method_entry_mono_ns",
-    "golden_call_start_mono_ns",
-    "golden_return_mono_ns",
-    "yield_mono_ns",
-    "stream_drained_mono_ns",
-    "release_start_mono_ns",
-    "release_end_mono_ns",
-)
+# The mark table, ordering, eviction and emission live in golden_envelope so
+# the logic stays testable without importing this module's torch/ComfyUI
+# dependency tree. These names remain as aliases for existing call sites.
+_GOLDEN_ENVELOPE = _env_marks.ENVELOPE
+_GOLDEN_ENVELOPE_MAX = _env_marks.ENVELOPE_MAX
+_GOLDEN_ENVELOPE_ORDER = _env_marks.ENVELOPE_ORDER
 
 
 def _executed_source_sha256() -> str:
-    """SHA-256 of the module file this code was actually imported from.
+    """SHA-256 of the source this interpreter actually imported.
 
-    The source probe hashes the file mounted in a *fresh* container, which is
-    not necessarily the file the running interpreter holds. After a redeploy a
-    warm container from the previous image can still serve a request, so the
-    probe can report MATCH while the executing module is stale code. Emitting
-    the executing sha with every call closes that gap: the run itself states
-    which bytes ran, and a caller can compare it with the expected local sha.
+    Previously this hashed ``__file__`` during the request, which proves only
+    the currently mounted filesystem: a container restored from a memory
+    snapshot executes the code objects imported before capture, so the hash
+    would report the newer mounted bytes while older code runs. The value is
+    now frozen at import time by ``source_identity``, which is both correct
+    across snapshots and free of request-time filesystem I/O.
     """
-    try:
-        import hashlib as _hashlib
-
-        path = globals().get("__file__")
-        if not path:
-            return ""
-        digest = _hashlib.sha256()
-        with open(path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1 << 20), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-    except Exception:  # noqa: BLE001 - identity aid must never fail a run
-        return ""
+    return _env_marks.executed_source_sha256()
 
 
 def _emit_golden_envelope(request_id: str) -> None:
     """Print the measured call envelope as deltas from method entry."""
-    marks = _GOLDEN_ENVELOPE.pop(request_id, None)
-    if not marks:
-        return
-    base = marks.get("method_entry_mono_ns")
-    parts = []
-    for key in _GOLDEN_ENVELOPE_ORDER:
-        value = marks.get(key)
-        if value is None:
-            continue
-        delta = "" if base is None else " delta_ms=%.3f" % ((value - base) / 1e6)
-        parts.append("%s=%d%s" % (key, value, delta))
-    print(
-        "[v2.golden.envelope] request_id=%s executed_source_sha256=%s %s"
-        % (request_id, _executed_source_sha256(), " ".join(parts)),
-        flush=True,
-    )
+    _env_marks.emit_envelope(request_id)
+
+
 _GOLDEN_WATERFALL_STATUS_WIDTH = 10
 
 
@@ -23578,12 +23544,10 @@ class ModalRuntimeEntrypoint:
             _env_request_id = str(request.get("request_id") or "")
         except Exception:  # noqa: BLE001 - instrumentation must never fail a run
             _env_request_id = ""
-        _envelope: dict[str, int] = {}
+        _envelope_marks: dict[str, int] = {}
         if _env_request_id:
-            _envelope["method_entry_mono_ns"] = time.monotonic_ns()
-            _GOLDEN_ENVELOPE[_env_request_id] = _envelope
-            while len(_GOLDEN_ENVELOPE) > _GOLDEN_ENVELOPE_MAX:
-                _GOLDEN_ENVELOPE.pop(next(iter(_GOLDEN_ENVELOPE)), None)
+            _envelope_marks["method_entry_mono_ns"] = time.monotonic_ns()
+            _env_marks.record(_env_request_id, _envelope_marks)
         outer_mark_lifetime = __import__(
             "comfymodal_runtime.golden_parallel", fromlist=["_OuterLifetime"]
         )._OuterLifetime

@@ -14,7 +14,8 @@ from comfymodal_runtime import golden_model_metadata_cache as cache
 from comfymodal_runtime.golden_model_transport import GoldenModelTransport
 
 
-pytestmark = pytest.mark.fast_unit
+# No file-level marker: tests here have genuinely different import
+# needs. See the per-test markers below.
 
 
 def _write_model(path, seed: int = 0) -> None:
@@ -29,6 +30,7 @@ def _write_model(path, seed: int = 0) -> None:
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
 
 
+@pytest.mark.fast_unit
 def test_round_trip_preserves_one_normalized_blueprint(tmp_path):
     model = tmp_path / "checkpoints" / "clip.safetensors"
     model.parent.mkdir()
@@ -42,6 +44,7 @@ def test_round_trip_preserves_one_normalized_blueprint(tmp_path):
     assert "__metadata__" not in str(decoded[entry["path"]]["tensors"])
 
 
+@pytest.mark.fast_unit
 def test_identity_mismatch_and_changed_header_are_misses(tmp_path, monkeypatch):
     models = tmp_path / "models"
     models.mkdir()
@@ -67,6 +70,7 @@ def test_identity_mismatch_and_changed_header_are_misses(tmp_path, monkeypatch):
     lambda raw: b"wrong-schema" + raw[12:],
     lambda raw: raw[:-7],
 ])
+@pytest.mark.fast_unit
 def test_corrupt_wrong_schema_and_truncated_blob_fail_soft(tmp_path, mutator):
     model = tmp_path / "clip.safetensors"
     _write_model(model)
@@ -82,6 +86,7 @@ def test_corrupt_wrong_schema_and_truncated_blob_fail_soft(tmp_path, mutator):
     assert state["schema"] in {"corrupt", "absent"}
 
 
+@pytest.mark.fast_unit
 def test_unknown_model_is_a_safe_miss(tmp_path, monkeypatch):
     models = tmp_path / "models"
     models.mkdir()
@@ -101,6 +106,7 @@ def test_unknown_model_is_a_safe_miss(tmp_path, monkeypatch):
     assert result["reason"] == "unknown_model"
 
 
+@pytest.mark.fast_unit
 def test_three_model_hydration_is_bounded_and_compact(tmp_path):
     entries = {}
     tensor_count = 2000
@@ -135,6 +141,7 @@ def test_three_model_hydration_is_bounded_and_compact(tmp_path):
     assert state["hydration_ms"] < 75.0
 
 
+@pytest.mark.fast_unit
 def test_transport_uses_persistent_layout_blueprint_for_clip(tmp_path, monkeypatch):
     models = tmp_path / "models"
     models.mkdir()
@@ -157,6 +164,7 @@ def test_transport_uses_persistent_layout_blueprint_for_clip(tmp_path, monkeypat
     assert layout.tensor_map[0]["key"] == "tensor.8"
 
 
+@pytest.mark.fast_unit
 def test_corrupt_cache_falls_back_to_canonical_transport_parse(tmp_path, monkeypatch):
     models = tmp_path / "models"
     models.mkdir()
@@ -206,6 +214,9 @@ def _patch_precohort_runtime(monkeypatch, tmp_path, *, volume):
     return modal_app.ModalRuntimeEntrypoint(), models, cache_path
 
 
+@pytest.mark.heavy_local
+# Reaches ModalRuntimeEntrypoint / container CACHE_PATH, so it needs
+# the heavy modal_app import: not FAST_UNIT.
 def test_precohort_publishes_present_models_and_skips_missing(tmp_path, monkeypatch):
     class Volume:
         commits = 0
@@ -239,6 +250,9 @@ def test_precohort_publishes_present_models_and_skips_missing(tmp_path, monkeypa
     }
 
 
+@pytest.mark.heavy_local
+# Reaches ModalRuntimeEntrypoint / container CACHE_PATH, so it needs
+# the heavy modal_app import: not FAST_UNIT.
 def test_precohort_is_idempotent_and_absent_volume_is_visible(tmp_path, monkeypatch):
     class Volume:
         commits = 0
@@ -280,6 +294,7 @@ def test_precohort_is_idempotent_and_absent_volume_is_visible(tmp_path, monkeypa
     assert degraded["runtime_config_volume"] == "absent"
 
 
+@pytest.mark.fast_unit
 def test_a_miss_is_not_memoized_so_a_late_blob_is_still_seen(tmp_path, monkeypatch):
     """A hydrate() miss must stay re-checkable.
 
@@ -320,6 +335,9 @@ def test_a_miss_is_not_memoized_so_a_late_blob_is_still_seen(tmp_path, monkeypat
     cache.reset_for_tests()
 
 
+@pytest.mark.heavy_local
+# Reaches ModalRuntimeEntrypoint / container CACHE_PATH, so it needs
+# the heavy modal_app import: not FAST_UNIT.
 def test_cache_path_lives_inside_the_v2_runtime_state_mount():
     """The blob must sit on the mount the V2 runtime actually provides.
 
@@ -336,6 +354,7 @@ def test_cache_path_lives_inside_the_v2_runtime_state_mount():
     assert cache.CACHE_PATH.endswith("caching_data/golden_model_metadata.bin")
 
 
+@pytest.mark.fast_unit
 def test_cache_path_follows_the_configured_runtime_state_root(monkeypatch):
     monkeypatch.setenv("COMFYMODAL_V2_STATE_VOLUME_ROOT", "/mnt/somewhere-else")
     reloaded = importlib.reload(cache)
@@ -347,6 +366,7 @@ def test_cache_path_follows_the_configured_runtime_state_root(monkeypatch):
 
 
 
+@pytest.mark.fast_unit
 def test_lookup_hits_on_stat_identity_without_rereading_the_header(tmp_path, monkeypatch):
     """A lookup must not re-read the SafeTensors header on the fast path.
 
@@ -383,6 +403,21 @@ def test_lookup_hits_on_stat_identity_without_rereading_the_header(tmp_path, mon
     monkeypatch.undo()
     monkeypatch.setenv("COMFYMODAL_MODELS_PATH", str(models))
     _write_model(model, 12)
+    # The cache treats size+mtime_ns as the change signal, but _write_model
+    # always emits a fixed 16-byte payload, so size provably cannot change
+    # here. Without an explicit mtime bump this assertion depended on the
+    # filesystem clock happening to tick between two writes microseconds apart,
+    # which made it fail intermittently (passing in isolation, failing in the
+    # full suite). Establish the precondition the contract relies on instead of
+    # assuming it.
+    _before = model.stat()
+    _bumped = _before.st_mtime_ns + 2_000_000_000
+    os.utime(model, ns=(_bumped, _bumped))
+    _after = model.stat()
+    assert (
+        _after.st_size != _before.st_size
+        or _after.st_mtime_ns != _before.st_mtime_ns
+    ), "test setup must actually change the stat identity"
     cache.reset_for_tests()
     entry2 = cache.build_entry(model, "checkpoints/clip.safetensors")
     assert entry2["header_sha256"] != entry["header_sha256"]
