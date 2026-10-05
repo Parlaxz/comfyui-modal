@@ -13,12 +13,15 @@ import asyncio
 import re
 import time
 import uuid
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from tools.v2_control.profile_catalog import GoldenProfile, resolve_golden_profile
+
+_log = logging.getLogger(__name__)
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 DEFAULT_MAX_EVENTS = 256
@@ -280,6 +283,90 @@ def _materialize_image(result: Any, request_id: str) -> dict[str, Any]:
         return data
 
 
+def _primary_output_path(materialized: Any) -> str:
+    """Best-effort primary output path from a materialized Golden result."""
+    if not isinstance(materialized, Mapping):
+        return ""
+    for key in ("output_path", "primary_output_path"):
+        value = materialized.get(key)
+        if value:
+            return str(value)
+    for key in ("outputs", "images"):
+        items = materialized.get(key)
+        if isinstance(items, list) and items:
+            first = items[0]
+            if isinstance(first, str):
+                return first
+            if isinstance(first, Mapping):
+                for sub in ("path", "output_path", "filename"):
+                    if first.get(sub):
+                        return str(first[sub])
+    return ""
+
+
+def _record_golden_history(
+    request_id: str,
+    profile: GoldenProfile,
+    controls: Mapping[str, Any] | None,
+    materialized: Any,
+    timings: Mapping[str, Any] | None = None,
+) -> str:
+    """Record a completed Golden run in the History store.
+
+    Golden streams its result straight back to the Playground, so it never went
+    through the ordinary save-history seam and the run was invisible on the
+    History page even though it produced an image. This mirrors the working
+    modern path (studio_workflow_run._record_workflow_run_success): a
+    nonterminal record first, then the terminal update carrying the output
+    association, because a completed modern record must already carry a visible
+    output.
+
+    Best-effort by design: History is a record, not the execution contract, so a
+    recording failure must never fail a run that already produced output.
+    """
+    try:
+        from experiment_service import REGISTRY
+    except Exception as exc:
+        _log.warning("Golden history: REGISTRY unavailable: %s", exc)
+        return ""
+    try:
+        controls_map = controls if isinstance(controls, Mapping) else {}
+        output_path = _primary_output_path(materialized)
+        meta = {
+            "source": "studio_golden",
+            "golden_profile": profile.name,
+            "golden_request_id": request_id,
+            "golden_method": profile.target["method"],
+            "golden_app": profile.target["app"],
+            "prompt": str(controls_map.get("prompt") or ""),
+            "negative_prompt": str(controls_map.get("negative_prompt") or ""),
+            "studio_workflow_id": str(controls_map.get("_workflow_id") or ""),
+        }
+        record = REGISTRY.history().record_run(
+            kind="playground_run",
+            prompt_id=request_id,
+            status="running",
+            meta=meta,
+        )
+        if not isinstance(record, dict):
+            return ""
+        run_id = str(record.get("run_id") or "")
+        if not run_id:
+            return ""
+        update_kwargs: dict[str, Any] = {"status": "completed"}
+        if output_path:
+            update_kwargs["output_path"] = output_path
+        if timings:
+            update_kwargs["timings"] = dict(timings)
+        REGISTRY.history().update_run(run_id, **update_kwargs)
+        return run_id
+    except Exception as exc:
+        # Never swallow silently: an unlogged History failure is
+        # indistinguishable from "the run was never recorded".
+        _log.warning("Golden history: failed to record run %s: %s", request_id, exc)
+        return ""
+
+
 async def run_golden_workflow(
     *,
     workflow_id: str,
@@ -419,6 +506,15 @@ async def run_golden_workflow(
                 "profile": profile.name,
             }
         materialized = _materialize_image(terminal.get("data", terminal), request_id)
+        # Make the run visible on the History page. Golden bypasses the ordinary
+        # save-history seam, so without this the image existed only in the
+        # Playground's local store.
+        _record_golden_history(
+            request_id,
+            profile,
+            merged["values"],
+            materialized,
+        )
         # The Studio result contract is flat: the Playground reads
         # ``payload.output_paths`` directly.  Merge the materialized result to
         # the top level and keep the raw Golden payload under ``result`` for
