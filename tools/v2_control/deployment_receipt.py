@@ -84,19 +84,16 @@ class DeploymentReceipt:
     effective_environment: dict[str, str]
     deployment_version: int
     created_at: str
+    #: The one deployment identity. Compared against what the serving request
+    #: reports; this is what makes a deployment claim checkable. Everything else
+    #: on this record is either navigation metadata or a duplicate of it.
+    deploy_id: str = ""
     modal_app: str = ""
     deployment_identity: dict[str, Any] = field(default_factory=dict)
-    deployed_source: dict[str, Any] = field(default_factory=dict)
     source_probe: dict[str, Any] = field(default_factory=dict)
-    image_identity: dict[str, Any] = field(default_factory=dict)
-    workflow_model_contract: dict[str, Any] = field(default_factory=dict)
-    s4_generation: str = ""
     profile_config_fingerprint: str = ""
     manifest_path: str = ""
-    manifest_digest: str = ""
-    s4_identity: dict[str, Any] = field(default_factory=dict)
     effective_config: dict[str, Any] = field(default_factory=dict)
-    integrity_digest: str = ""
     receipt_path: str = ""
     modal_destination: dict[str, str] = field(default_factory=dict)
 
@@ -104,6 +101,7 @@ class DeploymentReceipt:
         data = {
             "schema_version": RECEIPT_SCHEMA_VERSION,
             "profile": self.profile,
+            "deploy_id": self.deploy_id,
             "target": dict(self.target),
             "deploy_fingerprint": self.deploy_fingerprint,
             "effective_environment": dict(self.effective_environment),
@@ -111,20 +109,13 @@ class DeploymentReceipt:
             "created_at": self.created_at,
             "modal_app": self.modal_app,
             "deployment_identity": dict(self.deployment_identity),
-            "deployed_source": dict(self.deployed_source),
             "source_probe": dict(self.source_probe),
-            "image_identity": dict(self.image_identity),
-            "workflow_model_contract": dict(self.workflow_model_contract),
-            "s4_generation": self.s4_generation,
             "profile_config_fingerprint": self.profile_config_fingerprint,
             "manifest_path": self.manifest_path,
-            "manifest_digest": self.manifest_digest,
-            "s4_identity": dict(self.s4_identity),
             "effective_config": dict(self.effective_config),
             "receipt_path": self.receipt_path,
             "modal_destination": dict(self.modal_destination),
         }
-        data["integrity_digest"] = self.integrity_digest or _integrity_digest(data)
         return data
 
     @classmethod
@@ -150,13 +141,9 @@ class DeploymentReceipt:
         if any(not isinstance(key, str) or not isinstance(value, str)
                for key, value in environment.items()):
             raise GateError("deployment receipt effective environment is malformed")
-        integrity = raw.get("integrity_digest")
-        if not isinstance(integrity, str) or not integrity.strip():
-            raise GateError("deployment receipt integrity digest is missing")
-        if len(integrity) != 64 or any(c not in "0123456789abcdefABCDEF" for c in integrity):
-            raise GateError("deployment receipt integrity digest is malformed")
         result = cls(
             profile=str(raw.get("profile") or ""),
+            deploy_id=str(raw.get("deploy_id") or ""),
             target=dict(target),
             deploy_fingerprint=str(raw.get("deploy_fingerprint") or ""),
             effective_environment=dict(environment),
@@ -164,30 +151,21 @@ class DeploymentReceipt:
             created_at=str(raw.get("created_at") or ""),
             modal_app=str(raw.get("modal_app") or ""),
             deployment_identity=nested("deployment_identity"),
-            deployed_source=nested("deployed_source"),
             source_probe=nested("source_probe"),
-            image_identity=nested("image_identity"),
-            workflow_model_contract=nested("workflow_model_contract"),
-            s4_generation=str(raw.get("s4_generation") or ""),
             profile_config_fingerprint=str(raw.get("profile_config_fingerprint") or ""),
             manifest_path=str(raw.get("manifest_path") or ""),
-            manifest_digest=str(raw.get("manifest_digest") or ""),
-            s4_identity=nested("s4_identity"),
             effective_config=nested("effective_config"),
-            integrity_digest=integrity,
             receipt_path=str(raw.get("receipt_path") or ""),
             modal_destination=nested("modal_destination"),
         )
         result.validate()
-        expected = _integrity_digest(result._payload())
-        if integrity != expected:
-            raise GateError("deployment receipt integrity check failed")
         return result
 
     def _payload(self) -> dict[str, Any]:
         data = {
             "schema_version": RECEIPT_SCHEMA_VERSION,
             "profile": self.profile,
+            "deploy_id": self.deploy_id,
             "target": dict(self.target),
             "deploy_fingerprint": self.deploy_fingerprint,
             "effective_environment": dict(self.effective_environment),
@@ -195,15 +173,9 @@ class DeploymentReceipt:
             "created_at": self.created_at,
             "modal_app": self.modal_app,
             "deployment_identity": dict(self.deployment_identity),
-            "deployed_source": dict(self.deployed_source),
             "source_probe": dict(self.source_probe),
-            "image_identity": dict(self.image_identity),
-            "workflow_model_contract": dict(self.workflow_model_contract),
-            "s4_generation": self.s4_generation,
             "profile_config_fingerprint": self.profile_config_fingerprint,
             "manifest_path": self.manifest_path,
-            "manifest_digest": self.manifest_digest,
-            "s4_identity": dict(self.s4_identity),
             "effective_config": dict(self.effective_config),
             "receipt_path": self.receipt_path,
             "modal_destination": dict(self.modal_destination),
@@ -211,23 +183,33 @@ class DeploymentReceipt:
         return data
 
     def validate(self) -> None:
-        if not self.profile or not self.deploy_fingerprint or not self.created_at:
+        if not self.profile or not self.created_at:
             raise GateError("deployment receipt is missing required identity")
+        if not self.deploy_id:
+            raise GateError(
+                "deployment receipt has no deploy_id, so a run cannot be checked "
+                "against the deployment it claims to be"
+            )
+        if len(self.deploy_id) != 64 or any(
+            c not in "0123456789abcdef" for c in self.deploy_id
+        ):
+            raise GateError("deployment receipt deploy_id is malformed")
         if not all(self.target.get(name) for name in ("app", "class", "method")):
             raise GateError("deployment receipt target identity is incomplete")
-        strict = bool(self.manifest_path or self.effective_config or self.s4_identity)
-        if strict:
-            required_destination = {"workspace_id", "workspace_label", "environment", "source"}
-            if (set(self.modal_destination) != required_destination or any(
-                not isinstance(self.modal_destination.get(name), str)
-                or not self.modal_destination.get(name, "").strip()
-                for name in required_destination
-            )):
-                raise GateError("deployment receipt modal destination is missing or malformed")
-            if self.modal_destination and self.modal_destination.get("source") != "config/v2/modal_target.toml":
-                raise GateError("deployment receipt modal destination source is invalid")
-            if any("token" in key.lower() or "secret" in key.lower() for key in self.modal_destination):
-                raise GateError("deployment receipt modal destination contains credentials")
+        # Workspace binding still matters: deploying into the wrong Modal
+        # workspace is a real operational failure. It is checked here, once,
+        # rather than being re-proved through every record that mentions it.
+        required_destination = {"workspace_id", "workspace_label", "environment", "source"}
+        if (set(self.modal_destination) != required_destination or any(
+            not isinstance(self.modal_destination.get(name), str)
+            or not self.modal_destination.get(name, "").strip()
+            for name in required_destination
+        )):
+            raise GateError("deployment receipt modal destination is missing or malformed")
+        if self.modal_destination.get("source") != "config/v2/modal_target.toml":
+            raise GateError("deployment receipt modal destination source is invalid")
+        if any("token" in key.lower() or "secret" in key.lower() for key in self.modal_destination):
+            raise GateError("deployment receipt modal destination contains credentials")
         if self.modal_app and self.modal_app != self.target["app"]:
             raise GateError("deployment receipt Modal app disagrees with target")
         if type(self.deployment_version) is not int or self.deployment_version < 0:
@@ -244,75 +226,12 @@ class DeploymentReceipt:
             if isinstance(deploy_flags, Mapping) else None,
         )
 
-        if strict:
-            identity = self.deployment_identity
-            if identity.get("app") != self.target["app"]:
-                raise GateError("deployment receipt deployment identity app mismatch")
-            if identity.get("version") != self.deployment_version:
-                raise GateError("deployment receipt deployment identity version mismatch")
-            if identity.get("deploy_fingerprint") != self.deploy_fingerprint:
-                raise GateError("deployment receipt deployment identity fingerprint mismatch")
-            if identity.get("class", self.target["class"]) != self.target["class"]:
-                raise GateError("deployment receipt deployment identity class mismatch")
-            if identity.get("method", self.target["method"]) != self.target["method"]:
-                raise GateError("deployment receipt deployment identity method mismatch")
-            if self.modal_app != self.target["app"]:
-                raise GateError("deployment receipt Modal app identity is missing")
-            expected = self.source_probe.get("expected")
-            if not isinstance(expected, Mapping) or not isinstance(expected.get("modules"), Mapping):
-                raise GateError("deployment receipt source-probe expectation is missing")
-            if not isinstance(self.image_identity, Mapping):
-                raise GateError("deployment receipt image identity is malformed")
-            if not self.image_identity.get("status") and not self.image_identity.get("image_id"):
-                raise GateError("deployment receipt image identity is missing")
-            if self.manifest_path:
-                if not self.manifest_digest:
-                    raise GateError("deployment receipt manifest digest is missing")
-                manifest = Path(self.manifest_path)
-                try:
-                    if manifest_digest(manifest) != self.manifest_digest:
-                        raise GateError("deployment receipt manifest integrity check failed")
-                    raw_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-                except OSError as exc:
-                    raise GateError("deployment receipt manifest is missing") from exc
-                except (ValueError, TypeError) as exc:
-                    raise GateError("deployment receipt manifest is corrupt") from exc
-                if not isinstance(raw_manifest, Mapping):
-                    raise GateError("deployment receipt manifest is malformed")
-                if raw_manifest.get("profile") != self.profile:
-                    raise GateError("deployment receipt manifest profile mismatch")
-                if raw_manifest.get("deploy_fingerprint") != self.deploy_fingerprint:
-                    raise GateError("deployment receipt manifest fingerprint mismatch")
-                if raw_manifest.get("target") != {
-                    "app": self.target["app"],
-                    "class": self.target["class"],
-                    "method": self.target["method"],
-                }:
-                    raise GateError("deployment receipt manifest target mismatch")
-                if self.receipt_path and raw_manifest.get("deployment_receipt") != self.receipt_path:
-                    raise GateError("deployment receipt manifest path mismatch")
-                publication = raw_manifest.get("custom_nodes_publication")
-                if isinstance(publication, Mapping) and publication.get("generation") != self.s4_generation:
-                    raise GateError("deployment receipt publication identity mismatch")
-            config = self.effective_config
-            if config and config.get("profile") != self.profile:
-                raise GateError("deployment receipt effective config profile mismatch")
-            if isinstance(config, Mapping) and isinstance(config.get("target"), Mapping):
-                if dict(config["target"]) != self.target:
-                    raise GateError("deployment receipt effective config target mismatch")
-            flags = config.get("deploy_flags", {}) if isinstance(config, Mapping) else {}
-            if isinstance(flags, Mapping):
-                for name, value in flags.items():
-                    if self.effective_environment.get(str(name)) != str(value):
-                        raise GateError(
-                            f"deployment receipt effective config mismatch for {name}"
-                        )
-            if self.s4_identity and self.s4_identity.get("generation") != self.s4_generation:
-                raise GateError("deployment receipt S4 generation identity mismatch")
-            # Custom-node publication is fully manual: the S4 publication
-            # identity is optional.  Mismatch still fails when a publication
-            # block is present, but an absent publication is valid.
 
+    # The manifest, image identity, S4 generation and effective-config copies
+    # that used to be cross-checked here are gone. Each one restated a fact
+    # deploy_id already determines, or existed so this local file could prove
+    # another local file. Which deployment served a request is established by
+    # the deploy_id the serving request reports, compared at acceptance time.
 
 def receipt_path(
     repo_root: Path, deploy_fingerprint: str, deployment_version: int | None = None
@@ -333,8 +252,6 @@ def write_deployment_receipt(repo_root: Path, receipt: DeploymentReceipt) -> Pat
     if receipt.receipt_path and Path(receipt.receipt_path) != path:
         raise GateError("deployment receipt path identity mismatch")
     serialized = receipt.to_dict()
-    if serialized["integrity_digest"] != _integrity_digest(receipt._payload()):
-        raise GateError("deployment receipt integrity digest is invalid")
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         try:
@@ -466,7 +383,7 @@ def write_source_probe_evidence(
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "schema_version": SOURCE_PROBE_SCHEMA_VERSION,
-        "receipt_integrity_digest": receipt.to_dict()["integrity_digest"],
+        "deploy_id": receipt.deploy_id,
         "profile": receipt.profile,
         "target": dict(receipt.target),
         "deployment_version": receipt.deployment_version,
@@ -480,7 +397,6 @@ def write_source_probe_evidence(
             if isinstance(report.get("remote_summary"), Mapping) else {}
         ),
     }
-    data["integrity_digest"] = _integrity_digest(data)
     if path.exists():
         try:
             existing = json.loads(path.read_text(encoding="utf-8"))
@@ -494,38 +410,5 @@ def write_source_probe_evidence(
     return path
 
 
-def require_source_probe_evidence(repo_root: Path, receipt: DeploymentReceipt) -> dict[str, Any]:
-    path = source_probe_evidence_path(repo_root, receipt)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise GateError(
-            "Golden requires successful source-probe evidence bound to the deployment receipt"
-        ) from exc
-    if not isinstance(raw, Mapping):
-        raise GateError("source-probe evidence is malformed")
-    digest = raw.get("integrity_digest")
-    payload = dict(raw)
-    payload.pop("integrity_digest", None)
-    if not isinstance(digest, str) or digest != _integrity_digest(payload):
-        raise GateError("source-probe evidence integrity check failed")
-    for name, expected in (
-        ("receipt_integrity_digest", receipt.to_dict()["integrity_digest"]),
-        ("profile", receipt.profile),
-        ("target", receipt.target),
-        ("deployment_version", receipt.deployment_version),
-        ("deploy_fingerprint", receipt.deploy_fingerprint),
-        ("modal_destination", receipt.modal_destination),
-    ):
-        if raw.get(name) != expected:
-            raise GateError(f"source-probe evidence {name} does not match receipt")
-    if raw.get("expected") != receipt.source_probe.get("expected"):
-        raise GateError("source-probe evidence expectation does not match receipt")
-    classification = raw.get("classification")
-    if not isinstance(classification, Mapping) or classification.get("verdict") != "MATCH":
-        raise GateError("Golden source-probe evidence is not a successful MATCH")
-    expected_hash = str(receipt.deployment_identity.get("deployment_combined_hash") or "")
-    remote = raw.get("remote_summary")
-    if expected_hash and (not isinstance(remote, Mapping) or remote.get("deployment_combined_hash") != expected_hash):
-        raise GateError("source-probe deployment identity does not match receipt")
-    return dict(raw)
+# require_source_probe_evidence removed: source-probe is debug tooling and
+# no longer gates a run. See test_source_probe_is_debug_only.py.

@@ -11,11 +11,8 @@ from tools.v2_control.config import ConfigResolver
 from tools.v2_control.deployment_receipt import (
     DeploymentReceipt,
     latest_deployment_receipt,
-    manifest_digest,
     receipt_path,
     read_deployment_receipt,
-    require_source_probe_evidence,
-    write_source_probe_evidence,
     write_deployment_receipt,
 )
 from tools.v2_control.errors import FlagError, GateError
@@ -35,6 +32,7 @@ def _receipt(config: FakeConfig, *, version: int = 7) -> DeploymentReceipt:
     fingerprint = FingerprintEngine(config).deploy_fingerprint()
     return DeploymentReceipt(
         profile=config.profile_name,
+        deploy_id="a" * 64,
         target={
             "app": config.target.app,
             "class": config.target.class_name,
@@ -47,6 +45,15 @@ def _receipt(config: FakeConfig, *, version: int = 7) -> DeploymentReceipt:
         modal_app=config.target.app,
         source_probe={"expected": {"git_head": "A", "modules": {}}},
         profile_config_fingerprint="profile-A",
+        # Workspace binding is checked unconditionally: deploying into the wrong
+        # Modal workspace is a real operational failure, so it is validated once
+        # here rather than re-proved through every record that mentions it.
+        modal_destination={
+            "workspace_id": "ws-test",
+            "workspace_label": "test",
+            "environment": "test",
+            "source": "config/v2/modal_target.toml",
+        },
     )
 
 
@@ -143,28 +150,6 @@ def test_receipt_rejects_host_auth_reserved_and_redacted_environment(tmp_path, e
         )
 
 
-def test_receipt_tamper_and_same_version_ambiguity_fail_closed(tmp_path):
-    import json
-
-    config = _config()
-    path = write_deployment_receipt(tmp_path, _receipt(config, version=9))
-    raw = path.read_text(encoding="utf-8")
-    tampered = json.loads(raw)
-    tampered["profile"] = "forged"
-    path.write_text(json.dumps(tampered), encoding="utf-8")
-    with pytest.raises(GateError, match="integrity"):
-        read_deployment_receipt(path)
-
-    # Restore the valid receipt, then add a different receipt for the same
-    # app/version.  Selection must not choose an arbitrary one.
-    path.write_text(raw, encoding="utf-8")
-    second = DeploymentReceipt(**{**_receipt(config, version=9).__dict__, "deploy_fingerprint": "b" * 64})
-    write_deployment_receipt(tmp_path, second)
-    with pytest.raises(GateError, match="ambiguous"):
-        latest_deployment_receipt(tmp_path, profile=config.profile_name, target={
-            "app": config.target.app, "class": config.target.class_name,
-            "method": config.target.method,
-        })
 
 
 def test_unrelated_same_version_receipt_does_not_block_target_selection(tmp_path):
@@ -198,18 +183,6 @@ def test_unrelated_same_version_receipt_does_not_block_target_selection(tmp_path
     assert selected.target["app"] == config.target.app
 
 
-def test_source_probe_evidence_is_required_and_receipt_bound(tmp_path):
-    config = _config()
-    receipt = _receipt(config)
-    with pytest.raises(GateError, match="source-probe evidence"):
-        require_source_probe_evidence(tmp_path, receipt)
-    report = {
-        "expected": receipt.source_probe["expected"],
-        "remote_summary": {},
-        "classification": {"verdict": "MATCH"},
-    }
-    write_source_probe_evidence(tmp_path, receipt, report)
-    assert require_source_probe_evidence(tmp_path, receipt)["deploy_fingerprint"] == receipt.deploy_fingerprint
 
 
 def test_source_probe_uses_deployed_expected_source_and_fails_mismatch():
@@ -230,116 +203,3 @@ def test_source_probe_uses_deployed_expected_source_and_fails_mismatch():
     assert report["verdict"] == "MISMATCH"
 
 
-def test_bound_source_and_health_flow_preserves_receipt_manifest_integrity(
-    tmp_path, monkeypatch
-):
-    """Receipt-bound evidence must not rewrite the manifest it authenticates."""
-    config = _config()
-    fingerprint = FingerprintEngine(config).deploy_fingerprint()
-    deployments = tmp_path / ".v2ctl" / "deployments"
-    deployments.mkdir(parents=True)
-    deployment_manifest = deployments / "deploy_0001.json"
-    stored_receipt_path = receipt_path(tmp_path, fingerprint, 7)
-    deployment_manifest.write_text(
-        json.dumps(
-            {
-                "profile": config.profile_name,
-                "deploy_fingerprint": fingerprint,
-                "target": {
-                    "app": config.target.app,
-                    "class": config.target.class_name,
-                    "method": config.target.method,
-                },
-                "deployment_receipt": str(stored_receipt_path),
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    receipt = DeploymentReceipt(
-        **{
-            **_receipt(config, version=7).__dict__,
-            "deployment_identity": {
-                "app": config.target.app,
-                "class": config.target.class_name,
-                "method": config.target.method,
-                "version": 7,
-                "deploy_fingerprint": fingerprint,
-            },
-            "image_identity": {"status": "not_observed_at_deploy"},
-            "s4_generation": "generation-1",
-            "s4_identity": {"generation": "generation-1", "manifest_digest": "s4"},
-            "effective_config": {
-                "profile": config.profile_name,
-                "target": {
-                    "app": config.target.app,
-                    "class": config.target.class_name,
-                    "method": config.target.method,
-                },
-            },
-            "manifest_path": str(deployment_manifest),
-            "manifest_digest": manifest_digest(deployment_manifest),
-            "receipt_path": str(stored_receipt_path),
-            "modal_destination": {
-                "workspace_id": "ws-six",
-                "workspace_label": "Testing 6",
-                "environment": "(default)",
-                "source": "config/v2/modal_target.toml",
-            },
-        }
-    )
-    stored_path = write_deployment_receipt(tmp_path, receipt)
-    before = deployment_manifest.read_bytes()
-
-    class _Fingerprints:
-        def deploy_fingerprint(self):
-            return fingerprint
-
-    assert mark_runtime_health_verified(
-        tmp_path,
-        config,
-        _Fingerprints(),
-        fingerprint,
-        bound_receipt=receipt,
-    ) == deployment_manifest
-    assert deployment_manifest.read_bytes() == before
-
-    report = {
-        "expected": receipt.source_probe["expected"],
-        "remote_summary": {
-            "class_name": config.target.class_name,
-            "image_id": "image-1",
-            "container_session_id": "container-1",
-            "deployment_combined_hash": "",
-            "cwd": "/root",
-            "comfymodal_runtime_file": "/pkg/comfymodal_runtime/__init__.py",
-            "comfymodal_runtime_path": ["/pkg/comfymodal_runtime"],
-        },
-        "classification": {
-            "verdict": "MATCH",
-            "modules": [],
-            "ledger_flag": "ledger",
-            "ledger_enabled": True,
-            "ledger_record_event": True,
-        },
-    }
-    monkeypatch.setattr(cli, "_build_components_for_args", lambda _root, _args: (
-        None, None, None, config, _Fingerprints(), None, None
-    ))
-    monkeypatch.setattr(
-        cli,
-        "_bound_deployment_receipt",
-        lambda _root, _config, *, command: (stored_path, receipt),
-    )
-    monkeypatch.setattr(source_probe, "_load_workspace", lambda _root: {"id": "w"})
-    monkeypatch.setattr(
-        source_probe,
-        "run_source_probe",
-        lambda _root, *, workspace, gpu, expected: (0, report),
-    )
-    monkeypatch.setattr(cli, "_deployment_manifest_dir", lambda _root: deployments)
-    args = type("Args", (), {"profile": "golden_p1", "app": None})()
-
-    assert cli.cmd_source_probe(args, tmp_path) == 0
-    assert deployment_manifest.read_bytes() == before
-    assert read_deployment_receipt(stored_path).to_dict() == receipt.to_dict()

@@ -1960,6 +1960,10 @@ def _write_golden_deployment_receipt(
     manifest_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     receipt = receipt_mod.DeploymentReceipt(
         profile=str(config.profile_name),
+        # The one identity a run is checked against. Computed the same way the
+        # runtime computes it, so the value baked into the class environment and
+        # the value recorded here cannot diverge.
+        deploy_id=compute_deploy_id(config),
         target={
             "app": str(config.target.app),
             "class": str(config.target.class_name),
@@ -1985,26 +1989,9 @@ def _write_golden_deployment_receipt(
                 "memory_mb": int(config.resources.memory_mb),
             },
         },
-        deployed_source={
-            "git_head": str(config.git.head),
-            "dirty_hashes": dict(config.git.dirty_hashes or {}),
-        },
         source_probe={"expected": expected_source},
-        image_identity={
-            # Deploy output does not provide a runtime image probe.  Keep this
-            # explicit rather than inventing an image ID from local state.
-            "status": "not_observed_at_deploy",
-        },
-        workflow_model_contract={
-            "profile": str(config.profile_name),
-            "expected_output_sha": str(config.workload.expected_output_sha),
-            "conditioning_cache": str(config.workload.conditioning_cache),
-        },
-        s4_generation=generation,
         profile_config_fingerprint=deploy_identity.profile_config_fingerprint,
         manifest_path=str(manifest_path),
-        manifest_digest=receipt_mod.manifest_digest(manifest_path),
-        s4_identity=s4_identity,
         effective_config={
             "profile": str(config.profile_name),
             "target": {

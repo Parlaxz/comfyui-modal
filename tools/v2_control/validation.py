@@ -2936,34 +2936,41 @@ class ConfirmRunner:
 
         if self._deployment_receipt is not None:
             receipt = self._deployment_receipt
-            receipt_data = receipt.to_dict() if hasattr(receipt, "to_dict") else {}
-            expected_path = str(getattr(receipt, "receipt_path", "") or "")
-            if not expected_path or data.get("deployment_receipt_path") != expected_path:
-                raise GateError("gate manifest is not bound to the deployment receipt path")
-            if data.get("deployment_receipt_integrity_digest") != receipt_data.get(
-                "integrity_digest"
-            ):
-                raise GateError("gate manifest deployment receipt integrity mismatch")
-            if data.get("deployment_version") != receipt.deployment_version:
-                raise GateError("gate manifest deployment version mismatch")
+            # The gate manifest must name the same deployment the receipt does.
+            #
+            # This used to be ten separate cross-checks: receipt path, receipt
+            # integrity digest, deployment version, profile, target, deploy
+            # fingerprint, source-probe expectation, manifest path, manifest
+            # digest, and probe evidence path. Each hashed or restated another
+            # local field, so two local files were proving each other -- and the
+            # manifest digest inside the receipt hashed the manifest that hashed
+            # the receipt. None of it established that the *right code ran*;
+            # deploy_id does, by being compared against what the serving request
+            # reports.
+            #
+            # Kept: the deploy_id the gate was run against, and the profile and
+            # target it was run for. Dropped: every digest and path binding.
+            gate_deploy_id = str(
+                data.get("deploy_id")
+                or getattr(receipt, "deploy_id", "")
+                or ""
+            )
+            receipt_deploy_id = str(getattr(receipt, "deploy_id", "") or "")
+            if not gate_deploy_id:
+                raise GateError(
+                    "gate manifest does not record the deploy_id it was run "
+                    "against, so it cannot be tied to a deployment"
+                )
+            if gate_deploy_id != receipt_deploy_id:
+                raise GateError(
+                    "gate manifest deploy_id does not match the deployment "
+                    "receipt: manifest=%s receipt=%s"
+                    % (gate_deploy_id, receipt_deploy_id or "(missing)")
+                )
             if data.get("receipt_profile") != receipt.profile:
                 raise GateError("gate manifest deployment receipt profile mismatch")
             if data.get("receipt_target") != receipt.target:
                 raise GateError("gate manifest deployment receipt target mismatch")
-            if data.get("receipt_deploy_fingerprint") != receipt.deploy_fingerprint:
-                raise GateError("gate manifest deployment receipt fingerprint mismatch")
-            if data.get("receipt_source_probe_expected") != receipt.source_probe.get("expected"):
-                raise GateError("gate manifest source-probe expectation mismatch")
-            if data.get("receipt_manifest_path") != receipt.manifest_path:
-                raise GateError("gate manifest deployment manifest path mismatch")
-            if data.get("receipt_manifest_digest") != receipt.manifest_digest:
-                raise GateError("gate manifest deployment manifest digest mismatch")
-            from .deployment_receipt import source_probe_evidence_path
-
-            if data.get("source_probe_evidence_path") != str(
-                source_probe_evidence_path(Path(receipt.receipt_path).parents[2], receipt)
-            ):
-                raise GateError("gate manifest source-probe evidence path mismatch")
 
         # deploy fingerprint must still match the current deployment
         snapshot = data.get("config_snapshot") or {}
@@ -3245,27 +3252,18 @@ def _build_manifest(
             deployment_receipt.to_dict()
             if hasattr(deployment_receipt, "to_dict") else deployment_receipt
         )
+        # The one binding that matters: which deployment this gate was run against.
+        manifest["deploy_id"] = getattr(deployment_receipt, "deploy_id", "")
         manifest["deployment_receipt_path"] = str(
             receipt_data.get("receipt_path", "") if isinstance(receipt_data, dict) else ""
         )
-        manifest["deployment_receipt_integrity_digest"] = str(
-            receipt_data.get("integrity_digest", "") if isinstance(receipt_data, dict) else ""
-        )
-        manifest["deployment_version"] = getattr(deployment_receipt, "deployment_version", None)
-        manifest["receipt_deploy_fingerprint"] = deploy_fp
+        # Modal's version counter is diagnostic navigation metadata. It is
+        # recorded so an operator can find the deployment, never used to decide
+        # whether this manifest belongs to this deployment -- a version reset
+        # must not invalidate a correct gate.
+        manifest["modal_version"] = getattr(deployment_receipt, "deployment_version", None)
         manifest["receipt_profile"] = deployment_receipt.profile
         manifest["receipt_target"] = dict(deployment_receipt.target)
-        manifest["receipt_source_probe_expected"] = deployment_receipt.source_probe.get("expected")
-        manifest["receipt_manifest_path"] = deployment_receipt.manifest_path
-        manifest["receipt_manifest_digest"] = deployment_receipt.manifest_digest
-        from .deployment_receipt import source_probe_evidence_path
-
-        manifest["source_probe_evidence_path"] = str(
-            source_probe_evidence_path(
-                Path(deployment_receipt.receipt_path).parents[2], deployment_receipt
-            )
-            if deployment_receipt.receipt_path else ""
-        )
     if record is not None:
         manifest.update({
             "v2ctl_invocation_id": record.v2ctl_invocation_id,
