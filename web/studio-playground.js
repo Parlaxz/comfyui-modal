@@ -2799,28 +2799,37 @@ function renderProgressSection(state, context) {
 
   section.style.display = "block";
 
-  // Overall progress bar
+  // Overall progress bar. Golden stage segments are added below once the
+  // telemetry snapshot is available; the fill remains a truthful fallback
+  // for the short interval before the first stage event arrives.
   const barContainer = el("div", {
-    style: "width:100%;height:8px;background:#1a1a1a;border-radius:4px;overflow:hidden;margin-bottom:6px;",
+    class: "comfymodal-studio-progress-bar",
+    "data-testid": "progress-bar",
   });
   const barFill = el("div", {
-    style: "width:0%;height:100%;background:var(--color-accent, #5a7fdb);border-radius:4px;transition:width 0.3s ease;",
+    class: "comfymodal-studio-progress-fill",
     "data-testid": "progress-bar-fill",
   });
   barContainer.appendChild(barFill);
+  barContainer.appendChild(el("div", {
+    class: "comfymodal-studio-progress-segments",
+    "data-testid": "progress-bar-segments",
+  }));
 
   // Stage / status info
   const info = el("div", {
-    style: "display:flex;flex-wrap:wrap;gap:4px 12px;font-size:10px;color:#aaa;",
+    class: "comfymodal-studio-progress-summary",
   });
 
   const stageEl = el("span", { "data-testid": "progress-stage" });
   const nodesEl = el("span", { "data-testid": "progress-nodes" });
   const elapsedEl = el("span", { "data-testid": "progress-elapsed" });
-  const stepEl = el("span", { "data-testid": "progress-step" });
+  const percentEl = el("span", { "data-testid": "progress-percent", class: "comfymodal-studio-progress-percent" });
+  const stepEl = el("span", { "data-testid": "progress-step", style: "display:none;" });
   const queueEl = el("span", { "data-testid": "progress-queue" });
 
   info.appendChild(stageEl);
+  info.appendChild(percentEl);
   info.appendChild(nodesEl);
   info.appendChild(elapsedEl);
   info.appendChild(stepEl);
@@ -2839,13 +2848,24 @@ function renderProgressSection(state, context) {
   if (runState.goldenStage) stageLabel = runState.goldenStage;
 
   stageEl.textContent = "Stage: " + stageLabel;
+  percentEl.textContent = runState.goldenProgressPercent != null
+    ? Math.round(Math.max(0, Math.min(100, runState.goldenProgressPercent))) + "%"
+    : "Progress pending";
   if (runState.totalNodes != null && runState.totalNodes > 0) {
     nodesEl.textContent = "Nodes: " + (runState.completedNodes || 0) + "/" + runState.totalNodes;
   } else {
     nodesEl.style.display = "none";
   }
-  var samplerPct = runState.samplerPercent != null ? " (" + Math.round(runState.samplerPercent) + "%)" : "";
-  stepEl.textContent = "Sampler: " + (runState.samplerStep != null ? runState.samplerStep : 0) + "/" + (runState.samplerMaximum || 0) + samplerPct;
+  // Golden telemetry has no sampler tick stream. Keep this node for legacy
+  // callers/tests, but never show a fabricated 0/0 readout.
+  if (runState.samplerMaximum > 0 && runState.samplerStep != null) {
+    var samplerPct = runState.samplerPercent != null ? " (" + Math.round(runState.samplerPercent) + "%)" : "";
+    stepEl.textContent = "Sampler: " + runState.samplerStep + "/" + runState.samplerMaximum + samplerPct;
+    stepEl.style.display = "";
+  } else {
+    stepEl.textContent = "";
+    stepEl.style.display = "none";
+  }
   elapsedEl.textContent = "Elapsed: " + _formatDuration(runState.elapsedMs);
 
   if (runState.queuePosition > 0) {
@@ -2883,16 +2903,45 @@ function _formatGoldenNs(value) {
 }
 
 function _goldenStageTimingText(stage) {
-  const start = stage && stage.started ? (stage.started.entryMonotonicNs ?? stage.started.entryWallNs) : null;
-  const terminal = stage && (stage.completed || stage.failed);
-  const end = terminal ? (terminal.endMonotonicNs ?? terminal.endWallNs) : null;
-  return "start: " + _formatGoldenNs(start) + " ┬╖ end: " + _formatGoldenNs(end)
-    + " ┬╖ " + _formatGoldenTiming(stage && stage.durationMs);
+  // Absolute monotonic timestamps are useful for diagnostics, not for people
+  // reading a progress panel. Golden already computes the meaningful delta.
+  return _formatGoldenTiming(stage && stage.durationMs);
 }
 
 function _appendGoldenProgress(section, runState) {
   const golden = runState && runState.goldenProgress;
   if (!golden) return;
+  const stages = Array.isArray(golden.stages) ? golden.stages : [];
+  const segmentBar = section.querySelector('[data-testid="progress-bar-segments"]');
+  if (segmentBar) {
+    while (segmentBar.firstChild) segmentBar.removeChild(segmentBar.firstChild);
+    const knownTotal = stages.reduce(function (sum, stage) {
+      const duration = Number(stage && stage.durationMs);
+      return sum + (Number.isFinite(duration) && duration > 0 ? duration : 0);
+    }, 0);
+    stages.forEach(function (stage) {
+      const duration = Number(stage && stage.durationMs);
+      const hasDuration = Number.isFinite(duration) && duration > 0;
+      const phase = stage.phase === "failed" ? "failed" : stage.phase === "completed" ? "completed" : "active";
+      const segment = el("div", {
+        class: "comfymodal-studio-progress-segment is-" + phase,
+        "data-stage": stage.stage,
+        "data-duration-known": hasDuration ? "true" : "false",
+        "aria-label": stage.stage + ": " + (hasDuration ? _formatDuration(duration) : "timing pending"),
+      });
+      if (hasDuration && knownTotal > 0) {
+        segment.style.width = ((duration / knownTotal) * 100).toFixed(3) + "%";
+      } else {
+        segment.style.width = "0%";
+      }
+      if (stage.stage === golden.currentStage || (stage.phase === "failed" && stage.stage === golden.failedStage)) {
+        segment.classList.add("is-current");
+        segment.setAttribute("aria-current", "step");
+      }
+      segment.appendChild(el("span", { class: "comfymodal-studio-progress-segment-label", text: stage.stage }));
+      segmentBar.appendChild(segment);
+    });
+  }
   // Total first: the per-stage rows below only sum stage time, which excludes
   // submission, container start and output transfer, so the total is reported
   // from the run's own elapsed clock rather than derived from the rows.
@@ -2900,19 +2949,20 @@ function _appendGoldenProgress(section, runState) {
   section.appendChild(el("div", {
     "data-testid": "progress-golden-total",
     text: "Total: " + _formatDuration(_totalMs),
-    style: "font-size:10px;color:#ccc;margin-top:6px;font-weight:var(--font-weight-semibold, 600);",
+    class: "comfymodal-studio-progress-total",
   }));
   const list = el("div", {
     "data-testid": "progress-golden-stages",
-    style: "display:flex;flex-direction:column;gap:2px;margin-top:6px;font-size:10px;",
+    class: "comfymodal-studio-progress-stages",
   });
-  (Array.isArray(golden.stages) ? golden.stages : []).forEach((stage) => {
-    const phaseText = stage.phase === "failed" ? "failed" : stage.phase;
+  stages.forEach((stage) => {
+    const phaseText = stage.phase === "failed" ? "Failed" : stage.phase === "completed" ? "Completed" : "In progress";
+    const stateMark = stage.phase === "failed" ? "[!]" : stage.phase === "completed" ? "[done]" : "[active]";
     list.appendChild(el("div", {
       "data-testid": "progress-golden-stage-row",
       "data-stage": stage.stage,
-      text: stage.stage + " ΓÇö " + phaseText + " ┬╖ " + _goldenStageTimingText(stage),
-      style: stage.phase === "failed" ? "color:var(--color-danger,#f87171);" : "color:#aaa;",
+      class: "comfymodal-studio-progress-stage-row is-" + (stage.phase === "failed" ? "failed" : stage.phase === "completed" ? "completed" : "active"),
+      text: stateMark + "  " + stage.stage + " - " + phaseText + " - " + _goldenStageTimingText(stage),
     }));
   });
   section.appendChild(list);
@@ -2962,6 +3012,13 @@ function _domPatchProgress(state) {
     stageEl.textContent = "Stage: " + stageLabel;
   }
 
+  var percentEl = document.querySelector('[data-testid="progress-percent"]');
+  if (percentEl) {
+    percentEl.textContent = rs.goldenProgressPercent != null
+      ? Math.round(Math.max(0, Math.min(100, rs.goldenProgressPercent))) + "%"
+      : "Progress pending";
+  }
+
   var nodesEl = document.querySelector('[data-testid="progress-nodes"]');
   if (nodesEl) {
     if (rs.totalNodes != null && rs.totalNodes > 0) {
@@ -2988,8 +3045,14 @@ function _domPatchProgress(state) {
 
   var stepEl = document.querySelector('[data-testid="progress-step"]');
   if (stepEl) {
-    var sp = rs.samplerPercent != null ? " (" + Math.round(rs.samplerPercent) + "%)" : "";
-    stepEl.textContent = "Sampler: " + (rs.samplerStep != null ? rs.samplerStep : 0) + "/" + (rs.samplerMaximum || 0) + sp;
+    if (rs.samplerMaximum > 0 && rs.samplerStep != null) {
+      var sp = rs.samplerPercent != null ? " (" + Math.round(rs.samplerPercent) + "%)" : "";
+      stepEl.textContent = "Sampler: " + rs.samplerStep + "/" + rs.samplerMaximum + sp;
+      stepEl.style.display = "";
+    } else {
+      stepEl.textContent = "";
+      stepEl.style.display = "none";
+    }
   }
 
   var queueEl = document.querySelector('[data-testid="progress-queue"]');
@@ -3016,30 +3079,14 @@ function _domPatchProgress(state) {
     }
   }
 
-  var stageList = document.querySelector('[data-testid="progress-golden-stages"]');
-  if (!stageList && rs.goldenProgress) {
+  if (rs.goldenProgress) {
     var progressSection = document.querySelector('[data-testid="progress-section"]');
-    if (progressSection) _appendGoldenProgress(progressSection, rs);
-    stageList = document.querySelector('[data-testid="progress-golden-stages"]');
-  }
-  if (stageList && rs.goldenProgress) {
-    while (stageList.firstChild) stageList.removeChild(stageList.firstChild);
-    (Array.isArray(rs.goldenProgress.stages) ? rs.goldenProgress.stages : []).forEach(function (stage) {
-      stageList.appendChild(el("div", {
-        "data-testid": "progress-golden-stage-row",
-        "data-stage": stage.stage,
-        text: stage.stage + " ΓÇö " + stage.phase + " ┬╖ " + _goldenStageTimingText(stage),
-        style: stage.phase === "failed" ? "color:var(--color-danger,#f87171);" : "color:#aaa;",
-      }));
-    });
-    var stageError = document.querySelector('[data-testid="progress-golden-stage-error"]');
-    if (rs.goldenProgress.error && !stageError) {
-      var errorSection = document.querySelector('[data-testid="progress-section"]');
-      if (errorSection) _appendGoldenProgress(errorSection, rs);
-    } else if (stageError) {
-      stageError.textContent = rs.goldenProgress.error
-        ? "Golden stage failure: " + rs.goldenProgress.error : "";
-      stageError.style.display = rs.goldenProgress.error ? "" : "none";
+    if (progressSection) {
+      ["progress-golden-total", "progress-golden-stages", "progress-golden-stage-error"].forEach(function (testId) {
+        var oldEl = progressSection.querySelector('[data-testid="' + testId + '"]');
+        if (oldEl) oldEl.remove();
+      });
+      _appendGoldenProgress(progressSection, rs);
     }
   }
 }
@@ -3319,7 +3366,7 @@ function renderCanvas(state, context) {
   } else if (outputUrl) {
     const img = el("img", {
       src: outputUrl,
-      style: "max-width:100%;max-height:100%;object-fit:contain;border-radius:4px;",
+      class: "comfymodal-studio-canvas-output",
       "data-testid": "canvas-output",
     });
     // Click-to-preview: the zoom/pan + detail-sidebar overlay was written
@@ -3331,7 +3378,9 @@ function renderCanvas(state, context) {
     img.setAttribute("tabindex", "0");
     img.setAttribute("aria-label", "Open generated image preview");
     var _openPreview = function () {
-      var _prevFocus = document.activeElement;
+       // The image is the invoking control; restore focus here rather than to
+       // whichever element happened to be active before a pointer click.
+       var _prevFocus = img;
       var _run = (state.playground && state.playground._selectedRun) || null;
       // opts.sections takes DOM Nodes appended verbatim, not {label, value}
       // descriptors - plain objects throw on appendChild.
