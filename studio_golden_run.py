@@ -284,11 +284,14 @@ async def run_golden_workflow(
     *,
     workflow_id: str,
     version_id: str,
-    preset_id: str,
     controls: Mapping[str, Any] | None,
     request_id: str,
     node_dir: str | Path,
     profile_name: str,
+    # Retired by the Studio preset collapse (f3954638): control defaults now
+    # come from the version's own executable_prompt. Kept as an optional
+    # argument so pre-collapse callers still work; nothing reads it.
+    preset_id: str = "",
     workspace: Mapping[str, Any] | None = None,
     event_store: GoldenStageEventStore = EVENT_STORE,
     handle_factory: Callable[[GoldenProfile, Mapping[str, Any] | None], Any] | None = None,
