@@ -1241,7 +1241,7 @@ export function renderSettings(state, context) {
           deployButton.disabled = true;
           deployStatus.textContent = "Deploying " + selectedProfile.name + "\u2026";
           try {
-            const started = await fetch(base + "/golden/deploy", {
+            const started = await fetch(base + "/studio/golden/deploy", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ profile: selectedProfile.name }),
@@ -1269,7 +1269,7 @@ export function renderSettings(state, context) {
       for (let attempt = 0; attempt < 900; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
         const response = await fetch(
-          base + "/golden/deploy?profile=" + encodeURIComponent(name)
+          base + "/studio/golden/deploy?profile=" + encodeURIComponent(name)
         );
         const payload = await response.json();
         if (payload && payload.state === "done") {

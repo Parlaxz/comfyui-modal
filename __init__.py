@@ -7644,3 +7644,42 @@ if _server:
         return web.json_response(response_data)
 
     print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*, /comfymodal/history-v2/feed, /comfymodal/history-v2/generations/{id}/*, /comfymodal/history-v2/experiments/{id}/*, /comfymodal/history-v2/assets/{id}")
+
+
+# ComfyUI collects a custom node's classes from this module's NODE_CLASS_MAPPINGS,
+# which is declared empty above and was never populated. The two
+# ComfyModalProduction output nodes were registered only as a side effect of
+# comfyapp._start_in_process_backend(), so on any other execution backend they
+# never reached this dict and plan validation rejected valid workflows with
+# missing_node_type. Register them from the entry point ComfyUI always imports,
+# and mirror into ComfyUI's global registry so plan validation resolves them.
+# Guarded: a failure here must never break route setup.
+try:
+    from comfyapp import (  # noqa: E402
+        ComfyModalProductionImageComparerOutput,
+        ComfyModalProductionOutput,
+    )
+
+    NODE_CLASS_MAPPINGS["ComfyModalProductionOutput"] = ComfyModalProductionOutput
+    NODE_CLASS_MAPPINGS["ComfyModalProductionImageComparerOutput"] = (
+        ComfyModalProductionImageComparerOutput
+    )
+
+    import nodes as _cmfm_global_nodes  # noqa: E402
+
+    _cmfm_global_nodes.NODE_CLASS_MAPPINGS.setdefault(
+        "ComfyModalProductionOutput", ComfyModalProductionOutput
+    )
+    _cmfm_global_nodes.NODE_CLASS_MAPPINGS.setdefault(
+        "ComfyModalProductionImageComparerOutput",
+        ComfyModalProductionImageComparerOutput,
+    )
+    print(
+        "[comfyui-modal] Registered ComfyModalProductionOutput and "
+        "ComfyModalProductionImageComparerOutput"
+    )
+except Exception as _cmfm_node_registration_error:  # pragma: no cover
+    print(
+        "[comfyui-modal] ComfyModalProduction node registration skipped: "
+        f"{_cmfm_node_registration_error}"
+    )
