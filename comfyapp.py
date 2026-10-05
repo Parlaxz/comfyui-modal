@@ -1284,6 +1284,29 @@ class ComfyModalProductionImageComparerOutput:
 
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 2: Custom-node retry registry GÃ¶Ã‡GÃ¶Ã‡
+# These two nodes were registered only as a side effect of
+# _start_in_process_backend(), so the subprocess backend never registered them
+# and plan validation rejected any workflow referencing them with
+# missing_node_type. Node registration must not depend on which execution
+# backend is selected, so register them at import time. The later in-backend
+# assignment is harmless and stays as a belt-and-braces duplicate.
+try:
+    import nodes as _cmfm_registration_nodes
+
+    _cmfm_registration_nodes.NODE_CLASS_MAPPINGS["ComfyModalProductionOutput"] = (
+        ComfyModalProductionOutput
+    )
+    _cmfm_registration_nodes.NODE_CLASS_MAPPINGS[
+        "ComfyModalProductionImageComparerOutput"
+    ] = ComfyModalProductionImageComparerOutput
+except Exception as _cmfm_registration_error:  # pragma: no cover
+    # Never break module import over an optional registry write.
+    print(
+        "[comfyapp] ComfyModalProductionOutput registration failed: "
+        f"{_cmfm_registration_error}"
+    )
+
+
 class CustomNodeRetryEntry:
     __slots__ = (
         "path", "first_seen_at", "retry_count", "last_retry_at",
