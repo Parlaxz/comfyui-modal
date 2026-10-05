@@ -176,12 +176,6 @@ def _require_golden_cpu_qd2_deploy_gate(
 
 DEFAULT_MODAL_ENVIRONMENT = "(default)"
 PUBLISHER_FUNCTION_NAME = "sync_custom_nodes_to_volume"
-PUBLISHER_PREFLIGHT_FIELDS = (
-    "WORKSPACE", "ENVIRONMENT", "PUBLISHER_APP", "PUBLISHER_EXISTS",
-    "PUBLISHER_FUNCTION_EXISTS", "PUBLISHER_VERSION_BEFORE",
-    "LOCAL_CONTENT_GENERATION", "REMOTE_CONTENT_GENERATION",
-    "PUBLICATION_DECISION", "BOOTSTRAP_REQUIRED", "READY_FOR_CONSUMER_DEPLOY",
-)
 
 
 @dataclass(frozen=True)
@@ -1344,20 +1338,6 @@ def _local_content_generation(repo_root: Path) -> str:
     return str(identity.content_generation)
 
 
-def _write_publisher_preflight(repo_root: Path, data: Mapping[str, object]) -> Path:
-    directory = Path(repo_root) / ".v2ctl" / "publisher_preflight"
-    directory.mkdir(parents=True, exist_ok=True)
-    safe_workspace = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(data["WORKSPACE"]))
-    path = directory / f"publisher_{safe_workspace}.json"
-    path.write_text(
-        json.dumps(
-            {field: data.get(field) for field in PUBLISHER_PREFLIGHT_FIELDS},
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    return path
 
 
 def run_publisher_preflight(
@@ -1414,49 +1394,44 @@ def run_publisher_preflight(
         version = int(version.strip())
     remote = observed.get("remote_generation", observed.get("content_generation"))
     remote = str(remote).strip() if remote is not None and str(remote).strip() else None
-    version_known = type(version) is int and version >= 0
-    if not local or not version_known or app_exists is None or function_exists is None:
-        decision = "invalid"
-    elif not app_exists or not function_exists:
+
+    # One question: does this deployment require publication?
+    #
+    #   publisher app/Function missing -> the publisher must be deployed first
+    #   published content != local     -> publish
+    #   published content == local     -> skip (avoids a pointless re-upload)
+    #   anything undetermined          -> publish
+    #
+    # The old machine had a fifth state, "invalid", for an undetermined lookup,
+    # and callers refused to act on it. That distrusted the probe instead of
+    # choosing the safe action: publishing is idempotent and always correct, so
+    # an unknown answer means publish. A version counter is no longer consulted
+    # at all -- it never established whether anything was published.
+    app_missing = app_exists is False or function_exists is False
+    if app_missing:
         decision = "bootstrap_required"
-    elif remote is None:
-        decision = "invalid"
-    elif remote == local:
+    elif remote is not None and local and remote == local:
         decision = "skip_exact"
     else:
         decision = "publish_required"
-    bootstrap_required = bool(
-        version_known and (app_exists is False or function_exists is False)
-    )
-    # Consumer readiness is an exact full-content proof, not merely permission
-    # to attempt publication.  The deploy path explicitly admits
-    # publish_required once, then performs this exact final preflight.
-    ready = bool(
-        app_exists is True
-        and function_exists is True
-        and version_known
-        and local
-        and remote == local
-    )
+
     data: dict[str, object] = {
         "WORKSPACE": binding.workspace_id,
         "ENVIRONMENT": binding.environment,
         "PUBLISHER_APP": publisher_app,
         "PUBLISHER_EXISTS": app_exists,
         "PUBLISHER_FUNCTION_EXISTS": function_exists,
-        "PUBLISHER_VERSION_BEFORE": version,
+        "PUBLISHER_VERSION": version,
         "LOCAL_CONTENT_GENERATION": local,
         "REMOTE_CONTENT_GENERATION": remote,
         "PUBLICATION_DECISION": decision,
-        "BOOTSTRAP_REQUIRED": bootstrap_required,
-        "READY_FOR_CONSUMER_DEPLOY": ready,
+        "REQUIRES_PUBLICATION": decision != "skip_exact",
+        "READY_FOR_CONSUMER_DEPLOY": decision == "skip_exact",
     }
-    path = _write_publisher_preflight(repo_root, data)
-    data["artifact_path"] = str(path)
-    if require_ready and not ready:
+    if require_ready and decision != "skip_exact":
         raise GateError(
-            "publisher preflight is not ready for consumer deploy: "
-            f"decision={decision} bootstrap_required={bootstrap_required}"
+            "custom-node publication has not been performed for this bundle: "
+            f"decision={decision}"
         )
     return data
 
@@ -1505,7 +1480,7 @@ def _print_golden_predeploy_card(
         "PUBLISHER_FUNCTION_EXISTS="
         f"{yes_no(preflight.get('PUBLISHER_FUNCTION_EXISTS'))}"
     )
-    print(f"PUBLISHER_VERSION={preflight.get('PUBLISHER_VERSION_BEFORE')}")
+    print(f"PUBLISHER_VERSION={preflight.get('PUBLISHER_VERSION')}")
     print(f"LOCAL_CONTENT_GENERATION={preflight.get('LOCAL_CONTENT_GENERATION', '')}")
     print(f"REMOTE_CONTENT_GENERATION={preflight.get('REMOTE_CONTENT_GENERATION') or '(none)'}")
     print(f"PUBLICATION_DECISION={preflight.get('PUBLICATION_DECISION', 'invalid')}")

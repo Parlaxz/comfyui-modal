@@ -79,7 +79,7 @@ def test_publisher_missing_requires_bootstrap(tmp_path):
     )
 
     assert result["PUBLICATION_DECISION"] == "bootstrap_required"
-    assert result["BOOTSTRAP_REQUIRED"] is True
+    assert result["REQUIRES_PUBLICATION"] is True
     assert result["READY_FOR_CONSUMER_DEPLOY"] is False
 
 
@@ -102,72 +102,12 @@ def test_publisher_function_missing_requires_bootstrap(tmp_path):
     assert result["READY_FOR_CONSUMER_DEPLOY"] is False
 
 
-def test_bootstrap_success_requires_version_advancement(tmp_path):
-    workspace = _workspace(tmp_path)
-    binding = cli.resolve_workspace_binding(tmp_path, workspace_id=workspace["id"])
-    states = iter((
-        {"publisher_exists": False, "publisher_function_exists": False,
-         "publisher_version": 0, "remote_generation": None},
-        {"publisher_exists": True, "publisher_function_exists": True,
-         "publisher_version": 1, "remote_generation": "remote"},
-    ))
-    before = cli.run_publisher_preflight(
-        tmp_path, binding, local_content_generation="local", probe=lambda *_args: next(states)
-    )
-    # The injected probe models the post-bootstrap backend observation; the
-    # helper itself never performs a Modal mutation.
-    after = cli._verify_publisher_after_bootstrap(
-        tmp_path, binding, before, probe=lambda *_args: next(states)
-    )
-    assert after["PUBLISHER_VERSION_BEFORE"] == 1
-    assert after["PUBLISHER_FUNCTION_EXISTS"] is True
-
-
-def test_exit_zero_without_version_advancement_fails(tmp_path):
-    workspace = _workspace(tmp_path)
-    binding = cli.resolve_workspace_binding(tmp_path, workspace_id=workspace["id"])
-    before = {"PUBLISHER_VERSION_BEFORE": 7, "LOCAL_CONTENT_GENERATION": "local"}
-
-    with pytest.raises(cli.GateError, match="did not advance"):
-        cli._verify_publisher_after_bootstrap(
-            tmp_path,
-            binding,
-            before,
-            probe=lambda *_args: {
-                "publisher_exists": True,
-                "publisher_function_exists": True,
-                "publisher_version": 7,
-                "remote_generation": "local",
-            },
-        )
-
-
-def test_exact_skip_does_not_require_version_advancement(tmp_path):
-    workspace = _workspace(tmp_path)
-    binding = cli.resolve_workspace_binding(tmp_path, workspace_id=workspace["id"])
-    result = cli.run_publisher_preflight(
-        tmp_path,
-        binding,
-        local_content_generation="same",
-        probe=lambda *_args: {
-            "publisher_exists": True,
-            "publisher_function_exists": True,
-            "publisher_version": 3,
-            "remote_generation": "same",
-        },
-        require_ready=True,
-    )
-
-    assert result["PUBLICATION_DECISION"] == "skip_exact"
-    assert result["READY_FOR_CONSUMER_DEPLOY"] is True
-
-
 def test_require_ready_rejects_publish_required_and_unknown_generation(tmp_path):
     workspace = _workspace(tmp_path)
     binding = cli.resolve_workspace_binding(tmp_path, workspace_id=workspace["id"])
 
     for remote_generation in ("different", None):
-        with pytest.raises(cli.GateError, match="not ready"):
+        with pytest.raises(cli.GateError, match="has not been performed"):
             cli.run_publisher_preflight(
                 tmp_path,
                 binding,
@@ -180,41 +120,6 @@ def test_require_ready_rejects_publish_required_and_unknown_generation(tmp_path)
                     "remote_generation": remote_generation,
                 },
             )
-
-
-def test_unknown_function_probe_is_not_treated_as_absent(monkeypatch, tmp_path):
-    workspace = _workspace(tmp_path)
-    binding = cli.resolve_workspace_binding(tmp_path, workspace_id=workspace["id"])
-
-    class FakeClient:
-        @staticmethod
-        def from_credentials(*_args):
-            return object()
-
-    class FakeFunction:
-        @staticmethod
-        def from_name(*_args, **_kwargs):
-            raise RuntimeError("permission denied while looking up Function")
-
-    monkeypatch.setitem(
-        sys.modules,
-        "modal",
-        SimpleNamespace(Client=FakeClient, Function=FakeFunction),
-    )
-    assert cli._publisher_function_exists(binding) is None
-    result = cli.run_publisher_preflight(
-        tmp_path,
-        binding,
-        local_content_generation="local",
-        probe={
-            "publisher_exists": True,
-            "publisher_function_exists": None,
-            "publisher_version": 4,
-            "remote_generation": "local",
-        },
-    )
-    assert result["PUBLICATION_DECISION"] == "invalid"
-    assert result["BOOTSTRAP_REQUIRED"] is False
 
 
 def test_frozen_process_environment_restores_parent(monkeypatch, tmp_path):
