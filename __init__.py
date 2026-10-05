@@ -7386,7 +7386,17 @@ if _server:
             job = _golden_deploy_jobs[name]
             job["state"] = "running"
             app = str((record.get("target") or {}).get("app") or "")
-            argv = [sys.executable, os.path.join("tools", "v2ctl.py"), "--profile", name, "deploy"]
+            _cmfm_tools = os.path.join(str(Path(__file__).parent), "tools")
+            argv = [
+                sys.executable,
+                "-c",
+                (
+                    "import sys, runpy; "
+                    "sys.path.insert(0, r'" + _cmfm_tools + "'); "
+                    "runpy.run_path(r'" + _cmfm_tools + "/v2ctl.py', run_name='__main__')"
+                ),
+                "--profile", name, "deploy",
+            ]
             if app:
                 argv += ["--app", app]
             try:
@@ -7814,7 +7824,17 @@ async def _start_golden_deploy_job(profile_name, record=None):
         job = _golden_deploy_jobs[profile_name]
         job["state"] = "running"
         app = str((record.get("target") or {}).get("app") or "")
-        argv = [sys.executable, os.path.join("tools", "v2ctl.py"), "--profile", profile_name, "deploy"]
+        _cmfm_tools = os.path.join(str(Path(__file__).parent), "tools")
+        argv = [
+            sys.executable,
+            "-c",
+            (
+                "import sys, runpy; "
+                "sys.path.insert(0, r'" + _cmfm_tools + "'); "
+                "runpy.run_path(r'" + _cmfm_tools + "/v2ctl.py', run_name='__main__')"
+            ),
+            "--profile", profile_name, "deploy",
+        ]
         if app:
             argv += ["--app", app]
         try:

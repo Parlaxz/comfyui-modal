@@ -282,7 +282,22 @@ def latest_deployment_receipt(
     if not directory.is_dir():
         return None
     matches: list[tuple[Path, DeploymentReceipt]] = []
-    for path in sorted(directory.glob(f"{RECEIPT_PREFIX}*.json"), reverse=True):
+
+    def _receipt_order(path: Path) -> tuple[int, str]:
+        # Receipt filenames are receipt_<seq>_<digest>.json. Sorting on the raw
+        # filename orders lexically, which puts receipt_9_* ahead of receipt_11_*
+        # and makes the scan read stale receipts before current ones. Order on
+        # the numeric sequence instead, then the digest for a stable tiebreak.
+        name = path.name
+        try:
+            seq = int(name[len(RECEIPT_PREFIX):].split("_", 1)[0])
+        except (ValueError, IndexError):
+            seq = -1
+        return (seq, name)
+
+    for path in sorted(
+        directory.glob(f"{RECEIPT_PREFIX}*.json"), key=_receipt_order, reverse=True
+    ):
         # Older receipts from another app may predate the immutable digest
         # field.  When the caller has already identified the profile/target,
         # filter those unrelated records before strict receipt parsing.  A
@@ -314,6 +329,12 @@ def latest_deployment_receipt(
                     registered_workspace_id = None
                 if registered_workspace_id != workspace_id:
                     continue
+            # Receipts written before deploy_id became mandatory cannot be
+            # validated and are not corruption; they are simply older records.
+            # Skip them here so a legacy receipt does not abort the scan before
+            # a current, deploy_id-bearing receipt is considered.
+            if not metadata.get("deploy_id"):
+                continue
         try:
             receipt = read_deployment_receipt(path)
         except GateError:
