@@ -262,7 +262,13 @@ def test_summarize_probe_preserves_diagnostic_evidence(repo_root: Path) -> None:
 
 
 def test_deployment_manifest_states(tmp_path: Path, repo_root: Path) -> None:
-    """Deploy manifest starts unverified; cmd_source_probe flips to verified."""
+    """Deploy records health as unverified and source identity as unknown.
+
+    Health is still unverified until a real request is observed. Source identity
+    is no longer a lifecycle state at all: the probe no longer flips it, because
+    a debug command must not decide deployment validity. Which deployment served
+    a request is established by the deploy_id that request reports.
+    """
     from tools.v2_control.cli import write_deployment_manifest
 
     # Build a minimal fake config/fingerprint/env to write a manifest.
@@ -307,7 +313,7 @@ def test_deployment_manifest_states(tmp_path: Path, repo_root: Path) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["deployment_transport_status"] == "deployed"
     assert manifest["runtime_health_status"] == "unverified"
-    assert manifest["source_identity_status"] == "unverified"
+    assert manifest["source_identity_status"] == "unknown"
 
     # Simulate the probe flipping it to verified.
     manifest["source_identity_status"] = "verified"

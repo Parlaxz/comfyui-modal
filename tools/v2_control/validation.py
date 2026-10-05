@@ -2746,10 +2746,9 @@ class GateRunner:
         from .cli import _require_full_run_mode
 
         _require_full_run_mode(config, command="v2ctl gate")
-        if self._deployment_receipt is not None:
-            from .deployment_receipt import require_source_probe_evidence
-
-            require_source_probe_evidence(self._repo_root, self._deployment_receipt)
+        # No source-probe precondition. Deployment correctness is decided by the
+        # same-request deploy_id comparison in StructuralValidator, which is
+        # strictly stronger than a probe of the mounted filesystem.
         # Keep selector, run count, nonce, and selector env in one canonical
         # construction shared with confirm and CLI dry-run reporting.
         from .cli import _validation_backend_args
@@ -2917,10 +2916,9 @@ class ConfirmRunner:
         from .cli import _require_full_run_mode
 
         _require_full_run_mode(config, command="v2ctl confirm")
-        if self._deployment_receipt is not None:
-            from .deployment_receipt import require_source_probe_evidence
-
-            require_source_probe_evidence(self._repo_root, self._deployment_receipt)
+        # No source-probe precondition. Deployment correctness is decided by the
+        # same-request deploy_id comparison in StructuralValidator, which is
+        # strictly stronger than a probe of the mounted filesystem.
         path = Path(gate_manifest)
         if not path.is_file():
             raise GateError(f"gate manifest not found: {path}")

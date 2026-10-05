@@ -1822,12 +1822,11 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
         "deployment_transport_status": "deployed",
         "runtime_health_status": "unverified",
         # ── Source-identity health state (E29 source-identity stop-gate) ──
-        # A deploy proves the app was uploaded but NOT that the bytes the
-        # container imports equal the expected local source.  source_identity
-        # is "unverified" at deploy time and flips to "verified" only after a
-        # successful v2ctl source-probe (remote SHA-256 == expected local
-        # SHA-256 for every required module).
-        "source_identity_status": "unverified",
+# A deploy proves the app was uploaded. Which deployment actually served a
+           # request is established by the deploy_id the executing interpreter
+           # reports, compared against the expected one at acceptance time, so
+           # no separate probe is required. This field is diagnostic only.
+           "source_identity_status": "unknown",
         "health_check_note": (
             "deploy exit 0 proves transport only; remote restore lifecycle "
             "health is unverified until the first gate/run invocation observes "
@@ -2501,7 +2500,6 @@ def cmd_golden_status(args, repo_root: Path) -> int:
         out["ready"] = bool(
             fingerprint_match
             and out["runtime_health_status"] == "verified"
-            and out["source_identity_status"] == "verified"
             and not out["runtime_overrides_present"]
             and not lock_active
             # A pending post-capture guard makes the next request invalid;
@@ -2740,13 +2738,23 @@ def cmd_golden_profile(args, repo_root: Path) -> int:
     rc, probe = _run_v2ctl(repo_root, base() + ["source-probe"], capture=True)
     sys.stdout.write(probe)
     sys.stdout.flush()
+    # Diagnostic only: a failed probe no longer aborts the experiment.
+    #
+    # It used to return nonzero here, on the reasoning that the deployment was
+    # "stale or mismatched". But the probe inspects the mounted filesystem of a
+    # container it starts, which cannot establish what code a restored snapshot
+    # executes -- so it could block a valid experiment while passing on a stale
+    # one. The question it was standing in for is now answered directly: the run
+    # reports the deploy_id of the deployment that served it, and acceptance
+    # compares that with the expected id. A probe failure is still printed so it
+    # remains visible when investigating.
     if rc != 0 or "RESULT=PASS" not in probe:
         print(
-            "ERROR: source-probe did not report RESULT=PASS. The deployment is "
-            "stale or mismatched, so a run now would not measure this source.",
+            "NOTE: source-probe did not report RESULT=PASS (rc=%r). This is "
+            "diagnostic only and does not gate the run; correctness is decided "
+            "by the deploy_id the serving request reports." % (rc,),
             file=sys.stderr,
         )
-        return rc or 1
 
     advance("publish-model-metadata-cache")
     rc, publication = _run_v2ctl(
@@ -4025,8 +4033,12 @@ def cmd_run(args, repo_root: Path) -> int:
         # ── Full-run guard: run must generate (run_plan_stream), never the
         # snapshot-restore-only PROBE. ──
         _require_full_run_mode(config, command="v2ctl run")
-        if bound_receipt is not None:
-            receipt_mod.require_source_probe_evidence(repo_root, bound_receipt)
+        # No source-probe precondition here. Which deployment served a request is
+        # decided by comparing the expected deploy_id with the one the executing
+        # interpreter reports (see StructuralValidator). Requiring a separate
+        # probe container first meant an extra GPU round trip before every run,
+        # and it could only ever describe the mounted filesystem -- never the
+        # code a restored snapshot actually executes.
         run_count = args.run_count or config.workload.run_count
         selector = _backend_selector(config)
         if selector:
@@ -4427,6 +4439,18 @@ def cmd_confirm(args, repo_root: Path) -> int:
         return 1
 
 
+def cmd_debug(args, repo_root: Path) -> int:
+    """Diagnostic tooling.
+
+    Nothing under ``debug`` participates in admission. These commands exist to
+    answer "what is actually in this container?" after something has already
+    gone wrong, and none of them can make a deployment or a result valid.
+    """
+    print("[v2ctl.debug] available commands:")
+    print("  source-probe   report which source files are mounted in a container")
+    return 0
+
+
 def cmd_source_probe(args, repo_root: Path) -> int:
     """v2ctl source-probe: prove the deployed bytes equal the local source.
 
@@ -4572,36 +4596,12 @@ def cmd_source_probe(args, repo_root: Path) -> int:
                   file=sys.stderr)
         else:
             print(f"[v2ctl.source-probe] RESULT=PASS source_identity=MATCH")
-            # A receipt seals the deployment manifest.  Bound source-probe
-            # evidence is persisted separately, so do not amend that ledger.
-            if bound_receipt is None:
-                # Flip the deployment manifest's source_identity_status to
-                # verified when it exists (truthful health semantics).
-                try:
-                    import json as _json
-                    mdir = _deployment_manifest_dir(repo_root)
-                    files = sorted(mdir.glob("deploy_*.json")) if mdir.is_dir() else []
-                    for manifest_path in reversed(files):
-                        try:
-                            manifest = _json.loads(
-                                manifest_path.read_text(encoding="utf-8")
-                            )
-                        except (OSError, _json.JSONDecodeError):
-                            # An unrelated/corrupt record must not hide a valid
-                            # current deployment record farther down the ledger.
-                            continue
-                        if not isinstance(manifest, dict):
-                            continue
-                        if manifest.get("deploy_fingerprint") == deploy_fp:
-                            manifest["source_identity_status"] = "verified"
-                            manifest_path.write_text(
-                                json.dumps(manifest, indent=2, sort_keys=True),
-                                encoding="utf-8",
-                            )
-                            print(f"[v2ctl.source-probe] manifest source_identity_status=verified")
-                            break
-                except Exception as _exc_manifest:
-                    print(f"[v2ctl.source-probe] (manifest status update skipped: {_exc_manifest})")
+            # Deliberately no longer flips source_identity_status on the
+            # deployment manifest. A debug command must not mutate deployment
+            # validity: it inspected the mounted filesystem in a container it
+            # started, which is weaker evidence than the deploy_id the serving
+            # request reports, and writing a verdict back into the ledger meant a
+            # later run's correctness depended on this command having been run.
         return exit_code
     except (V2CtlError, OSError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -5014,7 +5014,22 @@ def build_parser() -> argparse.ArgumentParser:
                 )
         child.set_defaults(func=cmd_golden)
 
-    p = sub.add_parser("source-probe")
+    p = sub.add_parser("debug")
+    p.set_defaults(func=cmd_debug)
+    dsub = p.add_subparsers(dest="debug_command")
+    dsrc = dsub.add_parser(
+        "source-probe",
+        help=(
+            "diagnostic: report which source files are mounted in a container "
+            "this command starts. Does not gate deploy/run and does not "
+            "establish which code served a request."
+        ),
+    )
+    dsrc.set_defaults(func=cmd_source_probe)
+
+    # Retained as a hidden alias so existing muscle memory and any saved command
+    # lines keep working. The command is diagnostic either way.
+    p = sub.add_parser("source-probe", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_source_probe)
 
     p = sub.add_parser(

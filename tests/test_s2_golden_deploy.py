@@ -932,8 +932,16 @@ def test_source_probe_skips_malformed_unrelated_manifest(tmp_path, monkeypatch):
     )
 
     assert cli.cmd_source_probe(args, tmp_path) == 0
-    updated = json.loads(current.read_text(encoding="utf-8"))
-    assert updated["source_identity_status"] == "verified"
+    # A diagnostic command must not mutate deployment records. It reports what is
+    # mounted in the container it started; which deployment actually served a
+    # request is decided by the same-request deploy_id instead. So neither the
+    # matching manifest nor the malformed unrelated one is touched.
+    unchanged = json.loads(current.read_text(encoding="utf-8"))
+    assert unchanged == {"deploy_fingerprint": deploy_fp}
+    assert "source_identity_status" not in unchanged
+    assert (manifest_dir / "deploy_20260830-130000_unrelated.json").read_text(
+        encoding="utf-8"
+    ) == "{malformed"
 
 
 def test_native_golden_deploy_refuses_backend_when_publication_fails(monkeypatch, tmp_path):
