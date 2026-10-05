@@ -51,6 +51,42 @@ export async function buildStudioModalOptions(apiBase) {
   return options;
 }
 
+// Output/config options are needed by every run, so start loading them with
+// the workflow rather than making the Run click pay for the first request.
+// Keep the promise (not just its result) so selection and click paths share a
+// single request. Settings changes update an already-warm value below.
+const _studioModalOptionsCache = new Map();
+
+function _preloadStudioModalOptions(apiBase) {
+  const base = apiBase || "/comfymodal";
+  let entry = _studioModalOptionsCache.get(base);
+  if (entry) return entry.promise;
+  entry = { value: null, promise: null };
+  entry.promise = buildStudioModalOptions(base).then((options) => {
+    entry.value = options;
+    return options;
+  });
+  _studioModalOptionsCache.set(base, entry);
+  return entry.promise;
+}
+
+// A settings POST has completed before this event is published. Merge the
+// returned settings into the warm cache so a changed preference is not sent
+// stale merely because the config request was preloaded earlier.
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+  window.addEventListener("comfymodal:output-preferences-changed", (event) => {
+    const changed = event && event.detail;
+    if (!changed || typeof changed !== "object") return;
+    _studioModalOptionsCache.forEach((entry) => {
+      entry.promise = entry.promise.then((options) => {
+        const merged = Object.assign({}, options, changed);
+        entry.value = merged;
+        return merged;
+      });
+    });
+  });
+}
+
 // Compatibility seam for the retired legacy History renderer. Experiment
 // details now belong to History V2; route the old tile action through its
 // supported focus request instead of reviving the deleted legacy loader.
@@ -1530,6 +1566,7 @@ async function initWorkflowRun(state, context, actions) {
       pg._workflowRun = store;
       pg._workflowRunModule = wf;
       const apiBase = (context && context.apiBase) || "/comfymodal";
+      _preloadStudioModalOptions(apiBase);
 
       // The library must be present for resolveHandoffSelection and the
       // saved-selection restore to validate the requested entities.
@@ -1722,9 +1759,27 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
   const store = state && state.playground && state.playground._workflowRun;
   const wf = state && state.playground && state.playground._workflowRunModule;
   if (!store || !wf) return;
-  // Never clobber an in-flight run's button state.
+  // Never clobber an actually active run.  runState is a legacy projection
+  // and can outlive the controller's current run (or contain a non-terminal
+  // status from an older path), so it is not sufficient to treat every
+  // non-terminal value as in-flight.  The controller is authoritative when
+  // present; the explicit status fallback protects older callers.
   const runState = state && state.playground && state.playground.runState;
-  if (runState && runState.status && LEGACY_TERMINAL_STATUSES.indexOf(runState.status) === -1) return;
+  const controller = state && state.playground && state.playground._runController;
+  const controllerRunActive = !!(
+    controller
+    && typeof controller.getRunId === "function"
+    && controller.getRunId()
+    && typeof controller.isTerminal === "function"
+    && !controller.isTerminal()
+  );
+  const activeStatus = runState && ["created", "submitted", "waiting", "queued", "in_progress", "running"].indexOf(runState.status) !== -1;
+  const legacyRunActive = activeStatus && (
+    !controller
+    || typeof controller.getRunId !== "function"
+    || !controller.getRunId()
+  );
+  if (controllerRunActive || legacyRunActive) return;
   if (reason) while (reason.firstChild) reason.removeChild(reason.firstChild);
   const g = workflowGatingInfo(store, wf, state);
   if (store.status === "loading" || store.status === "error" || !store.runContext) {
@@ -1803,6 +1858,10 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   requestId = requestId || (typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
     : "studio-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2));
+  // Capture the actual click boundary before any cold-path fallback or local
+  // validation can add time to the client-to-HTTP measurement.
+  var t0_perf_ms = performance.now();
+  var t0_now = Date.now();
   var ctrl = _getRunController(state, actions);
   if (!ctrl) {
     if (btn) { btn.disabled = false; btn.textContent = "Run"; }
@@ -1812,7 +1871,6 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   // Known incompatible models must never execute, even on a forced click.
   // Gating mirrors the Run-button state; this is a defensive re-check so a
   // terminal-state re-run cannot bypass the disabled button.
-  const _modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
   const _gated = _workflowRunnableForExecution(state, store, wf);
   if (!_gated.runnable) {
     const _reasonText = (_gated.reasons && _gated.reasons.length)
@@ -1826,13 +1884,12 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
     return;
   }
 
-  ctrl.mark("submit_entered");
-
   // Put determinate sampler fields into running state BEFORE the remote call
   // (mirrors the legacy handler). beginRun must precede any applyLocalError.
   var _modernSteps = store.controlValues && store.controlValues.steps;
   var _runMaxSteps = (_modernSteps != null && Number(_modernSteps) > 0) ? Number(_modernSteps) : 0;
   ctrl.beginRun({ samplerMaximum: _runMaxSteps }, requestId);
+  ctrl.mark("submit_entered");
 
   // Cold-path guard: selection normally preloads run-context; refetch only
   // when it is missing (rare). Measured via performance.now.
@@ -1874,11 +1931,10 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   if (state && state.playground && state.playground.runState) delete state.playground.runState._localStartTime;
   _startLocalElapsedTimer(state, context);
 
-  const modalOptions = await buildStudioModalOptions(apiBase);
-
-  // Capture client-side timestamps at press time (top-level `trace` for server)
-  var t0_perf_ms = performance.now();
-  var t0_now = Date.now();
+  // Selection/init normally warmed this promise. Awaiting here is retained as
+  // the correctness fallback when a caller reaches Run before preload or
+  // after a settings change replaced the cache entry.
+  const modalOptions = await _preloadStudioModalOptions(apiBase);
 
   ctrl.mark("build_start");
   const payload = wf.buildRunPayload(apiBase, store, modalOptions, {
