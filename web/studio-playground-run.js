@@ -435,6 +435,27 @@ export function createPlaygroundRunController() {
       return this;
     },
 
+    /**
+     * Apply a local notice that is not a failure.
+     *
+     * Used when the run was accepted but the backend is taking a preparatory
+     * action first, e.g. auto-deploying a Golden profile the user forgot to
+     * deploy. That must not render as a red failed run, because nothing failed
+     * and the user can simply run again.
+     */
+    applyLocalNotice(message) {
+      if (!_runId || _disposed) return this;
+      _applyEvents([createRunEvent({
+        id: _runId + ":local-notice",
+        runId: _runId,
+        stage: "notice",
+        status: "running",
+        timestamp: _now(),
+        source: "playground.local",
+        message: message != null ? String(message) : null,
+      })]);
+      return this;
+    },
     /** Canonical derived state of the current run, or undefined. */
     getRun() {
       return _runId ? store.getRun(_runId) : undefined;

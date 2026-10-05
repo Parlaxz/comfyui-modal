@@ -1920,6 +1920,16 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
     _startLocalElapsedTimer(state, context);
   } else {
     _stopGoldenProgressPolling(state, requestId);
+    // A "deploying" status means the backend accepted the run but is preparing
+    // first (auto-deploying a forgotten Golden profile). Nothing failed, so it
+    // must not render as a red failed run.
+    if (result && result.status === "deploying") {
+      if (ctrl && typeof ctrl.applyLocalNotice === "function") {
+        ctrl.applyLocalNotice(result.message || "Deploying...");
+      }
+      if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+      return;
+    }
     const errMsg = (result && result.message) || "Run failed.";
     if (result && result.error_code) {
       console.error("[Studio run] execution failed", {
