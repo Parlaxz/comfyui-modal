@@ -1551,17 +1551,29 @@ def _bound_deployment_receipt(
         }
         if destination != expected_destination:
             raise GateError(f"{command} deployment receipt destination mismatch")
-    # A different app version is a different remote deployment, even when the
-    # local source happens to be unchanged.  Unknown lookup is fail-closed.
+    # Modal's numeric app version is diagnostic metadata only, never authority.
+    #
+    # It used to be a hard gate here: a receipt was rejected unless the current
+    # version counter matched what the receipt recorded. That proved nothing
+    # about which code actually serves a request, while creating invalid local
+    # state whenever Modal reset or renumbered its version history -- which it
+    # did, leaving a perfectly good deployment unusable until redeployed. The
+    # serving request's own deploy_id is the authority; a version drift is
+    # reported so it is visible when debugging, not treated as a failure.
     if workspace_binding is not None:
         assert_workspace_binding_current(repo_root, workspace_binding)
-        current_version = _call_version_probe(receipt.target["app"], workspace_binding)
+        observed_version = _call_version_probe(
+            receipt.target["app"], workspace_binding
+        )
     else:
-        current_version = _app_version_number(receipt.target["app"])
-    if current_version is None or current_version != receipt.deployment_version:
-        raise GateError(
-            f"{command} deployment receipt version mismatch: stored="
-            f"{receipt.deployment_version} current={current_version!r}"
+        observed_version = _app_version_number(receipt.target["app"])
+    if observed_version != receipt.deployment_version:
+        print(
+            "[v2ctl.%s] note: Modal app version is %r but the receipt recorded %r. "
+            "This is diagnostic only; the request's deploy_id decides which "
+            "deployment served it."
+            % (command, observed_version, receipt.deployment_version),
+            file=sys.stderr,
         )
     try:
         current_fp = str(fp_mod.FingerprintEngine(config).deploy_fingerprint())

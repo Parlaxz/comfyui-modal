@@ -81,12 +81,30 @@ def test_local_source_drift_warns_but_receipt_binding_uses_remote_identity(
     assert "source drift is warning-only" in capsys.readouterr().err
 
 
-def test_changed_modal_version_fails_receipt_binding(tmp_path, monkeypatch):
+def test_changed_modal_version_is_diagnostic_not_authoritative(
+    tmp_path, monkeypatch, capsys
+):
+    """A Modal version drift must not invalidate an otherwise good receipt.
+
+    It used to raise GateError, which meant a Modal-side version reset made a
+    working deployment unusable and forced a redeploy -- without ever proving
+    which code served a request. The request's own deploy_id is the authority;
+    the version is reported for debugging only.
+    """
     config = _config()
-    write_deployment_receipt(tmp_path, _receipt(config, version=7))
+    stored = _receipt(config, version=7)
+    path = write_deployment_receipt(tmp_path, stored)
     monkeypatch.setattr(cli, "_app_version_number", lambda _app: 8)
-    with pytest.raises(GateError, match="version mismatch"):
-        cli._bound_deployment_receipt(tmp_path, config, command="gate")  # type: ignore[arg-type]
+
+    selected_path, selected = cli._bound_deployment_receipt(
+        tmp_path, config, command="gate"  # type: ignore[arg-type]
+    )
+
+    assert selected_path == path
+    assert selected.deployment_version == stored.deployment_version
+    err = capsys.readouterr().err
+    assert "diagnostic only" in err
+    assert "deploy_id" in err
 
 
 def test_receipt_environment_can_prove_registered_metadata_is_not_local_truth():
