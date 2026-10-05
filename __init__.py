@@ -7053,6 +7053,29 @@ if _server:
         }, status=409)
 
     # ── Studio run / experiment routes ─────────────────────────────────
+
+    def _golden_workspace() -> dict:
+        """Return the Modal workspace dict the Golden handle factory needs.
+
+        Prefer the active registry entry, then fill credentials from the
+        config-owned destination resolver (the same source the deploy path
+        uses). Returns {} when nothing is configured so callers still fail
+        with the existing "requires an active Modal workspace" message rather
+        than an opaque KeyError.
+        """
+        ws = dict(_active_workspace() or {})
+        if ws.get("token_id") and ws.get("token_secret"):
+            return ws
+        try:
+            dest = _workspace_store.resolve_modal_destination(_NODE_DIR)
+        except Exception:
+            return ws
+        if not isinstance(dest, dict):
+            return ws
+        for key in ("token_id", "token_secret", "environment", "workspace_id", "label"):
+            if not ws.get(key) and dest.get(key):
+                ws[key] = dest[key]
+        return ws
     @_server.routes.post("/comfymodal/studio/run")
     async def studio_run(request: web.Request) -> web.Response:
         """Execute a single Studio preset run.
@@ -7165,11 +7188,14 @@ if _server:
                         run_golden_workflow(
                             workflow_id=str((body or {}).get("workflow_id") or ""),
                             version_id=_golden_version_id,
-                            preset_id=str((body or {}).get("preset_id") or ""),
                             controls=controls,
                             request_id=_golden_request_id,
                             node_dir=_golden_node_dir,
                             profile_name=_golden_profile,
+                            # The handle factory needs Modal credentials to
+                            # build a client. Without this the run failed with
+                            # "requires an active Modal workspace".
+                            workspace=_golden_workspace(),
                         ),
                         timeout=1800,
                     )

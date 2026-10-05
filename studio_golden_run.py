@@ -356,7 +356,6 @@ async def run_golden_workflow(
             "client_id": request_id,
             "workflow_id": str(workflow_id or ""),
             "workflow_version_id": str(version_id or ""),
-            "preset_id": str(bundle.get("preset", {}).get("preset_id", "") or ""),
             "studio_controls": copy.deepcopy(merged["values"]),
         },
         "modal_options": {},
