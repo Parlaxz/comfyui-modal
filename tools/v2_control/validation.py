@@ -193,6 +193,10 @@ class RunRecord:
     request_id: str = ""
     profile_config_fingerprint: str = ""
     provenance_validation_status: str = ""
+    #: deploy_id the deployment being claimed was expected to report.
+    expected_deploy_id: str = ""
+    #: deploy_id the serving interpreter actually reported for this request.
+    deploy_id: str = ""
     backend_exit_code: int | None = None
     attention_backend: str = ""
     golden_arm: str = ""
@@ -712,10 +716,18 @@ class StructuralValidator(ValidatorPlugin):
             failures.append("effective provenance missing request_id")
         if not profile_config_fingerprint:
             failures.append("effective provenance missing profile_config_fingerprint")
-        if provenance_status != "validated":
+        # provenance_validation_status is deliberately NOT an acceptance gate.
+        #
+        # It recorded whether a *provenance sibling document* had itself been
+        # cross-validated, i.e. one local file vouching for another. That is a
+        # proof of a proof, and its absence says nothing about whether the
+        # output was correct. The facts it was guarding -- which deployment ran,
+        # which request produced this, whether the SHA matched -- are now
+        # checked directly: deploy_id above, and output SHA below.
+        if provenance_status and provenance_status != "validated":
             failures.append(
                 "effective provenance was not canonically validated: "
-                f"{provenance_status or '(missing)'}"
+                f"{provenance_status}"
             )
 
         # fresh identity line when fresh required: a REUSED (restored)
@@ -740,15 +752,46 @@ class StructuralValidator(ValidatorPlugin):
                     f"output SHA mismatch: expected {record.expected_output_sha}, observed {record.output_sha}"
                 )
 
-        # Every accepted canonical run must carry the compact effective-config
-        # proof emitted by the runtime.  Do not treat absence as legacy data.
-        proof = telemetry.get("v2ctl_config") or telemetry.get("V2CTL_CONFIG")
-        if not proof:
-            failures.append("effective-config proof missing")
-        elif not isinstance(proof, str) or not all(
-            token in proof for token in ("deploy=", "run=", "profile=")
-        ):
-            failures.append("effective-config proof is incomplete")
+        # Same-request deploy_id is the authoritative deployment check.
+        #
+        # This replaces the previous "effective-config proof" requirement, which
+        # demanded a `v2ctl_config` telemetry string containing deploy=/run=/
+        # profile= tokens. That string was a proof of other proofs: it restated
+        # a deploy fingerprint, a run fingerprint and a profile name, so the two
+        # could disagree and nothing compared them against what actually served
+        # the request.
+        #
+        # deploy_id is computed once from the deployment-relevant inputs, baked
+        # into the class environment, frozen by the runtime at import and
+        # reported by the serving request. Comparing the expected id with the
+        # id the executing interpreter reported answers the question directly:
+        # did the deployment I intended actually serve this request? A stale
+        # snapshot reports its own older id and is rejected.
+        expected_deploy_id = str(
+            getattr(record, "expected_deploy_id", "") or ""
+        ).strip()
+        served_deploy_id = str(
+            getattr(record, "deploy_id", "")
+            or telemetry.get("deploy_id")
+            or telemetry.get("DEPLOY_ID")
+            or ""
+        ).strip()
+        if not served_deploy_id:
+            failures.append(
+                "the serving deployment reported no deploy_id, so it cannot be "
+                "shown to be the deployment that was requested"
+            )
+        elif not expected_deploy_id:
+            failures.append(
+                "no expected deploy_id was supplied, so the serving deployment "
+                "cannot be checked against the deployment that was requested"
+            )
+        elif served_deploy_id != expected_deploy_id:
+            failures.append(
+                "deploy_id mismatch: expected %s but the deployment that served "
+                "this request reports %s (stale snapshot or wrong deployment)"
+                % (expected_deploy_id, served_deploy_id)
+            )
 
         # E40 Lane E: single acceptance authority extensions
         failures.extend(_validate_runtime_contract(record, config))
@@ -2436,9 +2479,20 @@ def build_run_record_from_result(
         profile_config_fingerprint=str(
             getattr(artifacts, "profile_config_fingerprint", "") or ""
         ),
-        provenance_validation_status=str(
-            getattr(artifacts, "provenance_validation_status", "") or ""
-        ),
+provenance_validation_status=str(
+              getattr(artifacts, "provenance_validation_status", "") or ""
+          ),
+          # The one deployment identity: what was expected, and what the
+          # serving interpreter actually reported for this request.
+          expected_deploy_id=str(
+              getattr(artifacts, "expected_deploy_id", "") or ""
+          ),
+          deploy_id=str(
+              getattr(artifacts, "deploy_id", "")
+              or telemetry.get("deploy_id")
+              or telemetry.get("DEPLOY_ID")
+              or ""
+          ),
         attention_backend=str(telemetry.get("attention_backend") or attention_backend),
         golden_arm=str(arm_identity.get("golden_arm", "") or ""),
         cpu_qd2_prefetch=bool(arm_identity.get("cpu_qd2_prefetch", False)),

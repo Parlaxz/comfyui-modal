@@ -33,6 +33,14 @@ class FakeArtifactSet:
     profile: str = "production"
     profile_config_fingerprint: str = "fake-profile-config"
     provenance_validation_status: str = "validated"
+    #: The one deployment identity. Fake fixtures present a matching
+    #: expected/served pair; tests for stale or wrong deployments override the
+    #: served value to exercise fail-closed behaviour.
+    deploy_id: str = "f" * 64
+    #: What the deployment being claimed was expected to report. Defaults to the
+    #: same value as deploy_id so fixtures are consistent; stale/wrong-deployment
+    #: tests override deploy_id only.
+    expected_deploy_id: str = "f" * 64
 
 
 @dataclass

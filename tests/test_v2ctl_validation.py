@@ -194,6 +194,8 @@ def _golden_cohort_record(tmp_path: Path, *, include_warning: bool = True,
         v2ctl_invocation_id="invocation",
         profile_config_fingerprint="profile-fingerprint",
         provenance_validation_status="validated",
+        expected_deploy_id=DEPLOY_ID,
+        deploy_id=DEPLOY_ID,
     )
 
 
@@ -205,6 +207,11 @@ def _golden_config(record: RunRecord) -> FakeConfig:
     config.resources.gpu = "rtx-pro-6000"
     config.workload.expected_output_sha = GOLDEN_EXPECTED_SHA
     return config
+
+
+# The one deployment identity. Structural acceptance compares the expected value
+# with the value the serving interpreter reported.
+DEPLOY_ID = "d" * 64
 
 
 class TestParsing:
@@ -238,8 +245,9 @@ class TestValidators:
                 "request_id": "r1",
                 "correlation_id": "c1",
                 "fresh": "1",
-                "v2ctl_config": "deploy=abc12345 run=def67890 profile=production",
+                "deploy_id": DEPLOY_ID,
             },
+            expected_deploy_id=DEPLOY_ID,
         )
         assert StructuralValidator().validate(record, FakeConfig()) == []
 
@@ -267,8 +275,11 @@ class TestValidators:
         text = "\n".join(failures)
         assert "effective provenance missing v2ctl_invocation_id" in text
         assert "effective provenance missing profile_config_fingerprint" in text
-        assert "effective-config proof missing" in text
-        assert "not canonically validated" in text
+        # deploy_id is now the deployment check; the v2ctl_config proof string
+        # and the provenance-sibling status are no longer acceptance gates.
+        assert "effective-config proof missing" not in text
+        assert "not canonically validated" not in text
+        assert "deploy_id" in text
 
     def test_structural_valid_failures(self, tmp_path):
         record = RunRecord(
