@@ -1931,23 +1931,12 @@ def _write_golden_deployment_receipt(
         if name in env
     }
     safe_env.update(deployment_flag_values)
-    # Custom-node publication is fully manual: deploy carries no publication
-    # identity.  S4 fields stay empty when there is no publication; the manual
-    # `golden publish-custom-nodes` command owns publication separately.
-    identity = getattr(publication, "identity", None) if publication is not None else None
-    generation = str(getattr(identity, "generation", "") or "") if identity is not None else ""
-    if generation:
-        s4_identity: dict[str, Any] = {
-            "generation": generation,
-            "identity_schema": getattr(identity, "identity_schema", None),
-            "packaging_policy_version": getattr(identity, "packaging_policy_version", None),
-            "file_count": getattr(identity, "file_count", None),
-            "total_bytes": getattr(identity, "total_bytes", None),
-            "manifest_digest": getattr(identity, "manifest_digest", None),
-        }
-    else:
-        generation = ""
-        s4_identity = {}
+    # Custom-node publication carries no identity on the receipt. The receipt
+    # records deploy_id, which is what a run is checked against; a publication
+    # generation would be a second identity describing static code that already
+    # belongs to the deployment. Publication is owned separately by
+    # `golden publish-custom-nodes` and verified by the deploy path, not
+    # attested to here.
     planned_path = receipt_mod.receipt_path(
         repo_root, deploy_identity.deploy_fingerprint, deployment_version
     )

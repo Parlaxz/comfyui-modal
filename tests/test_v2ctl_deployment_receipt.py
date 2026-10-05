@@ -43,7 +43,6 @@ def _receipt(config: FakeConfig, *, version: int = 7) -> DeploymentReceipt:
         deployment_version=version,
         created_at="2026-08-30T00:00:00+00:00",
         modal_app=config.target.app,
-        source_probe={"expected": {"git_head": "A", "modules": {}}},
         profile_config_fingerprint="profile-A",
         # Workspace binding is checked unconditionally: deploying into the wrong
         # Modal workspace is a real operational failure, so it is validated once
