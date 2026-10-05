@@ -209,6 +209,28 @@ export function renderSettings(state, context) {
   let effectiveTracingLevel = null;
   let goldenProfiles = [];
   let goldenProfilesError = null;
+  // Favorites are a personal, per-browser preference: they mark which profiles a
+  // user cares about without changing what is selected or deployed.
+  const FAVORITE_PROFILES_KEY = "comfymodal.studio.golden.favorites.v1";
+  function favoriteProfileNames() {
+    try {
+      const raw = localStorage.getItem(FAVORITE_PROFILES_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return new Set(Array.isArray(parsed) ? parsed.filter((n) => typeof n === "string") : []);
+    } catch (e) {
+      return new Set();
+    }
+  }
+  function toggleFavoriteProfile(name) {
+    const names = favoriteProfileNames();
+    if (names.has(name)) names.delete(name);
+    else names.add(name);
+    try {
+      localStorage.setItem(FAVORITE_PROFILES_KEY, JSON.stringify(Array.from(names)));
+    } catch (e) {
+      // A full or unavailable localStorage must not break the settings panel.
+    }
+  }
 
   // ΓöÇΓöÇ Pending-restart banner (persistent across rebuilds) ΓöÇΓöÇ
   const bannerEl = el("div", {
@@ -1155,8 +1177,12 @@ export function renderSettings(state, context) {
         const option = el("option", {
           value: profile.name,
           text: profile.name + (deployed ? " (deployed)" : " (undeployed ΓÇö deploy before use)"),
-          disabled: !deployed,
         });
+        // An undeployed profile is a normal, selectable state: the user picks it
+        // and then deploys it. Disabling the option made that impossible.
+        if (favoriteProfileNames().has(profile.name)) {
+          option.text = "\u2605 " + option.text;
+        }
         if (profile.name === selected) option.selected = true;
         select.appendChild(option);
       });
@@ -1164,8 +1190,16 @@ export function renderSettings(state, context) {
     }
     select.addEventListener("change", async () => {
       const profile = goldenProfiles.find((item) => item.name === select.value);
-      if (!profile || profile.deployed !== true) return;
+      if (!profile) return;
       const previous = loadGoldenProfileSelection();
+      // Persist the choice either way so the Deploy control has a target, but
+      // only hand a deployed profile to the backend. Selecting is not the same
+      // as committing to run.
+      saveGoldenProfileSelection(profile.name);
+      if (profile.deployed !== true) {
+        renderGoldenProfileHost(host, base, profile.name);
+        return;
+      }
       try {
         const response = await fetch(base + "/config", {
           method: "POST",
@@ -1183,6 +1217,78 @@ export function renderSettings(state, context) {
     });
     host.appendChild(select);
 
+    const selectedProfile = goldenProfiles.find(
+      (item) => item.name === (selected || "")
+    );
+    if (selectedProfile && selectedProfile.deployed !== true) {
+      const selTarget = selectedProfile.target && typeof selectedProfile.target === "object"
+        ? selectedProfile.target
+        : {};
+      const deployStatus = el("p", {
+        class: "comfymodal-studio-settings-hint",
+        "data-testid": "settings-golden-profile-deploy-status",
+        text: selTarget.app
+          ? "Not deployed. Deploying runs v2ctl for " + selectedProfile.name
+            + " (" + selTarget.app + ")."
+          : "Not deployed.",
+      });
+      const deployButton = el("button", {
+        class: "comfymodal-primary-btn",
+        "data-testid": "settings-golden-profile-deploy",
+        "data-profile-name": selectedProfile.name,
+        text: "Deploy " + selectedProfile.name,
+        onclick: async () => {
+          deployButton.disabled = true;
+          deployStatus.textContent = "Deploying " + selectedProfile.name + "\u2026";
+          try {
+            const started = await fetch(base + "/golden/deploy", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ profile: selectedProfile.name }),
+            });
+            const payload = await started.json();
+            if (!started.ok || payload.status !== "ok") {
+              throw new Error(payload.error || "HTTP " + started.status);
+            }
+            await pollGoldenDeploy(base, selectedProfile.name, deployStatus, deployButton);
+          } catch (error) {
+            deployStatus.textContent =
+              "Deploy failed: " + (error.message || "request failed");
+            deployButton.disabled = false;
+          }
+        },
+      });
+      host.appendChild(deployStatus);
+      host.appendChild(deployButton);
+    }
+
+    // Deploys are long-running, so the UI polls job state instead of holding the
+    // request open. Success is never inferred: the catalog is re-read when the
+    // job finishes, so deployed state comes from the backend.
+    async function pollGoldenDeploy(base, name, status, button) {
+      for (let attempt = 0; attempt < 900; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const response = await fetch(
+          base + "/golden/deploy?profile=" + encodeURIComponent(name)
+        );
+        const payload = await response.json();
+        if (payload && payload.state === "done") {
+          status.textContent = "Deploy finished.";
+          button.disabled = false;
+          refreshGoldenProfiles(base);
+          return;
+        }
+        if (payload && payload.state === "failed") {
+          const tail = String(payload.output || "").trim().split("\n").pop();
+          status.textContent = "Deploy failed: " + (tail || "see v2ctl output");
+          button.disabled = false;
+          return;
+        }
+      }
+      status.textContent = "Deploy still running. Reopen Settings to check its status.";
+      button.disabled = false;
+    }
+
     const catalogList = el("div", {
       class: "comfymodal-studio-settings-golden-profile-catalog",
       "data-testid": "settings-golden-profile-catalog",
@@ -1197,6 +1303,19 @@ export function renderSettings(state, context) {
           + " ┬╖ method: " + (target.method || "unknown")
           + " ┬╖ " + (profile.deployed === true ? "deployed" : "undeployed ΓÇö must be deployed before use"),
       });
+      const star = el("button", {
+        class: "comfymodal-secondary-btn",
+        "data-testid": "settings-golden-profile-favorite",
+        "data-profile-name": profile.name,
+        "aria-pressed": favoriteProfileNames().has(profile.name) ? "true" : "false",
+        text: favoriteProfileNames().has(profile.name) ? "\u2605" : "\u2606",
+        title: "Favorite this profile",
+        onclick: () => {
+          toggleFavoriteProfile(profile.name);
+          renderGoldenProfileHost(host, base, select.value);
+        },
+      });
+      row.appendChild(star);
       catalogList.appendChild(row);
     });
     host.appendChild(catalogList);
