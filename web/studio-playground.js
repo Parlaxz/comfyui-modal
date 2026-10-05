@@ -2291,6 +2291,18 @@ function _getRunController(state, actions) {
   ctrl.subscribe(function (run, extras) {
     if (!run || !state.playground) return;
     var legacy = projectRunToLegacy(run, extras);
+    // Project Golden stage progress onto runState. The renderer reads
+    // runState.goldenProgress / goldenProgressPercent, but the controller keeps
+    // that state privately and only exposes it via getGoldenProgress(), so
+    // without this the bar stayed on the 30% indeterminate fallback and no stage
+    // rows ever rendered. Kept beside the canonical projection rather than
+    // inside it: the cursor stream is presentation-only and must not influence
+    // lifecycle derivation.
+    var golden = ctrl.getGoldenProgress();
+    if (golden) {
+      legacy.goldenProgress = golden;
+      legacy.goldenProgressPercent = golden.percent != null ? golden.percent : null;
+    }
     var prev = state.playground.runState;
     var prevStatus = prev && prev.status;
     if (prev && prevStatus === legacy.status) {
@@ -2825,6 +2837,15 @@ function _goldenStageTimingText(stage) {
 function _appendGoldenProgress(section, runState) {
   const golden = runState && runState.goldenProgress;
   if (!golden) return;
+  // Total first: the per-stage rows below only sum stage time, which excludes
+  // submission, container start and output transfer, so the total is reported
+  // from the run's own elapsed clock rather than derived from the rows.
+  var _totalMs = runState && runState.elapsedMs != null ? runState.elapsedMs : null;
+  section.appendChild(el("div", {
+    "data-testid": "progress-golden-total",
+    text: "Total: " + _formatDuration(_totalMs),
+    style: "font-size:10px;color:#ccc;margin-top:6px;font-weight:var(--font-weight-semibold, 600);",
+  }));
   const list = el("div", {
     "data-testid": "progress-golden-stages",
     style: "display:flex;flex-direction:column;gap:2px;margin-top:6px;font-size:10px;",
@@ -2898,6 +2919,15 @@ function _domPatchProgress(state) {
   var elapsedEl = document.querySelector('[data-testid="progress-elapsed"]');
   if (elapsedEl && rs.elapsedMs != null) {
     elapsedEl.textContent = "Elapsed: " + _formatDuration(rs.elapsedMs);
+  }
+
+  // Keep the Golden total in sync. The progress section is built once and then
+  // only DOM-patched, so a total appended at build time goes stale (it showed
+  // "Total: 14.3s" next to "Elapsed: 42.0s").
+  var goldenTotalEl = document.querySelector('[data-testid="progress-golden-total"]');
+  if (goldenTotalEl) {
+    goldenTotalEl.textContent = "Total: " + _formatDuration(
+      rs && rs.elapsedMs != null ? rs.elapsedMs : null);
   }
 
   var stepEl = document.querySelector('[data-testid="progress-step"]');
@@ -3235,6 +3265,80 @@ function renderCanvas(state, context) {
       src: outputUrl,
       style: "max-width:100%;max-height:100%;object-fit:contain;border-radius:4px;",
       "data-testid": "canvas-output",
+    });
+    // Click-to-preview: the zoom/pan + detail-sidebar overlay was written
+    // (studio-ui.js createImagePreviewOverlay) and imported, but never wired to
+    // the Playground canvas, so pressing a finished image did nothing. It must
+    // be mounted by the caller, so own the mount and teardown here.
+    img.style.cursor = "zoom-in";
+    img.setAttribute("role", "button");
+    img.setAttribute("tabindex", "0");
+    img.setAttribute("aria-label", "Open generated image preview");
+    var _openPreview = function () {
+      var _prevFocus = document.activeElement;
+      var _run = (state.playground && state.playground._selectedRun) || null;
+      var _meta = (_run && _run.extra) || {};
+      var _previewSections = [];
+      if (_run && _run.prompt) {
+        _previewSections.push({ label: "Prompt", value: _run.prompt });
+      }
+      if (_run && _run.negativePrompt) {
+        _previewSections.push({ label: "Negative prompt", value: _run.negativePrompt });
+      }
+      _previewSections.push({
+        label: "Output",
+        value: (_run && _run.outputPath) || outputUrl,
+      });
+      var _timings = (_run && _run.timings) || {};
+      if (_run && _run.durationMs != null) {
+        _previewSections.push({
+          label: "Duration",
+          value: _formatDuration(_run.durationMs),
+        });
+      }
+      var _preview;
+      try {
+        // opts.sideColumn is an ELEMENT the overlay styles and appends, not a
+        // boolean flag - passing true threw on `sideCol.style.cssText`.
+        var _sideCol = el("div", {
+          class: "comfymodal-studio-preview-overlay-side",
+          style: "padding:10px;font-size:11px;color:#ddd;overflow:auto;",
+        }, [
+          el("div", {
+            style: "font-weight:600;margin-bottom:6px;color:#fff;",
+            text: "Details",
+          }),
+        ]);
+        var _ctl = _run && _run.resolvedControls;
+        if (_ctl && typeof _ctl === "object") {
+          _sideCol.appendChild(el("div", {
+            style: "color:#999;",
+            text: Object.keys(_ctl).length + " resolved controls",
+          }));
+        }
+        _preview = createImagePreviewOverlay({
+          imageUrl: outputUrl,
+          alt: "Generated image",
+          focusTrap: true,
+          sideColumn: _sideCol,
+          sections: _previewSections,
+          onClose: function () {
+            try { if (_prevFocus && _prevFocus.focus) _prevFocus.focus(); } catch (e) {}
+          },
+        });
+      } catch (e) {
+        // Do not swallow: a silent failure here looks like "click does nothing".
+        console.error("comfymodal: image preview overlay failed to open", e);
+        return;
+      }
+      document.body.appendChild(_preview.overlay);
+    };
+    img.addEventListener("click", _openPreview);
+    img.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        _openPreview();
+      }
     });
     canvas.appendChild(img);
     const runState = state.playground && state.playground.runState;
