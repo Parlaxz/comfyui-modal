@@ -62,7 +62,13 @@ from typing import Any, Iterable, Mapping, Sequence
 # memory snapshot keeps the code objects imported before capture while the
 # mounted tree can be newer, so a request-time hash would read the NEW file
 # and wrongly vouch for OLD executing code.
-from .source_identity import freeze_imported_sha as _freeze_imported_sha
+try:  # works both as a package module and when a test loads this file
+    # standalone via spec_from_file_location, which sets no parent package.
+    from .source_identity import freeze_imported_sha as _freeze_imported_sha
+except ImportError:  # pragma: no cover - taken by standalone-load tests
+    from comfymodal_runtime.source_identity import (
+        freeze_imported_sha as _freeze_imported_sha,
+    )
 
 _IMPORTED_SOURCE_SHA256 = _freeze_imported_sha(__name__, __file__)
 
