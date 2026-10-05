@@ -449,7 +449,7 @@ export function createPlaygroundRunController() {
         id: _runId + ":local-notice",
         runId: _runId,
         stage: "notice",
-        status: "running",
+        status: "notice",
         timestamp: _now(),
         source: "playground.local",
         message: message != null ? String(message) : null,
