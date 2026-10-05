@@ -7233,6 +7233,92 @@ if _server:
                 "profiles": [],
             })
 
+    # Golden deploys are long-running (tens of seconds to minutes), so the UI
+    # starts one and polls for the outcome instead of holding a request open.
+    _golden_deploy_jobs: dict[str, dict] = {}
+
+    def _golden_deploy_record(name: str) -> dict | None:
+        try:
+            from tools.v2_control.profile_catalog import catalog_golden_profiles
+        except Exception:
+            return None
+        for profile in catalog_golden_profiles():
+            if profile.name == name:
+                return {
+                    "profile": profile.name,
+                    "owner": profile.owner,
+                    "target": profile.target,
+                    "deployed": profile.deployed,
+                }
+        return None
+
+    @_server.routes.post("/comfymodal/studio/golden/deploy")
+    async def studio_golden_deploy(request: web.Request) -> web.Response:
+        """Start an asynchronous v2ctl deploy for one catalogued Golden profile."""
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response(
+                {"status": "error", "error": "expected a JSON body"}, status=400
+            )
+        name = str((body or {}).get("profile") or "").strip()
+        record = _golden_deploy_record(name) if name else None
+        if record is None:
+            return web.json_response(
+                {"status": "error", "error": "unknown Golden profile: " + (name or "<empty>")},
+                status=404,
+            )
+        existing = _golden_deploy_jobs.get(name)
+        if existing is not None and existing["state"] == "running":
+            return web.json_response({"status": "ok", "profile": name, "state": "running"})
+
+        import asyncio
+        import sys
+
+        async def _run() -> None:
+            job = _golden_deploy_jobs[name]
+            job["state"] = "running"
+            app = str((record.get("target") or {}).get("app") or "")
+            argv = [sys.executable, "-m", "tools.v2ctl", "--profile", name, "deploy"]
+            if app:
+                argv += ["--app", app]
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=str(Path(__file__).parent),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                out, _ = await proc.communicate()
+                job["exit_code"] = proc.returncode
+                job["output"] = (out or b"").decode("utf-8", "replace")[-4000:]
+                job["state"] = "done" if proc.returncode == 0 else "failed"
+            except Exception as exc:  # pragma: no cover - defensive
+                job["state"] = "failed"
+                job["output"] = "%s: %s" % (type(exc).__name__, exc)
+            # Deployed state is re-read from the catalog, never assumed from exit code.
+            job["deployed"] = bool((_golden_deploy_record(name) or {}).get("deployed"))
+
+        _golden_deploy_jobs[name] = {
+            "id": "%s-%d" % (name, time.time_ns()),
+            "profile": name,
+            "app": str((record.get("target") or {}).get("app") or ""),
+            "state": "running",
+            "started_at": time.time_ns(),
+            "deployed": record.get("deployed"),
+        }
+        asyncio.get_running_loop().create_task(_run())
+        return web.json_response({"status": "ok", "profile": name, "state": "running"})
+
+    @_server.routes.get("/comfymodal/studio/golden/deploy")
+    async def studio_golden_deploy_status(request: web.Request) -> web.Response:
+        """Return the current deploy job state for one Golden profile."""
+        name = str(request.query.get("profile") or "").strip()
+        job = _golden_deploy_jobs.get(name)
+        if job is None:
+            return web.json_response({"status": "ok", "profile": name, "state": "unknown"})
+        return web.json_response({"status": "ok", **job})
+
     @_server.routes.get("/comfymodal/studio/run-progress/{request_id}")
     async def studio_run_progress(request: web.Request) -> web.Response:
         """Poll bounded in-memory Golden events using the caller cursor."""
