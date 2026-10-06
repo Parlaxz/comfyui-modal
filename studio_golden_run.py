@@ -188,6 +188,20 @@ def browser_override_error(body: Mapping[str, Any]) -> str | None:
     return None
 
 
+# Modal clients and class handles are reused across runs. Building a fresh
+# client per run is cheap to construct but defers its real cost (TLS, auth and
+# connection setup) to the first remote call, where it lands as measurable
+# latency before Modal has even created an input. Measured against Modal's own
+# timeline: 12.08s from issuing the call to the first stage event, of which only
+# 5.49s is Modal's input-created -> execution-started. v2ctl reuses its client,
+# which is why it is near-instant.
+_MODAL_CLIENT_CACHE: dict[tuple, Any] = {}
+
+
+def _clear_modal_client_cache() -> None:
+    _MODAL_CLIENT_CACHE.clear()
+
+
 def _default_handle_factory(
     profile: GoldenProfile,
     workspace: Mapping[str, Any] | None,
@@ -202,14 +216,27 @@ def _default_handle_factory(
     token_secret = str(workspace.get("token_secret") or "")
     if not token_id or not token_secret:
         raise GoldenRunError("Golden execution requires an active Modal workspace")
+    environment = str(workspace.get("environment") or "") or None
+    cache_key = (
+        token_id,
+        token_secret,
+        profile.target["app"],
+        profile.target["class"],
+        environment or "",
+    )
+    cached = _MODAL_CLIENT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     client = modal.Client.from_credentials(token_id, token_secret)
     cls = modal.Cls.from_name(
         profile.target["app"],
         profile.target["class"],
         client=client,
-        environment_name=str(workspace.get("environment") or "") or None,
+        environment_name=environment,
     )
-    return cls()
+    handle = cls()
+    _MODAL_CLIENT_CACHE[cache_key] = handle
+    return handle
 
 
 def _materialize_image(result: Any, request_id: str) -> dict[str, Any]:
@@ -542,6 +569,13 @@ async def run_golden_workflow(
             event_store.finish(request_id)
         raise
     except Exception as exc:
+        # Drop cached Modal handles on failure so a stale/redeployed handle
+        # cannot wedge every future run. Caching is an optimisation only; it
+        # must never turn one transient failure into a permanent one.
+        try:
+            _clear_modal_client_cache()
+        except Exception:
+            pass
         if request_id in event_store._runs:
             event_store.append(request_id, {
                 "type": "error",
