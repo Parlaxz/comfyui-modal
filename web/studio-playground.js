@@ -1663,7 +1663,21 @@ async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff
 
 async function _restoreWorkflowSelection(state, context, actions, wf, store, saved) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  const workflow = (store.library || []).find((w) => String(w.workflow_id) === String(saved.workflowId));
+  const library = store.library || [];
+  // An empty library means the load FAILED, not that the workflow was deleted.
+  // Treating "unknown" as "deleted" cleared the persisted selection, so a
+  // single failed load permanently destroyed the user's saved workflow: every
+  // later refresh then found nothing to restore, store.workflowId stayed "",
+  // _isModernRunSelected() returned false, modern gating was skipped entirely,
+  // and Run was left disabled with no tooltip and no reason. Fail closed on
+  // restoring, but never destroy the selection on a transport error.
+  if (!library.length) {
+    store.statusLine = "Workflow library unavailable";
+    store.setStatus("error");
+    store.setReasons(["Workflow library unavailable"]);
+    return;
+  }
+  const workflow = library.find((w) => String(w.workflow_id) === String(saved.workflowId));
   if (!workflow) {
     store.statusLine = "Saved workflow is no longer available";
     store.setStatus("idle");
@@ -1837,7 +1851,18 @@ function _resolvePrimaryRunButton() {
 }
 
 function _syncRunButtonGating(state, context, actions) {
-  if (!_isModernRunSelected(state)) return;
+  if (!_isModernRunSelected(state)) {
+    // No workflow selected: modern gating does not apply, but the button is
+    // still rendered disabled. Returning silently left it grey with an empty
+    // title and an empty reason div, so the cause was invisible - it read as
+    // "nothing is stopping it". Explain it instead. Title only: the legacy path
+    // owns enabling/disabling in this mode, so do not touch `disabled` here.
+    const unselected = _resolvePrimaryRunButton();
+    if (unselected && !unselected.title) {
+      unselected.title = "Select a workflow to run";
+    }
+    return;
+  }
   const btn = _resolvePrimaryRunButton();
   if (!btn) return;
   const section = btn.closest(".comfymodal-studio-run-section");
