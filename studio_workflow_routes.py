@@ -73,6 +73,7 @@ from __future__ import annotations
 import json
 import logging
 import copy
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -221,6 +222,54 @@ def _enrich_workflow_summary(
     return summary
 
 
+_REMOTE_INVENTORY_WARM_TASK: "asyncio.Task[None] | None" = None
+
+
+async def _remote_inventory_refresher(interval_s: float = 15.0) -> None:
+    """Keep the Modal volume snapshot warm off the request path.
+
+    ``remote_inventory`` caches for only ``TTL_S`` (30s), so a snapshot that is
+    not being refreshed goes stale and the next reader pays a cold Modal round
+    trip. That round trip was the reason restoring a persisted Playground
+    selection took ~40s: the read-only workflow routes await it, so the store
+    stays empty until it completes.
+
+    Removing the await is not an option - gating needs the snapshot, and
+    returning early leaves Run permanently disabled. Instead this refresher
+    keeps the cache populated, so the routes' own ``get_inventory`` becomes a
+    cache hit. Failures stay silent: version state falls back to local truth.
+    """
+    while True:
+        try:
+            await remote_inventory.get_inventory()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _log.debug("Remote inventory warm refresh failed", exc_info=True)
+        await asyncio.sleep(interval_s)
+
+
+def _ensure_remote_inventory_warm() -> None:
+    """Start the refresher once, on the first async route call.
+
+    Deliberately not called at registration time: routes are registered during
+    module import, before any event loop is running, so there is no loop to
+    create a task on. Every caller is a coroutine, so the running loop is
+    guaranteed here.
+    """
+    global _REMOTE_INVENTORY_WARM_TASK
+    task = _REMOTE_INVENTORY_WARM_TASK
+    if task is not None and not task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    # Retain the task: asyncio only holds a weak reference, so it could
+    # otherwise be collected mid-flight and silently stop refreshing.
+    _REMOTE_INVENTORY_WARM_TASK = loop.create_task(_remote_inventory_refresher())
+
+
 async def _refresh_remote_inventory() -> None:
     """Refresh the shared Modal volume snapshot that version state reads.
 
@@ -229,11 +278,21 @@ async def _refresh_remote_inventory() -> None:
     reports state refreshes here so the version card and the dependency report
     can never disagree. Cached, so a page of routes costs one call. A failure
     is silent: state then falls back to local-only truth.
+
+    The await is retained on purpose - gating needs this snapshot, and skipping
+    it left Run permanently disabled. ``_ensure_remote_inventory_warm`` keeps
+    the cache populated so this call is normally a cache hit rather than a
+    cold Modal round trip.
     """
     try:
         await remote_inventory.get_inventory()
     except Exception:  # noqa: BLE001
         _log.debug("Remote inventory refresh failed", exc_info=True)
+    finally:
+        # Keep the snapshot warm so later reads are cache hits rather than cold
+        # Modal round trips. Started after the first fetch so the very first
+        # read still gets real data (gating needs it) but does not pay again.
+        _ensure_remote_inventory_warm()
 
 
 def register_workflow_routes(
