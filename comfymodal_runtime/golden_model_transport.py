@@ -1665,6 +1665,24 @@ class GoldenModelTransport:
                         arena_bytes=getattr(runtime, "size_bytes", None),
                         source_child_pid=source_child_pid,
                     ),
+                    # Runtime-observed experiment controls.  This sub-dict is
+                    # the projection that reaches run artifacts, so the
+                    # effective controls live here (not only at stats top
+                    # level): requested-vs-observed comparison needs them next
+                    # to the source measurements.  None when no experimental
+                    # request selected them.
+                    "golden_source_experiment": (
+                        dict(experiment_controls.effective_description)
+                        if experiment_controls is not None else None
+                    ),
+                    "microscope_scope_note": (
+                        dict(source_telemetry.get("microscope_scope_note"))
+                        if isinstance(source_telemetry.get("microscope_scope_note"), dict)
+                        else None
+                    ),
+                    "microscope_records": list(
+                        source_telemetry.get("microscope_records") or []
+                    ),
                 },
                 "quiescence": {
                     "workers_joined": False,
