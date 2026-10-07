@@ -139,17 +139,30 @@ def _golden_cpu_qd2_prefetch_requested(config: config_mod.ResolvedConfig) -> boo
 
 
 def _golden_source_experiment_env(config: config_mod.ResolvedConfig) -> dict[str, str]:
-    """Project explicit experiment-profile selectors, never baseline defaults."""
-    if GOLDEN_SOURCE_EXPERIMENT_PROFILE_MARKER not in str(config.profile_name):
-        return {}
-    values: dict[str, str] = {}
-    values[GOLDEN_SOURCE_EXPERIMENT_ENV] = "1"
-    for name in (
+    """Project explicit experiment selectors, never baseline defaults.
+
+    Fires when the experiment profile is selected OR when any selector flag
+    was explicitly set for this run. Baseline runs (base profile, no --set)
+    still resolve to {} so ordinary requests stay byte-identical.
+    """
+    names = (
         "COMFYMODAL_GOLDEN_SOURCE_POLICY",
         "COMFYMODAL_GOLDEN_SOURCE_LAUNCH_GAP_NS",
         "COMFYMODAL_GOLDEN_MICROSCOPE",
         "COMFYMODAL_GOLDEN_QD_MODE",
-    ):
+    )
+    if GOLDEN_SOURCE_EXPERIMENT_PROFILE_MARKER not in str(config.profile_name):
+        explicit = False
+        for name in names:
+            flag = config.flag(name)
+            if flag is not None and str(getattr(flag, "source", "")) in {"cli", "inherit", "set"}:
+                explicit = True
+                break
+        if not explicit:
+            return {}
+    values: dict[str, str] = {}
+    values[GOLDEN_SOURCE_EXPERIMENT_ENV] = "1"
+    for name in names:
         flag = config.flag(name)
         if flag is not None:
             values[name] = str(getattr(flag, "value", ""))
