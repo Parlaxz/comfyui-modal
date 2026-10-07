@@ -11,7 +11,10 @@
 ## 2. Integration branch SHA
 
 - Branch: `integration/golden-source-experiment-controls-oct07`
-- HEAD: `b6d6c87b799d3832e979ea8a039378dd6952585c` (8 commits on `origin/main`):
+- Code-freeze HEAD (all validation ran on this code): `b6d6c87`
+- Report HEAD (this file; docs-only delta over code-freeze): updated below
+  before merge; no source changes after `b6d6c87`.
+- Commits on `origin/main`:
   - `92c60c9f` feat: request-scoped controls (PHASE/GAP/forensic microscope,
     fail-closed; LRU8/QD1 blocked)
   - `2aac85c6` fix(deploy): restore `us-central` region-pin allowlist entry
@@ -24,6 +27,7 @@
     in the `source_detail` projection (the only projection artifacts carry)
   - `b6d6c87b` fix: match original subdivide64 ordinal selection
     (second/mid/last, four-full-block pool)
+  - `678f8626` docs: this integration report (v1, DO_NOT_MERGE pending §11)
 - Uncommitted (operator-local, intentionally NOT in branch):
   `config/v2/modal_target.toml` → Testing5 (`ws_c1487d319820`).
   Committed file still says Testing 1, matching `origin/main`.
@@ -125,11 +129,16 @@ untouched). Deployed-file diff stat at HEAD: 7 tracked files + 4 new files
   (zero placements in 10 unpinned samples + slow scheduling), Modal rejects
   GCP-canonical pins (`us-central1`, `us-west1` unsupported), so the cohort
   pins Modal-short-label `us-west` (allowlist entry added, deploy-time only).
-- Current deployment: fingerprint
-  `64b63a1aeea42d3fea2e8b6ffb9bba25ec884024d6709b99eccdf80fc140668e`
-  (receipt_8). Prior fingerprints (same app): `b85f3844`, `d5181a43`,
-  `1eac5646`, `107032e5` (unpinned), `9d25dbf1`, `051e17e4`, `513f38a9`.
-  Do not mix runs across fingerprints in one cohort.
+- Integration deployment (final): fingerprint
+  `d23d6be08957486aba9edcb87ec33d85f65a86cedbb4de4eb6287e6503a9b313`
+  (pinned `us-central`; code-freeze `b6d6c87`).
+  Control deployment: app `batch-origin-controls-oct07`, pristine
+  `origin/main`, fingerprint
+  `2881bf6bb9d6980d1e141777e001f8fa1adc10afb36cf605b7e37fd90858fde7`,
+  UNPINNED. Prior integration fingerprints (same app): `b85f3844`,
+  `d5181a43`, `1eac5646`, `107032e5` (unpinned), `9d25dbf1`, `051e17e4`,
+  `513f38a9`, `64b63a1a`, `7505a16c`. Do not mix runs across
+  fingerprints in one cohort.
 - `source-probe` is broken on current main (pre-existing:
   `DeploymentReceipt` has no `source_probe` after the receipt refactor).
   Placement sampling used 10 unpinned full runs instead.
@@ -153,16 +162,46 @@ Excluded evidence retained: GAP20/OCI run, no-flags/Azure run (named
 providers, pre-authorized exclusion rule), plus pre-fix runs on older
 fingerprints. Manifests under `.v2ctl/runs/` + `artifacts/` in the worktree.
 
-## 10. No-flag control-vs-integration comparison (§11)
+## 10. No-flag control-vs-integration comparison (§11) — PERFORMED, GATE PASSES
 
-NOT PERFORMED. Requires a second isolated app deployed from pristine
-`origin/main` plus a 6+6 interleaved cohort. No clean `origin/main`
-checkout exists (main is dirty with other work; creating a worktree was
-prohibited for this task), and Testing5 credit already spent heavily today.
-Available proxies (all no-flags integration runs: 4.0–4.1 ms floors,
-ELIGIBLE, exact SHA across 4 deployments) show stability but are NOT a
-control comparison. Do not treat thousands of source ops as N; run is the
-unit — cohort still owed.
+Design (user-authorized): same H100/profile/workflow, sequential
+interleaved `C I I C C I I C C I I C`, no flags, all runs true-cold,
+SHA-exact, run = experimental unit (no significance claims at n=6;
+regression tripwire only).
+- C = pristine `origin/main` `30e0dc4`, disposable checkout
+  (`.slim/worktrees/ctrl-origin-main-oct07`, removed after), app
+  `batch-origin-controls-oct07`, deploy `2881bf6b`, UNPINNED (pristine
+  allowlist rejects every Modal-accepted pin — pre-existing drift, §8).
+- I = integration code-freeze `b6d6c87`, app `batch-source-controls-oct07`,
+  deploy `d23d6be0`, pinned `us-central`.
+- Pool: us-central for all 12 (control filtered; providers mixed
+  Azure/UNSPECIFIED/OCI across BOTH arms, no provider pin, recorded below).
+- Excluded while sampling (retained): eu-north, eu-south, GCP/us-west
+  control runs (wrong pool for this cohort).
+
+| slot | arm | provider | CLIP eff QD | UNET eff QD | floor ms |
+|---|---|---|---|---|---|
+| 1 | C | Azure | 3.910 | 3.709 | 4.05 |
+| 2 | I | UNSPECIFIED | 3.917 | 3.683 | 4.06 |
+| 3 | I | Azure | 3.877 | 3.616 | 4.04 |
+| 4 | C | Azure | 3.886 | 3.366 | 4.01 |
+| 5 | C | Azure | 3.897 | 3.508 | 4.04 |
+| 6 | I | OCI | 3.921 | 3.659 | 4.03 |
+| 7 | I | UNSPECIFIED | 3.932 | 3.772 | 4.03 |
+| 8 | C | UNSPECIFIED | 3.924 | 3.947 | 4.03 |
+| 9 | C | UNSPECIFIED | 3.915 | 3.802 | 4.02 |
+| 10 | I | UNSPECIFIED | 3.930 | 3.951 | 4.01 |
+| 11 | I | UNSPECIFIED | 3.907 | 3.931 | 4.04 |
+| 12 | C | Azure | 3.904 | 3.539 | 4.05 |
+
+(120 ops = CLIP geometry, 184 ops = UNET; eff QD = time-weighted effective
+reader concurrency; floor = min source gap; all valid/true-cold, r=q=1.)
+Verdict: same performance regime, intermingled, no systematic shift.
+CLIP eff means C 3.906 vs I 3.914 (Δ+0.2%); UNET means C 3.645 vs I 3.769
+(ranges overlap: C 3.37–3.95, I 3.62–3.95; C's own spread 0.58 exceeds the
+0.12 mean gap). Floors identical (4.01–4.06 ms). The tripwire is quiet:
+no-flags integration behaves like pristine `origin/main` within normal
+run-to-run noise. Gate passes.
 
 ## 11. Deliberately omitted (exact source unprovable)
 
@@ -170,19 +209,20 @@ LRU8_EXACT, TRUE_QD1, TRUE_QD1_128, pure SUBDIVIDED64_EXACT — all
 BLOCKED_PENDING_EXACT_SOURCE_RECOVERY (§3). Omission does not block the
 proven controls.
 
-## 12. Recommendation: DO_NOT_MERGE (pending §11 only)
+## 12. Recommendation: SAFE_TO_MERGE
 
-All merge gates pass EXCEPT the live no-flags control-vs-integration perf
-comparison, which was not run: local tests pass (with disclosed Windows
-flake), SHA passes, no-flags path preserved statically + behaviorally,
-no systematic signal against integration (stable 4 ms floors, ELIGIBLE
-throughout), PHASE exactness proven (static + runtime labels; adaptations
-outside the selection critical section), every enabled mode adheres to
-requested controls with requested==observed, no unresolved hot-path
-adaptation (18Q preserved; ordinal selection corrected to the original).
-Reason: §15 requires the §11 comparison before merge. Run the 6v6
-interleaved GCP/us-west cohort (control app from pristine `origin/main`)
-and flip to SAFE_TO_MERGE on no systematic regression.
+All §15 gates pass: local tests pass (Windows order-flake disclosed, every
+test green standalone + exclusion run); exact SHA on every counted run;
+no-flags path preserved statically and behaviorally; §11 tripwire quiet
+(same regime, intermingled, §10); PHASE exactness proven (static behavioral
+identity of scheduling/lock-release sections + runtime adherence with
+4R/QD4/64MiB topology); every enabled mode adheres with
+requested==observed; no unresolved hot-path adaptation (18Q preserved,
+ordinal selection matches the original lane, adaptations outside the
+selection critical section). Omitted modes stay blocked, never substituted.
+Merge the branch into `main` with normal non-destructive operations, push
+normally, record the final SHA below. Do not force-push, reset, rewrite
+history, or tag a release.
 
 ## 13. Research questions
 
