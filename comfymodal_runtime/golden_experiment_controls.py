@@ -138,7 +138,7 @@ def subdivision_scope_note(selected_ordinals: tuple[int, ...] | list[int], *, ex
     """Immutable diagnostic scope note shared by runtime and report consumers."""
     selected = tuple(int(value) for value in selected_ordinals)
     return MappingProxyType({
-        "selection_algorithm": "three_fixed_full_parent_ordinals:first_midpoint_last",
+        "selection_algorithm": "three_fixed_full_parent_ordinals:second_midpoint_last",
         "selected_ordinal_list": list(selected),
         "expected_count": int(expected_count),
         "actual_count": len(selected),

@@ -1104,8 +1104,8 @@ class SourceThreadProcess:
             index for index, item in enumerate(planned) if int(item.length) == SLOT_BYTES
         )
         microscope_ordinals = (
-            (full_ordinals[0], full_ordinals[len(full_ordinals) // 2], full_ordinals[-1])
-            if microscope != "OFF" and len(full_ordinals) >= 3 else ()
+            (full_ordinals[1], full_ordinals[len(full_ordinals) // 2], full_ordinals[-1])
+            if microscope != "OFF" and len(full_ordinals) >= 4 else ()
         )
         if microscope != "OFF" and len(set(microscope_ordinals)) != 3:
             raise SourceProtocolError("subdivided64_requires_three_full_parents")
@@ -1549,13 +1549,13 @@ class SourcePlanBridge:
                 index for index, item in enumerate(normalized)
                 if int(item.length) == SLOT_BYTES
             )
-            if len(full_ordinals) < 3:
-                raise SourceProtocolError("subdivided64_requires_three_full_parents")
-            selected = (full_ordinals[0], full_ordinals[len(full_ordinals) // 2], full_ordinals[-1])
+            if len(full_ordinals) < 4:
+                raise SourceProtocolError("subdivided64_requires_four_full_parents")
+            selected = (full_ordinals[1], full_ordinals[len(full_ordinals) // 2], full_ordinals[-1])
             if len(set(selected)) != 3:
                 raise SourceProtocolError("subdivided64_requires_distinct_full_parents")
             self.manager.telemetry["microscope_scope_note"] = {
-                "selection_algorithm": "three_fixed_full_parent_ordinals:first_midpoint_last",
+                "selection_algorithm": "three_fixed_full_parent_ordinals:second_midpoint_last",
                 "selected_ordinal_list": list(selected),
                 "expected_count": 3,
                 "actual_count": len(selected),
@@ -1888,8 +1888,8 @@ def build_plan(message: Mapping[str, Any], *, open_source: bool) -> _ChildPlan:
     if microscope != "OFF":
         full_ordinals = tuple(index for index, item in enumerate(ranges) if item[1] == SLOT_BYTES)
         expected = (
-            (full_ordinals[0], full_ordinals[len(full_ordinals) // 2], full_ordinals[-1])
-            if len(full_ordinals) >= 3 else ()
+            (full_ordinals[1], full_ordinals[len(full_ordinals) // 2], full_ordinals[-1])
+            if len(full_ordinals) >= 4 else ()
         )
         if selected_ordinals != expected or len(set(selected_ordinals)) != 3:
             raise SourceProtocolError("subdivided64_selection_mismatch")
