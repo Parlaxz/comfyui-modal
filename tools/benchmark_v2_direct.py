@@ -267,6 +267,36 @@ def _experiment_origin_overrides() -> dict[str, str]:
     arm = str(getattr(args, "arm", "") or "")
     return dict(_EXPERIMENT_ORIGIN_OVERRIDES.get((experiment, arm), {}))
 
+
+def _source_experiment_origin_overrides() -> dict[str, object]:
+    """Request-level Golden source experiment selectors (absence-preserving).
+
+    Reads COMFYMODAL_GOLDEN_SOURCE_EXPERIMENT=1 plus the four selector env
+    keys and validates them fail-fast via the control contract. Baseline
+    (marker unset) returns {} so ordinary requests are byte-identical.
+    """
+    if str(os.environ.get("COMFYMODAL_GOLDEN_SOURCE_EXPERIMENT", "")).strip().lower() not in {"1", "true", "yes", "on"}:
+        return {}
+    raw: dict[str, object] = {}
+    for key, env_name in (
+        ("source_policy", "COMFYMODAL_GOLDEN_SOURCE_POLICY"),
+        ("source_launch_gap_ns", "COMFYMODAL_GOLDEN_SOURCE_LAUNCH_GAP_NS"),
+        ("microscope_mode", "COMFYMODAL_GOLDEN_MICROSCOPE"),
+        ("qd_mode", "COMFYMODAL_GOLDEN_QD_MODE"),
+    ):
+        if env_name in os.environ:
+            raw[key] = os.environ[env_name]
+    if not raw:
+        return {}
+    from comfymodal_runtime.golden_experiment_controls import parse_controls
+    controls = parse_controls(raw, explicit=True)
+    return {
+        "source_policy": controls.source_policy,
+        "source_launch_gap_ns": controls.launch_gap_ns,
+        "microscope_mode": controls.microscope_mode,
+        "qd_mode": controls.qd_mode,
+    }
+
 # Plan-carried validation proof collection (plan-validation feature; default
 # ON = harness behavior unchanged).  Explicitly disable with
 # COMFYMODAL_V2_PLAN_VALIDATION_PROOF=0 when the local node registry cannot
@@ -4361,6 +4391,9 @@ async def _run_one(
     _experiment_origin = _experiment_origin_overrides()
     if _experiment_origin:
         request_origin_info.update(_experiment_origin)
+    _source_experiment_origin = _source_experiment_origin_overrides()
+    if _source_experiment_origin:
+        request_origin_info.update(_source_experiment_origin)
     prompt_id = _req_id  # request_id == prompt_id
 
     # Mirror the ComfyUI server's full node registry before any plan build:
