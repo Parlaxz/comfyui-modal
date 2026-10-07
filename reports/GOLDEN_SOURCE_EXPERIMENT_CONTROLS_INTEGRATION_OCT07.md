@@ -12,8 +12,9 @@
 
 - Branch: `integration/golden-source-experiment-controls-oct07`
 - Code-freeze HEAD (all validation ran on this code): `b6d6c87`
-- Report HEAD (this file; docs-only delta over code-freeze): updated below
-  before merge; no source changes after `b6d6c87`.
+- Report HEAD (this file; docs-only delta over code-freeze): this commit.
+  No source changes after `b6d6c87` (verified: `git diff b6d6c87..HEAD`
+  touches only this report). Merge SHA recorded by merger at §15.
 - Commits on `origin/main`:
   - `92c60c9f` feat: request-scoped controls (PHASE/GAP/forensic microscope,
     fail-closed; LRU8/QD1 blocked)
