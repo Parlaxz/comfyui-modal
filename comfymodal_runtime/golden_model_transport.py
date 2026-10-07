@@ -1168,19 +1168,29 @@ class GoldenModelTransport:
         # Measured on trace a4a4eaaf52fe456cbcd3583527068891: this path drives
         # 184 source reads (clip_load's 120) and produced zero frames. Imported
         # lazily so this module stays importable without the trace runtime.
+        #
+        # Request-scoped experiment controls ride the same handoff explicitly:
+        # ContextVars do not cross asyncio.to_thread, so capture the active
+        # controls here (async request context) and thread them through the
+        # sync loaders.  None (no experimental request) preserves today's path.
+        try:
+            from .golden_experiment_controls import active_controls as _active_controls
+        except BaseException:
+            _active_controls = None
+        _request_controls = _active_controls() if _active_controls is not None else None
         try:
             from .full_execution_trace import thread_traced
-            target = thread_traced(functools.partial(self._load_sync, role=role))
+            target = thread_traced(functools.partial(self._load_sync, role=role, experiment_controls=_request_controls))
         except BaseException:
-            return await asyncio.to_thread(self._load_sync, path, role=role)
+            return await asyncio.to_thread(self._load_sync, path, role=role, experiment_controls=_request_controls)
         return await asyncio.to_thread(target, path)
 
     def load_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
         return self._load_sync(path, role=role)
 
-    def _load_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
+    def _load_sync(self, path: str, *, role: str = "model", experiment_controls: Any = None) -> LoadedSafetensors:
         if self._c0_enabled:
-            return self._load_c0_sync(path, role=role)
+            return self._load_c0_sync(path, role=role, experiment_controls=experiment_controls)
         started_ns = time.perf_counter_ns()
         with self._lock:
             if self._poisoned:
@@ -1339,7 +1349,7 @@ class GoldenModelTransport:
             self._load_count += 1
             return LoadedSafetensors(layout.path, views, owner, layout, stats)
 
-    def _load_c0_source_threads_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
+    def _load_c0_source_threads_sync(self, path: str, *, role: str = "model", experiment_controls: Any = None) -> LoadedSafetensors:
         """Load through the restore-created source process and shared arena."""
         started_ns = time.perf_counter_ns()
         started_mono_ns = time.monotonic_ns()
@@ -1347,7 +1357,11 @@ class GoldenModelTransport:
         from . import golden_io_process_v2 as c0
         from . import golden_qd_transport as qd_transport
         from .golden_experiment_controls import active_controls
-        experiment_controls = active_controls()
+        # The sync loader runs on an executor thread where the request
+        # ContextVar is invisible, so prefer explicitly threaded controls and
+        # fall back to the context read (direct sync callers).
+        if experiment_controls is None:
+            experiment_controls = active_controls()
 
         with self._lock:
             if self._poisoned:
@@ -1694,7 +1708,7 @@ class GoldenModelTransport:
             self._load_count += 1
             return LoadedSafetensors(layout.path, views, owner, layout, stats)
 
-    def _load_c0_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
+    def _load_c0_sync(self, path: str, *, role: str = "model", experiment_controls: Any = None) -> LoadedSafetensors:
         """Load one checkpoint through the persistent C0 shared arena.
 
         C0 body, M2 engines: the C0 arena stays the backing resource,
@@ -1705,7 +1719,7 @@ class GoldenModelTransport:
         are forked here, and no standalone M2 loader wrapper is entered.
         """
         if self._c0_source_threads_enabled:
-            return self._load_c0_source_threads_sync(path, role=role)
+            return self._load_c0_source_threads_sync(path, role=role, experiment_controls=experiment_controls)
         started_ns = time.perf_counter_ns()
         started_mono_ns = time.monotonic_ns()
         # Passive per-load setup waterfall (observation-only monotonic_ns).
