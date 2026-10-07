@@ -4886,6 +4886,7 @@ _REGION_PIN_ALLOWLIST = frozenset({
     "sa-east-1", "us-east4", "us-west1", "us-central1", "us-west4",
     "europe-west1", "europe-west4", "asia-east1", "asia-southeast1",
     "us-central",
+    "us-west",
 })
 
 
