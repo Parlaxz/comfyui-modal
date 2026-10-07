@@ -41,7 +41,9 @@ complete.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import ctypes
+import contextvars
 import json
 import mmap as _mmap
 import os
@@ -94,6 +96,12 @@ SLOT_BYTES = 64 * 1024 * 1024
 READER_COUNT = 4
 THREAD_COUNT = READER_COUNT
 PACER_GAP_NS = 4_000_000
+SOURCE_POLICY_ARMS = ("CURRENT", "PHASE_EXACT")
+SUBDIVIDE64_CHUNK_BYTES = 4 * 1024 * 1024
+SUBDIVIDE64_CHUNK_COUNT = 16
+SUBDIVIDE64_CHECKPOINTS = (-1, 0, 1, 3, 7, 15)
+_SOURCE_POLICY = contextvars.ContextVar("golden_source_policy", default="CURRENT")
+_SOURCE_LAUNCH_GAP = contextvars.ContextVar("golden_source_launch_gap_ns", default=PACER_GAP_NS)
 # Fail-closed per-model-load wall gate.  This is a GUARDRAIL, not a throughput
 # mechanism: a healthy 8 GiB CLIP load is ~1.3 s and a healthy 12 GiB UNET load
 # is ~2.3 s, so 30 s is ~20x the worst healthy observation.  It replaces the
@@ -195,6 +203,36 @@ def worker_kind(value: Any = None) -> str:
     if kind not in WORKER_KINDS:
         raise SourceProtocolError(f"unsupported_source_worker_kind:{kind!r}")
     return kind
+
+
+def normalize_source_policy(value: Any = None) -> str:
+    selected = _SOURCE_POLICY.get() if value is None else value
+    policy = str(selected or "CURRENT").strip().upper()
+    if policy not in SOURCE_POLICY_ARMS:
+        raise SourceProtocolError(f"unsupported_source_policy:{policy!r}")
+    return policy
+
+
+def configured_source_launch_gap_ns(value: Any = None) -> int:
+    selected = _SOURCE_LAUNCH_GAP.get() if value is None else value
+    try:
+        gap = int(str(selected).strip())
+    except (TypeError, ValueError) as exc:
+        raise SourceProtocolError("invalid_source_launch_gap_ns") from exc
+    if gap not in (4_000_000, 6_000_000, 8_000_000, 10_000_000, 15_000_000, 20_000_000):
+        raise SourceProtocolError(f"unsupported_source_launch_gap_ns:{gap}")
+    return gap
+
+
+@contextmanager
+def source_experiment_context(*, policy: Any = None, launch_gap_ns: Any = None):
+    policy_token = _SOURCE_POLICY.set(normalize_source_policy(policy))
+    gap_token = _SOURCE_LAUNCH_GAP.set(configured_source_launch_gap_ns(launch_gap_ns))
+    try:
+        yield
+    finally:
+        _SOURCE_LAUNCH_GAP.reset(gap_token)
+        _SOURCE_POLICY.reset(policy_token)
 
 
 def geometry() -> dict[str, int]:
@@ -322,6 +360,7 @@ class GlobalSourcePacer:
         self._clock = clock
         self._sleep = sleeper
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self.last_start_ns: int | None = None
         self.timestamps_ns: list[int] = []
         self.actual_timestamps_ns: list[int] = []
@@ -329,6 +368,33 @@ class GlobalSourcePacer:
         self.zero_delay_count = 0
         self.correction_ns = 0
         self.correction_count = 0
+        self.policy = "CURRENT"
+        self.generation: int | None = None
+        self.model = ""
+        self._phase_next_reader = 0
+        self._phase_ready_readers: set[int] = set()
+        self._admission_sequence = 0
+
+    def configure_plan(self, generation: int, model: str, policy: Any, gap_ns: Any = None) -> None:
+        selected = normalize_source_policy(policy)
+        with self._condition:
+            if self._phase_ready_readers:
+                raise SourceProtocolError("source_policy_plan_changed_with_waiting_readers")
+            self.generation = int(generation)
+            self.model = str(model)
+            self.policy = selected
+            if gap_ns is not None:
+                self.gap_ns = configured_source_launch_gap_ns(gap_ns)
+            self._phase_next_reader = 0
+            self._condition.notify_all()
+
+    @staticmethod
+    def _phase_candidate(expected_reader: int, ready: set[int]) -> int | None:
+        for distance in range(READER_COUNT):
+            candidate = (int(expected_reader) + distance) % READER_COUNT
+            if candidate in ready:
+                return candidate
+        return None
 
     def reserve(self, *, now_ns: int | None = None) -> tuple[int, int]:
         """Reserve and return ``(reserved_start_ns, wait_ns)``.
@@ -376,6 +442,8 @@ class GlobalSourcePacer:
         ``callback`` receives a one-shot marker callable and must invoke it
         immediately before entering the native copy.
         """
+        if self.policy == "PHASE_EXACT":
+            return self._phase_copy(callback, reader_id=int(reader_id), ordinal=int(ordinal))
         self._lock.acquire()
         released = False
         try:
@@ -420,6 +488,73 @@ class GlobalSourcePacer:
         finally:
             if not released:
                 self._lock.release()
+
+    def _phase_copy(self, callback: Any, *, reader_id: int, ordinal: int) -> tuple[int, int, int]:
+        """Committed PHASE_EXACT scheduler: ready-set + cyclic fallback.
+
+        Selection state is changed only under the condition lock.  The lock is
+        released by the native-copy start marker, before memmove; no timing or
+        diagnostic dictionary is created in the selection critical section.
+        """
+        if reader_id < 0 or reader_id >= READER_COUNT:
+            raise SourceProtocolError(f"phase_reader_out_of_range:{reader_id}")
+        self._condition.acquire()
+        registered = False
+        released = False
+        waited = 0
+        try:
+            if reader_id in self._phase_ready_readers:
+                raise SourceProtocolError(f"phase_reader_already_waiting:{reader_id}")
+            self._phase_ready_readers.add(reader_id)
+            registered = True
+            self._condition.notify_all()
+            while True:
+                now = int(self._clock())
+                previous = self.actual_timestamps_ns[-1] if self.actual_timestamps_ns else None
+                deadline = None if previous is None else previous + self.gap_ns
+                if deadline is not None and now < deadline:
+                    started = now
+                    self._condition.wait((deadline - now) / 1e9)
+                    waited += max(0, min(int(self._clock()), deadline) - started)
+                    continue
+                scheduled = self._phase_next_reader
+                selected = self._phase_candidate(scheduled, self._phase_ready_readers)
+                if selected is None or selected != reader_id:
+                    self._condition.wait()
+                    continue
+                self._phase_next_reader = (scheduled + 1) % READER_COUNT
+                self._phase_ready_readers.remove(reader_id)
+                registered = False
+                break
+            access_start = int(self._clock())
+
+            def mark_actual_start() -> int:
+                nonlocal released
+                actual = int(self._clock())
+                previous = self.actual_timestamps_ns[-1] if self.actual_timestamps_ns else None
+                corrected = 0
+                while previous is not None and actual - previous < self.gap_ns:
+                    delay = self.gap_ns - (actual - previous)
+                    self._sleep(delay / 1e9)
+                    corrected += delay
+                    actual = int(self._clock())
+                self.actual_timestamps_ns.append(actual)
+                self.timestamps_ns.append(actual)
+                self.last_start_ns = actual
+                self.wait_ns.append(waited + corrected)
+                self._condition.notify_all()
+                self._condition.release()
+                released = True
+                return actual
+
+            result = callback(mark_actual_start)
+            return access_start, int(result if result is not None else self._clock()), waited
+        finally:
+            if registered:
+                self._phase_ready_readers.discard(reader_id)
+                self._condition.notify_all()
+            if not released:
+                self._condition.release()
 
 
 class SharedSourcePacer:
@@ -934,6 +1069,9 @@ class SourceThreadProcess:
         self, *, generation: int, path: str, identity: Sequence[int],
         ranges: Sequence[SourceRange], destination_size: int,
         mmap_lifecycle: str | None = None,
+        source_policy: Any = "CURRENT",
+        source_launch_gap_ns: Any = PACER_GAP_NS,
+        microscope_mode: Any = "OFF",
     ) -> dict[str, Any]:
         if self._proc is None or self._proc.stdin is None:
             raise SourceProtocolError("source_process_not_started")
@@ -953,6 +1091,24 @@ class SourceThreadProcess:
         lifecycle = str(mmap_lifecycle or self.mmap_lifecycle).strip().lower()
         if lifecycle not in {"fresh", "whole"}:
             raise SourceProtocolError("unsupported_mmap_lifecycle")
+        policy = normalize_source_policy(source_policy)
+        gap_ns = configured_source_launch_gap_ns(source_launch_gap_ns)
+        microscope = str(microscope_mode or "OFF").strip().upper()
+        if microscope not in {"OFF", "SUBDIVIDED64_RESIDENCY_FORENSIC_EXACT"}:
+            raise SourceProtocolError(f"unsupported_microscope_mode:{microscope}")
+        if policy == "PHASE_EXACT" and self.worker_kind != "thread":
+            raise SourceProtocolError("phase_exact_requires_thread_readers")
+        if microscope != "OFF" and lifecycle != "whole":
+            raise SourceProtocolError("subdivided64_requires_whole_mmap")
+        full_ordinals = tuple(
+            index for index, item in enumerate(planned) if int(item.length) == SLOT_BYTES
+        )
+        microscope_ordinals = (
+            (full_ordinals[0], full_ordinals[len(full_ordinals) // 2], full_ordinals[-1])
+            if microscope != "OFF" and len(full_ordinals) >= 3 else ()
+        )
+        if microscope != "OFF" and len(set(microscope_ordinals)) != 3:
+            raise SourceProtocolError("subdivided64_requires_three_full_parents")
         plan_install_begin_ns = time.monotonic_ns()
         # The generation this process is about to serve must be visible to
         # ``_resolve_ready_block`` BEFORE any READY_BLOCK can be read.  The
@@ -970,6 +1126,10 @@ class SourceThreadProcess:
             "op": "PLAN", "generation": int(generation), "path": os.path.abspath(path),
             "identity": list(identity), "destination_size": int(destination_size),
             "mmap_lifecycle": lifecycle,
+            "source_policy": policy,
+            "source_launch_gap_ns": gap_ns,
+            "microscope_mode": microscope,
+            "microscope_ordinals": list(microscope_ordinals),
             "ranges": [item.as_dict() for item in planned],
         }
         self._proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
@@ -1008,6 +1168,9 @@ class SourceThreadProcess:
         self.telemetry["plan_install_ms"] = (plan_install_ns - plan_install_begin_ns) / 1e6
         self.telemetry["plan_count"] = self._plan_count
         self.telemetry["plan_range_count"] = len(planned)
+        self.telemetry["source_policy"] = policy
+        self.telemetry["source_launch_gap_ns"] = gap_ns
+        self.telemetry["microscope_mode"] = microscope
         return dict(ack)
 
     def _raise_if_failed(self, header: Sequence[int]) -> None:
@@ -1178,6 +1341,11 @@ class SourceThreadProcess:
                 continue
             if operation != "READY_BLOCK":
                 continue
+            microscope_record = message.get("microscope_record")
+            if isinstance(microscope_record, Mapping):
+                self.telemetry.setdefault("microscope_records", []).append(
+                    dict(microscope_record)
+                )
             record = self._resolve_ready_block(message)
             if record is not None:
                 return record
@@ -1366,15 +1534,43 @@ class SourcePlanBridge:
     def publish_all(self, ranges: Sequence[Any], *, generation: int, path: str,
                     identity: Sequence[int], destination_size: int,
                     timeout_s: float = MODEL_LOAD_GATE_S,
-                    role: str = "model") -> int:
+                    role: str = "model", source_policy: Any = "CURRENT",
+                    source_launch_gap_ns: Any = PACER_GAP_NS,
+                    microscope_mode: Any = "OFF") -> int:
         normalized = tuple(
             SourceRange(int(item.source_offset), int(item.length), int(item.target_offset), item.record_id)
             for item in ranges
         )
+        policy = normalize_source_policy(source_policy)
+        gap_ns = configured_source_launch_gap_ns(source_launch_gap_ns)
+        microscope = str(microscope_mode or "OFF").strip().upper()
+        if microscope == "SUBDIVIDED64_RESIDENCY_FORENSIC_EXACT":
+            full_ordinals = tuple(
+                index for index, item in enumerate(normalized)
+                if int(item.length) == SLOT_BYTES
+            )
+            if len(full_ordinals) < 3:
+                raise SourceProtocolError("subdivided64_requires_three_full_parents")
+            selected = (full_ordinals[0], full_ordinals[len(full_ordinals) // 2], full_ordinals[-1])
+            if len(set(selected)) != 3:
+                raise SourceProtocolError("subdivided64_requires_distinct_full_parents")
+            self.manager.telemetry["microscope_scope_note"] = {
+                "selection_algorithm": "three_fixed_full_parent_ordinals:first_midpoint_last",
+                "selected_ordinal_list": list(selected),
+                "expected_count": 3,
+                "actual_count": len(selected),
+                "scope": "three_fixed_full_parent_ordinals_per_model",
+                "reconciliation": "64MiB_parent=16x4MiB_subchunks",
+                "probe_fault_overhead": "included_in_parent_wall_and_classified_contaminated",
+                "contamination_classification": "diagnostic_probe_fault_read_overhead",
+            }
         plan_install_begin_ns = time.monotonic_ns()
         self.manager.plan_once(generation=generation, path=path, identity=identity,
                                ranges=normalized, destination_size=destination_size,
-                               mmap_lifecycle=getattr(self.manager, "mmap_lifecycle", "fresh"))
+                                mmap_lifecycle=getattr(self.manager, "mmap_lifecycle", "fresh"),
+                                source_policy=policy,
+                                source_launch_gap_ns=gap_ns,
+                                microscope_mode=microscope)
         plan_install_end_ns = time.monotonic_ns()
         remaining = len(normalized)
         published = 0
@@ -1548,11 +1744,26 @@ def _native_mmap_setup() -> Any:
     libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     libc.memmove.restype = ctypes.c_void_p
     libc.memmove.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    if hasattr(libc, "mincore"):
+        libc.mincore.restype = ctypes.c_int
+        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_ubyte)]
     return libc
 
 
 def _map_failed(address: Any) -> bool:
     return not address or int(ctypes.cast(address, ctypes.c_void_p).value or 0) == ctypes.c_void_p(-1).value
+
+
+def _thread_fault_counts(thread_id: int) -> tuple[int, int] | None:
+    """Read Linux minor/major fault counters for forensic contamination notes."""
+    if os.name != "posix":
+        return None
+    try:
+        with open(f"/proc/self/task/{int(thread_id)}/stat", "r", encoding="utf-8") as stream:
+            fields = stream.read().rsplit(")", 1)[-1].split()
+        return int(fields[7]), int(fields[9])
+    except (OSError, IndexError, ValueError):
+        return None
 
 
 class _PosixAttachment:
@@ -1589,6 +1800,10 @@ class _ChildPlan:
     destination_size: int
     mmap_lifecycle: str
     ranges: tuple[tuple[int, int, int, int | None], ...]
+    source_policy: str = "CURRENT"
+    source_launch_gap_ns: int = PACER_GAP_NS
+    microscope_mode: str = "OFF"
+    microscope_ordinals: tuple[int, ...] = ()
     fd: int = -1
     map_address: int = 0
     map_length: int = 0
@@ -1608,6 +1823,10 @@ class _ChildPlan:
             "identity": list(self.identity),
             "destination_size": self.destination_size,
             "mmap_lifecycle": self.mmap_lifecycle,
+            "source_policy": self.source_policy,
+            "source_launch_gap_ns": self.source_launch_gap_ns,
+            "microscope_mode": self.microscope_mode,
+            "microscope_ordinals": list(self.microscope_ordinals),
             "ranges": [
                 {
                     "source_offset": item[0],
@@ -1631,6 +1850,12 @@ class _ChildPlan:
                 (int(item[0]), int(item[1]), int(item[2]), item[3])
                 for item in metadata["ranges"]
             ),
+            source_policy=normalize_source_policy(metadata.get("source_policy", "CURRENT")),
+            source_launch_gap_ns=configured_source_launch_gap_ns(
+                metadata.get("source_launch_gap_ns", PACER_GAP_NS)
+            ),
+            microscope_mode=str(metadata.get("microscope_mode", "OFF")).strip().upper(),
+            microscope_ordinals=tuple(int(value) for value in metadata.get("microscope_ordinals") or ()),
             fd=fd, map_address=map_address, map_length=map_length,
             plan_install_ns=plan_install_ns,
         )
@@ -1645,6 +1870,14 @@ def build_plan(message: Mapping[str, Any], *, open_source: bool) -> _ChildPlan:
     lifecycle = str(message.get("mmap_lifecycle") or "fresh").lower()
     if lifecycle not in {"fresh", "whole"}:
         raise SourceProtocolError("unsupported_mmap_lifecycle")
+    policy = normalize_source_policy(message.get("source_policy", "CURRENT"))
+    gap_ns = configured_source_launch_gap_ns(message.get("source_launch_gap_ns", PACER_GAP_NS))
+    microscope = str(message.get("microscope_mode") or "OFF").strip().upper()
+    if microscope not in {"OFF", "SUBDIVIDED64_RESIDENCY_FORENSIC_EXACT"}:
+        raise SourceProtocolError(f"unsupported_microscope_mode:{microscope}")
+    if microscope != "OFF" and lifecycle != "whole":
+        raise SourceProtocolError("subdivided64_requires_whole_mmap")
+    selected_ordinals = tuple(int(value) for value in message.get("microscope_ordinals") or ())
     path = str(message["path"])
     identity = tuple(int(value) for value in message["identity"])
     ranges = tuple(
@@ -1652,6 +1885,14 @@ def build_plan(message: Mapping[str, Any], *, open_source: bool) -> _ChildPlan:
          int(item["destination_offset"]), item.get("record_id"))
         for item in message["ranges"]
     )
+    if microscope != "OFF":
+        full_ordinals = tuple(index for index, item in enumerate(ranges) if item[1] == SLOT_BYTES)
+        expected = (
+            (full_ordinals[0], full_ordinals[len(full_ordinals) // 2], full_ordinals[-1])
+            if len(full_ordinals) >= 3 else ()
+        )
+        if selected_ordinals != expected or len(set(selected_ordinals)) != 3:
+            raise SourceProtocolError("subdivided64_selection_mismatch")
     actual = _validate_identity(path, identity)
     validate_plan(
         tuple(SourceRange(*item) for item in ranges),
@@ -1679,7 +1920,9 @@ def build_plan(message: Mapping[str, Any], *, open_source: bool) -> _ChildPlan:
     return _ChildPlan(
         generation=int(message["generation"]), path=path, identity=actual,
         destination_size=int(message["destination_size"]), mmap_lifecycle=lifecycle,
-        ranges=ranges, fd=fd, map_address=map_address, map_length=map_length,
+        ranges=ranges, source_policy=policy, source_launch_gap_ns=gap_ns,
+        microscope_mode=microscope, microscope_ordinals=selected_ordinals,
+        fd=fd, map_address=map_address, map_length=map_length,
         plan_install_ns=time.monotonic_ns(),
     )
 
@@ -1727,11 +1970,79 @@ def execute_block(plan: _ChildPlan, arena_buf: Any, control_buf: Any, lock: Any,
         copy_address = base_address + source_offset - aligned
         temporary_map = True
     target_address = ctypes.addressof(ctypes.c_char.from_buffer(target))
+    microscope_record: dict[str, Any] | None = None
+    microscope_enabled = (
+        plan.microscope_mode == "SUBDIVIDED64_RESIDENCY_FORENSIC_EXACT"
+        and claim.range_index in plan.microscope_ordinals
+    )
+    if microscope_enabled:
+        if os.name != "posix" or plan.mmap_lifecycle != "whole" or length != SLOT_BYTES:
+            raise SourceProtocolError("subdivided64_requires_linux_whole_64mib_parent")
+        if not hasattr(_MAPPER, "mincore"):
+            raise SourceProtocolError("subdivided64_mincore_unavailable")
+        microscope_record = {
+            "ordinal": int(claim.range_index),
+            "parent_bytes": SLOT_BYTES,
+            "subdivision_bytes": SUBDIVIDE64_CHUNK_BYTES,
+            "subchunks": [],
+            "residency_fault_checkpoints": [],
+            "scope": "three_fixed_full_parent_ordinals_per_model",
+        }
+    microscope_thread_id: int | None = None
+    if microscope_enabled:
+        microscope_thread_id = int(threading.get_native_id())
+
+    def _probe(checkpoint: int) -> None:
+        if microscope_record is None:
+            return
+        aligned_offset = (source_offset // page_size) * page_size
+        window_bytes = min(256 * 1024 * 1024, max(0, plan.map_length - aligned_offset))
+        page_count = max(1, (window_bytes + page_size - 1) // page_size)
+        vector = (ctypes.c_ubyte * max(1, int(page_count)))()
+        started = time.monotonic_ns()
+        rc = int(_MAPPER.mincore(
+            ctypes.c_void_p(plan.map_address + aligned_offset),
+            ctypes.c_size_t(int(page_count) * page_size), vector,
+        ))
+        probe_ns = time.monotonic_ns() - started
+        if rc != 0:
+            raise SourceProtocolError(f"subdivided64_mincore_failed:{ctypes.get_errno()}")
+        fault_started = time.monotonic_ns()
+        faults = _thread_fault_counts(int(microscope_thread_id))
+        fault_read_ns = time.monotonic_ns() - fault_started
+        microscope_record["residency_fault_checkpoints"].append({
+            "checkpoint": int(checkpoint),
+            "resident_pages": sum(int(vector[index]) & 1 for index in range(int(page_count))),
+            "window_pages": int(page_count),
+            "probe_ns": int(probe_ns),
+            "minor_faults": int(faults[0]) if faults else None,
+            "major_faults": int(faults[1]) if faults else None,
+            "fault_read_ns": int(fault_read_ns),
+            "contamination": "diagnostic_probe_fault_read_overhead",
+        })
 
     def _copy(mark_actual_start: Any) -> int:
         start = mark_actual_start()
-        _MAPPER.memmove(ctypes.c_void_p(target_address), ctypes.c_void_p(copy_address),
-                        ctypes.c_size_t(length))
+        if microscope_record is None:
+            _MAPPER.memmove(ctypes.c_void_p(target_address), ctypes.c_void_p(copy_address), ctypes.c_size_t(length))
+        else:
+            _probe(-1)
+            for index in range(SUBDIVIDE64_CHUNK_COUNT):
+                sub_start = time.monotonic_ns()
+                _MAPPER.memmove(
+                    ctypes.c_void_p(target_address + index * SUBDIVIDE64_CHUNK_BYTES),
+                    ctypes.c_void_p(copy_address + index * SUBDIVIDE64_CHUNK_BYTES),
+                    ctypes.c_size_t(SUBDIVIDE64_CHUNK_BYTES),
+                )
+                sub_end = time.monotonic_ns()
+                microscope_record["subchunks"].append({
+                    "subchunk_index": index,
+                    "start_ns": int(sub_start),
+                    "end_ns": int(sub_end),
+                    "duration_ns": int(sub_end - sub_start),
+                })
+                if index in {0, 1, 3, 7, 15}:
+                    _probe(index)
         return start
 
     try:
@@ -1761,9 +2072,12 @@ def execute_block(plan: _ChildPlan, arena_buf: Any, control_buf: Any, lock: Any,
         del target
     # One doorbell per READY block.  The parent blocks on this line, so it
     # never polls the slot table.  It is emitted outside the control lock.
-    emit({"op": "READY_BLOCK", "slot_index": int(claim.slot_index),
-          "generation": int(claim.slot_generation), "reader_id": int(reader_id),
-          "ready_ns": int(ready_ns)})
+    ready_message = {"op": "READY_BLOCK", "slot_index": int(claim.slot_index),
+           "generation": int(claim.slot_generation), "reader_id": int(reader_id),
+           "ready_ns": int(ready_ns)}
+    if microscope_record is not None:
+        ready_message["microscope_record"] = microscope_record
+    emit(ready_message)
 
 
 def _paced_copy(pacer: Any, control_buf: Any, lock: Any, callback: Any,
@@ -2095,6 +2409,15 @@ def _child_main(arena_name: str, control_name: str, lock_path: str, kind: str = 
             if previous is not None:
                 drain_previous()
             installed = build_plan(message, open_source=(kind == "thread"))
+            if kind == "thread":
+                pacer.configure_plan(
+                    installed.generation,
+                    installed.path,
+                    installed.source_policy,
+                    installed.source_launch_gap_ns,
+                )
+            elif installed.source_policy != "CURRENT":
+                raise SourceProtocolError("phase_exact_requires_thread_readers")
             # Publish the descriptor and mapping BEFORE the control block names
             # this generation.  Readers only read the holder, so publishing
             # first guarantees a reader can never observe a header generation
@@ -2271,6 +2594,9 @@ def _reader_main(arena_name: str, control_name: str, lock_path: str, reader_id: 
             if int(metadata["generation"]) != generation:
                 return holder["plan"]
         adopted = build_plan(metadata, open_source=True)
+        if adopted.source_policy != "CURRENT":
+            raise SourceProtocolError("phase_exact_requires_thread_readers")
+        pacer.gap_ns = adopted.source_launch_gap_ns
         previous = holder["plan"]
         holder["plan"] = adopted
         retire_plan(previous)
@@ -2343,8 +2669,10 @@ if __name__ == "__main__":
 __all__ = [
     "ARENA_BYTES", "CONTROL_BYTES", "COUNTER_NAMES", "EXPERIMENT_ENV", "FREE", "FILLING",
     "FREE_MASK", "READY", "IN_FLIGHT", "PACER_GAP_NS", "READER_COUNT", "SLOT_BYTES", "SLOT_COUNT",
-    "THREAD_COUNT", "WORKER_KINDS", "WORKER_KIND_ENV", "GlobalSourcePacer", "ReadyRecord",
+    "THREAD_COUNT", "WORKER_KINDS", "WORKER_KIND_ENV", "SOURCE_POLICY_ARMS",
+    "GlobalSourcePacer", "ReadyRecord",
     "SharedSourcePacer", "SourcePlanBridge", "SourceProtocolError", "SourceRange",
     "SourceThreadProcess", "canonical_source_span", "claim_block", "enabled", "geometry",
     "new_control_buffer", "publish_ready", "validate_plan", "worker_kind",
+    "normalize_source_policy", "configured_source_launch_gap_ns", "source_experiment_context",
 ]

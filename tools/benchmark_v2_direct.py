@@ -10524,6 +10524,10 @@ def _golden_p1_request_payload(
     golden_mode: str = "serial",
     c0_mmap_lifecycle: str | None = None,
     c0_source_threads: bool | None = None,
+    source_policy: str | None = None,
+    source_launch_gap_ns: int | str | None = None,
+    microscope_mode: str | None = None,
+    qd_mode: str | None = None,
 ) -> dict[str, Any]:
     """Compatibility wrapper for the dependency-free payload builder."""
     from tools.v2_control.golden_payload import _golden_p1_request_payload as build
@@ -10538,6 +10542,10 @@ def _golden_p1_request_payload(
         golden_mode=golden_mode,
         c0_mmap_lifecycle=c0_mmap_lifecycle,
         c0_source_threads=c0_source_threads,
+        source_policy=source_policy,
+        source_launch_gap_ns=source_launch_gap_ns,
+        microscope_mode=microscope_mode,
+        qd_mode=qd_mode,
     )
 
 

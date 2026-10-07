@@ -1,0 +1,13 @@
+# v2ctl profile: explicit Golden source-control arm.
+# Request payloads still omit controls unless the caller selects this arm (or
+# passes selectors directly), preserving the byte-compatible baseline request.
+schema_version = 1
+name = "golden_p1_parallel_source_experiment_controls"
+extends = "golden_p1_parallel"
+owner = "golden-source-experiment-controls"
+
+[environment]
+COMFYMODAL_GOLDEN_SOURCE_POLICY = "CURRENT"
+COMFYMODAL_GOLDEN_SOURCE_LAUNCH_GAP_NS = "4000000"
+COMFYMODAL_GOLDEN_MICROSCOPE = "OFF"
+COMFYMODAL_GOLDEN_QD_MODE = "CURRENT"

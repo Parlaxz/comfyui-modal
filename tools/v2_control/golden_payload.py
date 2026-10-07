@@ -96,6 +96,10 @@ def _golden_p1_request_payload(
     deep_trace: bool = False,
     c0_mmap_lifecycle: str | None = None,
     c0_source_threads: bool | None = None,
+    source_policy: str | None = None,
+    source_launch_gap_ns: int | str | None = None,
+    microscope_mode: str | None = None,
+    qd_mode: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(cpu_qd2_prefetch, bool):
         raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
@@ -151,6 +155,55 @@ def _golden_p1_request_payload(
     payload["attention_backend"] = normalized
     payload["c0_mmap_lifecycle"] = lifecycle
     payload["request_origin_info"]["c0_mmap_lifecycle"] = lifecycle
+    # Experimental controls are deliberately absent from the ordinary payload.
+    # In particular, do not turn the historical implicit 4 ms floor into an
+    # explicit selector on every benchmark request.
+    control_values: dict[str, Any] = {}
+    explicit_controls = (
+        source_policy is not None
+        or source_launch_gap_ns is not None
+        or microscope_mode is not None
+        or qd_mode is not None
+    )
+    if not explicit_controls and str(
+        os.environ.get("COMFYMODAL_GOLDEN_SOURCE_EXPERIMENT", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}:
+        for key, env_name in (
+            ("source_policy", "COMFYMODAL_GOLDEN_SOURCE_POLICY"),
+            ("source_launch_gap_ns", "COMFYMODAL_GOLDEN_SOURCE_LAUNCH_GAP_NS"),
+            ("microscope_mode", "COMFYMODAL_GOLDEN_MICROSCOPE"),
+            ("qd_mode", "COMFYMODAL_GOLDEN_QD_MODE"),
+        ):
+            if env_name in os.environ:
+                control_values[key] = os.environ[env_name]
+        explicit_controls = bool(control_values)
+    else:
+        control_values = {
+            key: value for key, value in {
+                "source_policy": source_policy,
+                "source_launch_gap_ns": source_launch_gap_ns,
+                "microscope_mode": microscope_mode,
+                "qd_mode": qd_mode,
+            }.items() if value is not None
+        }
+    if explicit_controls:
+        from comfymodal_runtime.golden_experiment_controls import parse_controls
+        controls = parse_controls(control_values, explicit=True)
+        payload.update({
+            "source_policy": controls.source_policy,
+            "source_launch_gap_ns": controls.launch_gap_ns,
+            "microscope_mode": controls.microscope_mode,
+            "qd_mode": controls.qd_mode,
+        })
+        payload["request_origin_info"]["golden_source_experiment"] = dict(
+            controls.effective_description
+        )
+        payload["request_origin_info"].update({
+            "source_policy": controls.source_policy,
+            "source_launch_gap_ns": controls.launch_gap_ns,
+            "microscope_mode": controls.microscope_mode,
+            "qd_mode": controls.qd_mode,
+        })
     # Keep the control payload byte-compatible: the optional request selector
     # is emitted only for the explicit QD2 arm.
     if cpu_qd2_prefetch:

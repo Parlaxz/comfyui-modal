@@ -1346,6 +1346,8 @@ class GoldenModelTransport:
         self._c0_setup_marks = marks = {"load_enter": int(started_mono_ns)}
         from . import golden_io_process_v2 as c0
         from . import golden_qd_transport as qd_transport
+        from .golden_experiment_controls import active_controls
+        experiment_controls = active_controls()
 
         with self._lock:
             if self._poisoned:
@@ -1401,6 +1403,9 @@ class GoldenModelTransport:
                     identity=layout.identity,
                     destination_size=layout.data_bytes,
                     role=role,
+                    source_policy=(experiment_controls.source_policy if experiment_controls else "CURRENT"),
+                    source_launch_gap_ns=(experiment_controls.launch_gap_ns if experiment_controls else golden_source_threads.PACER_GAP_NS),
+                    microscope_mode=(experiment_controls.microscope_mode if experiment_controls else "OFF"),
                 )
                 marks["plan_install_end"] = time.monotonic_ns()
                 # The source pipeline span covers every range published through
@@ -1678,6 +1683,14 @@ class GoldenModelTransport:
                 },
                 "transport_lifecycle": self.lifecycle_telemetry(reused=self._load_count > 0),
             }
+            if experiment_controls is not None:
+                effective_controls = dict(experiment_controls.effective_description)
+                stats["golden_source_experiment"] = effective_controls
+                stats["source_scheduler"] = effective_controls
+            if isinstance(source_telemetry.get("microscope_scope_note"), dict):
+                stats["microscope_scope_note"] = dict(
+                    source_telemetry["microscope_scope_note"]
+                )
             self._load_count += 1
             return LoadedSafetensors(layout.path, views, owner, layout, stats)
 

@@ -213,6 +213,50 @@ owner = "golden-c0-source"
 description = "C0 source owner arm: one CUDA-sterile source process owning the 512 MiB / 8 x 64 MiB shared C0 arena, with four persistent self-serve readers. Reader isolation is selected by COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND. Default OFF; no fallback is permitted when selected."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_SOURCE_POLICY"
+type = "enum"
+default = "CURRENT"
+enum_values = ["CURRENT", "PHASE_EXACT"]
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "golden-source-experiment-controls"
+description = "Request-selectable source scheduler. CURRENT is the default and preserves the historical path; PHASE_EXACT is the committed four-reader/QD4/64MiB exact phase scheduler and fails closed when its topology is absent."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_SOURCE_LAUNCH_GAP_NS"
+type = "enum"
+default = "4000000"
+enum_values = ["4000000", "6000000", "8000000", "10000000", "15000000", "20000000"]
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "golden-source-experiment-controls"
+description = "Optional source launch floor sweep. Supported values are 4, 6, 8, 10, 15, and 20 ms; absence preserves the existing 4 ms mechanism and is not serialized into the request."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_MICROSCOPE"
+type = "enum"
+default = "OFF"
+enum_values = ["OFF", "SUBDIVIDED64_RESIDENCY_FORENSIC_EXACT"]
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "golden-source-experiment-controls"
+description = "Diagnostic-only 64 MiB parent / 16 x 4 MiB residency forensic microscope. Requires Linux probes, one whole mmap, and three distinct full parents; probe/fault overhead is reported as contamination."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_QD_MODE"
+type = "enum"
+default = "CURRENT"
+enum_values = ["CURRENT"]
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "golden-source-experiment-controls"
+description = "QD selector. Only CURRENT is implemented. TRUE_QD1, TRUE_QD1_128, LRU8_EXACT, and pure SUBDIVIDED64_EXACT are intentionally blocked and never silently substituted."
+
+[[flag]]
 name = "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND"
 type = "enum"
 default = "thread"
