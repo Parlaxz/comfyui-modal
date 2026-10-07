@@ -1,0 +1,59 @@
+{
+  "matched_logs": [
+    {
+      "file_descriptor": 3,
+      "text": "Snapshot created. Restoring Function from memory snapshot.\n",
+      "timestamp_ns": 1791409202118703604
+    },
+    {
+      "file_descriptor": 3,
+      "text": "Restoring Function from memory snapshot.\n",
+      "timestamp_ns": 1791409202583673239
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.outer] remote_method_entry t_ns=44228114284 elapsed_ms=0.002",
+      "timestamp_ns": 1791409205467604876
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.outer] pre_yield t_ns=54047161410 elapsed_ms=9819.049 detail=result",
+      "timestamp_ns": 1791409215286636829
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.outer] post_yield_resume t_ns=54057058782 elapsed_ms=9828.947",
+      "timestamp_ns": 1791409215296546698
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.outer] remote_method_return t_ns=54057193873 elapsed_ms=9829.082",
+      "timestamp_ns": 1791409215296667814
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.outer] OUTER_SUMMARY outer_wall_ms=9829.080 marks=4 first=remote_method_entry last=remote_method_return",
+      "timestamp_ns": 1791409215296732664
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.post_method] {\"clock_domain\": \"remote_process_wall_unix_ns_and_monotonic_ns\", \"durations_ms\": {\"envelope_emit_ms\": 0.007, \"release_ms\": 0.769, \"remote_to_wrapper_finally_ms\": 0.082, \"total_post_method_user_seam_ms\": 0.866, \"wrapper_finally_total_ms\": 0.784}, \"envelope_emit_begin_mono_ns\": 54058119624, \"envelope_emit_begin_wall_unix_ns\": 1791409215297560662, \"envelope_emit_end_mono_ns\": 54058127004, \"envelope_emit_end_wall_unix_ns\": 1791409215297568002, \"outer_wrapper_finally_begin_mono_ns\": 54057343884, \"outer_wrapper_finally_begin_wall_unix_ns\": 1791409215296783455, \"outer_wrapper_return_boundary_mono_ns\": 54058127438, \"outer_wrapper_return_boundary_wall_unix_ns\": 1791409215297568475, \"release_begin_mono_ns\": 54057349716, \"release_begin_wall_unix_ns\": 1791409215296790373, \"release_end_mono_ns\": 54058118574, \"release_end_wall_unix_ns\": 1791409215297559643, \"release_result\": {\"cleanup_errors\": {}, \"cuda_allocated_after\": 20760000512, \"cuda_allocated_before\": 20760000512, \"cuda_reserved_after\": 76044828672, \"cuda_reserved_before\": 76044828672, \"device_fallback_ran\": false, \"elapsed_ms\": 0.719, \"legacy_executor_reset\": false, \"legacy_workers_joined\": 0, \"preload_workers\": {\"done_before_wait\": 0, \"failed\": 0, \"pool\": {\"alive_thread_count\": 0, \"alive_threads\": [], \"pool_present\": false, \"thread_count\": 0}, \"present\": 0}, \"release_performed\": true, \"request_id\": \"\", \"stage_results\": {\"activation_references\": {\"elapsed_ms\": 0.001, \"status\": \"ok\"}, \"cuda_memory_before\": {\"elapsed_ms\": 0.349, \"status\": \"ok\"}, \"legacy_request_workers\": {\"elapsed_ms\": 0.075, \"status\": \"ok\"}, \"preload_references\": {\"elapsed_ms\": 0.011, \"status\": \"ok\"}, \"preload_workers\": {\"elapsed_ms\": 0.025, \"status\": \"ok\"}, \"request_references\": {\"elapsed_ms\": 0.157, \"status\": \"ok\"}, \"request_samplers\": {\"elapsed_ms\": 0.004, \"status\": \"ok\"}}, \"status\": \"ok\", \"teardown_mode\": \"minimal\", \"unload_all_models_ran\": false}, \"remote_method_return_mono_ns\": 54057261537, \"remote_method_return_wall_unix_ns\": 1791409215296701517, \"request_id\": \"golden-p1-0-9d3398e5a301\"}",
+      "timestamp_ns": 1791409215297744513
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[Cache] Cleared all cached merge results (0 entries removed)",
+      "timestamp_ns": 1791409216745079279
+    }
+  ],
+  "platform": {
+    "app_id": "ap-soWT6Aad5GxBRbNMAbsLhC",
+    "enqueued_at": 1791409158.100468,
+    "finished_at": 1791409223.914413,
+    "queue_to_task_start_ms": 47331.271171569824,
+    "started_at": 1791409205.431739,
+    "task_id": "ta-01M4C4WXVY191019J7K6MGRNKR",
+    "task_wall_ms": 18482.67388343811
+  },
+  "schema": "golden_lost_execution_phase2_platform_raw_v1"
+}

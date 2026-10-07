@@ -22861,6 +22861,10 @@ class ModalRuntimeEntrypoint:
         # early return) would leave the PREVIOUS request's path in place for the
         # post-yield outer-marks write below to overwrite.
         self._golden_telemetry_path = None
+        self._golden_post_method_audit = {
+            "request_id": str(request.get("request_id", "") or "") if isinstance(request, Mapping) else "",
+            "clock_domain": "remote_process_wall_unix_ns_and_monotonic_ns",
+        }
 
         # --- Golden call-envelope instrumentation (measurement only) ----------
         # Modal's UI "Execution time" covers the whole method call, but
@@ -22904,6 +22908,13 @@ class ModalRuntimeEntrypoint:
             yield event
             outer.mark("post_yield_resume")
         outer.mark("remote_method_return")
+        try:
+            _post_method_audit = getattr(self, "_golden_post_method_audit", None)
+            if isinstance(_post_method_audit, dict):
+                _post_method_audit["remote_method_return_wall_unix_ns"] = time.time_ns()
+                _post_method_audit["remote_method_return_mono_ns"] = time.monotonic_ns()
+        except Exception:
+            pass
         outer.report()
         # NOTE: a post-yield rewrite of the Golden telemetry JSON used to live
         # here.  It re-read and re-wrote the whole document on the mounted
@@ -24196,18 +24207,62 @@ def _build_decorated_v2_class() -> type:
                                     )
                             yield item
                     finally:
+                        _post_method_audit = getattr(self, "_golden_post_method_audit", None)
+                        if not isinstance(_post_method_audit, dict):
+                            _post_method_audit = {
+                                "request_id": str(kwargs.get("request_id", "") or ""),
+                                "clock_domain": "remote_process_wall_unix_ns_and_monotonic_ns",
+                            }
+                            self._golden_post_method_audit = _post_method_audit
+                        _post_method_audit["outer_wrapper_finally_begin_wall_unix_ns"] = time.time_ns()
+                        _post_method_audit["outer_wrapper_finally_begin_mono_ns"] = time.monotonic_ns()
+                        _env = None
                         if _release_on_close:
                             _env = _GOLDEN_ENVELOPE.get(
                                 str(kwargs.get("request_id", "") or "")
                             )
                             if _env is not None:
                                 _env["release_start_mono_ns"] = time.monotonic_ns()
-                            self._release_after_stream_complete(
+                            _post_method_audit["release_begin_wall_unix_ns"] = time.time_ns()
+                            _post_method_audit["release_begin_mono_ns"] = time.monotonic_ns()
+                            _release_result = self._release_after_stream_complete(
                                 request_id=str(kwargs.get("request_id", "") or ""),
                             )
-                            if _env is not None:
-                                _env["release_end_mono_ns"] = time.monotonic_ns()
-                        _emit_golden_envelope(str(kwargs.get("request_id", "") or ""))
+                            _post_method_audit["release_result"] = _release_result
+                            _post_method_audit["release_end_wall_unix_ns"] = time.time_ns()
+                            _post_method_audit["release_end_mono_ns"] = time.monotonic_ns()
+                        if _env is not None:
+                            _env["release_end_mono_ns"] = time.monotonic_ns()
+                        if "remote_method_return_mono_ns" in _post_method_audit:
+                            _post_method_audit["envelope_emit_begin_wall_unix_ns"] = time.time_ns()
+                            _post_method_audit["envelope_emit_begin_mono_ns"] = time.monotonic_ns()
+                            _emit_golden_envelope(str(kwargs.get("request_id", "") or ""))
+                            _post_method_audit["envelope_emit_end_wall_unix_ns"] = time.time_ns()
+                            _post_method_audit["envelope_emit_end_mono_ns"] = time.monotonic_ns()
+                            _post_method_audit["outer_wrapper_return_boundary_wall_unix_ns"] = time.time_ns()
+                            _post_method_audit["outer_wrapper_return_boundary_mono_ns"] = time.monotonic_ns()
+                            try:
+                                _post_method_audit["durations_ms"] = {
+                                    key.removesuffix("_mono_ns") + "_ms": round(
+                                        (_post_method_audit[end_key] - _post_method_audit[start_key]) / 1_000_000.0,
+                                        3,
+                                    )
+                                    for start_key, end_key, key in (
+                                        ("remote_method_return_mono_ns", "outer_wrapper_finally_begin_mono_ns", "remote_to_wrapper_finally"),
+                                        ("release_begin_mono_ns", "release_end_mono_ns", "release"),
+                                        ("envelope_emit_begin_mono_ns", "envelope_emit_end_mono_ns", "envelope_emit"),
+                                        ("outer_wrapper_finally_begin_mono_ns", "outer_wrapper_return_boundary_mono_ns", "wrapper_finally_total"),
+                                        ("remote_method_return_mono_ns", "outer_wrapper_return_boundary_mono_ns", "total_post_method_user_seam"),
+                                    )
+                                    if start_key in _post_method_audit and end_key in _post_method_audit
+                                }
+                            except Exception:
+                                pass
+                            print(
+                                "[v2.golden.post_method] "
+                                + json.dumps(_post_method_audit, sort_keys=True, default=str),
+                                flush=True,
+                            )
                 return _wrapper
             elif inspect.isgeneratorfunction(orig_method):
                 @functools.wraps(orig_method)

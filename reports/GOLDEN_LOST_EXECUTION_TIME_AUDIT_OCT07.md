@@ -112,7 +112,49 @@ The accounting identity is `TaskInfo task wall = pre-method + remote outer + pos
 
 ## Raw evidence
 - Per-run attempt/event artifacts: `C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.slim\worktrees\golden-lost-execution-audit\artifacts\phase_p1_parallel_golden_v1`.
-- Platform TaskInfo and task-log capture retained at `reports/GOLDEN_LOST_EXECUTION_TIME_AUDIT_OCT07_platform_raw.json`.
+- Platform TaskInfo and task-log capture retained at `C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.slim\worktrees\golden-lost-execution-audit\reports\GOLDEN_LOST_EXECUTION_TIME_AUDIT_OCT07_platform_raw.json`.
 - Deployment receipt: `C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.slim\worktrees\golden-lost-execution-audit\.v2ctl\deployments\receipt_3_00440b6df4be388452b18566c6b198ba6865e4593b9ab692a8efd8c4c5cdf414.json`.
 
 No optimization or source scheduler change was made in this audit.
+
+## Phase 2 — post-method localization
+
+### Static trace
+
+The post-method path is:
+
+`remote_method_return` (`comfymodal_runtime/modal_app.py:22906`) → dynamically installed outer async-generator wrapper `finally` (`modal_app.py:24241-24254`) → `_release_after_stream_complete` (`modal_app.py:20566-20604`) → `_run_pending_production_cleanup` (`modal_app.py:18241-18282`) → `_release_gpu_after_request` (`modal_app.py:7565-7966`) → envelope emission → Modal/framework task finalization.
+
+The release function already owns coarse stages: request samplers, preload workers, legacy workers, activation references, preload/request references, model-management unload, device fallback, model-management cleanup, legacy executor reset, garbage collection, and CUDA cleanup. The Golden profile selected `teardown_mode=minimal`, so model-management unload, device fallback, model-management cleanup, executor reset, garbage collection, and CUDA cleanup were not run in the smoke.
+
+### Cache-clear literal ownership
+
+The literal `[Cache] Cleared all cached merge results (0 entries removed)` was searched literally across the canonical worktree. It has no repository source owner. It appears in Modal task stdout after the application post-method record. `modal_client.clear_cache()` is a local handle-cache operation and does not emit this literal; it is not the owner.
+
+### Instrumented smoke — one run
+
+| Post-method segment | ms | Evidence/owner |
+|---|---:|---|
+| inner return → outer wrapper finally | 0.082 | `modal_app.py` structured post-method record |
+| final release coordinator | 0.769 | `_release_after_stream_complete` / `_release_gpu_after_request` return |
+| release sub-stages | <0.350 each | `stage_results`; minimal teardown, no model unload/CUDA cleanup |
+| envelope emit | 0.007 | structured post-method record |
+| remote return → latest user-code seam | 1.077 | remote log wall timestamps |
+| latest user-code seam → TaskInfo finish | **8,616.668** | `TaskGetInfo.finished_at - post_method_record_wall` |
+| total post-method | **8,617.745** | `TaskInfo task wall - remote outer wall` |
+| observed cache-clear log after latest user seam | 1,447.335 | platform stdout only; no source owner |
+| cache-clear log → TaskInfo finish | 7,169.334 | platform/task wall remainder |
+
+Smoke identity: `valid=true`, `true_cold=true`, exact SHA `3a6a03064c7e6e01ede339ada63daaea4cbf793f387f4faadbb101a787024577`, region `us-central`, H100, CURRENT source policy, 4 ms source launch gap, CURRENT QD mode, and QD4 geometry.
+
+### Causal conclusion
+
+The measured application-owned post-method path is sub-millisecond. The several-second interval begins after the latest user-code seam and remains after the platform cache-clear message. The cache-clear message is therefore a nearby platform/framework event, not proven ownership of the delay.
+
+**Final Phase-2 classification: PLATFORM/FRAMEWORK POST-USER-CODE GAP.** No application cleanup was removed or moved because no application function owns the measured cost. There is no safe application optimization to make in this task.
+
+### Phase-2 before/after and validation
+
+No fix was implemented because ownership was not application-owned. Therefore an after-fix cohort is not applicable. The Phase-1 six-run baseline remains the before reference: TaskInfo wall median 19.316 s, remote outer median 10.717 s, post-method median 8.715 s. The instrumented smoke preserved exactness and true-cold identity; no lifecycle/resource behavior was changed.
+
+The new raw platform/task-log evidence is retained in `reports/GOLDEN_LOST_EXECUTION_TIME_AUDIT_OCT07_platform_raw.json` and `reports/GOLDEN_LOST_EXECUTION_TIME_AUDIT_OCT07_PHASE2_SMOKE_platform_raw.json` in the audit checkout, plus the instrumented smoke's invocation-bound artifacts. No optimization code change was made.
