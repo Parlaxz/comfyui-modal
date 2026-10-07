@@ -10645,6 +10645,7 @@ async def _golden_p1_consume_stream(
     handle: Any,
     payload: dict[str, Any],
     remote_method: str = GOLDEN_P1_REMOTE_METHOD,
+    caller_timing: dict[str, Any] | None = None,
 ) -> list[Any]:
     """Call the selected Golden stream method via the existing
     app/class handle and stop at its terminal result.  Mirrors the established
@@ -10680,8 +10681,18 @@ async def _golden_p1_consume_stream(
         ait = stream.__aiter__()
         try:
             async for event in ait:
+                if caller_timing is not None:
+                    now_wall_ns = time.time_ns()
+                    now_mono_ns = time.perf_counter_ns()
+                    caller_timing["caller_first_remote_activity_wall_unix_ns"] = now_wall_ns
+                    caller_timing["caller_first_remote_activity_mono_ns"] = now_mono_ns
                 events.append(event)
                 if _golden_p1_is_terminal_result(event):
+                    if caller_timing is not None:
+                        now_wall_ns = time.time_ns()
+                        now_mono_ns = time.perf_counter_ns()
+                        caller_timing["caller_result_received_wall_unix_ns"] = now_wall_ns
+                        caller_timing["caller_result_received_mono_ns"] = now_mono_ns
                     break
         finally:
             aclose: Any = getattr(ait, "aclose", None)
@@ -10697,6 +10708,16 @@ async def _golden_p1_consume_stream(
         events.append(await stream)
     else:
         events.append(stream)
+    if caller_timing is not None and caller_timing.get("caller_result_received_mono_ns") is None:
+        now_wall_ns = time.time_ns()
+        now_mono_ns = time.perf_counter_ns()
+        caller_timing["caller_first_remote_activity_wall_unix_ns"] = now_wall_ns
+        caller_timing["caller_first_remote_activity_mono_ns"] = now_mono_ns
+        caller_timing["caller_result_received_wall_unix_ns"] = now_wall_ns
+        caller_timing["caller_result_received_mono_ns"] = now_mono_ns
+        caller_timing["caller_first_remote_activity_observation"] = (
+            "post_stream_fallback; stream adapter concealed intermediate event boundary"
+        )
     return events
 
 
@@ -11806,6 +11827,17 @@ async def _run_golden_p1(
                 "valid": False,
                 "evidence": {},
             },
+            "caller_timing": {
+                "clock_domain": "host_process_wall_unix_ns_and_perf_counter_ns",
+                "caller_invoke_begin_wall_unix_ns": None,
+                "caller_invoke_begin_mono_ns": None,
+                "caller_first_remote_activity_wall_unix_ns": None,
+                "caller_first_remote_activity_mono_ns": None,
+                "caller_result_received_wall_unix_ns": None,
+                "caller_result_received_mono_ns": None,
+                "caller_stream_closed_wall_unix_ns": None,
+                "caller_stream_closed_mono_ns": None,
+            },
         }
         attempt_start_ns = time.perf_counter_ns()
         events: list[Any] = []
@@ -11826,7 +11858,17 @@ async def _run_golden_p1(
             )
             # The selected remote stream is consumed through its terminal
             # result before dispatching the next attempt.
-            events = await _golden_p1_consume_stream(handle, payload, remote_method)
+            caller_timing = artifact["caller_timing"]
+            caller_timing["caller_invoke_begin_wall_unix_ns"] = time.time_ns()
+            caller_timing["caller_invoke_begin_mono_ns"] = time.perf_counter_ns()
+            events = await _golden_p1_consume_stream(
+                handle,
+                payload,
+                remote_method,
+                caller_timing=caller_timing,
+            )
+            caller_timing["caller_stream_closed_wall_unix_ns"] = time.time_ns()
+            caller_timing["caller_stream_closed_mono_ns"] = time.perf_counter_ns()
             artifact["event_count"] = len(events)
             artifact["golden_telemetry"] = _golden_p1_extract_telemetry(events)
             paired, pairing_status, pairing_evidence = _golden_p1_request_pairing(
