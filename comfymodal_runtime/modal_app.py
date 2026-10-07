@@ -22913,6 +22913,39 @@ class ModalRuntimeEntrypoint:
             if isinstance(_post_method_audit, dict):
                 _post_method_audit["remote_method_return_wall_unix_ns"] = time.time_ns()
                 _post_method_audit["remote_method_return_mono_ns"] = time.monotonic_ns()
+                try:
+                    _current_task = asyncio.current_task()
+                    _pending_tasks = []
+                    for _task in asyncio.all_tasks():
+                        if _task is _current_task:
+                            continue
+                        _coro = _task.get_coro()
+                        _qualname = str(getattr(_coro, "__qualname__", type(_coro).__name__))
+                        if not _task.done() or any(
+                            token in _qualname.lower()
+                            for token in ("persist", "drain", "commit", "output", "transport", "cleanup")
+                        ):
+                            _pending_tasks.append({
+                                "name": str(_task.get_name()),
+                                "qualname": _qualname,
+                                "done": bool(_task.done()),
+                                "cancelled": bool(_task.cancelled()),
+                            })
+                    _deferred_task = getattr(self, "_deferred_commit_task", None)
+                    _post_method_audit["background_inventory"] = {
+                        "asyncio_pending_or_relevant": _pending_tasks,
+                        "deferred_commit_pending": bool(getattr(self, "_deferred_commit_pending", False)),
+                        "deferred_commit_task_exists": _deferred_task is not None,
+                        "deferred_commit_task_done": bool(_deferred_task.done()) if _deferred_task is not None else None,
+                        "threads": [
+                            {"name": thread.name, "daemon": bool(thread.daemon), "alive": bool(thread.is_alive())}
+                            for thread in threading.enumerate()
+                            if thread is not threading.current_thread()
+                            and any(token in thread.name.lower() for token in ("persist", "drain", "commit", "output", "transport", "cleanup", "golden"))
+                        ],
+                    }
+                except Exception as _inventory_exc:
+                    _post_method_audit["background_inventory_error"] = type(_inventory_exc).__name__
         except Exception:
             pass
         outer.report()

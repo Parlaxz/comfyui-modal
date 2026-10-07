@@ -158,3 +158,59 @@ The measured application-owned post-method path is sub-millisecond. The several-
 No fix was implemented because ownership was not application-owned. Therefore an after-fix cohort is not applicable. The Phase-1 six-run baseline remains the before reference: TaskInfo wall median 19.316 s, remote outer median 10.717 s, post-method median 8.715 s. The instrumented smoke preserved exactness and true-cold identity; no lifecycle/resource behavior was changed.
 
 The new raw platform/task-log evidence is retained in `reports/GOLDEN_LOST_EXECUTION_TIME_AUDIT_OCT07_platform_raw.json` and `reports/GOLDEN_LOST_EXECUTION_TIME_AUDIT_OCT07_PHASE2_SMOKE_platform_raw.json` in the audit checkout, plus the instrumented smoke's invocation-bound artifacts. No optimization code change was made.
+
+## Phase 3 — surviving-work root-cause check
+
+### Corrected interpretation of Phase 2
+
+The Phase-2 latest synchronous user-code seam did not by itself prove platform ownership. Phase 3 added a direct inventory at `remote_method_return` for asyncio tasks, deferred-commit state, and relevant threads, then followed the same task to `TaskInfo.finished_at`.
+
+### Full Golden vs source-probe differential
+
+| Behavior/resource | Full Golden | Entry/source probe |
+|---|---|---|
+| Generator method | Yes; `_modal.method(is_generator=True)` | No; ordinary dict method |
+| Output encode/assembly | Yes | No |
+| Deferred output persistence | Path exists historically, but current `output_durability=off` run had no pending task | No |
+| Persistence drain | Transport supports it after early result close; no active drain was observed in this Golden smoke | No |
+| Golden teardown/telemetry | Yes | No |
+| Release wrapper | Yes | Ordinary method return |
+| Background inventory at remote return | Empty pending/relevant set | Not applicable |
+
+### Regression/introduction history
+
+Git history identifies deferred result-first persistence/drain behavior in the e28 critical-path work: `0ba7000b` / equivalent `e4be44ff`, dated 2026-08-18, with later carry-forward commits `a9a05ca9`, `37b041fa`, `bb8687d5`, and `0487ecee`. That history makes persistence a valid hypothesis, but the current measured path did not activate it because output durability was `off` and the remote-return inventory showed no deferred commit task.
+
+### Phase-3 instrumented smoke raw row
+
+| Field | Value |
+|---|---:|
+| TaskInfo task wall | 17,999.564 ms |
+| remote_method_entry → remote_method_return | 10,734.042 ms |
+| pre-method | 295.476 ms |
+| remote return → latest user seam | 0.837 ms |
+| latest user seam → TaskInfo finish | **6,969.208 ms** |
+| cache-clear log after latest user seam | 1,953.851 ms |
+| cache-clear log → TaskInfo finish | 5,015.357 ms |
+| pending asyncio tasks at remote return | `[]` |
+| deferred commit pending/task | `false` / absent |
+| relevant background threads | `[]` |
+| release duration | 0.596 ms |
+| teardown mode | minimal; model unload/CUDA cleanup not run |
+| exact SHA / true-cold | PASS / PASS |
+
+### Deferred persistence result
+
+Deferred persistence is **rejected as the current tail owner**. Static code proves that a deferred commit/drain exists for other output-durability paths, but the accepted Golden path uses `output_durability=off`; the smoke's remote-return inventory recorded no pending commit task, no persistence drain, and no relevant background thread. No persistence A/B was run because the measured current path had no persistence work to bypass.
+
+### Cache-clear result
+
+The literal cache-clear message is present in platform/task stdout and absent from canonical repository source. It is not emitted by `modal_client.clear_cache()` or a discovered custom-node source file. It is temporally after the latest user seam, but the direct inventory and release result show no corresponding repo-owned work. Its framework owner remains unidentified; it is not safe to delete application code based on this message.
+
+### Phase-3 causal classification
+
+At `remote_method_return`, the Golden process had no pending relevant asyncio tasks, no deferred commit task, and no relevant background threads. The outer wrapper then completed its release/envelope path in under 1 ms. The remaining 6.969 s is therefore bounded after the last measured repo-owned execution/resource boundary. No application cleanup fix is justified by the evidence, and no A/B removal was performed.
+
+**Phase-3 final classification: unresolved post-user-code/task-finalization gap, with repo-owned background work directly falsified for the measured path.** The cache-clear platform message remains an observation, not an attribution.
+
+Raw Phase-3 evidence is retained at `reports/GOLDEN_LOST_EXECUTION_TIME_AUDIT_OCT07_PHASE2_SMOKE_platform_raw.json`, `reports/GOLDEN_LOST_EXECUTION_TIME_AUDIT_OCT07_PHASE3_SMOKE_platform_raw.json`, and the invocation-bound smoke artifacts. No source/model/output behavior was changed.

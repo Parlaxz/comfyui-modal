@@ -1,0 +1,59 @@
+{
+  "matched_logs": [
+    {
+      "file_descriptor": 3,
+      "text": "Snapshot created. Restoring Function from memory snapshot.\n",
+      "timestamp_ns": 1791410986099868298
+    },
+    {
+      "file_descriptor": 3,
+      "text": "Restoring Function from memory snapshot.\n",
+      "timestamp_ns": 1791410986539015055
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.outer] remote_method_entry t_ns=43476224165 elapsed_ms=0.002\n",
+      "timestamp_ns": 1791410989407879353
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.outer] pre_yield t_ns=54199954548 elapsed_ms=10723.732 detail=result\n",
+      "timestamp_ns": 1791411000131604910
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.outer] post_yield_resume t_ns=54210221806 elapsed_ms=10733.999\n",
+      "timestamp_ns": 1791411000141874075
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.outer] remote_method_return t_ns=54210280904 elapsed_ms=10734.059\n",
+      "timestamp_ns": 1791411000141921759
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.outer] OUTER_SUMMARY outer_wall_ms=10734.057 marks=4 first=remote_method_entry last=remote_method_return\n",
+      "timestamp_ns": 1791411000142016888
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[v2.golden.post_method] {\"background_inventory\": {\"asyncio_pending_or_relevant\": [], \"deferred_commit_pending\": false, \"deferred_commit_task_done\": null, \"deferred_commit_task_exists\": false, \"threads\": []}, \"clock_domain\": \"remote_process_wall_unix_ns_and_monotonic_ns\", \"durations_ms\": {\"envelope_emit_ms\": 0.006, \"release_ms\": 0.629, \"remote_to_wrapper_finally_ms\": 0.095, \"total_post_method_user_seam_ms\": 0.734, \"wrapper_finally_total_ms\": 0.639}, \"envelope_emit_begin_mono_ns\": 54211029606, \"envelope_emit_begin_wall_unix_ns\": 1791411000142652635, \"envelope_emit_end_mono_ns\": 54211035170, \"envelope_emit_end_wall_unix_ns\": 1791411000142658220, \"outer_wrapper_finally_begin_mono_ns\": 54210397250, \"outer_wrapper_finally_begin_wall_unix_ns\": 1791411000142019703, \"outer_wrapper_return_boundary_mono_ns\": 54211035873, \"outer_wrapper_return_boundary_wall_unix_ns\": 1791411000142658919, \"release_begin_mono_ns\": 54210400001, \"release_begin_wall_unix_ns\": 1791411000142023004, \"release_end_mono_ns\": 54211028673, \"release_end_wall_unix_ns\": 1791411000142651513, \"release_result\": {\"cleanup_errors\": {}, \"cuda_allocated_after\": 20760000512, \"cuda_allocated_before\": 20760000512, \"cuda_reserved_after\": 76044828672, \"cuda_reserved_before\": 76044828672, \"device_fallback_ran\": false, \"elapsed_ms\": 0.596, \"legacy_executor_reset\": false, \"legacy_workers_joined\": 0, \"preload_workers\": {\"done_before_wait\": 0, \"failed\": 0, \"pool\": {\"alive_thread_count\": 0, \"alive_threads\": [], \"pool_present\": false, \"thread_count\": 0}, \"present\": 0}, \"release_performed\": true, \"request_id\": \"\", \"stage_results\": {\"activation_references\": {\"elapsed_ms\": 0.001, \"status\": \"ok\"}, \"cuda_memory_before\": {\"elapsed_ms\": 0.287, \"status\": \"ok\"}, \"legacy_request_workers\": {\"elapsed_ms\": 0.056, \"status\": \"ok\"}, \"preload_references\": {\"elapsed_ms\": 0.01, \"status\": \"ok\"}, \"preload_workers\": {\"elapsed_ms\": 0.022, \"status\": \"ok\"}, \"request_references\": {\"elapsed_ms\": 0.145, \"status\": \"ok\"}, \"request_samplers\": {\"elapsed_ms\": 0.002, \"status\": \"ok\"}}, \"status\": \"ok\", \"teardown_mode\": \"minimal\", \"unload_all_models_ran\": false}, \"remote_method_return_mono_ns\": 54210302344, \"remote_method_return_wall_unix_ns\": 1791411000141925110, \"request_id\": \"golden-p1-0-dc1dc6c18240\"}",
+      "timestamp_ns": 1791411000142758846
+    },
+    {
+      "file_descriptor": 1,
+      "text": "[Cache] Cleared all cached merge results (0 entries removed)",
+      "timestamp_ns": 1791411002096610069
+    }
+  ],
+  "platform": {
+    "app_id": "ap-soWT6Aad5GxBRbNMAbsLhC",
+    "enqueued_at": 1791410942.424018,
+    "finished_at": 1791411007.111967,
+    "queue_to_task_start_ms": 46688.385009765625,
+    "started_at": 1791410989.112403,
+    "task_id": "ta-01M4C6KCAYTAWWEP9RT71XVPER",
+    "task_wall_ms": 17999.564170837402
+  },
+  "schema": "golden_lost_execution_phase3_platform_raw_v1"
+}
