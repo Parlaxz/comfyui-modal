@@ -214,3 +214,20 @@ At `remote_method_return`, the Golden process had no pending relevant asyncio ta
 **Phase-3 final classification: unresolved post-user-code/task-finalization gap, with repo-owned background work directly falsified for the measured path.** The cache-clear platform message remains an observation, not an attribution.
 
 Raw Phase-3 evidence is retained at `reports/GOLDEN_LOST_EXECUTION_TIME_AUDIT_OCT07_PHASE2_SMOKE_platform_raw.json`, `reports/GOLDEN_LOST_EXECUTION_TIME_AUDIT_OCT07_PHASE3_SMOKE_platform_raw.json`, and the invocation-bound smoke artifacts. No source/model/output behavior was changed.
+
+### Recent profiler evidence (six runs)
+
+The existing profiler artifacts in `reports/golden_profiler_p9/` and `reports/golden_profiler_p9opt/` were inspected without new GPU calls:
+
+| Profiler set | Trace | `modal_app._wrapper` traced wall | Relevant finding |
+|---|---|---:|---|
+| P9 | `4d2d4d5a` | 2,108.614 ms | outer wrapper is traced, but no 7–10 s post-task owner |
+| P9 | `b94149a5` | 1,341.163 ms | same |
+| P9 | `bc298e38` | 1,398.627 ms | same |
+| P9opt | `ddb6c39a` | 1,630.776 ms | same |
+| P9opt | `ad2f1cf4` | 1,313.539 ms | same |
+| P9opt | `25172b0c` | 1,126.898 ms | same |
+
+Across those traces, `GoldenQDTransport.finalize_external_ready`/`drain` are at most tens of milliseconds in the relevant call trees; no deferred persistence finalizer or application release function spans the measured 7–10 s tail. `EpollSelector.select` appears as blocking wait inside traced stage/worker activity, not as a post-return owner. The profiler README explicitly states that traced walls are heavily inflated, Python-frame-only, and stage-scoped; it is ranking evidence, not a measurement of the TaskInfo post-method tail.
+
+Profiler conclusion: these six runs do not identify an application owner for the remaining tail and do not justify an optimization change. They reinforce that the expensive inner Golden stages are separate from the post-return TaskInfo interval.
