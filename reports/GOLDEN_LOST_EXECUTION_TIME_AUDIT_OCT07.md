@@ -232,6 +232,22 @@ Across those traces, `GoldenQDTransport.finalize_external_ready`/`drain` are at 
 
 Profiler conclusion: these six runs do not identify an application owner for the remaining tail and do not justify an optimization change. They reinforce that the expensive inner Golden stages are separate from the post-return TaskInfo interval.
 
+### True latest-user-code endpoint
+
+The exit-fallback trace `ad3704549be54b289131bb10cef4e636` is paired with TaskInfo task `ta-01M4C9QEBRE52EWGSCPYDM3W6R`:
+
+| Boundary | Wall time | Evidence |
+|---|---:|---|
+| profiler request start | 23:04:31.056 | `session_events.jsonl` |
+| Golden request return milestone | 23:04:43.174 | `session_events.jsonl` |
+| exit trace finalization / profiler stop | 23:04:59.569 | `session_events.jsonl` |
+| TaskInfo finished_at | 23:05:21.664 | `TaskGetInfo` |
+| latest user-profiler seam → TaskInfo finish | **22,094.374 ms** | derived from same wall domain |
+
+The profiler was alive through the latest user-controlled `exit()` lifecycle seam and stopped there. The remaining 22.094 s occurred after the profiler had stopped and after the process's user lifecycle callback completed. This is the strongest available E2E bound; it is not evidence of a hidden Python callback.
+
+The first A→B attempt is retained as a rejected orchestration attempt because B was dispatched before A's TaskInfo `finished_at`; it proved the session could span A into B but did not prove the A task endpoint. The exit-fallback trace supplies the valid latest-user-code bound above.
+
 ## Phase 4 — true E2E lifetime profiling
 
 ### E2E profiler implementation and scope
