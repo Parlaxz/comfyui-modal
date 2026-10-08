@@ -231,3 +231,44 @@ The existing profiler artifacts in `reports/golden_profiler_p9/` and `reports/go
 Across those traces, `GoldenQDTransport.finalize_external_ready`/`drain` are at most tens of milliseconds in the relevant call trees; no deferred persistence finalizer or application release function spans the measured 7–10 s tail. `EpollSelector.select` appears as blocking wait inside traced stage/worker activity, not as a post-return owner. The profiler README explicitly states that traced walls are heavily inflated, Python-frame-only, and stage-scoped; it is ranking evidence, not a measurement of the TaskInfo post-method tail.
 
 Profiler conclusion: these six runs do not identify an application owner for the remaining tail and do not justify an optimization change. They reinforce that the expensive inner Golden stages are separate from the post-return TaskInfo interval.
+
+## Phase 4 — true E2E lifetime profiling
+
+### E2E profiler implementation and scope
+
+The existing `FullExecutionTraceSession` / VizTracer implementation was reused with its existing blacklist, `ignore_c_function=True`, `log_async=True`, thread handoff, and 2,000,000-entry diagnostic capacity. Request A kept the session alive; a later diagnostic dump/exit path stopped and packaged it. The first successful package contained 961,165 events, `truncated=false`, one process, 20/20 traced lanes, and proven clock alignment. The trace covered the request-to-dump lifetime, but the first B orchestration occurred before A's TaskInfo endpoint; the later exit fallback produced a second artifact. No further E2E run was launched after the trace was opened and analyzed.
+
+Artifacts:
+
+- `96a800516f1247499d845fd60c3534cf`: 961,165 events, valid package, root wall 11,072.697 ms.
+- `ad3704549be54b289131bb10cef4e636`: 907,782 events, valid package, root wall 11,883.315 ms.
+
+Both traces report incomplete-call warnings but `ROOT_COMPLETE=true`; neither is treated as exhaustive proof of native/platform work.
+
+### E2E profiler finding
+
+The trace shows a concrete background thread created by the full Golden path:
+
+| Owner | Evidence | Duration/span |
+|---|---|---:|
+| `tqdm.TMonitor` | created by `tqdm.__new__` from RES4LYF `trange` at trace offset 6,085.24 ms | thread span 20,001.213 ms |
+| `TMonitor.run` | two `threading.Event.wait` intervals | 10,000.828 ms + 10,000.187 ms |
+| Thread identity | `parent/tid:106:tqdm_monitor`, daemon thread | 20,001.213 ms |
+
+The monitor is created from the RES4LYF sampler path (`RES4LYF.beta.rk_noise_sampler_beta` / `trange`). This is real post-request-surviving Python-thread activity in the E2E trace, but its causal relationship to TaskInfo completion was tested before retaining a fix.
+
+### Surgical treatment and validation
+
+The diagnostic treatment set tqdm's `monitor_interval=0` and closed any pre-existing monitor before Golden execution. It preserved output generation and source/model behavior.
+
+| Run | TaskInfo wall ms | Remote outer ms | Post-return tail ms | External restore ms | SHA | TRUE-COLD |
+|---|---:|---:|---:|---:|---|---|
+| Smoke | 17,382.288 | 9,725.401 | 7,629.716 | 1,328.477 | PASS | PASS |
+| Accepted 1 | 17,373.902 | 10,093.886 | 7,029.711 | 1,194.959 | PASS | PASS |
+| Accepted 2 | 17,765.600 | 10,625.793 | 7,098.968 | 919.231 | PASS | PASS |
+
+Before Phase-1 median post-return tail: **8,715.4 ms**. After tqdm treatment median: **7,098.968 ms**. The tail remains multi-second and the treatment is not accepted as the root-cause fix; the temporary tqdm change was reverted. Exact SHA and true-cold correctness remained intact.
+
+### Phase-4 conclusion
+
+The E2E profiler successfully crossed the previous inner-profiler boundary and exposed `tqdm.TMonitor`, but the surgical disable did not collapse the tail to the target range. The monitor is therefore a rejected sole-owner hypothesis. No fix is retained from this attempt. Remaining work is a deeper end-to-end/native/task-finalization investigation; no broad experiment family was started.
