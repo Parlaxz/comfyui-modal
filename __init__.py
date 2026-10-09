@@ -7476,7 +7476,17 @@ if _server:
         name = str(request.query.get("profile") or "").strip()
         job = _golden_deploy_jobs.get(name)
         if job is None:
-            return web.json_response({"status": "ok", "profile": name, "state": "unknown"})
+            record = _golden_deploy_record(name)
+            if record is None:
+                return web.json_response({"status": "ok", "profile": name, "state": "unknown"})
+            return web.json_response({
+                "status": "ok",
+                "profile": name,
+                "state": "done" if record.get("deployed") else "unknown",
+                "deployed": bool(record.get("deployed")),
+                "target": record.get("target") or {},
+                "durable_receipt": bool(record.get("deployed")),
+            })
         return web.json_response({"status": "ok", **job})
 
     @_server.routes.get("/comfymodal/studio/run-progress/{request_id}")

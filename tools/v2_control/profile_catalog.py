@@ -220,7 +220,12 @@ def _catalog_signature(root: Path) -> tuple:
                 pass
     except OSError:
         pass
-    return (sig_receipts, (count, newest))
+    target = root / "config" / "v2" / "modal_target.toml"
+    try:
+        sig_target = (target.stat().st_mtime_ns, target.stat().st_size)
+    except OSError:
+        sig_target = (0, 0)
+    return (sig_receipts, (count, newest), sig_target)
 
 
 def invalidate_catalog_cache() -> None:

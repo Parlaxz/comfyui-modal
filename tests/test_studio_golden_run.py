@@ -82,6 +82,45 @@ memory_mb = 24576
     }
 
 
+def test_catalog_cache_tracks_modal_destination_changes(tmp_path, monkeypatch) -> None:
+    profiles_dir = tmp_path / "config" / "v2" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    config_dir = tmp_path / "config" / "v2"
+    registry = config_dir / "flag_registry.toml"
+    registry.write_text(
+        (Path(__file__).parents[1] / "config" / "v2" / "flag_registry.toml").read_text(),
+        encoding="utf-8",
+    )
+    (profiles_dir / "golden.toml").write_text(
+        """schema_version = 1
+name = "golden"
+owner = "test"
+[target]
+app = "test-golden"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
+[resources]
+gpu = "H100"
+cpu = 12
+memory_mb = 24576
+""",
+        encoding="utf-8",
+    )
+    target = config_dir / "modal_target.toml"
+    target.write_text(
+        '[modal]\nworkspace_id = "legacy"\nworkspace_label = "Legacy"\nenvironment = "(default)"\n',
+        encoding="utf-8",
+    )
+    profile_catalog.invalidate_catalog_cache()
+    first_signature = profile_catalog._catalog_signature(tmp_path)
+    target.write_text(
+        '[modal]\nworkspace_id = "testing"\nworkspace_label = "Testing"\nenvironment = "(default)"\n',
+        encoding="utf-8",
+    )
+    second_signature = profile_catalog._catalog_signature(tmp_path)
+    assert first_signature != second_signature
+
+
 def test_unknown_method_fails_closed(tmp_path) -> None:
     profiles_dir = tmp_path / "config" / "v2" / "profiles"
     profiles_dir.mkdir(parents=True)
