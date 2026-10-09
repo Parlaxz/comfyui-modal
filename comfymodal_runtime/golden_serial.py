@@ -9536,10 +9536,49 @@ def resolve_golden_node_map(
             if isinstance(node_info, Mapping):
                 _count_links(node_info.get("inputs") or {})
 
-        chosen_id, chosen_class = max(
-            sampler_candidates,
-            key=lambda item: (referenced[item[0]], item[1] == "KSampler", item[0]),
-        )
+        consumers: dict[str, set[str]] = {node_id: set() for node_id, _ in sampler_candidates}
+
+        def _collect_links(value: Any, consumer_id: str) -> None:
+            if _is_link(value) and str(value[0]) in consumers:
+                consumers[str(value[0])].add(consumer_id)
+            elif isinstance(value, Mapping):
+                for nested in value.values():
+                    _collect_links(nested, consumer_id)
+            elif isinstance(value, (list, tuple)):
+                for nested in value:
+                    _collect_links(nested, consumer_id)
+
+        for consumer_id, node_info in prompt.items():
+            if isinstance(node_info, Mapping):
+                _collect_links(node_info.get("inputs") or {}, str(consumer_id))
+
+        vae_decode_ids = {str(node_id) for node_id in matches["vae_decode"]}
+
+        def _reaches_decode(node_id: str) -> tuple[bool, int]:
+            frontier = [(node_id, 0)]
+            visited = {node_id}
+            while frontier:
+                current, depth = frontier.pop(0)
+                if current in vae_decode_ids:
+                    return True, depth
+                for child in consumers.get(current, set()):
+                    if child not in visited:
+                        visited.add(child)
+                        frontier.append((child, depth + 1))
+            return False, -1
+
+        def _sampler_score(item: tuple[str, str]) -> tuple[int, int, int, bool, str]:
+            node_id, class_type = item
+            reaches_decode, depth = _reaches_decode(node_id)
+            return (
+                int(reaches_decode),
+                int(depth >= 0),
+                referenced[node_id],
+                class_type == "KSampler",
+                node_id,
+            )
+
+        chosen_id, chosen_class = max(sampler_candidates, key=_sampler_score)
         matches["sampler"] = [chosen_id]
         sampler_class_type = chosen_class
     else:
@@ -15176,6 +15215,78 @@ def _volume_rel_path_for_checked_asset(asset_path: str, mount_root: str) -> str:
     return _normalize_volume_rel_path(relative)
 
 
+async def _resolve_golden_output_images(
+    session: GoldenSession,
+    node_map: GoldenNodeMap,
+    classes: dict,
+    rec: GoldenTelemetryRecorder,
+) -> Any:
+    """Resolve the workflow's image terminal without requiring SaveImage wiring."""
+    save_nodes = [
+        (nid, info)
+        for nid, info in session.request.prompt.items()
+        if str(info.get("class_type")) == "SaveImage"
+    ]
+    if len(save_nodes) != 1:
+        images = getattr(session, "images", None)
+        if images is None or not hasattr(images, "cpu"):
+            raise RuntimeError("workflow_image_terminal_missing")
+        session.output_node_id = str(node_map.vae_decode_id)
+        rec.event(
+            "output_direct_vae_decode",
+            output_node_id=str(node_map.vae_decode_id),
+            reason="no_single_saveimage_terminal",
+        )
+        return images
+
+    save_id, save_info = save_nodes[0]
+    session.output_node_id = str(save_id)
+    images_link = (save_info.get("inputs") or {}).get("images")
+    if not _is_link(images_link) or int(images_link[1]) != 0:
+        raise RuntimeError("saveimage_images_link_mismatch")
+    switch_id = str(images_link[0])
+    switch_info = session.request.prompt.get(switch_id)
+    if switch_info is None:
+        raise RuntimeError("saveimage_passthrough_node_missing")
+    if str(switch_info.get("class_type")) != "Any Switch (rgthree)":
+        raise RuntimeError(
+            f"saveimage_passthrough_class_mismatch:{switch_info.get('class_type')}"
+        )
+    any_02 = (switch_info.get("inputs") or {}).get("any_02")
+    if not (
+        _is_link(any_02)
+        and str(any_02[0]) == str(node_map.vae_decode_id)
+        and int(any_02[1]) == 0
+    ):
+        raise RuntimeError("saveimage_passthrough_selected_input_mismatch")
+    save_class_def = classes.get("SaveImage")
+    save_fn_name = getattr(save_class_def, "FUNCTION", None)
+    if not save_fn_name or not callable(getattr(save_class_def, save_fn_name, None)):
+        raise RuntimeError("saveimage_contract_invalid")
+    executed = await session.runner.run_closure(switch_id, include_target=True)
+    _assert_runner_quiescence(session.runner)
+    executed_ids = [nid for nid, _cls, _sc in executed]
+    if switch_id not in executed_ids:
+        raise RuntimeError("saveimage_passthrough_did_not_execute")
+    if str(node_map.vae_decode_id) not in session.runner.cache:
+        raise RuntimeError("vae_decode_cache_missing_for_output_branch")
+    branch_entry = session.runner.cache.get(switch_id)
+    if branch_entry is None or not branch_entry.outputs:
+        raise RuntimeError("output_branch_output_missing")
+    branch_socket = branch_entry.outputs[0]
+    images = branch_socket[0] if isinstance(branch_socket, list) else branch_socket
+    if not hasattr(images, "cpu"):
+        raise RuntimeError("output_branch_not_image_tensor")
+    rec.event(
+        "output_branch_executed",
+        saveimage_node=str(save_id),
+        passthrough_node=switch_id,
+        passthrough_class="Any Switch (rgthree)",
+        executed_nodes=executed_ids,
+    )
+    return images
+
+
 async def golden_output(session: GoldenSession) -> PendingDurability | ReadyOutputArtifact:
     """Level-1 PNG from the decoded Comfy IMAGE tensor with EXACT current
     upstream output encoding semantics (255*scale, clip, uint8,
@@ -15210,75 +15321,13 @@ async def golden_output(session: GoldenSession) -> PendingDurability | ReadyOutp
         from PIL import Image  # third-party
         from PIL.PngImagePlugin import PngInfo  # third-party
 
-        # Explicit canonical output-branch validation (SaveImage itself is
-        # never executed).
         if session.runner is None:
             raise RuntimeError("output_requires_runner")
         node_map = session.node_map
         if node_map is None:
             raise RuntimeError("output_requires_node_map")
         classes = session.runner._classes()
-        save_nodes = [
-            (nid, info)
-            for nid, info in session.request.prompt.items()
-            if str(info.get("class_type")) == "SaveImage"
-        ]
-        if len(save_nodes) != 1:
-            raise RuntimeError(f"saveimage_node_ambiguous:{len(save_nodes)}")
-        save_id, save_info = save_nodes[0]
-        session.output_node_id = str(save_id)
-        images_link = (save_info.get("inputs") or {}).get("images")
-        if not _is_link(images_link):
-            raise RuntimeError("saveimage_images_link_mismatch")
-        if int(images_link[1]) != 0:
-            raise RuntimeError("saveimage_images_socket_mismatch")
-        switch_id = str(images_link[0])
-        switch_info = session.request.prompt.get(switch_id)
-        if switch_info is None:
-            raise RuntimeError("saveimage_passthrough_node_missing")
-        if str(switch_info.get("class_type")) != "Any Switch (rgthree)":
-            raise RuntimeError(
-                f"saveimage_passthrough_class_mismatch:{switch_info.get('class_type')}"
-            )
-        any_02 = (switch_info.get("inputs") or {}).get("any_02")
-        if not (
-            _is_link(any_02)
-            and str(any_02[0]) == str(node_map.vae_decode_id)
-            and int(any_02[1]) == 0
-        ):
-            raise RuntimeError("saveimage_passthrough_selected_input_mismatch")
-        try:
-            save_class_def = classes["SaveImage"]
-        except KeyError:
-            raise RuntimeError("saveimage_class_not_registered") from None
-        save_fn_name = getattr(save_class_def, "FUNCTION", None)
-        if not save_fn_name or not callable(getattr(save_class_def, save_fn_name, None)):
-            raise RuntimeError("saveimage_contract_invalid")
-
-        # Execute ONLY the pass-through node, one node at a time; VAEDecode is
-        # already cached so nothing upstream re-executes, and SaveImage node
-        # itself stays unexecuted (no uncontrolled duplicate output).
-        executed = await session.runner.run_closure(switch_id, include_target=True)
-        _assert_runner_quiescence(session.runner)
-        executed_ids = [nid for nid, _cls, _sc in executed]
-        if switch_id not in executed_ids:
-            raise RuntimeError("saveimage_passthrough_did_not_execute")
-        if str(node_map.vae_decode_id) not in session.runner.cache:
-            raise RuntimeError("vae_decode_cache_missing_for_output_branch")
-        branch_entry = session.runner.cache.get(switch_id)
-        if branch_entry is None or not branch_entry.outputs:
-            raise RuntimeError("output_branch_output_missing")
-        branch_socket = branch_entry.outputs[0]
-        images = branch_socket[0] if isinstance(branch_socket, list) else branch_socket
-        if not hasattr(images, "cpu"):
-            raise RuntimeError("output_branch_not_image_tensor")
-        rec.event(
-            "output_branch_executed",
-            saveimage_node=str(save_id),
-            passthrough_node=switch_id,
-            passthrough_class="Any Switch (rgthree)",
-            executed_nodes=executed_ids,
-        )
+        images = await _resolve_golden_output_images(session, node_map, classes, rec)
 
         # Exact upstream SaveImage.save_images conversion + encoding.
         i = 255.0 * images.detach().cpu().numpy()
