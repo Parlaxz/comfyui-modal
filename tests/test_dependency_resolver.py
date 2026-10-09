@@ -10,6 +10,7 @@ module is registered in ``sys.modules`` so core classes (e.g.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import os
 import sys
@@ -162,6 +163,24 @@ class DependencyResolverTestCase(unittest.TestCase):
                 }
             ]
         )
+
+    def _write_catalog(self, classes_by_repo: dict) -> None:
+        """Seed a fake Manager class catalog (extension-node-map.json shape).
+
+        ``classes_by_repo`` maps a repository URL to its backend class list.
+        A class absent from every list is unknown to the ecosystem catalog.
+        """
+        path = (
+            self.comfyui_root
+            / "custom_nodes"
+            / "comfyui-manager"
+            / "extension-node-map.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            repo: [list(classes), {}] for repo, classes in classes_by_repo.items()
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
 
     def _inject_requirements(self, version_id: str, requirements: dict) -> dict:
         """Mutate the stored version's dependency_metadata (test-only)."""
@@ -810,7 +829,7 @@ class DependencyResolverTestCase(unittest.TestCase):
         self.assertEqual(gamma[0]["classes"], ["NestedGammaClass"])
 
     @pytest.mark.fast_unit
-    def test_stored_graph_nested_virtual_panel_excluded(self):
+    def test_stored_graph_empty_shape_class_stays_missing(self):
         nested_graph = {
             "nodes": [],
             "definitions": {
@@ -838,9 +857,9 @@ class DependencyResolverTestCase(unittest.TestCase):
         }
         result = self.resolver.resolve_version(version)
         names = [n["name"] for n in result["custom_nodes"]]
-        self.assertNotIn("NestedPanel", names)
-        self.assertIn("NestedPanel", [u["name"] for u in result["unresolvable"]])
-        self.assertEqual(result["summary"]["attention"], 0)
+        self.assertIn("NestedPanel", names)
+        self.assertEqual(result["unresolvable"], [])
+        self.assertEqual(result["summary"]["attention"], 1)
 
     @pytest.mark.fast_unit
     def test_stored_graph_nested_only_nodes_union_into_version(self):
@@ -979,9 +998,23 @@ class DependencyResolverTestCase(unittest.TestCase):
     # ── 24. stored UI-graph virtual panels: unresolvable, not missing ─────
 
     def test_graph_virtual_panels_unresolvable_not_missing(self):
-        """The live Donut shape: real executable nodes keep their inputs/
-        outputs; workflow-only panels have empty inputs/outputs and no pack
-        identity. Only the real nodes may become missing packs."""
+        """Classes no known backend provides are advisory, whatever the shape.
+
+        The catalog maps the real backend classes; the UI panels and the
+        JS-only Set/Get nodes appear in the executable prompt and carry
+        links, yet no backend provides them. Catalog evidence — not graph
+        shape, not a name list — keeps them out of Missing.
+        """
+        self._write_catalog(
+            {
+                "https://example.com/donut": [
+                    "DonutEditStudio",
+                    "DonutReferenceStudio",
+                    "DonutImageSave",
+                    "BackendlessGraphClass",
+                ],
+            }
+        )
         version = {
             "workflow_version_id": "wv_virtual_panels",
             "executable_prompt": {
@@ -994,9 +1027,11 @@ class DependencyResolverTestCase(unittest.TestCase):
                     {"id": 1, "type": "DonutEditStudio", "inputs": [{"name": "image", "link": None}], "outputs": [{"name": "IMAGE"}]},
                     {"id": 2, "type": "DonutReferenceStudio", "inputs": [{"name": "image", "link": None}], "outputs": [{"name": "IMAGE"}]},
                     {"id": 3, "type": "DonutImageSave", "inputs": [{"name": "images", "link": None}], "outputs": []},
-                    {"id": 4, "type": "DonutWorkflowPanel", "inputs": [], "outputs": []},
+                    {"id": 4, "type": "DonutWorkflowPanel", "inputs": [{"name": "x", "link": 1}], "outputs": [{"name": "Y"}], "properties": {"cnr_id": "donutnodes"}},
                     {"id": 5, "type": "DonutLatestPreview", "inputs": [], "outputs": []},
                     {"id": 6, "type": "DonutModelDownloads", "inputs": [], "outputs": []},
+                    {"id": 7, "type": "SetNode", "inputs": [{"name": "x", "link": 1}], "outputs": [{"name": "Y"}]},
+                    {"id": 8, "type": "GetNode", "inputs": [], "outputs": [{"name": "Y"}], "properties": {"aux_id": "some-pack"}},
                 ]
             },
             "dependency_metadata": {
@@ -1004,52 +1039,81 @@ class DependencyResolverTestCase(unittest.TestCase):
                 "node_classes": [
                     "DonutEditStudio", "DonutReferenceStudio", "DonutImageSave",
                     "DonutWorkflowPanel", "DonutLatestPreview", "DonutModelDownloads",
+                    "SetNode", "GetNode", "BackendlessGraphClass",
                 ],
             },
         }
-        result = self.resolver.resolve_version(version)
+        result = self.resolver.resolve_version(version, remote={})
         missing = sorted(
             n["name"] for n in result["custom_nodes"] if n["state"] == "missing"
         )
         self.assertEqual(
-            missing, ["DonutEditStudio", "DonutImageSave", "DonutReferenceStudio"]
+            missing,
+            [
+                "BackendlessGraphClass",
+                "DonutEditStudio",
+                "DonutImageSave",
+                "DonutReferenceStudio",
+            ],
         )
-        virtual = {u["name"] for u in result["unresolvable"]}
-        self.assertEqual(
-            virtual,
-            {"DonutWorkflowPanel", "DonutLatestPreview", "DonutModelDownloads"},
-        )
-        self.assertEqual(result["summary"]["attention"], 3)
-        reasons = self.resolver.reasons_for(version)
-        for name in ("DonutWorkflowPanel", "DonutLatestPreview", "DonutModelDownloads"):
-            self.assertFalse(any(name in r for r in reasons), name + " inflated reasons")
+        unres = {u["name"]: u["reason"] for u in result["unresolvable"]}
+        for name in (
+            "DonutWorkflowPanel",
+            "DonutLatestPreview",
+            "DonutModelDownloads",
+            "SetNode",
+            "GetNode",
+        ):
+            self.assertNotIn(name, [n["name"] for n in result["custom_nodes"]])
+            self.assertIn(name, unres)
+            self.assertIn("no known backend", unres[name])
+        # A stale pack claim is surfaced, not trusted: GetNode's aux identity
+        # names the claimant instead of becoming an install target.
+        self.assertIn("some-pack", unres["GetNode"])
+        self.assertEqual(result["summary"]["attention"], 4)
+        reasons = self.resolver.reasons_for(version, remote={})
+        for name in ("SetNode", "GetNode", "DonutLatestPreview"):
+            self.assertFalse(any(name in r for r in reasons))
 
     def test_graph_empty_input_node_in_executable_stays_missing(self):
-        """Safety: a class that consumes an executable input stays a real
-        dependency even when its graph node carries empty inputs/outputs."""
+        """A catalog-mapped class blocks even when every panel around it is advisory."""
+        self._write_catalog({"https://example.com/donut": ["DonutWidgetOnly"]})
         version = {
             "workflow_version_id": "wv_empty_real",
             "executable_prompt": {
-                "1": {"class_type": "DonutWidgetOnly", "inputs": {"model": ["2", 0]}}
+                "1": {"class_type": "DonutWidgetOnly", "inputs": {"model": ["2", 0]}},
+                "2": {"class_type": "DonutWorkflowPanel", "inputs": {"model": ["2", 0]}},
+                "3": {"class_type": "SetNode", "inputs": {"value": ["2", 0]}},
+                "4": {"class_type": "GetNode", "inputs": {"value": ["2", 0]}},
             },
             "graph_json": {
                 "nodes": [
                     {"id": 1, "type": "DonutWidgetOnly", "inputs": [], "outputs": []},
+                    {"id": 2, "type": "DonutWorkflowPanel", "inputs": [], "outputs": []},
+                    {"id": 3, "type": "SetNode", "inputs": [], "outputs": []},
+                    {"id": 4, "type": "GetNode", "inputs": [], "outputs": []},
                 ]
             },
             "dependency_metadata": {
                 "model_stack": {},
-                "node_classes": ["DonutWidgetOnly"],
+                "node_classes": ["DonutWidgetOnly", "DonutWorkflowPanel", "SetNode", "GetNode"],
             },
         }
-        nodes = self.resolver.resolve_custom_nodes(version)
+        nodes = self.resolver.resolve_custom_nodes(version, remote={})
         self.assertEqual([n["state"] for n in nodes], ["missing"])
         self.assertEqual([n["name"] for n in nodes], ["DonutWidgetOnly"])
-        self.assertEqual(self.resolver.unresolvable_classes(version), [])
+        unres = {u["name"] for u in self.resolver.unresolvable_classes(version)}
+        self.assertEqual(unres, {"DonutWorkflowPanel", "SetNode", "GetNode"})
 
     def test_graph_empty_input_node_with_identity_stays_missing(self):
-        """Safety: an empty-input/outputs node carrying cnr_id/aux_id is a real
-        pack dependency, never a virtual panel."""
+        """A stale pack claim never becomes an install target.
+
+        DonutPanel is catalog-mapped, so its cnr identity means a real
+        missing pack. DonutWorkflowPanel/SetNode/GetNode are unknown to
+        every backend: their identities name claimants in the advisory
+        reason instead of producing Missing rows.
+        """
+        self._write_catalog({"https://example.com/donut": ["DonutPanel"]})
         version = {
             "workflow_version_id": "wv_empty_identity",
             "executable_prompt": {},
@@ -1062,19 +1126,46 @@ class DependencyResolverTestCase(unittest.TestCase):
                         "outputs": [],
                         "properties": {"cnr_id": "donutnodes"},
                     },
+                    {
+                        "id": 2,
+                        "type": "DonutWorkflowPanel",
+                        "inputs": [],
+                        "outputs": [],
+                        "properties": {"cnr_id": "donutnodes"},
+                    },
+                    {
+                        "id": 3,
+                        "type": "SetNode",
+                        "inputs": [],
+                        "outputs": [],
+                        "properties": {"aux_id": "donutnodes"},
+                    },
+                    {
+                        "id": 4,
+                        "type": "GetNode",
+                        "inputs": [],
+                        "outputs": [],
+                        "properties": {"aux_id": "donutnodes"},
+                    },
                 ]
             },
-            "dependency_metadata": {"model_stack": {}, "node_classes": ["DonutPanel"]},
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": ["DonutPanel", "DonutWorkflowPanel", "SetNode", "GetNode"],
+            },
         }
-        nodes = self.resolver.resolve_custom_nodes(version)
+        nodes = self.resolver.resolve_custom_nodes(version, remote={})
         self.assertEqual(len(nodes), 1)
         self.assertEqual(nodes[0]["state"], "missing")
         self.assertEqual(nodes[0]["cnr_id"], "donutnodes")
-        self.assertEqual(self.resolver.unresolvable_classes(version), [])
+        unres = {u["name"]: u["reason"] for u in self.resolver.unresolvable_classes(version)}
+        self.assertEqual(
+            set(unres), {"DonutWorkflowPanel", "SetNode", "GetNode"}
+        )
+        self.assertIn("donutnodes", unres["DonutWorkflowPanel"])
 
     def test_graph_real_shape_node_absent_from_executable_stays_missing(self):
-        """Safety: a node with real inputs/outputs but absent from the
-        executable prompt is still a dependency, not a virtual panel."""
+        """Without a catalog the resolver fails closed to Missing."""
         version = {
             "workflow_version_id": "wv_graph_real",
             "executable_prompt": {},
@@ -1093,9 +1184,98 @@ class DependencyResolverTestCase(unittest.TestCase):
                 "node_classes": ["DonutHiddenLoader"],
             },
         }
-        nodes = self.resolver.resolve_custom_nodes(version)
+        nodes = self.resolver.resolve_custom_nodes(version, remote={})
         self.assertEqual([n["state"] for n in nodes], ["missing"])
         self.assertEqual(self.resolver.unresolvable_classes(version), [])
+
+    def test_catalog_unmapped_class_is_advisory_not_missing(self):
+        """A loaded catalog that knows no such class keeps it out of Missing."""
+        self._write_catalog({"https://example.com/other": ["SomeRealClass"]})
+        version = {
+            "workflow_version_id": "wv_catalog_advisory",
+            "executable_prompt": {
+                "1": {"class_type": "DonutHiddenLoader", "inputs": {"model": ["1", 0]}},
+                "2": {"class_type": "SomeRealClass", "inputs": {}},
+            },
+            "graph_json": {"nodes": []},
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": ["DonutHiddenLoader", "SomeRealClass"],
+            },
+        }
+        result = self.resolver.resolve_version(version, remote={})
+        missing = [n["name"] for n in result["custom_nodes"] if n["state"] == "missing"]
+        self.assertEqual(missing, ["SomeRealClass"])
+        unres = {u["name"] for u in result["unresolvable"]}
+        self.assertIn("DonutHiddenLoader", unres)
+        self.assertEqual(result["summary"]["attention"], 1)
+
+    def test_stale_pack_identity_is_advisory_with_claimant(self):
+        """The KJNodes Set/Get regression: installed pack, backend-less class.
+
+        The registry proves the pack is installed yet provides no such
+        class, and the catalog maps no backend for it. The stale aux_id
+        is reported as a claim, never as an install target.
+        """
+        self._seed_registry()
+        self._write_catalog(
+            {"https://github.com/kijai/ComfyUI-KJNodes": ["SomeCustomClass"]}
+        )
+        version = {
+            "workflow_version_id": "wv_stale_identity",
+            "executable_prompt": {
+                "1": {"class_type": "SetNode", "inputs": {"v": ["2", 0]}},
+                "2": {"class_type": "SomeCustomClass", "inputs": {}},
+            },
+            "graph_json": {"nodes": []},
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": ["SetNode", "SomeCustomClass"],
+                "custom_node_requirements": {
+                    "SetNode": {"aux_id": "kijai/ComfyUI-KJNodes"},
+                },
+            },
+        }
+        result = self.resolver.resolve_version(version, remote={})
+        states = {n["name"]: n["state"] for n in result["custom_nodes"]}
+        self.assertEqual(states.get("ComfyUI-KJNodes"), "installed")
+        self.assertNotIn("SetNode", [n["name"] for n in result["custom_nodes"]])
+        unres = {u["name"]: u["reason"] for u in result["unresolvable"]}
+        self.assertIn("SetNode", unres)
+        self.assertIn("kijai/ComfyUI-KJNodes", unres["SetNode"])
+        self.assertTrue(result["summary"]["ready"])
+        self.assertEqual(self.resolver.reasons_for(version, remote={}), [])
+
+    def test_catalog_mapped_missing_class_blocks(self):
+        """The detail-daemon contract: catalog-mapped but not installed => Missing."""
+        self._write_catalog(
+            {"https://github.com/Jonseed/ComfyUI-Detail-Daemon": ["DetailDaemonSamplerNode"]}
+        )
+        version = {
+            "workflow_version_id": "wv_mapped_missing",
+            "executable_prompt": {
+                "1": {"class_type": "DetailDaemonSamplerNode", "inputs": {"x": ["1", 0]}},
+            },
+            "graph_json": {"nodes": []},
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": ["DetailDaemonSamplerNode"],
+                "custom_node_requirements": {
+                    "DetailDaemonSamplerNode": {
+                        "cnr_id": "comfyui-detail-daemon",
+                        "aux_id": "Jonseed/ComfyUI-Detail-Daemon",
+                    },
+                },
+            },
+        }
+        result = self.resolver.resolve_version(version, remote={})
+        missing = [n for n in result["custom_nodes"] if n["state"] == "missing"]
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(result["unresolvable"], [])
+        self.assertFalse(result["summary"]["ready"])
+        self.assertTrue(
+            any("comfyui-detail-daemon" in r for r in self.resolver.reasons_for(version, remote={}))
+        )
 
     # ── 24b. stored graph node types union into declared classes ─────────
 
@@ -1146,8 +1326,13 @@ class DependencyResolverTestCase(unittest.TestCase):
         self.assertEqual(result["summary"]["attention"], 2)
 
     def test_stored_graph_virtual_classes_excluded_from_union(self):
-        """The union must not turn a graph-only virtual panel into a fake
-        missing pack; it stays in unresolvable and out of attention."""
+        """Unioned graph classes are judged by backend evidence, not shape.
+
+        DonutImageSave is catalog-mapped, so it stays Missing. The panel
+        and the backend-less unioned class are unknown to every backend,
+        so they surface as advisory instead of blocking.
+        """
+        self._write_catalog({"https://example.com/donut": ["DonutImageSave"]})
         version = {
             "workflow_version_id": "wv_graph_union_virtual",
             "executable_prompt": {"1": {"class_type": "DonutImageSave", "inputs": {}}},
@@ -1159,7 +1344,8 @@ class DependencyResolverTestCase(unittest.TestCase):
                         "inputs": [{"name": "images", "link": None}],
                         "outputs": [],
                     },
-                    {"id": 2, "type": "DonutWorkflowPanel", "inputs": [], "outputs": []},
+                    {"id": 2, "type": "DonutWorkflowPanel", "inputs": [{"name": "x", "link": 1}], "outputs": [{"name": "Y"}], "properties": {"cnr_id": "donutnodes"}},
+                    {"id": 3, "type": "UnionBackendlessClass", "inputs": [], "outputs": []},
                 ],
             },
             "dependency_metadata": {
@@ -1167,11 +1353,11 @@ class DependencyResolverTestCase(unittest.TestCase):
                 "node_classes": ["DonutImageSave"],
             },
         }
-        result = self.resolver.resolve_version(version)
+        result = self.resolver.resolve_version(version, remote={})
         missing = [n["name"] for n in result["custom_nodes"] if n["state"] == "missing"]
         self.assertEqual(missing, ["DonutImageSave"])
-        virtual = [u["name"] for u in result["unresolvable"]]
-        self.assertEqual(virtual, ["DonutWorkflowPanel"])
+        unres = {u["name"] for u in result["unresolvable"]}
+        self.assertEqual(unres, {"DonutWorkflowPanel", "UnionBackendlessClass"})
         self.assertEqual(result["summary"]["attention"], 1)
 
     def test_synthetic_manager_mapped_missing_packs_group(self):
@@ -1318,6 +1504,12 @@ class DependencyResolverTestCase(unittest.TestCase):
     # ── 27. executable no-op panels are excluded like graph virtuals ─────
 
     def test_virtual_panels_with_empty_executable_inputs_excluded(self):
+        """Panels are advisory by catalog evidence, even inside the executable prompt."""
+        self._write_catalog(
+            {
+                "https://example.com/donut": ["DonutEditStudio", "BackendlessPanel"],
+            }
+        )
         version = {
             "workflow_version_id": "wv_live_virtual",
             "executable_prompt": {
@@ -1346,16 +1538,19 @@ class DependencyResolverTestCase(unittest.TestCase):
                     "DonutLatestPreview",
                     "DonutModelDownloads",
                     "DonutEditStudio",
+                    "BackendlessPanel",
                 ],
             },
         }
-        result = self.resolver.resolve_version(version)
+        result = self.resolver.resolve_version(version, remote={})
         names = [n["name"] for n in result["custom_nodes"]]
         unres = {u["name"] for u in result["unresolvable"]}
         for panel in ("DonutWorkflowPanel", "DonutLatestPreview", "DonutModelDownloads"):
             self.assertNotIn(panel, names, panel + " must not become a dependency")
-            self.assertNotIn(panel, unres, panel + " must not be reported as a dep")
+            self.assertIn(panel, unres, panel + " stays visible as advisory")
         self.assertIn("DonutEditStudio", names)
+        self.assertIn("BackendlessPanel", names)
+        self.assertEqual(result["summary"]["attention"], 2)
 
     # ── remote inventory reconciliation ──────────────────────────────────
     #
@@ -1765,8 +1960,10 @@ class DependencyResolverTestCase(unittest.TestCase):
             self.resolver.overrides.set_keys("wf_branches", set())
 
     def test_unresolvable_classes_are_untouched_by_remote(self):
-        # A graph artifact can never be a pack, so a remote inventory must not
-        # promote it into an installed dependency or clear it from the skip list.
+        # A class no backend provides can never be a pack, so a remote
+        # inventory must not promote it into an installed dependency. It
+        # stays visible as advisory instead.
+        self._write_catalog({"https://example.com/other": ["SomeRealClass"]})
         version = {
             "workflow_version_id": "wv_artifact",
             "executable_prompt": {},
@@ -1783,6 +1980,7 @@ class DependencyResolverTestCase(unittest.TestCase):
         )
         self.assertEqual(remote["custom_nodes"], [])
         self.assertEqual([u["name"] for u in remote["unresolvable"]], ["DonutLatestPreview"])
+        self.assertTrue(remote["summary"]["ready"])
 
     # ── version state and the report must agree ──────────────────────────
 

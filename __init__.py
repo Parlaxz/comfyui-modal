@@ -4561,6 +4561,23 @@ if _server:
             registry = _workspace_store.set_active_workspace(_WORKSPACES_FILE, body.get("workspace_id", ""))
         except KeyError as e:
             return web.json_response({"status": "error", "message": str(e)}, status=400)
+
+        # Workspace selection changes which Modal volume is authoritative. Drop
+        # the old snapshot and force one get_volume_status-backed read for the
+        # new workspace. remote_inventory's generation check prevents an older
+        # in-flight read from repopulating the cache after a later mutation;
+        # refresh failure is deliberately non-fatal to activation.
+        try:
+            import remote_inventory
+
+            remote_inventory.invalidate()
+            await remote_inventory.get_inventory(ttl_s=0)
+        except Exception:
+            pass
+
+        # A concurrent activation may have completed while the remote read was
+        # in flight. The registry is the response authority, so read it again.
+        registry = _workspace_registry()
         return web.json_response({
             "status": "ok",
             "active_workspace_id": registry.get("active_workspace_id"),

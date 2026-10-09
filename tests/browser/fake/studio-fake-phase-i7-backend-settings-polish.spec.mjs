@@ -157,7 +157,7 @@ test.describe("I7 Backend & Settings accessibility/loading/copy polish", () => {
       );
       expect(backendCensus).toEqual(["H2"]);
 
-      // Settings: sole h2 is the page title; the seven sections stay h3 and
+      // Settings: sole h2 is the page title; the five tab panels stay h3 and
       // the Runtime & Backend group stays h4 (frozen hierarchy).
       await t.gotoPage("settings");
       await expectOffscreenHeading(page, "settings-page-title", "Settings");
@@ -169,7 +169,7 @@ test.describe("I7 Backend & Settings accessibility/loading/copy polish", () => {
         };
       });
       expect(settingsCensus.tags.filter((tag) => tag === "H2")).toEqual(["H2"]);
-      expect(settingsCensus.tags.filter((tag) => tag === "H3").length).toBe(7);
+      expect(settingsCensus.tags.filter((tag) => tag === "H3").length).toBe(5);
       expect(settingsCensus.tags.filter((tag) => tag === "H4")).toEqual(["H4"]);
       expect(settingsCensus.texts).not.toContain("Backend");
       t.assertNoConsoleErrors();
@@ -273,7 +273,6 @@ test.describe("I7 Backend & Settings accessibility/loading/copy polish", () => {
       for (const expected of [
         "Reset Generation section",
         "Reset Outputs section",
-        "Reset History section",
         "Reset Interface section",
         "Reset Advanced section",
       ]) {
@@ -290,41 +289,36 @@ test.describe("I7 Backend & Settings accessibility/loading/copy polish", () => {
       const visibleTexts = await resets.evaluateAll((els) =>
         els.map((el) => el.textContent.trim()),
       );
-      expect(visibleTexts.filter((txt) => txt === "Reset section").length).toBe(5);
+      expect(visibleTexts.filter((txt) => txt === "Reset section").length).toBe(4);
       t.assertNoConsoleErrors();
     } finally {
       t.guard.dispose();
     }
   });
 
-  test("D. frozen wording rows render verbatim in Settings", async ({ page }) => {
+  test("D. Settings controls remain grouped under the five intended tabs", async ({ page }) => {
     const t = await setupFakeTest(page);
     try {
       await t.gotoPage("settings");
       const host = page.locator(".comfymodal-settings-sections");
       await expect(host).toBeVisible({ timeout: 15000 });
 
-      await expect(
-        host.getByText("Primary navigation: Playground / History / Workflows / Backend / Settings."),
-      ).toHaveCount(1);
-      await expect(host.getByText("Run history is stored locally and is kept until you delete it.")).toHaveCount(1);
-      await expect(
-        host.getByText("Experiments run up to 6 cells concurrently. Per-experiment overrides are not available."),
-      ).toHaveCount(1);
-
-      // Retired implementation-speak phrasing stays gone.
-      await expect(host.getByText(/no retention limit setting exists today/)).toHaveCount(0);
-      await expect(host.getByText(/fixed global backend width/)).toHaveCount(0);
-      await expect(host.getByText(/Backend remains available in navigation/)).toHaveCount(0);
-
-      // Frozen vocabulary preserved: preset systems keep their names.
-      await expect(host.getByText(/Workflow Presets/)).toHaveCount(0); // not renamed INTO settings copy
-      const runtimeGroupText = await page
-        .locator(".comfymodal-settings-group", { hasText: "Runtime & Backend" })
-        .textContent();
-      expect(runtimeGroupText).toContain("Deploy state");
-      expect(runtimeGroupText).toContain("Snapshots");
-      expect(runtimeGroupText).toContain("Presets");
+      await expect(host.locator('[data-section="generation"]')).toBeVisible();
+      await expect(host.locator('[data-section="outputs"]')).toBeHidden();
+      await expect(host.locator('[data-section="accounts"]')).toBeHidden();
+      await expect(host.locator('[data-section="interface"]')).toBeHidden();
+      await expect(host.locator('[data-section="advanced"]')).toBeHidden();
+      await expect(host.locator('[data-testid="settings-gpu"]')).toBeVisible();
+      await page.locator('#settings-tab-outputs').click();
+      await expect(host.locator('[data-testid="settings-output-format"]')).toBeVisible({ timeout: 10000 });
+      await page.locator('#settings-tab-accounts').click();
+      await expect(host.locator('[data-testid="backend-credentials"]')).toBeVisible();
+      await page.locator('#settings-tab-interface').click();
+      await expect(host.locator('[data-testid="settings-history-columns"]')).toBeVisible();
+      await expect(host.locator('[data-testid="settings-remote-inventory-refresh"]')).toBeVisible();
+      await page.locator('#settings-tab-advanced').click();
+      await expect(host.locator('[data-testid="settings-heavy-tracing"]')).toBeVisible();
+      await expect(host.locator('[data-testid="settings-open-workspaces"]')).toBeVisible();
       t.assertNoConsoleErrors();
     } finally {
       t.guard.dispose();
@@ -466,6 +460,7 @@ test.describe("I7 Backend & Settings accessibility/loading/copy polish", () => {
       // preset rows are informational; no provider selector, no legacy UI.
       await expect(page.getByRole("button", { name: /providers/i })).toHaveCount(0);
       await expect(page.locator(".comfymodal-studio-settings").getByText("Legacy Settings")).toHaveCount(0);
+      await page.locator('#settings-tab-advanced').click();
       await expect(page.locator('[data-testid="settings-reset-all"]')).toBeVisible();
 
       // The retired compatibility count fetch must NOT reappear in traffic.

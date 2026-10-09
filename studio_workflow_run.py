@@ -1029,6 +1029,15 @@ async def _modern_save_history_success(
     )
     actual_run_id = record.get("run_id", run_history_id) if record else run_history_id
 
+    # Bridge the run to its History V2 generation for the frontend: run
+    # responses carry only run-scoped ids, while History renders by
+    # generation id, and nothing else links the two.  Attached onto the
+    # result dict so it flows into the strict-JSON-validated response below.
+    if isinstance(result, dict) and isinstance(record, dict):
+        _bridged_gen_id = record.get("history_generation_id")
+        if _bridged_gen_id:
+            result["history_generation_id"] = str(_bridged_gen_id)
+
     # Completed => required History output association for modern
     # output-producing runs: the nonterminal ``running`` record must already
     # carry a visible output (path-attached original and/or adopted producer

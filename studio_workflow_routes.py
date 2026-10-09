@@ -16,7 +16,10 @@ Domain invariants enforced by the service (never re-implemented here):
 * Presets are tied to their Version and only move forward via copy-forward.
 * Incomplete Versions/Presets are saved but report ``state.runnable=false``.
 
-Route summary (all under ``/comfymodal/studio/workflows``):
+Route summary (all under ``/comfymodal/studio``):
+
+    Inventory:
+        GET   /comfymodal/studio/inventory/refresh                    -- refresh cache status
 
     Workflows:
         GET   /comfymodal/studio/workflows                            -- list/search
@@ -74,6 +77,7 @@ import json
 import logging
 import copy
 import asyncio
+import math
 from pathlib import Path
 from typing import Any
 
@@ -195,7 +199,9 @@ _LIST_OMITTED_FIELDS = frozenset({"static_graph"})
 
 
 def _enrich_workflow_summary(
-    service: WorkflowDomainService, raw: dict[str, Any]
+    service: WorkflowDomainService,
+    raw: dict[str, Any],
+    preloaded_versions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Lightweight summary for library lists (no heavy per-item enrichment)."""
     summary = {
@@ -204,7 +210,11 @@ def _enrich_workflow_summary(
         if field not in _LIST_OMITTED_FIELDS
     }
     workflow_id = str(raw.get("workflow_id", ""))
-    versions = service.store.list_versions_for_workflow(workflow_id)
+    versions = (
+        preloaded_versions
+        if preloaded_versions is not None
+        else service.store.list_versions_for_workflow(workflow_id)
+    )
     summary["version_count"] = len(versions)
     latest_id = str(raw.get("latest_version_id", ""))
     latest = None
@@ -222,77 +232,45 @@ def _enrich_workflow_summary(
     return summary
 
 
-_REMOTE_INVENTORY_WARM_TASK: "asyncio.Task[None] | None" = None
-
-
-async def _remote_inventory_refresher(interval_s: float = 15.0) -> None:
-    """Keep the Modal volume snapshot warm off the request path.
-
-    ``remote_inventory`` caches for only ``TTL_S`` (30s), so a snapshot that is
-    not being refreshed goes stale and the next reader pays a cold Modal round
-    trip. That round trip was the reason restoring a persisted Playground
-    selection took ~40s: the read-only workflow routes await it, so the store
-    stays empty until it completes.
-
-    Removing the await is not an option - gating needs the snapshot, and
-    returning early leaves Run permanently disabled. Instead this refresher
-    keeps the cache populated, so the routes' own ``get_inventory`` becomes a
-    cache hit. Failures stay silent: version state falls back to local truth.
-    """
-    while True:
-        try:
-            await remote_inventory.get_inventory()
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            _log.debug("Remote inventory warm refresh failed", exc_info=True)
-        await asyncio.sleep(interval_s)
-
-
-def _ensure_remote_inventory_warm() -> None:
-    """Start the refresher once, on the first async route call.
-
-    Deliberately not called at registration time: routes are registered during
-    module import, before any event loop is running, so there is no loop to
-    create a task on. Every caller is a coroutine, so the running loop is
-    guaranteed here.
-    """
-    global _REMOTE_INVENTORY_WARM_TASK
-    task = _REMOTE_INVENTORY_WARM_TASK
-    if task is not None and not task.done():
-        return
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    # Retain the task: asyncio only holds a weak reference, so it could
-    # otherwise be collected mid-flight and silently stop refreshing.
-    _REMOTE_INVENTORY_WARM_TASK = loop.create_task(_remote_inventory_refresher())
-
-
 async def _refresh_remote_inventory() -> None:
     """Refresh the shared Modal volume snapshot that version state reads.
 
     Version state is derived on synchronous paths, so it consults the last
-    snapshot instead of paying its own round trip. Every read-only route that
-    reports state refreshes here so the version card and the dependency report
-    can never disagree. Cached, so a page of routes costs one call. A failure
-    is silent: state then falls back to local-only truth.
+    snapshot instead of paying its own round trip. Routes that require current
+    state refresh here so the version card and dependency report can agree.
+    Cached, so a page of routes costs one call. A failure is logged: state then
+    falls back to local-only truth.
 
-    The await is retained on purpose - gating needs this snapshot, and skipping
-    it left Run permanently disabled. ``_ensure_remote_inventory_warm`` keeps
-    the cache populated so this call is normally a cache hit rather than a
-    cold Modal round trip.
+    Callers may schedule this without awaiting it when the inventory is not on
+    their critical path.
     """
     try:
-        await remote_inventory.get_inventory()
+        inventory = await remote_inventory.get_inventory()
+        if inventory is None:
+            _log.error("Remote inventory refresh failed: no inventory available")
     except Exception:  # noqa: BLE001
-        _log.debug("Remote inventory refresh failed", exc_info=True)
-    finally:
-        # Keep the snapshot warm so later reads are cache hits rather than cold
-        # Modal round trips. Started after the first fetch so the very first
-        # read still gets real data (gating needs it) but does not pay again.
-        _ensure_remote_inventory_warm()
+        _log.exception("Remote inventory refresh failed")
+
+
+def _inventory_ttl_from_query(request: web.Request) -> tuple[float | None, str | None]:
+    """Validate the client-controlled inventory freshness window."""
+    values = [
+        request.query.get(name)
+        for name in ("max_age", "max-age", "ttl")
+        if request.query.get(name) is not None
+    ]
+    if len(values) > 1 and len(set(values)) != 1:
+        return None, "Provide only one inventory TTL/max-age value"
+    raw = values[0] if values else None
+    if raw in (None, ""):
+        return remote_inventory.TTL_S, None
+    try:
+        ttl_s = float(raw)
+    except (TypeError, ValueError):
+        return None, "max_age must be a finite number of seconds"
+    if not math.isfinite(ttl_s) or ttl_s < 0 or ttl_s > 86400:
+        return None, "max_age must be between 0 and 86400 seconds"
+    return ttl_s, None
 
 
 def register_workflow_routes(
@@ -344,13 +322,35 @@ def register_workflow_routes(
             custom_node_registry_generation_source=registry_generation_source,
         )
 
+    @server.routes.get("/comfymodal/studio/inventory/refresh")
+    async def inventory_refresh(request: web.Request) -> web.Response:
+        """Client-triggered cache refresh without returning inventory data."""
+        ttl_s, error = _inventory_ttl_from_query(request)
+        if error:
+            return _json_error(400, error)
+        if ttl_s is None:
+            return _json_error(400, "Invalid inventory TTL/max-age")
+        try:
+            inventory = await remote_inventory.get_inventory(ttl_s=ttl_s)
+        except Exception:  # noqa: BLE001 — keep this status endpoint fail-safe
+            _log.debug("Remote inventory refresh failed", exc_info=True)
+            inventory = None
+        return web.json_response({
+            "status": "ok",
+            "available": inventory is not None,
+        })
+
     # ── Workflows ─────────────────────────────────────────────────────
 
     @server.routes.get("/comfymodal/studio/workflows")
     async def workflows_list(request: web.Request) -> web.Response:
         try:
-            await _refresh_remote_inventory()
             workflows = service.list_workflows()
+            versions_by_workflow: dict[str, list[dict[str, Any]]] = {}
+            for version in service.store.list_versions():
+                versions_by_workflow.setdefault(
+                    str(version.get("workflow_id", "")), []
+                ).append(version)
             search = (request.query.get("search") or "").strip().lower()
             tag = (request.query.get("tag") or "").strip()
             folder = (request.query.get("folder") or "").strip()
@@ -369,14 +369,24 @@ def register_workflow_routes(
                     continue
                 if favorite_only and not wf.get("favorite"):
                     continue
-                enriched.append(_enrich_workflow_summary(service, wf))
+                enriched.append(
+                    _enrich_workflow_summary(
+                        service,
+                        wf,
+                        versions_by_workflow.get(str(wf.get("workflow_id", "")), []),
+                    )
+                )
             # Derived-only list chips: cache reads only, ZERO live analysis.
             summaries = portability.workflow_portability_summaries(enriched)
             for row in enriched:
                 row["portability_summary"] = summaries.get(
                     str(row.get("workflow_id", ""))
                 )
-            return web.json_response({"status": "ok", "workflows": enriched})
+            response = web.json_response({"status": "ok", "workflows": enriched})
+            # Inventory is useful to derived state, but is not needed to serve
+            # this local list. Refresh it without adding it to the critical path.
+            asyncio.create_task(_refresh_remote_inventory())
+            return response
         except Exception as exc:  # noqa: BLE001
             _log.exception("Workflow list failed")
             status, message = _domain_status(exc)
@@ -561,7 +571,7 @@ def register_workflow_routes(
         wf_id = request.match_info.get("workflow_id", "")
         version_id = request.query.get("version_id") or ""
         try:
-            await _refresh_remote_inventory()
+            asyncio.create_task(_refresh_remote_inventory())
             workflow = service.get_workflow(wf_id)
             if not version_id:
                 version_id = str(workflow.get("latest_version_id", ""))
@@ -606,7 +616,7 @@ def register_workflow_routes(
     async def versions_list(request: web.Request) -> web.Response:
         wf_id = request.match_info.get("workflow_id", "")
         try:
-            await _refresh_remote_inventory()
+            asyncio.create_task(_refresh_remote_inventory())
             versions = service.list_versions(wf_id)
             return web.json_response({"status": "ok", "versions": versions})
         except WorkflowNotFoundError as exc:

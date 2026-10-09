@@ -1,16 +1,16 @@
 // Modal Studio — Settings E2E Tests
 //
-// Tests the redesigned seven-section Settings page (web/studio-settings.js)
+// Tests the redesigned five-tab Settings page (web/studio-settings.js)
 // against the in-memory mock API. Mock is installed BEFORE navigation per
 // isolation contract.
 //
 // DOM contract under test:
-//   - Seven sections: div.comfymodal-studio-settings-section[data-section=...]
-//   - Search input filters [data-search] rows and hides empty sections
+//   - Five tabs/panels: div.comfymodal-studio-settings-section[data-section=...]
+//   - Search input filters [data-search] rows and groups matches by tab
 //   - Outputs host populates asynchronously from /comfymodal/config
 //   - Persistence is localStorage-backed (flat keys) + POST /comfymodal/config
 //   - "Reset all settings" clears only MODERN_SETTINGS_KEYS (user data intact)
-//   - Legacy settings panels are reachable through the Advanced section
+//   - Accounts & Tokens owns credential controls; Advanced owns runtime links
 //   - Heavy-tracing banner reflects stored-vs-effective level mismatch
 
 import { test, expect } from "@playwright/test";
@@ -40,7 +40,12 @@ async function openSettings(page) {
   await openStudio(page, COMFYUI_URL);
   await waitVisible(page.locator('[data-testid="studio-page"]'));
   await page.locator('[data-page="settings"]').click();
-  await waitVisible(page.locator('[data-section="general"]'));
+  await waitVisible(page.locator('[data-section="generation"]'));
+}
+
+async function selectSettingsTab(page, tab) {
+  await page.locator(`#settings-tab-${tab}`).click();
+  await expect(page.locator(`[data-section="${tab}"]`)).toBeVisible({ timeout: 5000 });
 }
 
 /** Read a localStorage key from the page. */
@@ -55,22 +60,25 @@ test.describe("Studio Settings (redesigned)", () => {
     await installStudioMockApi(page);
   });
 
-  // ── Test 1: Section layout ───────────────────────────────────────────────
-  test("renders all seven settings sections", async ({ page }) => {
+  // ── Test 1: Tab layout ────────────────────────────────────────────────────
+  test("renders all five settings tabs and panels", async ({ page }) => {
     let guard;
     try {
       await openSettings(page);
       guard = installConsoleGuard(page);
 
-      // Seven data-section sections, one per id
+      // Five data-section panels, one per tab id
       const sections = page.locator(".comfymodal-settings-sections [data-section]");
-      await expect(sections).toHaveCount(7, { timeout: 10000 });
+      await expect(sections).toHaveCount(5, { timeout: 10000 });
       for (const id of [
-        "general", "generation", "outputs", "history",
-        "experiments", "interface", "advanced",
+        "generation", "outputs", "accounts", "interface", "advanced",
       ]) {
         await expect(page.locator(`[data-section="${id}"]`)).toHaveCount(1);
+        await expect(page.locator(`#settings-tab-${id}`)).toHaveAttribute("role", "tab");
       }
+      await expect(page.locator('[role="tablist"] [role="tab"]')).toHaveCount(5);
+      await expect(page.locator('[data-section="generation"]')).toBeVisible();
+      await expect(page.locator('[data-section="outputs"]')).toBeHidden();
 
       // Search input with the expected placeholder
       const search = page.locator('[data-testid="settings-search"]');
@@ -84,38 +92,42 @@ test.describe("Studio Settings (redesigned)", () => {
   });
 
   // ── Test 2: Search filtering ─────────────────────────────────────────────
-  test("search filters rows and sections", async ({ page }) => {
+  test("search groups matches across tabs and clearing restores the selected tab", async ({ page }) => {
     let guard;
     try {
       await openSettings(page);
       guard = installConsoleGuard(page);
 
       const search = page.locator('[data-testid="settings-search"]');
-      const general = page.locator('[data-section="general"]');
-      const experiments = page.locator('[data-section="experiments"]');
+      const generation = page.locator('[data-section="generation"]');
+      const outputs = page.locator('[data-section="outputs"]');
+      const interfaceTab = page.locator('[data-section="interface"]');
       const advanced = page.locator('[data-section="advanced"]');
       const results = page.locator('[data-testid="settings-search-results"]');
 
-      // "concurrent" → Experiments visible, General hidden
-      // (the row copy reads "...cells concurrently", so search the stem)
-      await search.fill("concurrent");
-      await expect(experiments).toBeVisible({ timeout: 5000 });
-      await expect(general).toBeHidden();
+      // Search is global: a history match reveals Interface even though
+      // Generation is the selected tab.
+      await search.fill("history");
+      await expect(interfaceTab).toBeVisible({ timeout: 5000 });
+      await expect(generation).toBeHidden();
+      await expect(results).toContainText("Interface");
+      await expect(results).toContainText("matching setting");
 
-      // "legacy" → Advanced visible (contains the legacy group), General hidden
-      await search.fill("legacy");
+      // A runtime match is grouped under Advanced.
+      await search.fill("workspace");
       await expect(advanced).toBeVisible({ timeout: 5000 });
-      await expect(general).toBeHidden();
+      await expect(generation).toBeHidden();
+      await expect(results).toContainText("Advanced");
 
-      // Clearing restores every section
+      // Clearing restores the selected Generation tab, not every panel.
       await search.fill("");
-      await expect(general).toBeVisible({ timeout: 5000 });
-      await expect(advanced).toBeVisible();
+      await expect(generation).toBeVisible({ timeout: 5000 });
+      await expect(outputs).toBeHidden();
 
       // No matches → the empty-state line
       await search.fill("zzzznope");
       await expect(results).toHaveText("No settings match your search");
-      await expect(general).toBeHidden();
+      await expect(generation).toBeHidden();
 
       guard.assertNoErrors(APP_NOISE_PATTERNS);
     } finally {
@@ -128,6 +140,7 @@ test.describe("Studio Settings (redesigned)", () => {
     let guard;
     try {
       await openSettings(page);
+      await selectSettingsTab(page, "outputs");
 
       // Wait for the async outputs host to populate
       const formatSelect = page.locator('[data-testid="settings-output-format"]');
@@ -200,6 +213,7 @@ test.describe("Studio Settings (redesigned)", () => {
     let guard;
     try {
       await openSettings(page);
+      await selectSettingsTab(page, "interface");
       const columns = page.locator('[data-testid="settings-history-columns"]');
       await waitVisible(columns);
       guard = installConsoleGuard(page);
@@ -209,12 +223,37 @@ test.describe("Studio Settings (redesigned)", () => {
         .poll(() => readLocalStorage(page, "comfymodal-studio-history-columns"))
         .toBe("4");
 
-      // Reset History → select returns to default 6 and the key is removed
-      await page.locator('[data-testid="settings-reset-history"]').click();
+      // Reset Interface → select returns to default 6 and the key is removed
+      await page.locator('[data-testid="settings-reset-interface"]').click();
       await expect(columns).toHaveValue("6", { timeout: 5000 });
       await expect
         .poll(() => readLocalStorage(page, "comfymodal-studio-history-columns"))
         .toBeNull();
+
+      guard.assertNoErrors(APP_NOISE_PATTERNS);
+    } finally {
+      if (guard) guard.dispose();
+    }
+  });
+
+  test("remote inventory refresh offers a five-minute default and resets", async ({ page }) => {
+    let guard;
+    try {
+      await openSettings(page);
+      await selectSettingsTab(page, "interface");
+      const refresh = page.locator('[data-testid="settings-remote-inventory-refresh"]');
+      await waitVisible(refresh);
+      guard = installConsoleGuard(page);
+
+      await expect(refresh).toHaveValue("300");
+      await expect(refresh.locator("option")).toHaveText(["Off", "1 minute", "5 minutes", "15 minutes", "30 minutes"]);
+      await refresh.selectOption("60");
+      await expect.poll(() => readLocalStorage(page, "comfymodal_remote_inventory_refresh_interval_s")).toBe("60");
+
+      page.once("dialog", (dialog) => dialog.accept());
+      await page.locator('[data-testid="settings-reset-interface"]').click();
+      await expect.poll(() => readLocalStorage(page, "comfymodal_remote_inventory_refresh_interval_s")).toBeNull();
+      await expect(refresh).toHaveValue("300");
 
       guard.assertNoErrors(APP_NOISE_PATTERNS);
     } finally {
@@ -227,6 +266,7 @@ test.describe("Studio Settings (redesigned)", () => {
     let guard;
     try {
       await openSettings(page);
+      await selectSettingsTab(page, "advanced");
       guard = installConsoleGuard(page);
 
       // Reset-all has two distinct contracts, asserted separately:
@@ -302,19 +342,20 @@ test.describe("Studio Settings (redesigned)", () => {
     }
   });
 
-  // ── Test 7: Modern and legacy output settings stay synchronized ──────────
-  test("modern and legacy output settings stay synchronized", async ({ page }) => {
+  // ── Test 7: Modern and shared output settings stay synchronized ──────────
+  test("modern and shared output settings stay synchronized", async ({ page }) => {
     let guard;
     try {
       await openSettings(page);
+      await selectSettingsTab(page, "outputs");
       const formatSelect = page.locator('[data-testid="settings-output-format"]');
       await formatSelect.waitFor({ state: "visible", timeout: 15000 });
       guard = installConsoleGuard(page);
 
       await formatSelect.selectOption("jpeg");
 
-      // The same localStorage key + window object the legacy panel writes to —
-      // one source of truth for both surfaces.
+      // The same localStorage key + window object the shared output helper
+      // writes to — one source of truth for all output surfaces.
       await expect
         .poll(() => readLocalStorage(page, "comfymodal_output_format"))
         .toBe("jpeg");
@@ -335,6 +376,7 @@ test.describe("Studio Settings (redesigned)", () => {
     let guard;
     try {
       await openSettings(page);
+      await selectSettingsTab(page, "advanced");
       guard = installConsoleGuard(page);
 
       const banner = page.locator('[data-testid="settings-restart-banner"]');

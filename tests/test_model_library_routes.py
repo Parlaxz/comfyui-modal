@@ -926,6 +926,35 @@ class ModelLibraryRoutesTestCase(unittest.TestCase):
         self._deps(version_id)
         self.assertEqual(len(calls), 2)
 
+    @pytest.mark.fast_unit
+    def test_inventory_refresh_route_uses_validated_client_ttl_without_inventory(self):
+        calls: list[int] = []
+
+        async def _fetch():
+            calls.append(1)
+            return {"models": [{"name": "hidden.safetensors"}], "custom_nodes": []}
+
+        remote_inventory._fetch = _fetch
+        remote_inventory.invalidate()
+
+        response = self._call(
+            "GET",
+            "/comfymodal/studio/inventory/refresh",
+            query={"max_age": "0"},
+        )
+        self.assertEqual(response.status, 200, msg=response.body)
+        body = self._body(response)
+        self.assertEqual(body, {"status": "ok", "available": True})
+        self.assertNotIn("models", body)
+        self.assertEqual(len(calls), 1)
+
+        invalid = self._call(
+            "GET",
+            "/comfymodal/studio/inventory/refresh",
+            query={"max_age": "not-a-number"},
+        )
+        self.assertEqual(invalid.status, 400)
+
     # ── nonessential override route ──────────────────────────────────────
 
     def test_nonessential_route_marks_and_restores(self):

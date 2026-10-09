@@ -1,6 +1,19 @@
 {
   "entries": [
     {
+      "added_at": 1791440335.0913744,
+      "filename": "Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors",
+      "folder": "clip",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1791440335.0913744,
+      "url": "https://huggingface.co/artsyww/fp8mix-clips/resolve/main/Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors?download=true"
+    },
+    {
       "added_at": 1781241682.608644,
       "filename": "flux-2-klein-9b-text-encoder-uncensored.safetensors",
       "folder": "clip",
@@ -194,6 +207,19 @@
       "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_bf16.safetensors"
     },
     {
+      "added_at": 1791441027.8889015,
+      "filename": "krea2_turbo_fp8_scaled.safetensors",
+      "folder": "unet",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1791441027.8889015,
+      "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors"
+    },
+    {
       "added_at": 1781240916.1024942,
       "filename": "ae.safetensors",
       "folder": "vae",
@@ -234,11 +260,12 @@
       "filename": "qwen_image_vae.safetensors",
       "folder": "vae",
       "notes": "",
+      "remove_on_swap": false,
       "requires_civitai_token": false,
-      "requires_hf_token": false,
+      "requires_hf_token": true,
       "sha256": null,
       "source_kind": "huggingface",
-      "updated_at": 1781243369.9858036,
+      "updated_at": 1791441086.0964262,
       "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors"
     }
   ],

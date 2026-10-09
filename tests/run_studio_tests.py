@@ -164,6 +164,10 @@ NODE_UNIT_FILES: list[Path] = [
     ROOT / "tests" / "studio_phase_e_wave2_unit.mjs",
     # E4C Generate Original frontend contract + E4 presentation/settings units
     ROOT / "tests" / "studio_phase_e4c_generate_original_unit.mjs",
+    # Shared image-viewer input contract: the Playground canvas preview and
+    # the History generation detail resolve one canonical record, one asset
+    # policy, and one timing payload, so the two overlays cannot drift apart.
+    ROOT / "tests" / "studio_shared_viewer_input_unit.mjs",
     # H20 Wave G registration: E4D Retry Original contract (sibling of e4c;
     # slice-bounded transport pin fixed this lane).
     ROOT / "tests" / "studio_phase_e4d_original_retry_unit.mjs",
@@ -214,6 +218,10 @@ NODE_UNIT_FILES: list[Path] = [
     # I10 cross-tab invalidation: one singleton BroadcastChannel, strict
     # four-kind schema, fail-soft delivery, and unsubscribe behavior.
     ROOT / "tests" / "studio_phase_i10_cross_tab_sync_unit.mjs",
+    ROOT / "tests" / "studio_remote_inventory_unit.mjs",
+    # History toolbar "Open folder": button adjacency to Clear all and the
+    # shared /comfymodal/open-folder POST (default + stored save folder)
+    ROOT / "tests" / "studio_history_open_folder_unit.mjs",
 ]
 
 # Intentionally excluded (documented in STUDIO_TEST_GATE.md):

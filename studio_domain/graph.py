@@ -108,6 +108,185 @@ def input_exists(prompt: dict[str, Any], node_id: Any, input_name: str) -> bool:
     return isinstance(inputs, dict) and input_name in inputs
 
 
+#: Entry kinds that bind a control to a node input (as opposed to a node
+#: output). All of them must resolve through :func:`resolve_binding_target`.
+INPUT_BINDING_KINDS = frozenset({"node_input", "widget", "node"})
+
+
+def resolve_binding_target(
+    prompt: dict[str, Any],
+    node_id: Any,
+    input_name: str,
+    *,
+    ui_graph: Any = None,
+    node_def_provider: Optional[Callable[[str], Optional[tuple[dict, dict]]]] = None,
+) -> dict[str, Any]:
+    """Resolve a (node_id, input_name) binding against every place a ComfyUI
+    value can live — generically, with no per-node-type knowledge.
+
+    A binding is *resolvable* only when ``input_name`` is a key of the
+    node's executable ``inputs`` dict, because that is the single location
+    both gating (``services.derive_version_state``) and execution
+    (``studio_workflow_run.apply_workflow_values_to_prompt``) read and
+    write. ``location`` additionally reports where else the name was found
+    so callers can explain *why* a binding fails (e.g. a pure-widget or
+    hidden-state value that never reaches the executable prompt).
+
+    Returns a dict with:
+
+    * ``resolvable`` — True only when the name is an executable-input key.
+    * ``location`` — ``"inputs"`` / ``"node_def"`` / ``"ui_widget"`` / None.
+    * ``linked`` / ``upstream_node_id`` — True and the source node id when
+      the executable input is a ``[node_id, slot]`` connection spec, meaning
+      writing the control replaces that link.
+    * ``node_present`` — False when the node id is absent from the prompt.
+    * ``node_def_available`` — whether a node definition could be probed.
+
+    Never raises.
+    """
+    node_id_str = str(node_id)
+    result: dict[str, Any] = {
+        "resolvable": False,
+        "location": None,
+        "linked": False,
+        "upstream_node_id": None,
+        "node_present": False,
+        "node_def_available": False,
+    }
+    try:
+        node = prompt.get(node_id_str) if isinstance(prompt, dict) else None
+        if not isinstance(node, dict):
+            return result
+        result["node_present"] = True
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict) and input_name in inputs:
+            result["resolvable"] = True
+            result["location"] = "inputs"
+            value = inputs.get(input_name)
+            if _is_connection_spec(value):
+                result["linked"] = True
+                result["upstream_node_id"] = str(value[0])
+            return result
+
+        provider = node_def_provider or _probe_node_def
+        try:
+            probed = provider(str(node.get("class_type", "")))
+            if isinstance(probed, tuple) and len(probed) == 2:
+                result["node_def_available"] = True
+                for defs_dict in probed:
+                    if isinstance(defs_dict, dict) and input_name in defs_dict:
+                        result["location"] = "node_def"
+                        return result
+        except Exception:
+            pass
+
+        if _ui_node_has_widget(ui_graph, node_id_str, input_name):
+            result["location"] = "ui_widget"
+        return result
+    except Exception:
+        return result
+
+
+def _ui_node_has_widget(ui_graph: Any, node_id_str: str, input_name: str) -> bool:
+    """True when the UI/static graph shows a widget named ``input_name`` on
+    the node — via its ``inputs`` slot list (``name`` or ``widget.name``) or
+    a dict entry inside ``widgets_values``.
+
+    Structural check only; knows nothing about specific node types.
+    """
+    try:
+        for node in iter_graph_nodes(ui_graph):
+            if not isinstance(node, dict):
+                continue
+            if str(node.get("id")) != node_id_str:
+                continue
+            ui_inputs = node.get("inputs")
+            if isinstance(ui_inputs, list):
+                for entry in ui_inputs:
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("name") == input_name:
+                        return True
+                    widget = entry.get("widget")
+                    if isinstance(widget, dict) and widget.get("name") == input_name:
+                        return True
+            widgets_values = node.get("widgets_values")
+            if isinstance(widgets_values, list):
+                for value in widgets_values:
+                    if isinstance(value, dict) and input_name in value:
+                        return True
+            return False
+    except Exception:
+        pass
+    return False
+
+
+def find_binding_candidates(
+    prompt: dict[str, Any],
+    input_name: str,
+    *,
+    ui_graph: Any = None,
+    node_def_provider: Optional[Callable[[str], Optional[tuple[dict, dict]]]] = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """List resolvable (node_id, input_name) bindings for ``input_name``.
+
+    Executable-input matches come first (in prompt order), node-def-only
+    declarations second. Used to suggest alternatives when a binding fails
+    validation. Generic — no role or node-type knowledge. Never raises.
+    """
+    candidates: list[dict[str, Any]] = []
+    try:
+        if not isinstance(prompt, dict) or not input_name:
+            return candidates
+        for nid, node in prompt.items():
+            if len(candidates) >= limit:
+                break
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs")
+            if isinstance(inputs, dict) and input_name in inputs:
+                value = inputs.get(input_name)
+                candidates.append({
+                    "node_id": str(nid),
+                    "input_name": input_name,
+                    "via": "inputs",
+                    "linked": bool(_is_connection_spec(value)),
+                    "upstream_node_id": (
+                        str(value[0]) if _is_connection_spec(value) else None
+                    ),
+                })
+        if len(candidates) >= limit:
+            return candidates
+        provider = node_def_provider or _probe_node_def
+        for nid, node in prompt.items():
+            if len(candidates) >= limit:
+                break
+            if not isinstance(node, dict):
+                continue
+            if any(c["node_id"] == str(nid) for c in candidates):
+                continue
+            try:
+                probed = provider(str(node.get("class_type", "")))
+            except Exception:
+                continue
+            if not (isinstance(probed, tuple) and len(probed) == 2):
+                continue
+            for defs_dict in probed:
+                if isinstance(defs_dict, dict) and input_name in defs_dict:
+                    candidates.append({
+                        "node_id": str(nid),
+                        "input_name": input_name,
+                        "via": "node_def",
+                        "linked": False,
+                        "upstream_node_id": None,
+                    })
+                    break
+    except Exception:
+        pass
+    return candidates
+
+
 def _probe_node_def(
     class_type: str,
 ) -> Optional[tuple[dict[str, Any], dict[str, Any]]]:

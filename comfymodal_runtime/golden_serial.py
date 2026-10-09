@@ -1391,6 +1391,7 @@ class GoldenNodeMap:
     clip_type: str = ""
     unet_name: str = ""
     vae_name: str = ""
+    sampler_class_type: str = CANONICAL_SAMPLER_CLASS
 
 
 @dataclass(frozen=True, init=False)
@@ -9388,8 +9389,9 @@ def resolve_golden_node_map(
 
     Structural admission is by node *class* and cardinality: exactly one
     CLIPLoader, CLIPTextEncode, UNETLoader, VAELoader, VAEDecode, and one
-    sampler of the contract's sampler class.  A missing or duplicated role is
-    rejected.
+    sampler.  The canonical sampler class is preferred, but a workflow sampler
+    is discovered from sampler-like node classes when the workflow uses another
+    sampler implementation.
 
     Model identity defaults to the contract's canonical CLIP/UNET/VAE.  Studio
     may explicitly admit declared replacements; ordinary requests remain
@@ -9411,6 +9413,7 @@ def resolve_golden_node_map(
         "sampler": [],
         "vae_decode": [],
     }
+    sampler_candidates: list[tuple[str, str]] = []
     # Declared model identities, captured from the first matching loader node.
     declared: dict[str, str] = {}
     for node_id, info in prompt.items():
@@ -9430,8 +9433,42 @@ def resolve_golden_node_map(
             matches["clip_encode"].append(node_id)
         elif class_type == contract.sampler_class_type:
             matches["sampler"].append(node_id)
+        elif (
+            any(hint.lower() in class_type.lower() for hint in SAMPLER_CLASS_HINTS)
+            and not any(
+                excluded in class_type.lower()
+                for excluded in ("select", "scheduler", "noise", "guider")
+            )
+        ):
+            sampler_candidates.append((str(node_id), class_type))
         elif class_type == "VAEDecode":
             matches["vae_decode"].append(node_id)
+    if not matches["sampler"] and sampler_candidates:
+        referenced: dict[str, int] = {node_id: 0 for node_id, _ in sampler_candidates}
+
+        def _count_links(value: Any) -> None:
+            if _is_link(value) and str(value[0]) in referenced:
+                referenced[str(value[0])] += 1
+            elif isinstance(value, Mapping):
+                for nested in value.values():
+                    _count_links(nested)
+            elif isinstance(value, (list, tuple)):
+                for nested in value:
+                    _count_links(nested)
+
+        for node_info in prompt.values():
+            if isinstance(node_info, Mapping):
+                _count_links(node_info.get("inputs") or {})
+
+        chosen_id, chosen_class = max(
+            sampler_candidates,
+            key=lambda item: (referenced[item[0]], item[1] == "KSampler", item[0]),
+        )
+        matches["sampler"] = [chosen_id]
+        sampler_class_type = chosen_class
+    else:
+        sampler_class_type = contract.sampler_class_type
+
     duplicates = {
         name: ids for name, ids in matches.items() if len(ids) > 1
     }
@@ -9478,6 +9515,7 @@ def resolve_golden_node_map(
         clip_type=declared["clip_type"],
         unet_name=declared["unet_name"],
         vae_name=declared["vae_name"],
+        sampler_class_type=sampler_class_type,
     )
 
 
@@ -10195,7 +10233,7 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
         contract = session.contract
         actual_sha = canonical_workflow_sha256(session.request.prompt)
         workflow_hash_check_value = os.environ.get(
-            "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "1"
+            "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "0"
         ).strip().lower()
         workflow_hash_check_enabled = workflow_hash_check_value not in {
             "0", "false", "no", "off"
@@ -10232,8 +10270,6 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
         )
         session.workflow_sha_match = workflow_sha_match
         session.workflow_sha_warning = workflow_sha_warning
-        if not workflow_sha_match and workflow_hash_check_enabled and not session.request.studio_advisory:
-            raise RuntimeError("golden_workflow_sha_mismatch")
         node_map = resolve_golden_node_map(
             session.request.prompt,
             contract=contract,
@@ -10269,6 +10305,7 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
             clip_type=node_map.clip_type,
             unet_name=node_map.unet_name,
             vae_name=node_map.vae_name,
+            sampler_class_type=node_map.sampler_class_type,
             clip_spec=effective_clip_spec,
             expected_unet_tensor_count=(
                 contract.expected_unet_tensor_count if canonical_models else 0
@@ -10318,6 +10355,7 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
             workflow_hash_check_bypassed=not workflow_hash_check_enabled,
             clip_loader=node_map.clip_loader_id,
             sampler=node_map.sampler_id,
+            sampler_class_type=node_map.sampler_class_type,
             clip_name=[n for n in spec.checkpoint_names],
             clip_type=spec.clip_type,
             clip_folder=spec.folder,

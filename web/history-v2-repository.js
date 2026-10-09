@@ -256,9 +256,22 @@ export function selectFeedAsset(output) {
   return { kind: "none", url: "", label: "No image" };
 }
 
+// Display-variant selection for a DETAIL surface (generation/cell detail).
+// Order: Preview (the display derivative) > Original > Thumbnail.
+//
+// The thumbnail is a capped 256px derivative (history_v2_writer._THUMBNAIL_MAX
+// / comfyapp._PRODUCTION_THUMBNAIL_MAX), so when the real image is already
+// materialized beside it the detail MUST show the original — never a
+// pixelated thumbnail. An Original-ONLY record still stays a placeholder
+// (frozen Phase E/E4B rule: no eager Original fetch), which is why the
+// thumbnail-vs-original preference only applies when both are projected; the
+// Original-only case falls through to the label-only branch below.
 export function selectDetailAsset(output) {
   const out = output && typeof output === "object" ? output : {};
   if (out.previewUrl) return { kind: "preview", url: out.previewUrl, label: "Preview" };
+  if (out.thumbUrl && out.originalUrl && !out.originalFailed) {
+    return { kind: "original", url: out.originalUrl, label: "Original" };
+  }
   if (out.thumbUrl) return { kind: "thumbnail", url: out.thumbUrl, label: "Thumbnail" };
   if (out.originalUrl || out.originalAvailable) return { kind: "original", url: "", label: "Original available" };
   if (out.originalFailed) return { kind: "original-failed", url: "", label: "Original generation failed" };
@@ -514,6 +527,17 @@ function _normalizeGeneration(raw) {
   const outputCount = _toInt(raw.output_count, outputs.length);
   const previewOnly = _toBool(raw.preview_only, _toBool(extra.preview_only, false));
   const status = _coerceStatus(raw.status, GENERATION_STATUSES, "running");
+  const params = raw.params && typeof raw.params === "object"
+    ? raw.params
+    : (raw.resolved_controls && typeof raw.resolved_controls === "object"
+      ? raw.resolved_controls
+      : (raw.controls && typeof raw.controls === "object" ? raw.controls : (extra.resolved_controls || extra.controls || {})));
+  // Timing rides along on the feed record (flat golden/legacy keys,
+  // timing_summary, or nested trace payloads) so any surface rendering a
+  // feed item without a detail fetch still shows the real pipeline flow.
+  const timing = [raw.timing, raw.timings, raw.timing_summary, extra.timing, extra.timings, extra.timing_summary]
+    .filter(function (t) { return t && typeof t === "object" && Object.keys(t).length > 0; })
+    .reduce(function (merged, t) { return Object.assign(merged, t); }, {});
 
   return {
     id: _firstString(raw.id, raw.run_id, raw.runId),
@@ -522,8 +546,8 @@ function _normalizeGeneration(raw) {
     workflow: _firstString(raw.workflow, raw.workflow_name, extra.workflow_name, extra.workflow),
     workflowVersion: _firstString(raw.workflow_version, raw.workflowVersion),
     preset: _firstString(raw.preset, raw.preset_id, raw.preset_label, extra.studio_preset_label, extra.studio_preset_id, extra.preset),
-    prompt: _firstString(raw.prompt, extra.prompt),
-    negativePrompt: _firstString(raw.negative_prompt, raw.negativePrompt, extra.negative_prompt),
+    prompt: _firstString(raw.prompt, extra.prompt, params.prompt),
+    negativePrompt: _firstString(raw.negative_prompt, raw.negativePrompt, extra.negative_prompt, extra.negativePrompt, params.negative_prompt, params.negativePrompt),
     startedAt: _firstString(raw.started_at, raw.created_at, raw.timestamp, raw.created, raw.startedAt),
     completedAt: _firstString(raw.completed_at, raw.completedAt),
     durationMs: _toDurationMs(raw),
@@ -547,6 +571,8 @@ function _normalizeGeneration(raw) {
     irreproducible: _toBool(raw.irreproducible, false),
     featuredOutput: _featuredOutput(raw, outputs),
     runId: _firstString(raw.run_id, raw.runId, raw.id),
+    params: params,
+    timing: Object.keys(timing).length > 0 ? timing : null,
   };
 }
 
@@ -897,8 +923,11 @@ function _bridgeGetGeneration(apiBase, id) {
       attempts: [],
       errors: [],
       exportState: "none",
-      params: {},
-      timing: null,
+      params: data.params && typeof data.params === "object"
+        ? data.params
+        : (data.resolved_controls && typeof data.resolved_controls === "object" ? data.resolved_controls : {}),
+       timing: Object.assign({}, data.timings || {}, data.timing || {}, data.timing_summary || {},
+         data.deltas_ms ? { deltas_ms: data.deltas_ms } : {}),
     });
   });
 }
@@ -1140,8 +1169,9 @@ function _v2GetGeneration(apiBase, id) {
         attempts: attempts,
         errors: Array.isArray(raw.errors) ? raw.errors : [],
         exportState: _firstString(raw.export_state, "none"),
-        params: raw.params && typeof raw.params === "object" ? raw.params : {},
-        timing: raw.timing && typeof raw.timing === "object" ? raw.timing : null,
+        params: raw.params && typeof raw.params === "object" ? raw.params : (item.params || {}),
+         timing: Object.assign({}, raw.timings || {}, raw.timing || {}, raw.timing_summary || {},
+           raw.deltas_ms ? { deltas_ms: raw.deltas_ms } : {}),
       });
     })
     .catch(function (err) {

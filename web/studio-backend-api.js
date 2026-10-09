@@ -201,6 +201,16 @@ export async function saveRunOutput(apiBase, runId, payload) {
 
 // ── Studio Workflow API ──────────────────────────────────────────────────
 
+/**
+ * Ask the backend to refresh its cached remote inventory. The response is a
+ * small status envelope; inventory contents remain server-side. Freshness is
+ * owned by the server; browser polling cadence must not become cache policy.
+ * @param {string} apiBase
+ */
+export async function refreshRemoteInventory(apiBase) {
+  return apiFetch(apiBase, "/studio/inventory/refresh");
+}
+
 export async function listWorkflows(apiBase, opts = {}) {
   const query = new URLSearchParams();
   if (opts) {
@@ -820,11 +830,15 @@ export async function upsertWorkspace(apiBase, payload) {
 }
 
 export async function activateWorkspace(apiBase, workspaceId) {
-  return apiFetch(apiBase, "/workspaces/active", {
+  const result = await apiFetch(apiBase, "/workspaces/active", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ workspace_id: workspaceId }),
   });
+  if (result && result.status === "ok" && typeof window !== "undefined") {
+    try { window.dispatchEvent(new Event("workspace-changed")); } catch (_) {}
+  }
+  return result;
 }
 
 export function workspaceSwapEndpointPath() {
@@ -1115,6 +1129,20 @@ export async function getCustomNodeSyncOperationStatus(apiBase, syncId) {
 
 export async function listGoldenProfiles(apiBase) {
   return apiFetch(apiBase, "/studio/golden/profiles");
+}
+
+export async function triggerGoldenProfileDeploy(apiBase, profile) {
+  if (!profile) return null;
+  return apiFetch(apiBase, "/studio/golden/deploy", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ profile }),
+  });
+}
+
+export async function getGoldenProfileDeployStatus(apiBase, profile) {
+  if (!profile) return null;
+  return apiFetch(apiBase, "/studio/golden/deploy?profile=" + encodeURIComponent(profile));
 }
 
 export async function getGoldenRunProgress(apiBase, requestId, cursor) {

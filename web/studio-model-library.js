@@ -38,6 +38,7 @@ import {
   setWorkflowNonessential,
   managerQueueInstall,
   managerQueueStart,
+  managerRebootAndWait,
 } from "./studio-backend-api.js";
 
 // ── Module helpers ────────────────────────────────────────────────────────
@@ -1287,8 +1288,12 @@ function _remoteDetailText(m) {
  *   after an install; { onInstallSettled(model) } lets the owner drop its
  *   tracked in-flight status once a model install resolves truthfully;
  *   { onFindInLibrary(filename) } enables the contextual "Find in library"
- *   handoff on missing model rows.  Every action is user-click-only; nothing
- *   here installs or downloads automatically and nothing ever reboots.
+ *   handoff on missing model rows; { useAdvancedAccordions } opts into the
+ *   detail-page accordion presentation (the default remains flat for the
+ *   setup wizard).
+  *   Every action is user-click-only; nothing
+  *   here installs or downloads automatically and nothing ever reboots on
+  *   its own (a Reboot button appears beside a settled install, click-only).
  * @returns {HTMLElement}
  */
 export function renderDependencySection(version, deps, refreshHandler, opts) {
@@ -1312,6 +1317,68 @@ export function renderDependencySection(version, deps, refreshHandler, opts) {
 
   const hasLive = !!(deps && deps.status === "ok");
 
+  const models = hasLive && Array.isArray(deps.models) ? deps.models : [];
+  const nodes = hasLive && Array.isArray(deps.custom_nodes) ? deps.custom_nodes : [];
+  const modelNames = _flattenStack((version && version.dependency_metadata || {}).model_stack);
+  const nodeNames = Array.isArray((version && version.dependency_metadata || {}).node_classes)
+    ? version.dependency_metadata.node_classes.map(String) : [];
+
+  if (!ctx.useAdvancedAccordions) {
+    // The setup wizard intentionally keeps the original flat report. The
+    // detail page opts into the accordion presentation below.
+    if (hasLive) {
+      const summary = deps.summary || {};
+      const ready = summary.ready === true;
+      const attention = summary.attention || 0;
+      section.appendChild(el("div", {
+        class: "comfymodal-studio-dependency-banner " + (ready ? "ready" : "attention"),
+        "data-testid": "dependency-status",
+      }, [
+        el("span", {
+          class: "comfymodal-studio-dependency-banner-label",
+          text: ready
+            ? "Ready"
+            : "Incomplete \u2014 " + attention + " dependenc" + (attention === 1 ? "y" : "ies")
+              + (attention === 1 ? " needs" : " need") + " attention",
+        }),
+      ]));
+
+      if (models.length) {
+        section.appendChild(el("div", { class: "comfymodal-studio-dependency-group", "data-testid": "dependency-models" }, [
+          el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Models" }),
+          el("div", { class: "comfymodal-studio-dependency-table" }, models.map((m) => renderDependencyModelRow(m, ctx))),
+        ]));
+      }
+      if (nodes.length) {
+        section.appendChild(el("div", { class: "comfymodal-studio-dependency-group", "data-testid": "dependency-nodes" }, [
+          el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Custom nodes" }),
+          el("div", { class: "comfymodal-studio-dependency-table" }, nodes.map((n) => renderDependencyNodeRow(n, ctx))),
+        ]));
+      }
+
+      const skipped = (deps && Array.isArray(deps.unresolvable)) ? deps.unresolvable : [];
+      if (skipped.length) {
+        section.appendChild(el("p", {
+          class: "comfymodal-studio-dependencies-note",
+          "data-testid": "dependency-artifacts-note",
+          text: `${skipped.length} graph artifact${skipped.length === 1 ? "" : "s"} skipped — not installable node classes.`,
+          title: skipped.map((u) => (u && u.name) || "").filter(Boolean).join(", "),
+        }));
+      }
+
+      const metaChips = renderMetadataChips(version);
+      if (!models.length && !nodes.length && !metaChips) {
+        section.appendChild(el("p", { class: "comfymodal-studio-dependencies-note", text: "No dependencies recorded for this version." }));
+      }
+    } else {
+      section.appendChild(el("p", { class: "comfymodal-studio-dependencies-note", text: "Dependency information is unavailable for this version." }));
+    }
+
+    const metaChips = renderMetadataChips(version);
+    if (metaChips) section.appendChild(metaChips);
+    return section;
+  }
+
   if (hasLive) {
     const summary = deps.summary || {};
     const ready = summary.ready === true;
@@ -1329,27 +1396,30 @@ export function renderDependencySection(version, deps, refreshHandler, opts) {
       }),
     ]));
 
-    const models = Array.isArray(deps.models) ? deps.models : [];
-    const nodes = Array.isArray(deps.custom_nodes) ? deps.custom_nodes : [];
-
+    const modelContent = [];
     if (models.length) {
-      section.appendChild(el("div", { class: "comfymodal-studio-dependency-group", "data-testid": "dependency-models" }, [
+      modelContent.push(el("div", { class: "comfymodal-studio-dependency-group", "data-testid": "dependency-models" }, [
         el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Models" }),
         el("div", { class: "comfymodal-studio-dependency-table" }, models.map((m) => renderDependencyModelRow(m, ctx))),
       ]));
     }
+    if (modelNames.length) modelContent.push(_renderDependencyChips("Model stack", modelNames));
+
+    const nodeContent = [];
     if (nodes.length) {
-      section.appendChild(el("div", { class: "comfymodal-studio-dependency-group", "data-testid": "dependency-nodes" }, [
+      nodeContent.push(el("div", { class: "comfymodal-studio-dependency-group", "data-testid": "dependency-nodes" }, [
         el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Custom nodes" }),
         el("div", { class: "comfymodal-studio-dependency-table" }, nodes.map((n) => renderDependencyNodeRow(n, ctx))),
       ]));
     }
+    if (nodeNames.length) nodeContent.push(_renderDependencyChips("Node classes", nodeNames));
+
     // Graph artifacts (frontend-only UUIDs / display titles recorded as
     // types) can never resolve to an installed pack, so the backend reports
     // them separately instead of "missing". Surface the skip truthfully.
     const skipped = (deps && Array.isArray(deps.unresolvable)) ? deps.unresolvable : [];
     if (skipped.length) {
-      section.appendChild(el("p", {
+      nodeContent.push(el("p", {
         class: "comfymodal-studio-dependencies-note",
         "data-testid": "dependency-artifacts-note",
         text: `${skipped.length} graph artifact${skipped.length === 1 ? "" : "s"} skipped — not installable node classes.`,
@@ -1357,19 +1427,19 @@ export function renderDependencySection(version, deps, refreshHandler, opts) {
       }));
     }
 
-    const metaChips = renderMetadataChips(version);
-    if (!models.length && !nodes.length && !metaChips) {
+    section.appendChild(_renderDependencyAccordion("Dependencies / models", "dependencies-accordion", models, modelNames, modelContent));
+    section.appendChild(_renderDependencyAccordion("Custom nodes", "custom-nodes-accordion", nodes, nodeNames, nodeContent));
+    if (!models.length && !nodes.length && !modelNames.length && !nodeNames.length) {
       section.appendChild(el("p", { class: "comfymodal-studio-dependencies-note", text: "No dependencies recorded for this version." }));
     }
   } else {
-    section.appendChild(el("p", { class: "comfymodal-studio-dependencies-note", text: "Dependency information is unavailable for this version." }));
+    section.appendChild(_renderDependencyAccordion("Dependencies / models", "dependencies-accordion", models, modelNames, [
+      modelNames.length ? _renderDependencyChips("Model stack", modelNames) : el("p", { class: "comfymodal-studio-dependencies-note", text: "Dependency information is unavailable for this version." }),
+    ]));
+    section.appendChild(_renderDependencyAccordion("Custom nodes", "custom-nodes-accordion", nodes, nodeNames, [
+      nodeNames.length ? _renderDependencyChips("Node classes", nodeNames) : el("p", { class: "comfymodal-studio-dependencies-note", text: "Dependency information is unavailable for this version." }),
+    ]));
   }
-
-  // Recorded metadata from the captured graph (model stack / node classes).
-  // Always rendered so older clients and tests that only have
-  // dependency_metadata still surface the recorded stack.
-  const metaChips = renderMetadataChips(version);
-  if (metaChips) section.appendChild(metaChips);
 
   return section;
 }
@@ -1380,21 +1450,35 @@ function renderMetadataChips(version) {
   const classes = Array.isArray(dep.node_classes) ? dep.node_classes.map(String) : [];
   if (stack.length === 0 && classes.length === 0) return null;
   const wrap = el("div", { class: "comfymodal-studio-dependencies-summary" });
-  if (stack.length) {
-    wrap.appendChild(el("div", { class: "comfymodal-studio-dependencies-group" }, [
-      el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Model stack" }),
-      el("div", { class: "comfymodal-studio-dependencies-chips" },
-        stack.map((m) => el("span", { class: "comfymodal-studio-wf-chip cm-chip", "data-tone": "neutral", text: m }))),
-    ]));
-  }
-  if (classes.length) {
-    wrap.appendChild(el("div", { class: "comfymodal-studio-dependencies-group" }, [
-      el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: "Node classes" }),
-      el("div", { class: "comfymodal-studio-dependencies-chips" },
-        classes.map((c) => el("span", { class: "comfymodal-studio-wf-chip cm-chip", "data-tone": "neutral", text: c }))),
-    ]));
-  }
+  if (stack.length) wrap.appendChild(_renderDependencyChips("Model stack", stack));
+  if (classes.length) wrap.appendChild(_renderDependencyChips("Node classes", classes));
   return wrap;
+}
+
+function _renderDependencyAccordion(label, testid, rows, fallbackNames, content) {
+  // Optional (nonessential) rows are advisory — they must not count against
+  // the total. Only required rows determine installed/total.
+  const required = rows.filter((row) => row && row.nonessential !== true);
+  const names = rows.length ? required : fallbackNames;
+  const installed = rows.length ? required.filter((row) => row.state === "installed").length : 0;
+  const total = names.length;
+  const complete = installed === total;
+  const details = el("details", { class: "comfymodal-studio-dependency-accordion", "data-testid": testid });
+  details.appendChild(el("summary", { class: "comfymodal-studio-accordion-summary" }, [
+    el("span", { class: "comfymodal-studio-accordion-label", text: label }),
+    el("span", { class: "comfymodal-studio-model-badge " + (complete ? "installed" : "missing") + " cm-chip", "data-tone": complete ? "ok" : "danger", text: `${installed}/${total} installed` }),
+  ]));
+  content.filter(Boolean).forEach((child) => details.appendChild(child));
+  return details;
+}
+
+function _renderDependencyChips(label, names) {
+  return el("div", { class: "comfymodal-studio-dependencies-group" }, [
+    el("span", { class: "comfymodal-studio-workflows-sidebar-label", text: label }),
+    el("div", { class: "comfymodal-studio-dependencies-chips" }, names.map((name) => el("span", {
+      class: "comfymodal-studio-wf-chip cm-chip", "data-tone": "neutral", text: name,
+    }))),
+  ]);
 }
 
 function renderDependencyModelRow(m, ctx) {
@@ -1522,7 +1606,47 @@ function renderModelInstallControls(m, downloadUrl, savePath, ctx, stateBadge) {
     "data-testid": "dependency-model-install-note",
     style: "display:none;font-size:10px;color:#888;margin-top:2px;",
   });
-  const baseInfo = { filename: m.filename || "", url: downloadUrl || "", savePath: savePath || "" };
+  // Inline install progress, same pattern as the backend manifest install
+  // rows (track + fill + label). Queue installs report real pct from
+  // /download/status polling; Install now (sync batch) shows indeterminate
+  // activity while the POST is in flight.
+  const progressFill = el("div", {
+    "data-testid": "dependency-model-install-progress-fill",
+    style: "height:100%;width:0%;background:#6a9fd8;transition:width 200ms ease;",
+  });
+  const progressTrack = el("div", {
+    "data-testid": "dependency-model-install-progress",
+    style: "display:none;height:6px;background:#2a2a2a;border-radius:3px;overflow:hidden;margin-top:4px;min-width:180px;",
+  }, [progressFill]);
+  const progressLabel = el("div", {
+    "data-testid": "dependency-model-install-progress-label",
+    style: "display:none;font-size:10px;color:#f5a623;margin-top:2px;",
+  });
+  const showProgress = (pct, message) => {
+    const p = Math.max(0, Math.min(100, Number(pct) || 0));
+    progressTrack.style.display = "block";
+    progressFill.style.width = `${p}%`;
+    if (message) {
+      progressLabel.style.display = "block";
+      progressLabel.textContent = message;
+    }
+  };
+  const hideProgress = () => {
+    progressTrack.style.display = "none";
+    progressFill.style.width = "0%";
+    progressLabel.style.display = "none";
+    progressLabel.textContent = "";
+  };
+  const progressFromStatus = (last) => {
+    const pct = Number(last.pct ?? last.progress ?? 0) || 0;
+    const dl = last.downloaded_mb ?? last.downloadedMb;
+    const total = last.total_mb ?? last.totalMb;
+    const msg = (dl != null && total != null)
+      ? `Downloading… ${Math.round(pct)}% (${dl} / ${total} MB)`
+      : (pct ? `Downloading… ${Math.round(pct)}%` : "Downloading…");
+    showProgress(pct, msg);
+  };
+  const baseInfo = { filename: _basename(m.filename || ""), url: downloadUrl || "", savePath: savePath || "" };
   const rowKey = m.key || m.filename || "";
 
   // In-flight truth: the SAME state badge transitions, then falls back to the
@@ -1578,11 +1702,13 @@ function renderModelInstallControls(m, downloadUrl, savePath, ctx, stateBadge) {
         note.textContent = "Starting install\u2026";
         note.classList.remove("error");
         markDownloading();
+        showProgress(0, "Starting install…");
         const res = await queueModelInstall(ctx.apiBase, {
           url: url,
           filename: baseInfo.filename,
           savePath: baseInfo.savePath,
-        });
+        }, progressFromStatus);
+        hideProgress();
         note.textContent = res.message;
         note.classList.toggle("error", !res.ok);
         if (res.ok) {
@@ -1598,6 +1724,8 @@ function renderModelInstallControls(m, downloadUrl, savePath, ctx, stateBadge) {
     wrap.appendChild(urlIn);
     wrap.appendChild(urlBtn);
     wrap.appendChild(note);
+    wrap.appendChild(progressTrack);
+    wrap.appendChild(progressLabel);
     return wrap;
   }
 
@@ -1618,7 +1746,9 @@ function renderModelInstallControls(m, downloadUrl, savePath, ctx, stateBadge) {
       note.textContent = "Starting install\u2026";
       note.classList.remove("error");
       markQueued();
-      const res = await queueModelInstall(ctx.apiBase, info);
+      showProgress(0, "Starting install…");
+      const res = await queueModelInstall(ctx.apiBase, info, progressFromStatus);
+      hideProgress();
       note.textContent = res.message;
       note.classList.toggle("error", !res.ok);
       if (res.ok) {
@@ -1647,7 +1777,13 @@ function renderModelInstallControls(m, downloadUrl, savePath, ctx, stateBadge) {
       note.textContent = "Installing\u2026";
       note.classList.remove("error");
       markDownloading();
+      // Sync batch has no pct endpoint: show indeterminate activity.
+      progressTrack.style.display = "block";
+      progressFill.style.width = "100%";
+      progressLabel.style.display = "block";
+      progressLabel.textContent = "Installing…";
       const res = await installModelNow(ctx.apiBase, info);
+      hideProgress();
       note.textContent = res.message;
       note.classList.toggle("error", !res.ok);
       if (res.ok) {
@@ -1664,11 +1800,13 @@ function renderModelInstallControls(m, downloadUrl, savePath, ctx, stateBadge) {
   wrap.appendChild(queueBtn);
   wrap.appendChild(nowBtn);
   wrap.appendChild(note);
+  wrap.appendChild(progressTrack);
+  wrap.appendChild(progressLabel);
   return wrap;
 }
 
 /** Async single model install + status poll. Explicit click only. */
-async function queueModelInstall(apiBase, info) {
+async function queueModelInstall(apiBase, info, onProgress) {
   try {
     const started = await installSingleModel(apiBase, {
       url: info.url, filename: info.filename, save_path: info.savePath || "",
@@ -1682,6 +1820,9 @@ async function queueModelInstall(apiBase, info) {
       const st = await modelDownloadStatus(apiBase, downloadId);
       const last = (st && (st.data || st)) || {};
       const s = String(last.state || last.status || "").toLowerCase();
+      if (typeof onProgress === "function") {
+        try { onProgress(last); } catch (e) { /* progress is best-effort */ }
+      }
       if (s === "complete" || s === "done" || s === "success") break;
       if (s === "error" || s === "failed") {
         return { ok: false, message: "Install failed: " + (last.message || last.error || "request failed") };
@@ -1909,12 +2050,69 @@ function renderNodeInstallNowControl(n, installPlan, ctx, nodeBadge) {
       if (!res.ok) {
         btn.disabled = false;
         btn.textContent = "Install now";
+      } else {
+        // Explicit install succeeded. Python custom nodes need a ComfyUI
+        // restart to import, so offer it right here: hosts without
+        // owner-managed restart state (the workflow detail page) otherwise
+        // leave the user with a dead disabled button and no next step.
+        btn.textContent = "Installed";
+        wrap.appendChild(renderNodeRebootControl(note, c));
       }
     },
   });
   wrap.appendChild(btn);
   wrap.appendChild(note);
   return wrap;
+}
+
+// Explicit reboot action for a settled Manager install on hosts without
+// owner-managed restart state (the workflow detail page). Fires only on
+// click, narrates the reconnect phases in the row note, then asks the host
+// to re-resolve dependencies against the fresh runtime. Never auto-reboots.
+function renderNodeRebootControl(note, ctx) {
+  const c = ctx || {};
+  const rebootBtn = el("button", {
+    class: "comfymodal-secondary-btn",
+    type: "button",
+    "data-testid": "dependency-node-reboot",
+    text: "Reboot ComfyUI",
+    style: "font-size:10px;padding:2px 8px;width:auto;margin-top:2px;",
+    onclick: async () => {
+      if (rebootBtn.disabled) return;
+      rebootBtn.disabled = true;
+      rebootBtn.textContent = "Rebooting\u2026";
+      rebootBtn.setAttribute("aria-busy", "true");
+      note.style.display = "block";
+      note.classList.remove("error");
+      // The install just went through Manager, so Manager is expected back.
+      // Success is decided by the bounded reconnect probes, never by the
+      // reboot POST itself (the connection drop is the expected shape).
+      const res = await managerRebootAndWait({
+        expectManager: true,
+        onPhase: (phase) => {
+          note.textContent = phase === "manager"
+            ? "ComfyUI reconnected \u2014 waiting for ComfyUI-Manager\u2026"
+            : "Rebooting ComfyUI \u2014 waiting for it to reconnect\u2026";
+        },
+      });
+      rebootBtn.removeAttribute("aria-busy");
+      if (res && res.ok) {
+        note.textContent = "ComfyUI rebooted and reconnected.";
+        if (typeof c.onDepsRefresh === "function") {
+          try { await c.onDepsRefresh(); } catch (e) { /* refresh is best-effort */ }
+        } else {
+          rebootBtn.textContent = "Rebooted";
+        }
+      } else {
+        note.textContent = (res && res.message)
+          || "ComfyUI did not reconnect \u2014 restart it manually if needed.";
+        note.classList.add("error");
+        rebootBtn.disabled = false;
+        rebootBtn.textContent = "Reboot ComfyUI";
+      }
+    },
+  });
+  return rebootBtn;
 }
 
 // ── Model picker (preset editor "Model choices") ──────────────────────────

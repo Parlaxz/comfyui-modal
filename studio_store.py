@@ -41,6 +41,8 @@ class StudioJsonStore:
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._lock = threading.RLock()
+        self._cache_signature: tuple[int, int] | None = None
+        self._cache_data: list[dict[str, Any]] | None = None
 
     # ── public helpers ──────────────────────────────────────────────────
 
@@ -90,17 +92,35 @@ class StudioJsonStore:
         Raises ``StudioStoreError`` on any I/O failure.
         """
         with self._lock:
-            data = self._read_unlocked()
+            # Do not mutate a list previously handed to a read() caller.
+            data = self._read_unlocked(use_cache=False)
             mutator(data)
             self._write_unlocked(data)
+            self._invalidate_cache()
             return data
 
     # ── private unlocked helpers (caller must hold _lock) ────────────────
 
-    def _read_unlocked(self) -> list[dict[str, Any]]:
+    def _read_unlocked(self, *, use_cache: bool = True) -> list[dict[str, Any]]:
         """Read without acquiring the lock (caller must hold _lock)."""
-        if not self._path.exists():
+        if not use_cache:
+            self._invalidate_cache()
+        try:
+            stat = self._path.stat()
+        except FileNotFoundError:
+            self._invalidate_cache()
             return []
+        except OSError as exc:
+            raise StudioStoreError(
+                f"Failed to stat {self._path}: {exc}"
+            ) from exc
+        signature = (stat.st_mtime_ns, stat.st_size)
+        if (
+            use_cache
+            and self._cache_signature == signature
+            and self._cache_data is not None
+        ):
+            return self._cache_data
         try:
             with open(self._path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
@@ -117,6 +137,9 @@ class StudioJsonStore:
                 f"Expected JSON array in {self._path}, "
                 f"got {type(data).__name__}"
             )
+        if use_cache:
+            self._cache_signature = signature
+            self._cache_data = data
         return data
 
     def _write_unlocked(self, data: list[dict[str, Any]]) -> None:
@@ -128,6 +151,7 @@ class StudioJsonStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, self._path)
+            self._invalidate_cache()
         except OSError as exc:
             # Best-effort cleanup of the temp file.
             try:
@@ -137,3 +161,8 @@ class StudioJsonStore:
             raise StudioStoreError(
                 f"Failed to write {self._path}: {exc}"
             ) from exc
+
+    def _invalidate_cache(self) -> None:
+        """Drop parsed rows after this store changes its file."""
+        self._cache_signature = None
+        self._cache_data = None

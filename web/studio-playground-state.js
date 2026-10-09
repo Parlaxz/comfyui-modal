@@ -176,6 +176,7 @@ export function saveRunResult(presetId, featureId, runData) {
     store[key] = {
       id: runData.id || null,
       experimentId: runData.experimentId || null,
+      generationId: runData.generationId || null,
       imageUrl: runData.imageUrl || null,
       outputPath: runData.outputPath || null,
       prompt: runData.prompt || null,

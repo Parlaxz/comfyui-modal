@@ -45,6 +45,82 @@ export function getComfyGraphContext() {
   };
 }
 
+// ── Graph loading onto the live canvas ─────────────────────────────────
+//
+// Binding capture ("Use Selected Node", canvas clicks, "Suggest from
+// current graph") operates on the LIVE ComfyUI canvas. A wizard opened
+// for a specific workflow version must therefore show THAT version's
+// graph on the canvas, otherwise every capture binds nodes from whatever
+// workflow happened to be open. These helpers load a version graph onto
+// the canvas (skipping when it is already there) and snapshot the
+// previous graph so the caller can restore it when it is done.
+
+function _nodesOf(graphish) {
+  if (!graphish) return [];
+  if (Array.isArray(graphish)) return graphish;
+  if (Array.isArray(graphish.nodes)) return graphish.nodes;
+  if (Array.isArray(graphish._nodes)) return graphish._nodes;
+  return [];
+}
+
+/** Sorted "id:type" fingerprint; identical graphs produce identical strings. */
+function _graphFingerprint(graphish) {
+  return _nodesOf(graphish)
+    .filter((n) => n && n.id != null)
+    .map((n) => `${n.id}:${n.type || n.class_type || ""}`)
+    .sort()
+    .join("|");
+}
+
+/**
+ * True when the live canvas already shows exactly the nodes of `graphJson`
+ * — re-loading would only throw away the user's view state.
+ */
+export function isLiveGraphEqualTo(graphJson) {
+  try {
+    const ctx = getComfyGraphContext();
+    if (!ctx.ok) return false;
+    const want = _graphFingerprint(graphJson);
+    if (!want) return false;
+    return _graphFingerprint(ctx.graph) === want;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Load a UI-format workflow graph onto the live ComfyUI canvas.
+ * Returns { ok, reason } — never throws when the host has no loader.
+ */
+export async function loadGraphIntoComfy(graphJson) {
+  const ctx = getComfyGraphContext();
+  if (!ctx.ok) return { ok: false, reason: ctx.reason || "ComfyUI graph unavailable" };
+  if (!graphJson || _nodesOf(graphJson).length === 0) {
+    return { ok: false, reason: "No graph nodes to load" };
+  }
+  if (typeof ctx.app.loadGraphData !== "function") {
+    return { ok: false, reason: "ComfyUI graph loader unavailable" };
+  }
+  try {
+    await ctx.app.loadGraphData(graphJson);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: (e && e.message) || "Failed to load the graph" };
+  }
+}
+
+/** Serialize the live graph so it can be restored later. Null-safe. */
+export function snapshotLiveGraph() {
+  try {
+    const ctx = getComfyGraphContext();
+    if (!ctx.ok || typeof ctx.graph.serialize !== "function") return null;
+    const snap = ctx.graph.serialize();
+    return snap && typeof snap === "object" ? snap : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // ── Capture: begin / cancel ─────────────────────────────────────────────
 
 // Create a CSS class that highlights nodes during capture
@@ -87,6 +163,21 @@ function _removeCaptureHints() {
   hints.forEach((h) => { if (h.parentNode) h.parentNode.removeChild(h); });
 }
 
+// A click that starts inside any Studio surface (wizard panel, Studio
+// modal, testing overlay) is never a canvas click. The wizard renders
+// over the canvas, so its own controls — e.g. "Use Selected Node", which
+// must read the CANVAS selection — can sit on top of a node; treating
+// that as a canvas click would bind the node under the wizard UI instead
+// of the node the user actually selected.
+function _isStudioUiTarget(target) {
+  return !!(target && typeof target.closest === "function" && target.closest(
+    ".comfymodal-studio-wizard-overlay,"
+    + " .comfymodal-studio-wizard-panel,"
+    + " .comfymodal-studio-modal,"
+    + " .comfymodal-testing-overlay"
+  ));
+}
+
 export function beginGraphBindingCapture({ bindingKey, label, onCapture, onCancel }) {
   // Guard: if already active, cancel cleanly first
   if (_captureState.active) {
@@ -120,6 +211,7 @@ export function beginGraphBindingCapture({ bindingKey, label, onCapture, onCance
 
   // Temporary click listener on the LiteGraph canvas
   function handleClick(e) {
+    if (_isStudioUiTarget(e.target)) return; // Studio UI handles its own clicks
     // Try to find the clicked node via ComfyUI/LiteGraph
     const targetNode = findClickedNode(e, ctx);
     if (!targetNode) return; // Click was not on a node
@@ -503,10 +595,16 @@ function findClickedNode(e, ctx) {
       const canvasEl = ctx.app.canvas.canvas || ctx.app.canvas;
       if (canvasEl) {
         const rect = canvasEl.getBoundingClientRect();
-        const mx = (e.clientX - rect.left) * (canvasEl.width / rect.width || 1);
-        const my = (e.clientY - rect.top) * (canvasEl.height / rect.height || 1);
-        const node = ctx.app.graph.getNodeOnPos(mx, my);
-        if (node) return node;
+        // Only a click INSIDE the canvas element can hit a canvas node —
+        // a position mapped from outside it (e.g. a host menu button) is
+        // never a deliberate node click.
+        if (e.clientX >= rect.left && e.clientX <= rect.right
+          && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+          const mx = (e.clientX - rect.left) * (canvasEl.width / rect.width || 1);
+          const my = (e.clientY - rect.top) * (canvasEl.height / rect.height || 1);
+          const node = ctx.app.graph.getNodeOnPos(mx, my);
+          if (node) return node;
+        }
       }
     }
   } catch { /* fall through */ }

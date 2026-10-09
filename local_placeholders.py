@@ -48,13 +48,21 @@ def normalize_model_filename(filename: str) -> str:
     normalized = filename.strip()
     if not normalized or normalized in {".", ".."}:
         raise ValueError("filename required")
-    if "/" in normalized or "\\" in normalized:
+    # ComfyUI loaders report subfolder-relative names (e.g.
+    # "krea2\\krea2_turbo_fp8_scaled.safetensors"). Installs land flat inside
+    # the model folder, so use whatever is after the last slash/backslash.
+    base = normalized.replace("\\", "/").split("/")[-1].strip()
+    if not base or base in {".", ".."}:
+        raise ValueError("filename required")
+    if "\x00" in base:
         raise ValueError(f"unsafe filename: {filename}")
-    if _WINDOWS_DRIVE_RE.match(normalized):
+    if _WINDOWS_DRIVE_RE.match(base):
         raise ValueError(f"unsafe filename: {filename}")
-    if os.path.isabs(normalized):
+    if len(base) >= 2 and base[1] == ":":
         raise ValueError(f"unsafe filename: {filename}")
-    return normalized
+    if os.path.isabs(base):
+        raise ValueError(f"unsafe filename: {filename}")
+    return base
 
 
 def _local_models_dir(comfyui_root: str) -> str:

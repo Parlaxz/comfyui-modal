@@ -9548,14 +9548,14 @@ def _publish_downloaded_model_metadata(path: str, save_path: str, filename: str)
         print(f"[comfyapp] golden_model_metadata_publish_failed {type(exc).__name__}:{exc}")
 
 
-@app.function(
-    image=download_image,
-    cpu=2,
-    memory=512,
-    timeout=1800,
-    volumes={MODELS_PATH: vol, RUNTIME_CONFIG_PATH: runtime_config_vol},
-)
-def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "", civitai_token: str = ""):
+def _download_single_model_to_volume(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "", civitai_token: str = ""):
+    """Shared single-model download implementation.
+
+    Runs in the same container/volume context as the callers. Extracted so
+    batch_download_models does not need Modal fan-out (``.starmap``/``.map``)
+    from inside a running Modal function, where the sibling handle resolves
+    to a plain function without those methods.
+    """
     import httpx
     from pathlib import Path
 
@@ -9604,6 +9604,17 @@ def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoi
     vol.commit()
     _publish_downloaded_model_metadata(str(dest), save_path, filename)
     return {"status": "ok", "path": str(dest)}
+
+
+@app.function(
+    image=download_image,
+    cpu=2,
+    memory=512,
+    timeout=1800,
+    volumes={MODELS_PATH: vol, RUNTIME_CONFIG_PATH: runtime_config_vol},
+)
+def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "", civitai_token: str = ""):
+    return _download_single_model_to_volume(url, filename, save_path, hf_token, civitai_token)
 
 
 @app.function(
@@ -9677,13 +9688,21 @@ def download_model_stream(url: str, filename: str, save_path: str = "checkpoints
     volumes={MODELS_PATH: vol},
 )
 def batch_download_models(items: list, hf_token: str = "", civitai_token: str = "") -> list:
-    starmap_args = []
+    # Sequential in-container downloads. Do not use download_model_to_volume
+    # .starmap/.map here: from inside this Modal function the sibling resolves
+    # to a plain function without fan-out methods, raising
+    # "'function' object has no attribute 'starmap'".
+    results = []
     for item in items:
-        args = [item["url"], item["filename"], item.get("save_path", "checkpoints"), hf_token]
-        if civitai_token:
-            args.append(civitai_token)
-        starmap_args.append(tuple(args))
-    results = list(download_model_to_volume.starmap(starmap_args))
+        results.append(
+            _download_single_model_to_volume(
+                item["url"],
+                item["filename"],
+                item.get("save_path", "checkpoints"),
+                hf_token,
+                civitai_token,
+            )
+        )
     return results
 
 

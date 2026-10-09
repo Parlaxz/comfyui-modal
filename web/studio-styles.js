@@ -11,8 +11,8 @@ const STUDIO_CSS = `
   background: #0a0a0a;
   border: 1px solid #2a2a2a;
   border-radius: 6px;
-  width: min(98vw, 1760px);
-  height: min(94vh, 1040px);
+  width: 100vw;
+  height: 100vh;
   max-width: calc(100vw - 16px);
   max-height: calc(100vh - 16px);
   display: flex;
@@ -20,6 +20,7 @@ const STUDIO_CSS = `
   overflow: hidden;
   color: #d0d0d0;
   font-size: 13px;
+  box-sizing: border-box;
 }
 
 /* When modal is open, body should not scroll behind it */
@@ -35,17 +36,15 @@ body.comfymodal-body-scroll-lock {
   min-height: 0;
 }
 
-.comfymodal-studio-header {
+.comfymodal-studio-topnav-heading {
   display: flex;
   align-items: center;
-  padding: 8px 16px;
-  border-bottom: 1px solid #2a2a2a;
+  padding: 0 12px 0 8px;
   flex-shrink: 0;
-  background: #0a0a0a;
   min-height: 40px;
 }
 
-.comfymodal-studio-header h1 {
+.comfymodal-studio-topnav-heading {
   margin: 0;
   color: #e0e0e0;
   font-size: 12px;
@@ -54,11 +53,13 @@ body.comfymodal-body-scroll-lock {
   text-transform: uppercase;
 }
 
-.comfymodal-studio-header-actions {
+.comfymodal-studio-topnav-actions {
   display: flex;
   align-items: center;
   gap: 4px;
   margin-left: auto;
+  padding-left: 8px;
+  flex-shrink: 0;
 }
 
 .comfymodal-studio-help,
@@ -89,24 +90,16 @@ body.comfymodal-body-scroll-lock {
   outline-offset: 2px;
 }
 
-.comfymodal-studio-header h2 {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  flex: 1;
-  color: #e0e0e0;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
 .comfymodal-studio-topnav {
   display: flex;
+  align-items: center;
   gap: 0;
   border-bottom: 1px solid #2a2a2a;
   flex-shrink: 0;
   padding: 0 8px;
   background: #0d0d0d;
   overflow-x: auto;
+  min-width: 0;
   -webkit-overflow-scrolling: touch;
 }
 
@@ -198,6 +191,13 @@ body.comfymodal-body-scroll-lock {
 .comfymodal-studio-topnav button.active {
   color: var(--color-accent, #5a7fdb);
   border-bottom-color: var(--color-accent, #5a7fdb);
+}
+
+.comfymodal-studio-topnav-actions button {
+  padding: 0;
+  border-bottom: 0;
+  text-transform: none;
+  letter-spacing: normal;
 }
 
 /* ── Shell page container ────────────────────────────────── */
@@ -392,6 +392,50 @@ body.comfymodal-body-scroll-lock {
   border-radius: 3px;
 }
 
+.comfymodal-studio-workflow-select-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.comfymodal-studio-workflow-label {
+  flex: 0 0 auto;
+  min-width: 52px;
+  color: #8b8f98;
+  font-size: 11px;
+}
+.comfymodal-studio-workflow-select-row .comfymodal-studio-workflow-select {
+  flex: 1;
+  min-width: 0;
+}
+.comfymodal-studio-workflow-type {
+  flex: 0 0 auto;
+  color: #8b8f98;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.comfymodal-studio-playground-deploy-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid #3a2f1e;
+  background: #17130d;
+}
+.comfymodal-studio-playground-deploy-notice .comfymodal-studio-settings-hint {
+  margin: 0;
+  color: #d9a441;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.comfymodal-studio-playground-deploy-notice .comfymodal-primary-btn {
+  width: auto;
+  align-self: flex-start;
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
 .comfymodal-studio-control-note {
   font-size: 11px;
   color: #555;
@@ -413,40 +457,6 @@ body.comfymodal-body-scroll-lock {
   margin: 8px 0 4px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-}
-
-/* ── Feature Tabs ────────────────────────────────────────── */
-
-.comfymodal-studio-feature-tabs {
-  display: flex;
-  gap: 0;
-  border-bottom: 1px solid #2a2a2a;
-  flex-shrink: 0;
-  background: #0d0d0d;
-}
-
-.comfymodal-studio-feature-tab {
-  background: transparent;
-  border: none;
-  color: #555;
-  padding: 6px 14px;
-  cursor: pointer;
-  font-size: 11px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  border-bottom: 2px solid transparent;
-  transition: color 0.15s, background 0.15s;
-}
-
-.comfymodal-studio-feature-tab:hover {
-  color: #d0d0d0;
-  background: #1a1a1a;
-}
-
-.comfymodal-studio-feature-tab.active {
-  color: var(--color-accent, #5a7fdb);
-  border-bottom-color: var(--color-accent, #5a7fdb);
 }
 
 /* ── Placeholder notices ─────────────────────────────────── */
@@ -1110,6 +1120,9 @@ body.comfymodal-body-scroll-lock {
   scroll-behavior: smooth;
   -webkit-overflow-scrolling: touch;
 }
+.comfymodal-studio-carousel-track[hidden] {
+  display: none;
+}
 
 .comfymodal-studio-carousel-track::-webkit-scrollbar {
   height: 4px;
@@ -1177,48 +1190,42 @@ body.comfymodal-body-scroll-lock {
   border: 1px solid rgba(0,0,0,0.5);
 }
 
-/* ── Carousel Header & Actions ──────────────────────────── */
+/* ── Recent runs accordion ───────────────────────────────── */
 
-.comfymodal-studio-carousel-header {
+.comfymodal-studio-carousel-accordion {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  min-height: 24px;
-}
-
-.comfymodal-studio-carousel-header-label {
-  font-size: 12px;
-  color: #888;
-}
-
-.comfymodal-studio-carousel-actions {
-  display: flex;
-  gap: 4px;
-}
-
-.comfymodal-studio-carousel-btn {
-  background: transparent;
-  border: none;
-  color: #666;
-  font-size: 12px;
+  justify-content: center;
+  gap: 14px;
+  min-height: 28px;
+  border-top: 1px solid #252525;
+  border-bottom: 1px solid #252525;
   cursor: pointer;
-  padding: 2px 6px;
-  line-height: 1;
+}
+.comfymodal-studio-carousel-accordion-label {
+  color: #9a9a9a;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+}
+.comfymodal-studio-carousel-accordion-arrow {
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #777;
+  cursor: pointer;
   font-family: inherit;
-  transition: color 0.15s;
+  font-size: 20px;
+  line-height: 1;
 }
-
-.comfymodal-studio-carousel-btn:hover {
-  color: #fff;
+.comfymodal-studio-carousel-accordion-arrow:hover,
+.comfymodal-studio-carousel-accordion-arrow:focus-visible {
+  color: #d0d0d0;
 }
-
-.comfymodal-studio-carousel-btn.danger:hover {
-  color: #f87171;
-}
-
-.comfymodal-studio-carousel-btn.close-btn {
-  font-size: 16px;
-  padding: 2px 4px;
+.comfymodal-studio-carousel-accordion-arrow:focus-visible {
+  outline: 1px solid #666;
+  outline-offset: 2px;
 }
 
 /* ── Carousel Reveal Bar ─────────────────────────────────── */
@@ -1410,18 +1417,21 @@ body.comfymodal-body-scroll-lock {
   flex-direction: column;
   align-items: center;
   gap: 6px;
+  width: 100%;
   max-width: 100%;
+  min-height: 0;
 }
 .comfymodal-studio-zoom-image-container {
-  overflow: auto;
+  overflow: hidden;
   position: relative;
   width: 100%;
   max-width: 100%;
   max-height: 80vh;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  touch-action: pan-x pan-y;
+  touch-action: none;
 }
 .comfymodal-studio-zoom-image-container img {
   max-width: 100%;
@@ -1501,16 +1511,16 @@ body.comfymodal-body-scroll-lock {
 }
 .comfymodal-studio-preview-overlay-content {
   position: relative;
-  max-width: min(92vw, 1120px);
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+  width: min(94vw, 1280px);
   max-height: 92vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  padding: 10px;
+  gap: 0;
+  overflow: hidden;
   border: 1px solid #2b2f38;
-  border-radius: var(--border-radius-md, 8px);
-  background: rgba(13, 14, 18, 0.96);
+  border-radius: 8px;
+  background: #0d0e12;
   box-shadow: 0 22px 70px rgba(0, 0, 0, 0.55);
 }
 .comfymodal-studio-preview-overlay-close {
@@ -1545,10 +1555,23 @@ body.comfymodal-body-scroll-lock {
   color: #555;
   font-size: 12px;
 }
-.comfymodal-studio-preview-overlay-sections {
+.comfymodal-studio-preview-overlay-stage {
+  box-sizing: border-box;
+   width: 100%;
+   min-width: 0;
+   min-height: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 18px;
+  background: #090a0d;
+}
+.comfymodal-studio-preview-overlay-sections {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
   gap: 6px;
   max-width: 100%;
   width: 100%;
@@ -1581,10 +1604,459 @@ body.comfymodal-body-scroll-lock {
   color: var(--color-text, #f3f4f6);
 }
 .comfymodal-studio-preview-overlay-side {
-  border-left-color: #343944 !important;
+  box-sizing: border-box;
+  min-width: 0;
+  max-height: 92vh;
+  overflow-y: auto;
+  padding: 18px;
+  border-left: 1px solid #343944;
+  background: #111318;
   color: var(--color-text, #e5e7eb);
   font-size: var(--font-size-sm, 11px) !important;
   line-height: 1.45;
+}
+.comfymodal-studio-preview-details {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.comfymodal-studio-preview-details-heading {
+  color: #f3f4f6;
+  font-size: 14px;
+  font-weight: 600;
+}
+.comfymodal-studio-preview-detail {
+  min-width: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #272a31;
+}
+.comfymodal-studio-preview-detail-label {
+  margin-bottom: 3px;
+  color: #858b98;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.comfymodal-studio-preview-detail-value {
+  color: #e5e7eb;
+  overflow-wrap: anywhere;
+}
+.comfymodal-studio-preview-detail.is-long .comfymodal-studio-preview-detail-value {
+  max-height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+.comfymodal-studio-preview-parameters {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 2px 0 8px;
+  border-bottom: 1px solid #272a31;
+}
+.comfymodal-studio-preview-parameter {
+  display: grid;
+  grid-template-columns: minmax(80px, 0.6fr) minmax(0, 1fr);
+  gap: 8px;
+  color: #d1d5db;
+}
+.comfymodal-studio-preview-parameter-key {
+  color: #858b98;
+  overflow-wrap: anywhere;
+}
+.comfymodal-studio-preview-parameter-value {
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+.comfymodal-studio-preview-timing {
+  padding-top: 8px;
+  border-top: 1px solid #272a31;
+}
+
+.comfymodal-studio-timing-flow-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.comfymodal-studio-timing-flow-title {
+  color: #f3f4f6;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.comfymodal-studio-timing-flow {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  min-width: max-content;
+  overflow-x: auto;
+  padding: 2px 2px 6px;
+}
+.comfymodal-studio-timing-flow-column {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  min-width: 122px;
+}
+.comfymodal-studio-timing-flow-node {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-height: 48px;
+  justify-content: center;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border: 1px solid #303745;
+  border-radius: 7px;
+  background: linear-gradient(145deg, #171c27, #11141b);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+.comfymodal-studio-timing-flow-node .comfymodal-studio-viewer-row-key {
+  color: #aeb7c8;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.comfymodal-studio-timing-flow-node .comfymodal-studio-viewer-row-value {
+  color: #f3f4f6;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.comfymodal-studio-timing-flow-arrow {
+  align-self: center;
+  color: var(--color-accent, #6e8fe8);
+  font-size: 20px;
+  line-height: 1;
+}
+.comfymodal-studio-timing-flow-section .comfymodal-studio-viewer-placeholder {
+  width: 100%;
+  box-sizing: border-box;
+}
+.comfymodal-studio-timing-flow-total {
+  display: flex;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  min-width: 0;
+}
+
+/* ── Shared viewer (the one full-size output overlay, every surface) ──
+   One overlay contract: zoom stage left, cards right, timing flow
+   full-width at the bottom with parallel stages stacked per column.
+   The viewer owns its vocabulary (viewer-*); no surface's naming leaks
+   into it, so any surface can mount it and look identical. */
+
+.comfymodal-studio-viewer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10050;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.comfymodal-studio-viewer-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.84);
+}
+.comfymodal-studio-viewer-content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-sizing: border-box;
+  width: min(1400px, 98vw);
+  height: calc(100vh - 24px);
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  padding: 18px;
+  border: 1px solid #2b2f38;
+  border-radius: 10px;
+  background: #0d0e12;
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.55);
+}
+.comfymodal-studio-viewer-close {
+  position: sticky;
+  top: 0;
+  align-self: flex-end;
+  z-index: 2;
+  border: 0;
+  background: transparent;
+  color: #aaa;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 8px;
+}
+.comfymodal-studio-viewer-close:hover { color: #fff; }
+.comfymodal-studio-viewer-close:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
+}
+.comfymodal-studio-viewer-body {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+  gap: 18px;
+  align-items: start;
+}
+.comfymodal-studio-viewer-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  padding: 18px;
+  background: #090a0d;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.comfymodal-studio-viewer-stage .comfymodal-studio-zoom-wrap {
+  width: 100%;
+  max-width: 100%;
+}
+.comfymodal-studio-viewer-stage .comfymodal-studio-zoom-image-container {
+  max-width: 100%;
+  max-height: calc(90vh - 90px);
+}
+/* Same sizing contract as _applyZoom in studio-ui.js: stage images fill
+   the stage width (small history previews upscale like playground outputs)
+   and cap at the stage height. The base 80vh img cap above still applies
+   to non-viewer contexts. */
+.comfymodal-studio-viewer-stage .comfymodal-studio-zoom-image-container img {
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+  max-height: calc(90vh - 90px);
+  object-fit: contain;
+}
+.comfymodal-studio-viewer-right {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+}
+.comfymodal-studio-viewer-run-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.comfymodal-studio-viewer-run-line .comfymodal-studio-viewer-favorite {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: #fbbf24;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+.comfymodal-studio-viewer-run-line .comfymodal-studio-viewer-favorite:hover {
+  color: #fde68a;
+}
+/* Cards / rows — the viewer's own vocabulary, not any surface's. */
+.comfymodal-studio-viewer-card {
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  background: #0f0f0f;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.comfymodal-studio-viewer-card-title {
+  font-size: 10px;
+  font-weight: 600;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0;
+}
+.comfymodal-studio-viewer-row {
+  display: flex;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  min-width: 0;
+}
+.comfymodal-studio-viewer-row-key {
+  color: #888;
+  flex-shrink: 0;
+}
+.comfymodal-studio-viewer-row-value {
+  color: #d0d0d0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.comfymodal-studio-viewer-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.comfymodal-studio-viewer-note {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 56px;
+  resize: vertical;
+  background: #0a0a0a;
+  border: 1px solid #2a2a2a;
+  color: #d0d0d0;
+  padding: 6px 8px;
+  font-size: 12px;
+  border-radius: 6px;
+  font-family: inherit;
+}
+.comfymodal-studio-viewer-note:focus {
+  border-color: var(--color-accent, #5a7fdb);
+  outline: none;
+}
+.comfymodal-studio-viewer-note-status {
+  font-size: 11px;
+  color: #fbbf24;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.comfymodal-studio-viewer-badge {
+  font-size: 11px;
+  color: #fbbf24;
+  background: #2a1a00;
+  border: 1px solid #4a3a00;
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.comfymodal-studio-viewer-placeholder {
+  font-size: 11px;
+  color: #666;
+  border: 1px dashed #2a2a2a;
+  border-radius: 4px;
+  padding: 10px;
+  text-align: center;
+}
+.comfymodal-studio-viewer-prompts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.comfymodal-studio-viewer-prompt-label {
+  color: #858b98;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.comfymodal-studio-viewer-prompt-value {
+  position: relative;
+  max-height: 54px;
+  overflow: hidden;
+  cursor: pointer;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #e5e7eb;
+  border-radius: 4px;
+}
+.comfymodal-studio-viewer-prompt-value:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 1px;
+}
+.comfymodal-studio-viewer-prompt-value .comfymodal-studio-viewer-prompt-fade {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 22px;
+  background: linear-gradient(transparent, #0f0f0f 85%);
+  pointer-events: none;
+}
+.comfymodal-studio-viewer-prompt-value.is-expanded {
+  max-height: 220px;
+  overflow-y: auto;
+  cursor: default;
+}
+.comfymodal-studio-viewer-prompt-value.is-expanded .comfymodal-studio-viewer-prompt-fade {
+  display: none;
+}
+.comfymodal-studio-viewer-negative-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #d1d5db;
+}
+.comfymodal-studio-viewer-params-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 6px;
+  margin-top: 6px;
+}
+.comfymodal-studio-viewer-param {
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  border-radius: 6px;
+  padding: 6px 8px;
+  min-width: 0;
+}
+.comfymodal-studio-viewer-param-key {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #777;
+}
+.comfymodal-studio-viewer-param-value {
+  font-size: 12px;
+  color: #d0d0d0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.comfymodal-studio-viewer-accordion-toggle {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-family: inherit;
+}
+.comfymodal-studio-viewer-accordion-toggle::after {
+  content: " \\25b8";
+}
+.comfymodal-studio-viewer-accordion-toggle[aria-expanded="true"]::after {
+  content: " \\25be";
+}
+.comfymodal-studio-viewer-accordion-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.comfymodal-studio-viewer-timing {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+@media (max-width: 720px) {
+  .comfymodal-studio-viewer-content {
+    width: calc(100vw - 20px);
+    height: calc(100vh - 20px);
+    max-height: calc(100vh - 20px);
+    padding: 10px;
+  }
+  .comfymodal-studio-viewer-body { grid-template-columns: 1fr; }
+  .comfymodal-studio-viewer-right { max-height: none; }
 }
 .comfymodal-studio-canvas-output {
   max-width: 100%;
@@ -1595,6 +2067,8 @@ body.comfymodal-body-scroll-lock {
 
 @media (max-width: 640px) {
   .comfymodal-studio-preview-overlay-content {
+    display: flex;
+    flex-direction: column;
     width: calc(100vw - 20px);
     max-width: calc(100vw - 20px);
     max-height: calc(100vh - 20px);
@@ -1603,74 +2077,148 @@ body.comfymodal-body-scroll-lock {
   .comfymodal-studio-preview-overlay .comfymodal-studio-zoom-image-container {
     max-height: 62vh;
   }
+  .comfymodal-studio-viewer-stage .comfymodal-studio-zoom-image-container {
+    max-height: 62vh;
+  }
   .comfymodal-studio-preview-overlay-side {
-    position: static !important;
     width: 100% !important;
-    max-height: 20vh;
+    max-height: 34vh;
+    padding: 12px;
     border-top: 1px solid #343944 !important;
     border-left: 0 !important;
     border-radius: 6px;
   }
 }
 
-/* ── Golden progress timeline ───────────────────────────── */
+/* ── Golden progress timeline ─────────────────────────────
+   Single slim bar in the run-button accent. The bar shell alone is
+   rounded; segments are square and separated by hairline gaps so the
+   track shows through. Narrow segments clip their text gracefully and
+   keep full detail in the title/aria-label tooltip. */
 .comfymodal-studio-progress-bar {
   position: relative;
   display: flex;
   width: 100%;
-  height: 34px;
-  margin-bottom: 9px;
+  height: 20px;
   overflow: hidden;
-  border: 1px solid #30333b;
-  border-radius: 999px;
-  background: #15171c;
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.35);
+  border: 1px solid #3a3d43;
+  border-radius: 2px;
+  background: #111214;
+  box-shadow: none;
 }
 .comfymodal-studio-progress-fill {
   position: absolute;
   inset: 0 auto 0 0;
   z-index: 0;
   width: 0;
-  border-radius: inherit;
-  background: var(--color-accent, #5a7fdb);
-  opacity: 0.2;
+  border-radius: 0;
+  background: #777;
+  opacity: 0.18;
   transition: width 0.3s ease;
 }
 .comfymodal-studio-progress-segments {
   position: relative;
   z-index: 1;
   display: flex;
+  box-sizing: border-box;
   width: 100%;
   height: 100%;
   gap: 0;
+  padding: 0;
 }
 .comfymodal-studio-progress-segment {
   position: relative;
   display: flex;
   align-items: center;
+  gap: 4px;
   flex: 0 0 auto;
   min-width: 0;
   overflow: hidden;
-  border-radius: 999px;
-  background: #3a465f;
-  color: #e7ebf4;
+  box-sizing: border-box;
+  padding: 0 7px;
+  border-radius: 0;
+  background: transparent;
+  border-right: 1px solid #4a4d53;
+  color: #b9bdc5;
+  white-space: nowrap;
+  text-shadow: none;
   transition: width 0.35s ease, background 0.2s ease;
+  container-type: inline-size;
 }
-.comfymodal-studio-progress-segment.is-completed { background: #496b61; }
-.comfymodal-studio-progress-segment.is-active { background: var(--color-accent, #5a7fdb); }
-.comfymodal-studio-progress-segment.is-failed { background: var(--color-danger, #b84b58); }
+.comfymodal-studio-progress-segment.is-completed { background: rgba(255,255,255,0.035); }
+.comfymodal-studio-progress-segment.is-completed.is-alt { background: transparent; }
+.comfymodal-studio-progress-segment.is-active {
+  background: rgba(255,255,255,0.06);
+  overflow: hidden;
+}
+.comfymodal-studio-progress-segment.is-active::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.28) 50%, transparent 80%);
+  transform: translateX(-100%);
+  animation: cm-seg-sheen 1.8s ease-in-out infinite;
+}
+.comfymodal-studio-progress-segment.is-failed { background: rgba(180,75,88,0.18); color: #f0a1aa; }
 .comfymodal-studio-progress-segment.is-current {
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.12);
+  min-width: 3px;
+  box-shadow: inset 0 0 0 1px #777;
+}
+@keyframes cm-seg-sheen {
+  to { transform: translateX(100%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .comfymodal-studio-progress-segment.is-active::after { animation: none; }
+  .comfymodal-studio-progress-segment { transition: none; }
+  .comfymodal-studio-progress-fill { transition: none; }
 }
 .comfymodal-studio-progress-segment-label {
-  width: 100%;
-  padding: 0 9px;
   overflow: hidden;
   font-size: var(--font-size-xs, 10px);
-  font-weight: var(--font-weight-semibold, 600);
-  line-height: 32px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-transform: uppercase;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.comfymodal-studio-progress-segment-time {
+  flex-shrink: 0;
+  overflow: hidden;
+  font-size: var(--font-size-xs, 10px);
+  font-weight: var(--font-weight-medium, 500);
+  line-height: 1;
+  white-space: nowrap;
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+}
+@container (max-width: 120px) {
+  .comfymodal-studio-progress-segment-time { display: none; }
+}
+@container (max-width: 64px) {
+  .comfymodal-studio-progress-segment-label { display: none; }
+  .comfymodal-studio-progress-segment { padding: 0; }
+}
+.comfymodal-studio-progress-total {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  flex: 0 0 auto;
+  min-width: 68px;
+  margin: 0;
+  color: var(--color-text-muted, #9297a3);
+  font-size: var(--font-size-sm, 11px);
+  font-variant-numeric: tabular-nums;
+}
+.comfymodal-studio-progress-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+.comfymodal-studio-progress-bar-row .comfymodal-studio-progress-bar {
+  flex: 1;
+  min-width: 0;
 }
 .comfymodal-studio-progress-summary {
   display: flex;
@@ -1685,31 +2233,6 @@ body.comfymodal-body-scroll-lock {
   font-weight: var(--font-weight-semibold, 600);
   font-variant-numeric: tabular-nums;
 }
-.comfymodal-studio-progress-total {
-  margin-top: 11px;
-  color: var(--color-text, #e5e7eb);
-  font-size: var(--font-size-md, 13px);
-  font-weight: var(--font-weight-semibold, 600);
-  font-variant-numeric: tabular-nums;
-}
-.comfymodal-studio-progress-stages {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 7px;
-}
-.comfymodal-studio-progress-stage-row {
-  padding: 5px 8px;
-  border: 1px solid #292c34;
-  border-radius: var(--border-radius-sm, 5px);
-  background: rgba(255, 255, 255, 0.025);
-  color: var(--color-text-muted, #9297a3);
-  font-size: var(--font-size-xs, 10px);
-  font-variant-numeric: tabular-nums;
-}
-.comfymodal-studio-progress-stage-row.is-completed { color: #b7d6c9; }
-.comfymodal-studio-progress-stage-row.is-active { color: #d9e2ff; border-color: rgba(90, 127, 219, 0.55); }
-.comfymodal-studio-progress-stage-row.is-failed { color: var(--color-danger, #f87171); border-color: rgba(248, 113, 113, 0.45); }
 .comfymodal-studio-progress-stage-error {
   margin-top: 6px;
   color: var(--color-danger, #f87171);
@@ -1762,8 +2285,36 @@ body.comfymodal-body-scroll-lock {
 .comfymodal-studio-settings {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 10px;
+  max-width: 920px;
+  margin: 0 auto;
+  width: 100%;
 }
+
+.comfymodal-studio-settings-tabs {
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  border-bottom: 1px solid #2a2a2a;
+  background: #0d0d0d;
+}
+.comfymodal-studio-settings-tab {
+  flex: 0 0 auto;
+  min-height: 38px;
+  padding: 8px 13px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: #777;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.comfymodal-studio-settings-tab:hover,
+.comfymodal-studio-settings-tab:focus-visible { color: #e4e6eb; background: #17181c; }
+.comfymodal-studio-settings-tab.active { color: var(--color-accent, #7fa2ff); border-bottom-color: var(--color-accent, #7fa2ff); }
 
 .comfymodal-studio-settings-section {
   background: #111;
@@ -1931,6 +2482,10 @@ body.comfymodal-body-scroll-lock {
 /* ── Responsive: breakpoint 768px ───────────────────────── */
 
 @media (max-width: 768px) {
+  .comfymodal-studio-settings-section { padding: 12px; }
+  .comfymodal-studio-settings-row { align-items: flex-start; gap: 10px; }
+  .comfymodal-settings-range-wrap { min-width: 120px; }
+  .comfymodal-studio-settings-tab { padding-inline: 10px; }
   .comfymodal-studio-playground {
     flex-direction: column;
   }
@@ -2115,6 +2670,7 @@ button.comfymodal-studio-feature-chip {
 /* ── Settings: search, banner, resets, groups (v2 page) ─── */
 
 .comfymodal-settings-search-wrap {
+  position: relative;
   margin-bottom: 4px;
 }
 .comfymodal-settings-search {
@@ -2122,15 +2678,47 @@ button.comfymodal-studio-feature-chip {
   box-sizing: border-box;
   font-size: 12px;
   padding: 6px 8px;
+  padding-right: 58px;
 }
+.comfymodal-settings-search-clear {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  padding: 3px 7px;
+  border: 0;
+  background: transparent;
+  color: #777;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+}
+.comfymodal-settings-search-clear:hover,
+.comfymodal-settings-search-clear:focus-visible { color: #e0e0e0; }
 .comfymodal-settings-search::-webkit-search-cancel-button {
   cursor: pointer;
 }
 .comfymodal-settings-search-results {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
   font-size: 11px;
   color: #888;
   margin-top: 4px;
 }
+.comfymodal-settings-search-group {
+  padding: 3px 7px;
+  border: 1px solid #30343e;
+  border-radius: 3px;
+  background: #17191f;
+  color: #aeb9d6;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+}
+.comfymodal-settings-search-group:hover { border-color: var(--color-accent, #5a7fdb); color: #e5e7eb; }
+.comfymodal-settings-search-empty { color: #c98a8a; }
+.comfymodal-studio-settings-section[hidden] { display: none; }
 .comfymodal-settings-row-hidden {
   display: none !important;
 }
@@ -2357,99 +2945,13 @@ button.comfymodal-studio-feature-chip {
   box-shadow: 0 4px 12px rgba(0,0,0,0.5);
 }
 
-/* ── Metadata Section ──────────────────────────────────────── */
-
-.comfymodal-studio-metadata-section {
-  background: #0f0f0f;
-  border: 1px solid #222;
-  border-radius: 3px;
-  padding: 6px 10px;
-  font-size: 11px;
-  line-height: 1.5;
-  flex-shrink: 0;
-}
-
-.comfymodal-studio-metadata-summary {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-}
-
-.comfymodal-studio-metadata-status {
-  font-weight: 600;
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-
-.comfymodal-studio-metadata-prompt,
-.comfymodal-studio-metadata-neg-prompt {
-  color: #aaa;
-  font-size: 10px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 300px;
-}
-
-.comfymodal-studio-metadata-source {
-  color: #888;
-  font-size: 10px;
-}
-
-.comfymodal-studio-metadata-duration,
-.comfymodal-studio-metadata-time {
-  color: #666;
-  font-size: 10px;
-}
-
-.comfymodal-studio-metadata-settings {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  margin-top: 4px;
-  padding-top: 4px;
-  border-top: 1px solid #1a1a1a;
-}
-
-.comfymodal-studio-metadata-setting {
-  font-size: 10px;
-  color: #777;
-}
-
-.comfymodal-studio-metadata-error {
-  margin-top: 4px;
-  padding: 4px 6px;
-  background: #1a0a0a;
-  border: 1px solid #3a0a0a;
-  border-radius: 2px;
-  color: #f87171;
-  font-size: 10px;
-}
-
-.comfymodal-studio-metadata-advanced,
-.comfymodal-studio-metadata-note-panel {
-  margin-top: 4px;
-  padding: 4px 6px;
-  background: #0a0a0a;
-  border: 1px solid #1a1a1a;
-  border-radius: 2px;
-}
-
-.comfymodal-studio-metadata-advanced-toggle {
-  font-family: inherit;
-  font-size: inherit;
-  line-height: inherit;
-}
-
 /* ── Progress Section ──────────────────────────────────── */
 
 .comfymodal-studio-progress-section {
-  background: #0f0f0f;
-  border: 1px solid #222;
-  border-radius: 3px;
-  padding: 6px 10px;
+  background: transparent;
+  border-top: 1px solid #282a2e;
+  border-bottom: 1px solid #282a2e;
+  padding: 8px 0;
   font-size: 11px;
   line-height: 1.5;
 }
@@ -3978,6 +4480,22 @@ button.comfymodal-studio-feature-chip {
   color: #f87171;
 }
 
+.comfymodal-studio-history-v2-open-folder {
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 4px 6px;
+  font-family: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.comfymodal-studio-history-v2-open-folder:hover {
+  color: #ccc;
+}
+
 .comfymodal-studio-history-v2-result-count {
   font-size: 12px;
   color: #888;
@@ -4394,8 +4912,9 @@ button.comfymodal-studio-feature-chip {
 
 .comfymodal-studio-history-v2-overlay-content {
   position: relative;
-  width: min(1000px, 96vw);
-  max-height: 90vh;
+  width: min(1400px, 98vw);
+  height: calc(100vh - 24px);
+  max-height: calc(100vh - 24px);
   overflow-y: auto;
   box-sizing: border-box;
   background: #0d0d0d;
@@ -4555,6 +5074,16 @@ button.comfymodal-studio-feature-chip {
 
 .comfymodal-studio-history-v2-section-error {
   border-color: #4a1a1a;
+}
+
+.comfymodal-studio-history-v2-timing-section {
+  grid-column: 1 / -1;
+  overflow: hidden;
+}
+
+.comfymodal-studio-history-v2-overflow-section {
+  grid-column: 1 / -1;
+  min-width: 0;
 }
 
 .comfymodal-studio-history-v2-section-title {
@@ -5499,6 +6028,46 @@ button.comfymodal-studio-feature-chip {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+
+/* ── Dependency accordions ───────────────────────────────── */
+.comfymodal-studio-advanced-accordion,
+.comfymodal-studio-dependency-accordion {
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  background: #0d0d0d;
+}
+.comfymodal-studio-accordion-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 34px;
+  padding: 7px 10px;
+  cursor: pointer;
+  list-style: none;
+  color: #c8c8c8;
+  font-size: 11px;
+  font-weight: 600;
+}
+.comfymodal-studio-accordion-summary::-webkit-details-marker { display: none; }
+.comfymodal-studio-accordion-summary::before {
+  content: "›";
+  color: #777;
+  font-size: 16px;
+  transition: transform 0.15s ease;
+}
+.comfymodal-studio-accordion-label { flex: 1; }
+.comfymodal-studio-advanced-accordion > .comfymodal-studio-accordion-summary {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.comfymodal-studio-advanced-accordion[open] > .comfymodal-studio-accordion-summary::before,
+.comfymodal-studio-dependency-accordion[open] > .comfymodal-studio-accordion-summary::before {
+  transform: rotate(90deg);
+}
+.comfymodal-studio-advanced-accordion > :not(summary) { margin: 0 10px 10px; }
+.comfymodal-studio-dependency-accordion { margin: 8px 10px 0; }
+.comfymodal-studio-dependency-accordion > :not(summary) { margin: 0 10px 10px; }
 
 /* ── Versions list ───────────────────────────────────────── */
 
@@ -6888,30 +7457,6 @@ button.comfymodal-studio-feature-chip {
   border-top: 1px solid #2a2a2a;
 }
 
-.comfymodal-studio-shelf-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.comfymodal-studio-shelf-workflow-name {
-  font-size: 12px;
-  font-weight: 600;
-  color: #d0d0d0;
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.comfymodal-studio-shelf-autosaved {
-  font-size: 10px;
-  color: #666;
-  font-style: italic;
-  white-space: nowrap;
-}
-
 .comfymodal-studio-shelf-mini-btn {
   font-size: 10px;
   padding: 2px 8px;
@@ -6949,11 +7494,40 @@ button.comfymodal-studio-feature-chip {
   opacity: 0.5;
 }
 
-.comfymodal-studio-shelf-card.is-drop-target,
-.comfymodal-studio-shelf-row.is-drop-target {
-  outline: 1px dashed var(--color-accent, #5a7fdb);
-  outline-offset: 2px;
+.comfymodal-studio-shelf-card.is-drop-before,
+.comfymodal-studio-shelf-card.is-drop-after {
+  position: relative;
 }
+.comfymodal-studio-shelf-card.is-drop-before::before,
+.comfymodal-studio-shelf-card.is-drop-after::after {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--color-accent, #5a7fdb);
+  content: "";
+  pointer-events: none;
+}
+.comfymodal-studio-shelf-card.is-drop-before::before { left: -4px; }
+.comfymodal-studio-shelf-card.is-drop-after::after { right: -4px; }
+.comfymodal-studio-shelf-row.is-drop-above,
+.comfymodal-studio-shelf-row.is-drop-below {
+  position: relative;
+}
+.comfymodal-studio-shelf-row.is-drop-above::before,
+.comfymodal-studio-shelf-row.is-drop-below::after {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--color-accent, #5a7fdb);
+  content: "";
+  pointer-events: none;
+}
+.comfymodal-studio-shelf-row.is-drop-above::before { top: -4px; }
+.comfymodal-studio-shelf-row.is-drop-below::after { bottom: -4px; }
 
 .comfymodal-studio-shelf-card-head {
   display: flex;
@@ -6968,6 +7542,7 @@ button.comfymodal-studio-feature-chip {
   font-size: 12px;
   letter-spacing: -2px;
   user-select: none;
+  touch-action: none;
   flex-shrink: 0;
 }
 
@@ -6986,6 +7561,11 @@ button.comfymodal-studio-feature-chip {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.comfymodal-studio-shelf-dragging,
+.comfymodal-studio-shelf-dragging * {
+  cursor: grabbing !important;
+  user-select: none !important;
 }
 
 .comfymodal-studio-shelf-card-body .comfymodal-input {

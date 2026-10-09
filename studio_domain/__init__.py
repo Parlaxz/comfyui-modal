@@ -37,12 +37,15 @@ from .models import (
 )
 from .store import WorkflowDomainStore
 from .graph import (
+    INPUT_BINDING_KINDS,
     derive_mapping_candidates,
     extract_dependency_metadata,
     extract_executable_prompt,
+    find_binding_candidates,
     graph_hash_from_capture,
     infer_control_kind,
     is_ui_workflow_format,
+    resolve_binding_target,
     ui_graph_to_api_prompt,
 )
 from .services import WorkflowDomainService
@@ -68,6 +71,7 @@ __all__ = [
     "ImmutableVersionError",
     "WorkflowNotRunnableError",
     "GraphHashError",
+    "INPUT_BINDING_KINDS",
     "make_workflow_id",
     "make_version_id",
     "make_mapping_id",
@@ -75,8 +79,10 @@ __all__ = [
     "derive_mapping_candidates",
     "extract_dependency_metadata",
     "extract_executable_prompt",
+    "find_binding_candidates",
     "graph_hash_from_capture",
     "infer_control_kind",
     "is_ui_workflow_format",
+    "resolve_binding_target",
     "ui_graph_to_api_prompt",
 ]

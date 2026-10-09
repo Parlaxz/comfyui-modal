@@ -653,8 +653,13 @@ class ModelLibraryService:
             raise ModelLibraryError(f"unsupported model folder: {folder}")
         if not isinstance(filename, str) or not filename.strip():
             raise ModelLibraryError("filename required")
-        fname = filename.strip()
-        if fname in {".", ".."} or "/" in fname or "\\" in fname:
+        # ComfyUI loaders report subfolder-relative names (e.g.
+        # "krea2\\krea2_turbo_fp8_scaled.safetensors"). Installs land flat
+        # inside the model folder, so use whatever is after the last slash.
+        fname = filename.strip().replace("\\", "/").split("/")[-1].strip()
+        if not fname or fname in {".", ".."}:
+            raise ModelLibraryError("filename required")
+        if "\x00" in fname:
             raise ModelLibraryError(f"unsafe filename: {filename}")
         if os.path.isabs(fname):
             raise ModelLibraryError(f"unsafe filename: {filename}")

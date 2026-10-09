@@ -836,6 +836,45 @@ export async function installStudioMockApi(page, options = {}) {
   }
 
   /**
+   * GET /comfymodal/studio/golden/profiles — Golden profile catalog.
+   * The Studio shell prefetches this on open (Playground/Settings read it),
+   * so every mocked spec needs it; shape mirrors the backend catalog and
+   * the fake server's route.
+   */
+  async function serveGoldenProfiles(route, url, body) {
+    return _json({
+      status: "ok",
+      defaultProfile: "golden_p1_parallel_c0_p8_h100",
+      profiles: [
+        {
+          name: "golden_p1_parallel_c0_p8_h100",
+          owner: "mock",
+          target: {
+            app: "mock-golden-h100",
+            class: "ModalRuntimeEntrypointV2",
+            method: "run_golden_serial_stream",
+          },
+          resources: { gpu: "h100!", cpu: 12, memory_mb: 24576 },
+          deployed: true,
+        },
+      ],
+    });
+  }
+
+  /**
+   * GET /comfymodal/studio/golden/deploy — deploy state for the catalog's
+   * default profile (probed alongside the catalog on shell open).
+   */
+  async function serveGoldenDeployStatus(route, url, body) {
+    return _json({
+      status: "ok",
+      profile: (url && url.searchParams && url.searchParams.get("profile")) || "golden_p1_parallel_c0_p8_h100",
+      state: "deployed",
+      deployed: true,
+    });
+  }
+
+  /**
    * POST /comfymodal/studio/custom-nodes/refresh — canonical registry refresh
    * (wizard best-effort refresh after an explicit Manager install).
    */
@@ -892,6 +931,10 @@ export async function installStudioMockApi(page, options = {}) {
 
     // Backend discovery (returns empty — Playground uses presets instead)
     ["GET", "/comfymodal/studio/backends", listBackends],
+
+    // Golden profile catalog (prefetched by the Studio shell on open)
+    ["GET", "/comfymodal/studio/golden/profiles", serveGoldenProfiles],
+    ["GET", "/comfymodal/studio/golden/deploy", serveGoldenDeployStatus],
 
     // Remote model-volume inventory (wizard Dependencies overlay).
     ["GET", "/comfymodal/models", listRemoteModelsMock],

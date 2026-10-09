@@ -60,6 +60,9 @@ class RemoteInventoryTestCase(unittest.IsolatedAsyncioTestCase):
 
     # ── caching ──────────────────────────────────────────────────────────
 
+    def test_default_ttl_is_thirty_seconds(self):
+        self.assertEqual(remote_inventory.TTL_S, 30.0)
+
     async def test_second_call_is_served_from_cache(self):
         calls = self._counting_fetch()
 

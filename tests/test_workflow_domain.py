@@ -13,15 +13,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 from studio_domain import (
+    INPUT_BINDING_KINDS,
     ImmutableVersionError,
+    Mapping,
     MappingAlreadyExistsError,
+    MappingEntry,
     WorkflowDomainService,
     WorkflowNotRunnableError,
     WorkflowDomainValidationError,
     WorkflowVersion,
     derive_mapping_candidates,
+    find_binding_candidates,
     graph_hash_from_capture,
+    resolve_binding_target,
 )
 from studio_domain.services import WorkflowDomainService as _Service  # noqa: F401
 
@@ -485,6 +492,201 @@ class VersionCompatTests(WorkflowDomainTestCase):
         # Old version keeps the old frozen list.
         self.assertEqual(
             self.service.get_version(v1_id)["compatible_models"], ["flux-dev.safetensors"]
+        )
+
+
+# ── binding resolution (fail fast at save time, never at run time) ────
+
+
+def linked_seed_prompt() -> dict:
+    """KSampler seed wired to an upstream seed-producer node with no inputs.
+
+    Mirrors the Krea 2 shape generically: node 204 holds its value only as
+    widget/hidden state (empty executable inputs); node 163 consumes it via
+    a connection spec.
+    """
+    return {
+        "163": {"class_type": "KSampler", "inputs": {"seed": ["204", 0], "steps": 35}},
+        "204": {"class_type": "SeedProducer", "inputs": {}},
+        "199": {"class_type": "SaveImage", "inputs": {"images": ["163", 0]}},
+    }
+
+
+def linked_seed_ui_graph() -> dict:
+    return {
+        "id": "g-seed",
+        "nodes": [
+            {
+                "id": 204,
+                "type": "SeedProducer",
+                "inputs": [],
+                "outputs": [{"name": "seed", "type": "INT", "links": [241]}],
+                "widgets_values": [{"seed": 953336612577361, "mode": "fixed"}],
+            },
+            {
+                "id": 163,
+                "type": "KSampler",
+                "inputs": [
+                    {"name": "seed", "type": "INT", "widget": {"name": "seed"}, "link": 241},
+                    {"name": "steps", "type": "INT", "widget": {"name": "steps"}},
+                ],
+                "widgets_values": [35],
+            },
+        ],
+        "links": [],
+    }
+
+
+def seed_producer_defs(class_type: str):
+    if class_type == "SeedProducer":
+        return ({}, {})
+    return None
+
+
+@pytest.mark.fast_unit
+class BindingResolutionTests(WorkflowDomainTestCase):
+    def test_resolver_accepts_plain_executable_input(self):
+        target = resolve_binding_target(txt2img_prompt(), "3", "seed")
+        self.assertTrue(target["resolvable"])
+        self.assertEqual(target["location"], "inputs")
+        self.assertFalse(target["linked"])
+        self.assertTrue(target["node_present"])
+
+    def test_resolver_accepts_linked_input_and_reports_upstream(self):
+        target = resolve_binding_target(linked_seed_prompt(), "163", "seed")
+        self.assertTrue(target["resolvable"])
+        self.assertEqual(target["location"], "inputs")
+        self.assertTrue(target["linked"])
+        self.assertEqual(target["upstream_node_id"], "204")
+
+    def test_resolver_rejects_widget_only_state(self):
+        target = resolve_binding_target(
+            linked_seed_prompt(),
+            "204",
+            "seed",
+            ui_graph=linked_seed_ui_graph(),
+            node_def_provider=seed_producer_defs,
+        )
+        self.assertFalse(target["resolvable"])
+        self.assertTrue(target["node_present"])
+        # The name exists, just never as an executable input.
+        self.assertIn(target["location"], ("node_def", "ui_widget"))
+
+    def test_resolver_reports_missing_node(self):
+        target = resolve_binding_target(linked_seed_prompt(), "999", "seed")
+        self.assertFalse(target["resolvable"])
+        self.assertFalse(target["node_present"])
+        self.assertIsNone(target["location"])
+
+    def test_candidates_suggest_downstream_consumer(self):
+        candidates = find_binding_candidates(linked_seed_prompt(), "seed")
+        self.assertTrue(candidates)
+        first = candidates[0]
+        self.assertEqual(first["node_id"], "163")
+        self.assertEqual(first["input_name"], "seed")
+        self.assertEqual(first["via"], "inputs")
+        self.assertTrue(first["linked"])
+        self.assertEqual(first["upstream_node_id"], "204")
+
+    def test_set_mapping_rejects_unresolvable_binding(self):
+        wf = self.create_workflow()
+        version = self.create_version(wf["workflow_id"], linked_seed_prompt())
+        bad = {
+            "seed": {
+                "semantic_role": "seed",
+                "node_id": "204",
+                "input_name": "seed",
+                "kind": "widget",
+                "control_kind": "integer",
+                "display_name": "Seed",
+            }
+        }
+        with self.assertRaises(WorkflowDomainValidationError) as ctx:
+            self.service.set_mapping(
+                version["workflow_version_id"], entries=bad, output_node_id="199"
+            )
+        message = str(ctx.exception)
+        self.assertIn("'seed'", message)
+        self.assertIn("204", message)
+        # Points at the fix, not just the failure.
+        self.assertIn("163", message)
+        # Nothing persisted.
+        self.assertIsNone(
+            self.service.store.get_mapping_for_version(version["workflow_version_id"])
+        )
+
+    def test_set_mapping_accepts_linked_downstream_binding(self):
+        wf = self.create_workflow()
+        version = self.create_version(wf["workflow_id"], linked_seed_prompt())
+        good = {
+            "seed": {
+                "semantic_role": "seed",
+                "node_id": "163",
+                "input_name": "seed",
+                "kind": "node",
+                "control_kind": "integer",
+                "display_name": "Seed",
+            }
+        }
+        self.service.set_mapping(
+            version["workflow_version_id"], entries=good, output_node_id="199"
+        )
+        state = self.service.derive_version_state(version["workflow_version_id"])
+        self.assertEqual(state.status, "ready")
+        self.assertTrue(state.runnable)
+
+    def test_mapping_revision_rejects_unresolvable_binding(self):
+        wf = self.create_workflow()
+        version_id, _ = self.setup_mapped_workflow(wf["workflow_id"])
+        prompt = self.service.get_version(version_id)["executable_prompt"]
+        bad_seed = {
+            "semantic_role": "seed",
+            "node_id": "nope",
+            "input_name": "seed",
+            "kind": "widget",
+            "control_kind": "integer",
+            "display_name": "Seed",
+        }
+        entries = {
+            role: e.to_dict()
+            for role, e in derive_mapping_candidates(
+                make_capture(prompt), node_def_provider=fake_node_def
+            )[0].items()
+        }
+        entries["seed"] = bad_seed
+        before = len(self.service.store.list_versions_for_workflow(wf["workflow_id"]))
+        with self.assertRaises(WorkflowDomainValidationError):
+            self.service.create_mapping_revision(
+                version_id, entries=entries, output_node_id="6"
+            )
+        # Rejected before any new version record.
+        self.assertEqual(
+            len(self.service.store.list_versions_for_workflow(wf["workflow_id"])), before
+        )
+
+    def test_gating_flags_unresolvable_node_kind_binding(self):
+        wf = self.create_workflow()
+        version = self.create_version(wf["workflow_id"], linked_seed_prompt())
+        version_id = version["workflow_version_id"]
+        bad_mapping = Mapping(
+            mapping_id="wm_testbad00000001",
+            workflow_version_id=version_id,
+            output_node_id="199",
+            entries={
+                "seed": MappingEntry(
+                    semantic_role="seed",
+                    node_id="204",
+                    input_name="seed",
+                    kind="node",
+                )
+            },
+        )
+        self.service.store.insert_mapping(bad_mapping)
+        state = self.service.derive_version_state(version_id)
+        self.assertEqual(state.status, "incomplete")
+        self.assertFalse(state.runnable)
+        self.assertIn(
+            "mapped entry 'seed' input 'seed' not present on node 204", state.reasons
         )
 
 

@@ -138,7 +138,9 @@ function generation(overrides = {}) {
   assert.equal(failed.featuredOutput.previewUrl, "/preview");
   assert.equal(failed.featuredOutput.originalFailed, true);
   assert.equal(selectDetailAsset(failed.featuredOutput).kind, "preview");
-  assert.equal(detailSource.includes("Original failed \\u2014 preview retained"), true);
+  // The failed-Original failure state lives in the generate/retry note (the
+  // one viewer composition in studio-ui.js also badges the zoom stage).
+  assert.equal(detailSource.includes("Original failed \\u2014 Preview retained."), true);
   section("12. Failed Original retains Preview and failure state");
 
   const retained = normalizeFeedItem(generation({
@@ -171,7 +173,9 @@ function generation(overrides = {}) {
   appendIfPresent(parent, null);
   appendIfPresent(parent, { nodeType: 1 });
   assert.equal(parent.children.length, 1);
-  assert.equal(detailSource.includes("appendIfPresent(col, buildParamsSection(record))"), true);
+  // Sparse-section null filtering lives in the detail _section helper (the
+  // right-column composition itself is the one shared viewer in studio-ui.js).
+  assert.equal(detailSource.includes("(rows || []).filter(function (r) { return r != null; })"), true);
   assert.equal(detailSource.includes('text: "No outputs"'), true);
   section("15. E4A sparse and empty-output detail safety remains green");
 

@@ -416,11 +416,11 @@ class TestGoldenGateRuntimePropagation(unittest.TestCase):
         for name, value in values.items():
             self.assertEqual(runtime_env[name], value)
 
-    def test_runtime_env_projects_workflow_hash_check_default_on_and_env_zero(self):
+    def test_runtime_env_projects_workflow_hash_check_default_off_and_env_zero(self):
         env_name = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
         with patch.dict(os.environ, clear=False):
             os.environ.pop(env_name, None)
-            self.assertEqual(modal_app._runtime_env()[env_name], "1")
+            self.assertEqual(modal_app._runtime_env()[env_name], "0")
             os.environ[env_name] = "0"
             self.assertEqual(modal_app._runtime_env()[env_name], "0")
 

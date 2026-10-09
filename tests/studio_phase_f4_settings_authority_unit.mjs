@@ -21,7 +21,7 @@
 //     is truthful; durable user-data namespaces survive.
 //  6. Preview/Output controls still load server values and save through the
 //     shared output-preferences module.
-//  7. Experiments section stays informational (fixed width 6, no controls).
+//  7. The five Settings tabs keep controls grouped under their new owners.
 //  8. Settings search keeps working after the stale-key cleanup.
 //  9. H12: one-time engine migration notice renders when the server
 //     surfaces engine_migration_notice.
@@ -36,6 +36,7 @@ const WEB = path.join(ROOT, "web");
 const readWeb = (name) => fs.readFileSync(path.join(WEB, name), "utf8");
 
 const settingsSource = readWeb("studio-settings.js");
+const backendSource = fs.readFileSync(path.join(ROOT, "__init__.py"), "utf8");
 const outputPrefsSource = readWeb("studio-output-preferences.js");
 const playgroundSource = readWeb("studio-playground.js");
 const playgroundStateSource = readWeb("studio-playground-state.js");
@@ -142,6 +143,14 @@ const SETTINGS_KEY_CONTRACT = {
     classification: "ui-preference",
     evidence: [[playgroundStateSource, '"comfymodal.studio.playground.carousel-cleared.v1"']],
   },
+  "comfymodal_remote_inventory_refresh_interval_s": {
+    classification: "value-setting",
+    evidence: [
+      [settingsSource, 'localStorage.getItem("comfymodal_remote_inventory_refresh_interval_s"'],
+      [settingsSource, 'localStorage.setItem("comfymodal_remote_inventory_refresh_interval_s"'],
+      [readWeb("studio-workflows.js"), 'comfymodal_remote_inventory_refresh_interval_s'],
+    ],
+  },
 };
 
 function parseModernSettingsKeys(source) {
@@ -204,6 +213,13 @@ function createDocumentStub() {
       appendChild(child) {
         child.parentNode = this;
         this.children.push(child);
+        return child;
+      },
+      insertBefore(child, reference) {
+        child.parentNode = this;
+        const index = this.children.indexOf(reference);
+        if (index === -1) this.children.push(child);
+        else this.children.splice(index, 0, child);
         return child;
       },
       removeChild(child) {
@@ -637,6 +653,32 @@ try {
   assert.equal(globalThis.localStorage.getItem("comfymodal.studio.playground.results.v1"), "user-results");
   section("9. Reset All: GPU-only POST, truthful disclosure, durable data preserved");
 
+  // 9a. Generation reset clears the browser-side Golden selection and sends
+  // the null sentinel through the same accepted /config endpoint. The
+  // backend route currently treats this as an accepted no-op (it does not
+  // persist a Golden selection), so this guards the request contract without
+  // claiming server-side Golden state that the route does not expose.
+  installBrowserStubs();
+  const fetchGoldenReset = installFetch(
+    makeRouter(makeConfig(), { level: "off", effective: "off" }),
+  );
+  const pageGoldenReset = renderPage();
+  await settle(fetchGoldenReset.inflight);
+  byTestid(pageGoldenReset, "settings-reset-generation").dispatch("click");
+  await settle(fetchGoldenReset.inflight);
+  const goldenResetPost = fetchGoldenReset.calls.find(
+    (c) => c.method === "POST" && c.url.endsWith("/config") && c.body && c.body.golden_profile === null,
+  );
+  assert.deepEqual(goldenResetPost && goldenResetPost.body, { golden_profile: null });
+  assert.equal(globalThis.localStorage.getItem("comfymodal.studio.golden.profile.v1"), null);
+  const configPostStart = backendSource.indexOf('@_server.routes.post("/comfymodal/config")');
+  const configPostEnd = backendSource.indexOf('@_server.routes.post("/comfymodal/open-folder")', configPostStart);
+  assert.ok(configPostStart >= 0 && configPostEnd > configPostStart, "config POST route boundaries must remain discoverable");
+  const configPostSource = backendSource.slice(configPostStart, configPostEnd);
+  assert.equal(configPostSource.includes("golden_profile"), false, "config POST currently accepts and ignores the Golden reset sentinel");
+  assert.ok(configPostSource.includes("return web.json_response(response_data)"), "config POST must acknowledge unknown Golden field");
+  section("9a. Generation reset sends accepted Golden null sentinel and clears local selection");
+
   // 9b. H12: Run mode control and V1/V2 engine selector are retired from
   //     modern Settings; no retired-engine vocabulary is advertised.
   installBrowserStubs();
@@ -709,23 +751,28 @@ try {
   assert.equal(globalThis.localStorage.getItem("comfymodal_preview_quality"), "80");
   section("10. Preview/Output controls unaffected: server-first load, revert-safe save");
 
-  // 11. Experiments section stays informational with no reset path.
-  installBrowserStubs();
-  const fetchI = installFetch(
-    makeRouter(makeConfig(), { level: "off", effective: "off" }),
-  );
-  const pageI = renderPage();
-  await settle(fetchI.inflight);
-  const sectionsI = pageI.querySelectorAll(".comfymodal-studio-settings-section");
-  const experiments = sectionsI.find((s) => s.dataset.section === "experiments");
-  assert.ok(experiments, "Experiments section must exist");
-  assert.equal(experiments.querySelectorAll("select").length, 0);
-  assert.equal(byTestid(pageI, "settings-reset-experiments"), null);
-  const infoText = JSON.stringify(experiments.textContent);
-  // I7 frozen wording (I1 §3.6): user-facing copy, frozen value 6 preserved.
-  assert.ok(infoText.includes("Experiments run up to 6 cells concurrently"));
-  assert.ok(infoText.includes("Per-experiment overrides are not available"));
-  section("11. Experiments fixed-concurrency informational UI intact");
+  // 11. The finished redesign exposes exactly five tabs and keeps controls in
+  //    their intended owners: Generation, Outputs, Accounts & Tokens,
+  //    Interface, and Advanced.
+   installBrowserStubs();
+   const fetchI = installFetch(
+     makeRouter(makeConfig(), { level: "off", effective: "off" }),
+   );
+   const pageI = renderPage();
+   await settle(fetchI.inflight);
+   const sectionsI = pageI.querySelectorAll(".comfymodal-studio-settings-section");
+   assert.deepEqual(
+     sectionsI.map((s) => s.dataset.section),
+     ["generation", "outputs", "accounts", "interface", "advanced"],
+   );
+   assert.ok(byTestid(pageI, "settings-gpu"));
+   assert.ok(byTestid(pageI, "settings-output-format"));
+   assert.ok(byTestid(pageI, "backend-credentials"));
+   assert.ok(byTestid(pageI, "settings-history-columns"));
+   assert.ok(byTestid(pageI, "settings-remote-inventory-refresh"));
+   assert.ok(byTestid(pageI, "settings-heavy-tracing"));
+   assert.equal(byTestid(pageI, "settings-run-mode"), null);
+   section("11. Five Settings tabs keep Generation/Outputs/Accounts/Interface/Advanced controls grouped");
 
   // 12. Search remains functional after stale-key cleanup.
   installBrowserStubs();
@@ -738,7 +785,7 @@ try {
   const resultsJ = byTestid(pageJ, "settings-search-results");
   searchJ.value = "gpu";
   searchJ.dispatch("input");
-  assert.match(resultsJ.textContent, /^\d+ matching settings?$/);
+   assert.match(resultsJ.textContent, /^\d+ matching settings? across \d+ tabs$/);
   searchJ.value = "zzz-no-such-setting";
   searchJ.dispatch("input");
   assert.equal(resultsJ.textContent, "No settings match your search");
@@ -799,15 +846,14 @@ try {
       collectResets(c);
     }
   })(pageL);
-  // Section resets (Generation/Outputs/History/Interface/Advanced) plus the
+   // Section resets (Generation/Outputs/Interface/Advanced) plus the
   // Interface panel-layout control and the footer Reset-all.
   const names = resetControls.map((b) => b.getAttribute("aria-label") || b.textContent);
   const expectedSectionNames = [
-    "Reset Generation section",
-    "Reset Outputs section",
-    "Reset History section",
-    "Reset Interface section",
-    "Reset Advanced section",
+     "Reset Generation section",
+     "Reset Outputs section",
+     "Reset Interface section",
+     "Reset Advanced section",
   ];
   for (const expected of expectedSectionNames) {
     assert.ok(names.includes(expected), "missing accessible name: " + expected);
@@ -824,22 +870,13 @@ try {
   assert.ok(byTestid(pageL, "settings-reset-generation"), "generation reset control intact");
   section("14. Section resets expose unique per-section accessible names");
 
-  // 15. Frozen wording rows render verbatim in the mounted page.
-  const generalL = pageL.querySelectorAll(".comfymodal-studio-settings-section")
-    .find((s) => s.dataset.section === "general");
-  assert.ok(generalL);
-  assert.ok(
-    generalL.textContent.includes("Playground / History / Workflows / Backend / Settings."),
-    "navigation row lists all five pages truthfully",
-  );
-  assert.equal(generalL.textContent.includes("Backend remains available"), false);
-  const historyL = pageL.querySelectorAll(".comfymodal-studio-settings-section")
-    .find((s) => s.dataset.section === "history");
-  assert.ok(
-    historyL.textContent.includes("Run history is stored locally and is kept until you delete it."),
-    "run-history retention copy is user-facing",
-  );
-  section("15. Frozen navigation + run-history copy rendered verbatim");
+  // 15. Retired seven-section wrappers and legacy controls stay absent.
+  assert.equal(pageL.querySelectorAll('[data-section="general"]').length, 0);
+  assert.equal(pageL.querySelectorAll('[data-section="history"]').length, 0);
+  assert.equal(pageL.querySelectorAll('[data-section="experiments"]').length, 0);
+  assert.equal(pageL.querySelectorAll('[data-testid="settings-reset-history"]').length, 0);
+  assert.ok(pageL.querySelector('[data-testid="settings-reset-interface"]'));
+  section("15. Retired seven-section wrappers and reset controls stay absent");
 } finally {
   globalThis.setTimeout = realSetTimeout;
 }

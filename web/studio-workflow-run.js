@@ -13,10 +13,10 @@
 // setter methods; every other export is a pure function over that store.
 
 import {
-  listWorkflows,
   listWorkflowVersions,
   getWorkflowRunContext,
 } from "./studio-backend-api.js";
+import { listCachedWorkflows } from "./studio-workflow-picker.js";
 
 import {
   saveWorkflowSelection,
@@ -158,7 +158,7 @@ function _entryDefault(entry) {
  */
 export async function loadWorkflowLibrary(apiBase, store) {
   try {
-    const data = await listWorkflows(apiBase);
+    const data = await listCachedWorkflows(apiBase);
     if (!data || data.status === "error") {
       const msg = (data && (data.message || data.error)) || "failed to load workflow library";
       store.setError(msg);
@@ -196,11 +196,15 @@ export async function loadRunContext(apiBase, store, workflowId, versionId) {
     }
     const version = data.version;
     if (!version || !version.state) {
-      const msg = "run context missing version state";
+      const stateReasons = data.state && Array.isArray(data.state.reasons)
+        ? data.state.reasons.map(String)
+        : [];
+      const noVersions = stateReasons.includes("no versions");
+      const msg = noVersions ? "workflow has no versions" : "run context missing version state";
       store.setStatus("error");
       store.setError(msg);
-      store.setReasons([msg]);
-      return { ok: false, error: msg, reasons: [msg] };
+      store.setReasons(stateReasons.length ? stateReasons : [msg]);
+      return { ok: false, error: msg, reasons: stateReasons.length ? stateReasons : [msg], noVersions };
     }
     store.setRunContext(data);
     if (version.workflow_version_id != null) store.setVersionId(String(version.workflow_version_id));
@@ -224,7 +228,8 @@ export async function loadRunContext(apiBase, store, workflowId, versionId) {
 }
 
 /**
- * Select a workflow: reset version state, load versions + run-context, and
+ * Select a workflow: reset version state, load the current run-context (with
+ * a versions-list fallback when the current version is unavailable), and
  * derive control defaults from the resolved version.
  * @param {string} apiBase
  * @param {object} store
@@ -247,27 +252,48 @@ export async function selectWorkflow(apiBase, store, workflowId) {
     store.controlValues = {};
     store.setWorkflowId(workflowId);
 
-    const versionsData = await listWorkflowVersions(apiBase, workflowId);
-    const versions = (versionsData && Array.isArray(versionsData.versions)) ? versionsData.versions : [];
-    store.setVersions(versions);
-
-    if (!versions.length) {
-      store.setStatus("error");
-      store.setError("workflow has no versions");
-      store.setReasons(["no versions"]);
-      return { ok: false, error: "workflow has no versions", reasons: ["no versions"] };
-    }
-
     const wf = (store.library || []).find((w) => String(w.workflow_id) === String(workflowId));
-    const versionId = _pickDefaultVersionId(versions, wf && wf.latest_version_id);
-    if (!versionId) {
-      store.setStatus("error");
-      store.setError("workflow has no runnable version");
-      store.setReasons(["no versions"]);
-      return { ok: false, error: "workflow has no runnable version", reasons: ["no versions"] };
+    const latestVersionId = wf && wf.latest_version_id;
+    let ctxResult = null;
+
+    // The library row already identifies the current version. Use the bundle
+    // directly in the common case; it contains the version state and mapping
+    // that the separate versions request would only repeat.
+    if (latestVersionId) {
+      ctxResult = await loadRunContext(apiBase, store, workflowId, latestVersionId);
+      if (ctxResult.ok) {
+        const loadedVersion = store.runContext && store.runContext.version;
+        store.setVersions(loadedVersion ? [loadedVersion] : []);
+      } else if (!ctxResult.noVersions) {
+        store.setStatus("error");
+        return { ok: false, error: ctxResult.error, reasons: ctxResult.reasons };
+      }
     }
 
-    const ctxResult = await loadRunContext(apiBase, store, workflowId, versionId);
+    // A missing library latest id, or a run-context response that explicitly
+    // reports no versions, still needs the history list to choose a version.
+    if (!ctxResult || !ctxResult.ok) {
+      const versionsData = await listWorkflowVersions(apiBase, workflowId);
+      const versions = (versionsData && Array.isArray(versionsData.versions)) ? versionsData.versions : [];
+      store.setVersions(versions);
+
+      if (!versions.length) {
+        store.setStatus("error");
+        store.setError("workflow has no versions");
+        store.setReasons(["no versions"]);
+        return { ok: false, error: "workflow has no versions", reasons: ["no versions"] };
+      }
+
+      const versionId = _pickDefaultVersionId(versions, latestVersionId);
+      if (!versionId) {
+        store.setStatus("error");
+        store.setError("workflow has no runnable version");
+        store.setReasons(["no versions"]);
+        return { ok: false, error: "workflow has no runnable version", reasons: ["no versions"] };
+      }
+      ctxResult = await loadRunContext(apiBase, store, workflowId, versionId);
+    }
+
     if (!ctxResult.ok) {
       store.setStatus("error");
       return { ok: false, error: ctxResult.error, reasons: ctxResult.reasons };
@@ -493,13 +519,12 @@ export function resolveRunnable(store) {
 }
 
 /**
- * Apply the execution target gate after local workflow validation. A remote
- * Golden target does not use the host's model/custom-node inventory; the
- * deployed container remains responsible for rejecting invalid structure.
+ * Keep the client gate aligned with the backend's authoritative bundle
+ * resolver. A remote Golden target can ignore host-only inventory checks, but
+ * it cannot make an incomplete workflow version executable.
  */
 export function resolveExecutionRunnable(gated, remoteSelected) {
-  if (gated.runnable || !remoteSelected) return gated;
-  return { runnable: true, reasons: [] };
+  return gated;
 }
 
 // ΓöÇΓöÇ Run payload ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ

@@ -311,9 +311,23 @@ def _materialize_image(result: Any, request_id: str) -> dict[str, Any]:
 
 
 def _primary_output_path(materialized: Any) -> str:
-    """Best-effort primary output path from a materialized Golden result."""
+    """Best-effort primary output path from a materialized Golden result.
+
+    ``output_paths`` is the key ``_materialize_image`` publishes, and it is a
+    LIST.  It must be read here: it is the ONLY place the materialized
+    on-disk name appears, so skipping it means no output candidate ever
+    reaches the writer, no asset is attached, and the History record shows
+    no image at all.
+    """
     if not isinstance(materialized, Mapping):
         return ""
+    paths = materialized.get("output_paths")
+    if isinstance(paths, str) and paths:
+        return paths
+    if isinstance(paths, (list, tuple)):
+        for item in paths:
+            if isinstance(item, str) and item:
+                return item
     for key in ("output_path", "primary_output_path"):
         value = materialized.get(key)
         if value:
@@ -331,67 +345,143 @@ def _primary_output_path(materialized: Any) -> str:
     return ""
 
 
-def _record_golden_history(
+def _golden_stage_timings(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive per-stage durations from Golden's own stage-boundary events.
+
+    Golden emits ``golden_stage`` events carrying per-stage
+    ``entry_monotonic_ns`` / ``end_monotonic_ns`` (see
+    ``golden_serial._observe_stage``).  Only CLOSED stages produce a row and
+    the value is Golden's own monotonic measurement — never a local
+    re-measurement or an estimate.  Returns ``{}`` when no stage closed, so
+    History keeps showing "Diagnostics pending" rather than fabricated zeros.
+    """
+    stages: list[dict[str, Any]] = []
+    for event in events:
+        if str(event.get("type", "")).strip().lower() != "golden_stage":
+            continue
+        label = str(event.get("stage") or "").strip()
+        if not label:
+            continue
+        start = event.get("entry_monotonic_ns")
+        end = event.get("end_monotonic_ns")
+        if not isinstance(start, int) or not isinstance(end, int) or end < start:
+            continue
+        stages.append({
+            "label": label,
+            "durationMs": round((end - start) / 1_000_000, 3),
+        })
+    if not stages:
+        return {}
+    return {"_run_type": "golden", "stages": stages}
+
+
+def _golden_history_meta(
     request_id: str,
     profile: GoldenProfile,
     controls: Mapping[str, Any] | None,
-    materialized: Any,
-    timings: Mapping[str, Any] | None = None,
-) -> str:
-    """Record a completed Golden run in the History store.
+) -> dict[str, Any]:
+    controls_map = controls if isinstance(controls, Mapping) else {}
+    return {
+        "source": "studio_golden",
+        "golden_profile": profile.name,
+        "golden_request_id": request_id,
+        "golden_method": profile.target["method"],
+        "golden_app": profile.target["app"],
+        "prompt": str(controls_map.get("prompt") or ""),
+        "negative_prompt": str(controls_map.get("negative_prompt") or ""),
+        "studio_workflow_id": str(controls_map.get("_workflow_id") or ""),
+    }
 
-    Golden streams its result straight back to the Playground, so it never went
-    through the ordinary save-history seam and the run was invisible on the
-    History page even though it produced an image. This mirrors the working
-    modern path (studio_workflow_run._record_workflow_run_success): a
-    nonterminal record first, then the terminal update carrying the output
-    association, because a completed modern record must already carry a visible
-    output.
 
-    Best-effort by design: History is a record, not the execution contract, so a
-    recording failure must never fail a run that already produced output.
+def _fail_golden_history(run_id: str, error: str) -> None:
+    """Close an opened Golden History record as failed.
+
+    Without this a run that errors after ``_begin_golden_history`` would stay
+    ``running`` forever.  Best-effort, never raises.
+    """
+    if not run_id:
+        return
+    try:
+        from experiment_service import REGISTRY
+    except Exception as exc:
+        _log.warning("Golden history: REGISTRY unavailable: %s", exc)
+        return
+    try:
+        REGISTRY.history().update_run(
+            run_id,
+            status="failed",
+            meta={"error": error},
+        )
+    except Exception as exc:
+        _log.warning("Golden history: failed to close run %s: %s", run_id, exc)
+
+
+def _begin_golden_history(
+    request_id: str,
+    profile: GoldenProfile,
+    controls: Mapping[str, Any] | None,
+) -> tuple[str, str]:
+    """Open the nonterminal History record BEFORE the run is dispatched.
+
+    Recording only after completion made ``started_at`` land at completion
+    time, so every Golden run reported a ~1s total time instead of its real
+    multi-second wall time.  Opening the record first makes the attempt span
+    the actual run, and ``update_run`` still supplies the terminal status,
+    the output association, and timings afterwards.
+
+    Best-effort by design: History is a record, not the execution contract, so
+    a recording failure must never fail a run.  Returns (legacy run id,
+    History V2 generation id), with "" for either half when unavailable.
     """
     try:
         from experiment_service import REGISTRY
     except Exception as exc:
         _log.warning("Golden history: REGISTRY unavailable: %s", exc)
-        return ""
+        return "", ""
     try:
-        controls_map = controls if isinstance(controls, Mapping) else {}
-        output_path = _primary_output_path(materialized)
-        meta = {
-            "source": "studio_golden",
-            "golden_profile": profile.name,
-            "golden_request_id": request_id,
-            "golden_method": profile.target["method"],
-            "golden_app": profile.target["app"],
-            "prompt": str(controls_map.get("prompt") or ""),
-            "negative_prompt": str(controls_map.get("negative_prompt") or ""),
-            "studio_workflow_id": str(controls_map.get("_workflow_id") or ""),
-        }
         record = REGISTRY.history().record_run(
             kind="playground_run",
             prompt_id=request_id,
             status="running",
-            meta=meta,
+            meta=_golden_history_meta(request_id, profile, controls),
         )
         if not isinstance(record, dict):
-            return ""
-        run_id = str(record.get("run_id") or "")
-        if not run_id:
-            return ""
+            return "", ""
+        return str(record.get("run_id") or ""), str(record.get("history_generation_id") or "")
+    except Exception as exc:
+        _log.warning("Golden history: failed to open run %s: %s", request_id, exc)
+        return "", ""
+
+
+def _complete_golden_history(
+    run_id: str,
+    materialized: Any,
+    timings: Mapping[str, Any] | None = None,
+) -> None:
+    """Apply the terminal status, output association, and timings.
+
+    ``output_path`` is what makes the produced image appear in History; it
+    must be a real materialized name on disk.  Best-effort, never raises.
+    """
+    if not run_id:
+        return
+    try:
+        from experiment_service import REGISTRY
+    except Exception as exc:
+        _log.warning("Golden history: REGISTRY unavailable: %s", exc)
+        return
+    try:
         update_kwargs: dict[str, Any] = {"status": "completed"}
+        output_path = _primary_output_path(materialized)
         if output_path:
             update_kwargs["output_path"] = output_path
         if timings:
             update_kwargs["timings"] = dict(timings)
         REGISTRY.history().update_run(run_id, **update_kwargs)
-        return run_id
     except Exception as exc:
         # Never swallow silently: an unlogged History failure is
         # indistinguishable from "the run was never recorded".
-        _log.warning("Golden history: failed to record run %s: %s", request_id, exc)
-        return ""
+        _log.warning("Golden history: failed to record run %s: %s", run_id, exc)
 
 
 async def run_golden_workflow(
@@ -491,7 +581,16 @@ async def run_golden_workflow(
         },
     }
 
+    history_run_id = ""
+    history_generation_id = ""
     try:
+        # Make the run visible on the History page. Golden bypasses the ordinary
+        # save-history seam, so without this the image existed only in the
+        # Playground's local store.  The record is opened BEFORE dispatch so the
+        # attempt's started_at is the real run start (otherwise every Golden run
+        # reported a ~1s total time), then completed below with the output and
+        # timings.  Both halves are best-effort and never fail a run.
+        history_run_id, history_generation_id = _begin_golden_history(request_id, profile, merged["values"])
         handle = (
             handle_factory(profile, workspace)
             if handle_factory is not None
@@ -512,12 +611,15 @@ async def run_golden_workflow(
         if hasattr(stream, "__await__"):
             stream = await stream
         terminal: dict[str, Any] | None = None
+        stage_events: list[dict[str, Any]] = []
         async for remote_event in stream:
             stored = event_store.append(request_id, remote_event)
+            stage_events.append(stored)
             if str(stored.get("type", "")).lower() in {"result", "error"}:
                 terminal = stored
         event_store.finish(request_id)
         if terminal is None:
+            _fail_golden_history(history_run_id, "Golden stream ended without a terminal event")
             return {
                 "status": "error",
                 "message": "Golden stream ended without a terminal event",
@@ -525,6 +627,10 @@ async def run_golden_workflow(
                 "runId": request_id,
             }
         if terminal.get("type") == "error":
+            _fail_golden_history(
+                history_run_id,
+                str(terminal.get("message") or "Golden execution failed"),
+            )
             return {
                 "status": "error",
                 "message": str(terminal.get("message") or "Golden execution failed"),
@@ -533,14 +639,10 @@ async def run_golden_workflow(
                 "profile": profile.name,
             }
         materialized = _materialize_image(terminal.get("data", terminal), request_id)
-        # Make the run visible on the History page. Golden bypasses the ordinary
-        # save-history seam, so without this the image existed only in the
-        # Playground's local store.
-        _record_golden_history(
-            request_id,
-            profile,
-            merged["values"],
+        _complete_golden_history(
+            history_run_id,
             materialized,
+            timings=_golden_stage_timings(stage_events),
         )
         # The Studio result contract is flat: the Playground reads
         # ``payload.output_paths`` directly.  Merge the materialized result to
@@ -553,6 +655,9 @@ async def run_golden_workflow(
             "runId": request_id,
             "profile": profile.name,
             "result": materialized,
+            # Bridge to the History V2 generation for this run so the
+            # Playground preview renders the exact record History shows.
+            "historyGenerationId": history_generation_id or "",
         }
         for key, value in materialized.items():
             if key in {"outputs", "images"}:
@@ -567,6 +672,7 @@ async def run_golden_workflow(
                 "message": "Golden execution cancelled",
             })
             event_store.finish(request_id)
+        _fail_golden_history(history_run_id, "Golden execution cancelled")
         raise
     except Exception as exc:
         # Drop cached Modal handles on failure so a stale/redeployed handle
@@ -576,6 +682,7 @@ async def run_golden_workflow(
             _clear_modal_client_cache()
         except Exception:
             pass
+        _fail_golden_history(history_run_id, f"{type(exc).__name__}: {exc}"[:500])
         if request_id in event_store._runs:
             event_store.append(request_id, {
                 "type": "error",

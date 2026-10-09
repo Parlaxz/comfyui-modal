@@ -226,13 +226,21 @@ class ModelLibraryTestCase(unittest.TestCase):
         with self.assertRaises(ModelLibraryError):
             self.service.install_request("bogus_folder", "a.safetensors", "https://x.com/a")
         with self.assertRaises(ModelLibraryError):
-            self.service.install_request("checkpoints", "../evil.safetensors", "https://x.com/a")
-        with self.assertRaises(ModelLibraryError):
-            self.service.install_request("checkpoints", "sub/a.safetensors", "https://x.com/a")
-        with self.assertRaises(ModelLibraryError):
             self.service.install_request("checkpoints", "a.safetensors", "ftp://x.com/a")
-        with self.assertRaises(ModelLibraryError):
-            self.service.install_request("checkpoints", "C:/evil.safetensors", "https://x.com/a")
+
+    def test_install_request_flattens_subfolder_relative_filenames(self):
+        req = self.service.install_request(
+            "unet", "krea2\\krea2_turbo_fp8_scaled.safetensors", "https://x.com/a"
+        )
+        self.assertEqual(req["filename"], "krea2_turbo_fp8_scaled.safetensors")
+        req = self.service.install_request(
+            "checkpoints", "sub/a.safetensors", "https://x.com/a"
+        )
+        self.assertEqual(req["filename"], "a.safetensors")
+        req = self.service.install_request(
+            "checkpoints", "../evil.safetensors", "https://x.com/a"
+        )
+        self.assertEqual(req["filename"], "evil.safetensors")
 
     # ── 9. no implicit scan on the generation path ───────────────────────
 

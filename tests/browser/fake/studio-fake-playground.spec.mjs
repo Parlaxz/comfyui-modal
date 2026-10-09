@@ -18,6 +18,9 @@ test.describe("Studio Playground (fake backend)", () => {
     const fx = await setupFakeTest(page);
     try {
       await expect(page.locator('[data-testid="control-panel"]')).toBeVisible({ timeout: 10000 });
+      await expect(page.locator('[data-testid="playground-golden-profile-deploy-host"]')).toHaveCount(0, {
+        timeout: 10000,
+      });
       const nav = page.locator(".comfymodal-studio-topnav");
       for (const name of ["Playground", "History", "Backend", "Settings"]) {
         await expect(nav.getByRole("button", { name })).toBeVisible();

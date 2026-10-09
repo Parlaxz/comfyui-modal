@@ -671,6 +671,10 @@ const ROUTES = [
   // Deploy status + profile level (deterministic defaults, session-scoped level)
   ["GET", "/comfymodal/deploy/status", async (res) => _json(res, engine.getDeployStatus(res._sid))],
   ["GET", "/comfymodal/auth/status", async (res) => _json(res, { status: "ok", connected: true })],
+  ["GET", "/comfymodal/hf-token", async (res) => _json(res, { status: "ok", token: "" })],
+  ["POST", "/comfymodal/hf-token", async (res) => _json(res, { status: "ok" })],
+  ["GET", "/comfymodal/civitai-token", async (res) => _json(res, { status: "ok", token: "" })],
+  ["POST", "/comfymodal/civitai-token", async (res) => _json(res, { status: "ok" })],
   ["GET", "/comfymodal/health", async (res) => _json(res, { status: "ok", message: "Fake runtime ready" })],
   ["GET", "/comfymodal/profile/level", async (res) => _json(res, engine.getProfileLevel(res._sid))],
   ["POST", "/comfymodal/profile/level", async (res, body) => {
@@ -734,6 +738,17 @@ const ROUTES = [
       ],
     });
   }],
+  ["GET", "/comfymodal/studio/golden/deploy", async (res) => _json(res, {
+    status: "ok",
+    profile: res._url.searchParams.get("profile") || FAKE_GOLDEN_PROFILE,
+    state: "deployed",
+    deployed: true,
+  })],
+  ["POST", "/comfymodal/studio/golden/deploy", async (res, body) => _json(res, {
+    status: "ok",
+    profile: body && body.profile ? body.profile : FAKE_GOLDEN_PROFILE,
+    request_id: "fake-deploy-request",
+  })],
   ["GET", "/comfymodal/studio/run-progress/:request_id", async (res, body, params) => {
     const requestId = String(params.request_id || "");
     if (!/^[\w.:-]+$/.test(requestId)) {

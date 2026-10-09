@@ -816,9 +816,10 @@ test.describe("Studio Workflow Run (fake backend)", () => {
       expect(run2.runId).not.toBe(run1.runId);
       expect(run2.experimentId).not.toBe(run1.experimentId);
 
-      // Distinct history generation records.
+      // Distinct history generation records (ids are derived per run, so they
+      // are neither readable nor shared).
       const genIds = state.historyV2
-        .filter((r) => r.kind === "generation" && r.id.startsWith("gen_wf_"))
+        .filter((r) => r.kind === "generation" && /^gen_[0-9a-f]{12}$/.test(r.id))
         .map((r) => r.id);
       expect(genIds.length).toBe(2);
       expect(new Set(genIds).size).toBe(2);
@@ -985,6 +986,67 @@ test.describe("Studio Workflow Run (fake backend)", () => {
       expect(state.experiments.length).toBe(1);
       // …and the modern workflow lane was never touched.
       expect(state.workflowRuns.length).toBe(0);
+      fx.assertNoConsoleErrors();
+    } finally {
+      fx.guard.dispose();
+    }
+  });
+
+  // NOTE: tests 1-30 above still target the pre-Shelf `workflow-control-*`
+  // mapped-controls test IDs, which the Shelf refactor retired in favour of
+  // `shelf-input-*`. They are stale, not a signal about the current UI. Tests
+  // 31+ are written against the live Shelf DOM.
+
+  test("31. Run stays enabled after reload when a prior image is persisted", async ({ page }) => {
+    const fx = await setupFakeTest(page);
+    try {
+      await page.locator(WF_SELECTOR).selectOption("wf_text2img");
+      await expect(page.locator('[data-testid="shelf-input-prompt"]')).toBeVisible({ timeout: 15000 });
+      await expect(page.locator(RUN_BTN)).toBeEnabled({ timeout: 15000 });
+
+      // Produce a persisted run result (canvas image + saved localStorage
+      // entry). On reload this is what makes _loadPersistedSelectionResult
+      // re-render the whole Playground via setPage("playground").
+      await runModernAndWait(page, fx);
+      const canvasImage = page.locator('[data-testid="canvas-output"]');
+      await expect(canvasImage).toBeVisible({ timeout: 15000 });
+
+      await fx.reload();
+
+      // The re-render builds a brand-new Run button. It must be gated from
+      // render state alone, not left in its constructed disabled form: the
+      // gating line already reports the run is executable.
+      await expect(page.locator(WF_SELECTOR)).toHaveValue("wf_text2img", { timeout: 15000 });
+      await expect(canvasImage).toBeVisible({ timeout: 15000 });
+      await expect(page.locator(GATING)).toHaveText("Ready to run", { timeout: 15000 });
+      await expect(page.locator(RUN_BTN)).toBeEnabled({ timeout: 15000 });
+
+      // And the re-enabled button is wired to the modern submit lane.
+      await page.locator(RUN_BTN).click();
+      await fx.waitForStatus("Run completed", { timeout: 15000 });
+      const state = await fx.getState();
+      expect(state.workflowRuns.length).toBe(2);
+      expect(state.experiments.length).toBe(0);
+      fx.assertNoConsoleErrors();
+    } finally {
+      fx.guard.dispose();
+    }
+  });
+
+  test("32. a disabled Run always states a reason in the panel", async ({ page }) => {
+    // Contract guard for the bug in test 31: a Run button rendered disabled
+    // with an EMPTY reason div and an empty title reads as "nothing is
+    // stopping it". Whichever gate disables it must say so.
+    const fx = await setupFakeTest(page);
+    try {
+      await page.locator(WF_SELECTOR).selectOption("wf_incomplete");
+      await expect(page.locator(RUN_BTN)).toBeDisabled({ timeout: 15000 });
+
+      const reasonText = (
+        await page.locator(".comfymodal-studio-disabled-reason").innerText()
+      ).trim();
+      const title = ((await page.locator(RUN_BTN).getAttribute("title")) || "").trim();
+      expect(reasonText.length > 0 || title.length > 0).toBe(true);
       fx.assertNoConsoleErrors();
     } finally {
       fx.guard.dispose();

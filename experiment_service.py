@@ -797,16 +797,22 @@ class RunHistoryService:
     def _lock_for(self, run_id: str) -> threading.Lock:
         return self._run_locks.acquire(run_id)
 
-    def _v2_try_mirror_record(self, meta_obj: dict) -> None:
-        """Best-effort mirror of a legacy record into History V2 (never raises)."""
+    def _v2_try_mirror_record(self, meta_obj: dict) -> Optional[str]:
+        """Best-effort mirror of a legacy record into History V2 (never raises).
+
+        Returns the mirrored History V2 generation id, or None when the
+        mirror did not produce one (writer unavailable, skipped kind, or any
+        failure).  Callers surface it as ``history_generation_id`` so the
+        frontend can fetch the exact record History renders for the run.
+        """
         try:
             from history_v2_writer import get_writer
             writer = get_writer()
             if writer is None:
-                return
+                return None
             run_id = str(meta_obj.get("run_id", ""))
             if not run_id:
-                return
+                return None
             timings: dict = {}
             timing_path = self._root / run_id / "timing.json"
             if timing_path.is_file():
@@ -816,7 +822,7 @@ class RunHistoryService:
                         timings = parsed
                 except Exception:
                     timings = {}
-            writer.record_run(
+            mirrored = writer.record_run(
                 run_id=run_id,
                 kind=str(meta_obj.get("kind", "")),
                 status=str(meta_obj.get("status", "running")),
@@ -827,8 +833,13 @@ class RunHistoryService:
                 output_path=str(meta_obj.get("output_path", "")),
                 started_at=meta_obj.get("started_at"),
             )
+            if isinstance(mirrored, dict):
+                gen_id = mirrored.get("generation_id")
+                return str(gen_id) if gen_id else None
+            return None
         except Exception as exc:
             print(f"[comfyui-modal.history-v2] mirror record failed: {type(exc).__name__}: {exc}")
+            return None
 
     def _v2_try_mirror_update(self, run_id: str, meta_obj: dict) -> None:
         """Best-effort mirror of a legacy update into History V2 (never raises)."""
@@ -906,7 +917,18 @@ class RunHistoryService:
             _atomic_write_json(timing_path, timings)
         # Phase 7: upsert into summary index (best-effort, never blocks caller)
         self._index_try_upsert(meta_obj, str(meta_path))
-        self._v2_try_mirror_record(meta_obj)
+        mirrored_generation_id = self._v2_try_mirror_record(meta_obj)
+        if mirrored_generation_id:
+            # Bridge the legacy run id to its History V2 generation: the
+            # frontend can only fetch what History renders by generation id,
+            # and nothing else on the wire links the two.  Stamped on the
+            # returned record (and persisted below) so run responses and
+            # re-read legacy entries carry it.
+            meta_obj["history_generation_id"] = mirrored_generation_id
+            try:
+                _atomic_write_json(meta_path, meta_obj)
+            except Exception:
+                pass
         return meta_obj
 
     def update_run(

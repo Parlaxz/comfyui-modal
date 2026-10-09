@@ -22,6 +22,7 @@ import {
   saveGoldenProfileSelection,
   clearGoldenProfileSelection,
 } from "./studio-playground-state.js";
+import { getGoldenProfileDeployStatus } from "./studio-backend-api.js";
 
 // ΓöÇΓöÇ Constants ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
@@ -39,6 +40,16 @@ const PREVIEW_DEFAULTS = {
   preview_codec: "webp",
   preview_quality: 70,
 };
+
+const REMOTE_INVENTORY_REFRESH_KEY = "comfymodal_remote_inventory_refresh_interval_s";
+const REMOTE_INVENTORY_REFRESH_OPTIONS = [
+  ["0", "Off"],
+  ["60", "1 minute"],
+  ["300", "5 minutes"],
+  ["900", "15 minutes"],
+  ["1800", "30 minutes"],
+];
+const REMOTE_INVENTORY_REFRESH_DEFAULT = "300";
 
 // Keys managed by the modern Settings page. "Reset all settings" clears
 // exactly this set ΓÇö nothing under comfymodal.studio.playground.* or the
@@ -68,6 +79,7 @@ const MODERN_SETTINGS_KEYS = [
   "comfymodal.studio.golden.profile.v1",
   "comfymodal-studio-panel-width",
   "comfymodal.studio.playground.carousel-cleared.v1",
+  "comfymodal_remote_inventory_refresh_interval_s",
 ];
 
 const HEAVY_TRACING_LEVELS = ["off", "summary", "detailed", "trace", "trace_verbose"];
@@ -77,6 +89,8 @@ const HEAVY_TRACING_LEVELS = ["off", "summary", "detailed", "trace", "trace_verb
 // the last-attached handler at module scope lets us remove it before
 // attaching the new one ΓÇö fixing the per-render window listener leak.
 let _outputPrefsListener = null;
+let _workspaceChangedCleanup = null;
+let _goldenDeployPageOwner = 0;
 
 let _outputPrefsModulePromise = null;
 function loadOutputPrefsModule() {
@@ -169,6 +183,8 @@ function selectWithOptions(options, testid) {
 // ΓöÇΓöÇ renderSettings (public) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 export function renderSettings(state, context) {
+  if (_workspaceChangedCleanup) _workspaceChangedCleanup();
+  const goldenDeployPageOwner = ++_goldenDeployPageOwner;
   const container = el("div", { class: "comfymodal-studio-settings" });
   let settingsStale = false;
   let unsubscribeSettingsSync = null;
@@ -209,6 +225,8 @@ export function renderSettings(state, context) {
   let effectiveTracingLevel = null;
   let goldenProfiles = [];
   let goldenProfilesError = null;
+  let activeGoldenDeployPoll = null;
+  let goldenDeployGeneration = 0;
   // Favorites are a personal, per-browser preference: they mark which profiles a
   // user cares about without changing what is selected or deployed.
   const FAVORITE_PROFILES_KEY = "comfymodal.studio.golden.favorites.v1";
@@ -254,11 +272,68 @@ export function renderSettings(state, context) {
     "data-testid": "settings-search",
     "aria-label": "Search settings",
   });
-  const searchWrap = el("div", { class: "comfymodal-settings-search-wrap" }, [searchInput, searchResultEl]);
+  const clearSearch = el("button", {
+    type: "button", class: "comfymodal-settings-search-clear", text: "Clear",
+    "aria-label": "Clear settings search",
+    onclick: () => { searchInput.value = ""; searchInput.focus(); applyFilter(); },
+  });
+  const searchWrap = el("div", { class: "comfymodal-settings-search-wrap" }, [searchInput, clearSearch, searchResultEl]);
   container.appendChild(searchWrap);
 
   const sectionsHost = el("div", { class: "comfymodal-settings-sections" });
   container.appendChild(sectionsHost);
+
+  const tabOrder = ["generation", "outputs", "accounts", "interface", "advanced"];
+  const tabLabels = { generation: "Generation", outputs: "Outputs", accounts: "Accounts & Tokens", interface: "Interface", advanced: "Advanced" };
+  let selectedTab = ["generation", "outputs", "accounts", "interface", "advanced"].includes(state?.settings?.activeSection)
+    ? state.settings.activeSection : "generation";
+  const tabsHost = el("div", { class: "comfymodal-studio-settings-tabs", role: "tablist", "aria-label": "Settings categories" });
+  container.insertBefore(tabsHost, sectionsHost);
+  const tabButtons = new Map();
+
+  function selectTab(tabId, focus) {
+    if (!tabOrder.includes(tabId)) tabId = "generation";
+    selectedTab = tabId;
+    if (state && state.settings) state.settings.activeSection = tabId;
+    tabButtons.forEach((button, id) => {
+      const active = id === selectedTab;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", active ? "true" : "false");
+      button.setAttribute("tabindex", active ? "0" : "-1");
+    });
+    sectionsHost.querySelectorAll("[data-settings-tab]").forEach((panel) => {
+      const active = panel.dataset.settingsTab === selectedTab;
+      panel.hidden = !active;
+      panel.setAttribute("aria-hidden", active ? "false" : "true");
+    });
+    if (focus) tabButtons.get(selectedTab).focus();
+    // A category choice is an explicit request to leave search mode. Re-run
+    // the normal filter path so hidden rows and the result summary cannot
+    // outlive the newly selected panel.
+    if ((searchInput.value || "").trim()) {
+      searchInput.value = "";
+      applyFilter();
+    }
+  }
+
+  tabOrder.forEach((tabId, index) => {
+    const button = el("button", {
+      type: "button", class: "comfymodal-studio-settings-tab", role: "tab",
+      id: "settings-tab-" + tabId, "aria-controls": "settings-panel-" + tabId,
+      text: tabLabels[tabId],
+    });
+    button.addEventListener("click", () => selectTab(tabId, true));
+    button.addEventListener("keydown", (event) => {
+      if (!["ArrowRight", "ArrowLeft", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const current = tabOrder.indexOf(tabId);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? tabOrder.length - 1
+        : (current + (event.key === "ArrowRight" ? 1 : -1) + tabOrder.length) % tabOrder.length;
+      selectTab(tabOrder[next], true);
+    });
+    tabsHost.appendChild(button);
+    tabButtons.set(tabId, button);
+  });
 
   const footerEl = el("div", { class: "comfymodal-settings-footer" });
   container.appendChild(footerEl);
@@ -267,26 +342,43 @@ export function renderSettings(state, context) {
   function applyFilter() {
     const q = (searchInput.value || "").trim().toLowerCase();
     let matched = 0;
+    const groups = new Map();
     sectionsHost.querySelectorAll("[data-search]").forEach((unit) => {
       const hit = !q || (unit.dataset.search || "").indexOf(q) !== -1;
       unit.classList.toggle("comfymodal-settings-row-hidden", !hit);
-      if (hit) matched++;
+      if (hit) {
+        matched++;
+        const panel = unit.closest("[data-settings-tab]");
+        if (panel) groups.set(panel.dataset.settingsTab, (groups.get(panel.dataset.settingsTab) || 0) + 1);
+      }
     });
-    sectionsHost.querySelectorAll(".comfymodal-studio-settings-section").forEach((section) => {
+    sectionsHost.querySelectorAll("[data-settings-tab]").forEach((section) => {
       const anyVisible = section.querySelectorAll(
         "[data-search]:not(.comfymodal-settings-row-hidden)"
       ).length > 0;
-      section.style.display = anyVisible ? "" : "none";
+      section.hidden = q ? !anyVisible : section.dataset.settingsTab !== selectedTab;
+      section.setAttribute("aria-hidden", section.hidden ? "true" : "false");
     });
     if (q) {
-      searchResultEl.textContent = matched === 0
-        ? "No settings match your search"
-        : matched + " matching setting" + (matched === 1 ? "" : "s");
+      while (searchResultEl.firstChild) searchResultEl.removeChild(searchResultEl.firstChild);
+      if (matched === 0) {
+        searchResultEl.appendChild(el("span", { class: "comfymodal-settings-search-empty", text: "No settings match your search" }));
+      } else {
+        searchResultEl.appendChild(el("span", {
+          class: "comfymodal-settings-search-summary",
+          text: matched + " matching setting" + (matched === 1 ? "" : "s") + " across " + groups.size + " tabs",
+        }));
+        groups.forEach((count, id) => searchResultEl.appendChild(el("button", {
+          type: "button", class: "comfymodal-settings-search-group", text: tabLabels[id] + " · " + count,
+           onclick: () => selectTab(id, true),
+        })));
+      }
       searchResultEl.style.display = "block";
     } else {
       searchResultEl.textContent = "";
       searchResultEl.style.display = "none";
     }
+    if (!q) selectTab(selectedTab, false);
   }
 
   searchInput.addEventListener("input", applyFilter);
@@ -328,10 +420,14 @@ export function renderSettings(state, context) {
 
   const resets = {
     generation: async () => {
-      removeKeys(["comfymodal_gpu", "comfymodal_preview_default"]);
+      removeKeys(["comfymodal_gpu", "comfymodal_preview_default", "comfymodal_preview_codec", "comfymodal_preview_quality"]);
       try {
         const m = await loadOutputPrefsModule();
-        await m.setOutputPreferences({ preview_default: PREVIEW_DEFAULTS.preview_default });
+        await m.setOutputPreferences({
+          preview_default: PREVIEW_DEFAULTS.preview_default,
+          preview_codec: PREVIEW_DEFAULTS.preview_codec,
+          preview_quality: PREVIEW_DEFAULTS.preview_quality,
+        });
       } catch (_) {}
       try {
         const defaultGpu = await fetchDefaultGpu();
@@ -342,6 +438,13 @@ export function renderSettings(state, context) {
         });
         if (resp.ok) publishStudioSync("settings");
       } catch (_) {}
+      clearGoldenProfileSelection();
+      try {
+        await fetch(apiBase + "/config", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ golden_profile: null }),
+        });
+      } catch (_) {}
     },
     outputs: async () => {
       removeKeys([
@@ -351,8 +454,6 @@ export function renderSettings(state, context) {
         "comfymodal_auto_save_local",
         "comfymodal_save_folder",
         "comfymodal_save_metadata_sidecar",
-        "comfymodal_preview_codec",
-        "comfymodal_preview_quality",
       ]);
       try {
         const m = await loadOutputPrefsModule();
@@ -360,11 +461,8 @@ export function renderSettings(state, context) {
       } catch (_) {}
       syncWindowOutputOptions();
     },
-    history: async () => {
-      removeKeys(["comfymodal-studio-history-columns"]);
-    },
     interface: async () => {
-      removeKeys(["comfymodal-studio-panel-width", "comfymodal.studio.playground.carousel-cleared.v1"]);
+      removeKeys(["comfymodal-studio-panel-width", "comfymodal.studio.playground.carousel-cleared.v1", REMOTE_INVENTORY_REFRESH_KEY, "comfymodal-studio-history-columns"]);
     },
     advanced: async () => {
       removeKeys(["comfymodal_heavy_tracing"]);
@@ -373,14 +471,6 @@ export function renderSettings(state, context) {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ level: "off" }),
-        });
-      } catch (_) {}
-      clearGoldenProfileSelection();
-      try {
-        await fetch(apiBase + "/config", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ golden_profile: null }),
         });
       } catch (_) {}
     },
@@ -395,7 +485,7 @@ export function renderSettings(state, context) {
 
   async function runResetAll() {
     const ok = confirm(
-      "Reset all Studio settings (General, Generation, Outputs, History, Experiments, Interface, Advanced) to defaults. " +
+      "Reset all Studio preferences to defaults. " +
       "The GPU selection is reset to the default. " +
       "Your Workflows, run History, drafts, and assets are NOT affected."
     );
@@ -417,6 +507,12 @@ export function renderSettings(state, context) {
     } catch (_) {}
     syncWindowOutputOptions();
     try {
+      await fetch(apiBase + "/config", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ golden_profile: null }),
+      });
+    } catch (_) {}
+    try {
       await fetch(apiBase + "/profile/level", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -426,7 +522,8 @@ export function renderSettings(state, context) {
     publishStudioSync("settings");
     rebuildPage();
     const confirmEl = el("span", { class: "comfymodal-settings-reset-confirm", text: "All settings reset to defaults" });
-    footerEl.appendChild(confirmEl);
+    const resetButton = sectionsHost.querySelector('[data-testid="settings-reset-all"]');
+    (resetButton && resetButton.parentNode ? resetButton.parentNode : sectionsHost).appendChild(confirmEl);
     setTimeout(() => { if (confirmEl.parentNode) confirmEl.parentNode.removeChild(confirmEl); }, 2600);
   }
 
@@ -471,21 +568,9 @@ export function renderSettings(state, context) {
     ]);
   }
 
-  // ΓöÇΓöÇ 1. General ΓöÇΓöÇ
-  function buildGeneralSection() {
-    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "general" });
-    // H12: the Cloud/Local Run mode control is retired ΓÇö it had zero modern
-    // Studio consumers and gated only legacy canvas /prompt interception.
-    // The canvas compatibility layer keeps its own key; nothing here resets
-    // or writes it. Nothing in General is resettable ΓåÆ no reset button.
-    section.appendChild(buildSectionHeader("General", ""));
-    section.appendChild(infoRow("Primary navigation: Playground / History / Workflows / Manage Modal / Settings."));
-    return section;
-  }
-
   // ΓöÇΓöÇ 2. Generation ΓöÇΓöÇ
   function buildGenerationSection() {
-    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "generation" });
+    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "generation", "data-settings-tab": "generation", id: "settings-panel-generation", role: "tabpanel", "aria-labelledby": "settings-tab-generation" });
     section.appendChild(buildSectionHeader("Generation", "settings-reset-generation"));
 
     // H12: the V1/V2 Execution Engine selector is retired ΓÇö Modal V2 is the
@@ -496,6 +581,11 @@ export function renderSettings(state, context) {
     const gpuSelect = el("select", { class: "comfymodal-input", "data-testid": "settings-gpu" });
     gpuSelect.style.cssText = "width:100%;font-size:11px;padding:3px 6px;";
     section.appendChild(controlRow("GPU", gpuSelect, "You only pay while generating.", "gpu graphics card"));
+    section.appendChild(el("div", {
+      class: "comfymodal-studio-settings-hint",
+      "data-testid": "settings-gpu-status",
+      style: "display:none;",
+    }));
 
     // Preview default (global, server-backed)
     const previewDefault = selectWithOptions([["off", "Off"], ["on", "On"]], "settings-preview-default");
@@ -508,6 +598,28 @@ export function renderSettings(state, context) {
     });
     section.appendChild(controlRow("Preview default", previewDefault, "Global default for result previews. Applies to new submissions only.", "preview default"));
 
+    const previewCodec = selectWithOptions([["webp", "WebP"]], "settings-preview-codec");
+    previewCodec.value = getPreviewPrefs().preview_codec;
+    previewCodec.addEventListener("change", () => {
+      const previous = previewCodec.value === "webp" ? "webp" : PREVIEW_DEFAULTS.preview_codec;
+      setPreviewPrefs({ preview_codec: previewCodec.value }).catch(() => { previewCodec.value = previous; });
+    });
+    section.appendChild(controlRow("Preview codec", previewCodec, "Codec used for preview thumbnails.", "preview codec"));
+
+    const previewQuality = el("input", { type: "range", min: "1", max: "100", step: "1", value: String(getPreviewPrefs().preview_quality), class: "comfymodal-settings-range", "data-testid": "settings-preview-quality", "aria-label": "Preview quality" });
+    const previewQualityVal = el("span", { class: "comfymodal-settings-range-value", "data-testid": "settings-preview-quality-value", text: previewQuality.value });
+    previewQuality.addEventListener("input", () => { previewQualityVal.textContent = previewQuality.value; });
+    previewQuality.addEventListener("change", () => {
+      const previous = previewQuality.value;
+      setPreviewPrefs({ preview_quality: parseInt(previewQuality.value, 10) || PREVIEW_DEFAULTS.preview_quality }).catch(() => { previewQuality.value = previous; previewQualityVal.textContent = previous; });
+    });
+    section.appendChild(controlRow("Preview quality", el("div", { class: "comfymodal-settings-range-wrap" }, [previewQuality, previewQualityVal]), "Compression quality for preview thumbnails (1-100).", "preview quality"));
+
+    const goldenProfileWrap = el("div", { class: "comfymodal-settings-control", "data-search": "golden profile owner method deployed undeployed runtime" });
+    goldenProfileWrap.appendChild(settingsRow("Golden profile", el("div", { "data-testid": "settings-golden-profile-host", style: "width:100%;" })));
+    goldenProfileWrap.appendChild(el("div", { class: "comfymodal-studio-settings-hint", text: "Select the server-catalogued execution profile used for generation." }));
+    section.appendChild(goldenProfileWrap);
+
     // One-time H12 migration notice (surfaced only when this server process
     // migrated a persisted retired engine value at startup).
     section.appendChild(el("div", { "data-testid": "settings-migration-notice-host" }));
@@ -516,45 +628,41 @@ export function renderSettings(state, context) {
 
   // ΓöÇΓöÇ 3. Outputs ΓöÇΓöÇ
   function buildOutputsSection() {
-    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "outputs" });
+    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "outputs", "data-settings-tab": "outputs", id: "settings-panel-outputs", role: "tabpanel", "aria-labelledby": "settings-tab-outputs" });
     section.appendChild(buildSectionHeader("Outputs", "settings-reset-outputs"));
     section.appendChild(el("div", { "data-testid": "settings-outputs-host" }));
     return section;
   }
 
-  // ΓöÇΓöÇ 4. History ΓöÇΓöÇ
-  function buildHistorySection() {
-    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "history" });
-    section.appendChild(buildSectionHeader("History", "settings-reset-history"));
-
-    const columnsSelect = el("select", { class: "comfymodal-input", "data-testid": "settings-history-columns" });
-    for (let n = 2; n <= 8; n++) {
-      columnsSelect.appendChild(el("option", { value: String(n), text: String(n) }));
-    }
-    const savedColumns = parseInt(localStorage.getItem("comfymodal-studio-history-columns"), 10);
-    columnsSelect.value = String(savedColumns >= 2 && savedColumns <= 8 ? savedColumns : 6);
-    columnsSelect.addEventListener("change", () => {
-      try { localStorage.setItem("comfymodal-studio-history-columns", columnsSelect.value); } catch (_) {}
-    });
-    section.appendChild(controlRow("Grid columns", columnsSelect, "Number of columns in the run history grid.", "history grid columns"));
-    section.appendChild(infoRow("Run history is stored locally and is kept until you delete it."));
-    return section;
-  }
-
-  // ΓöÇΓöÇ 5. Experiments ΓöÇΓöÇ
-  function buildExperimentsSection() {
-    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "experiments" });
-    // Informational only: concurrency is backend-fixed at 6, so there is
-    // nothing to reset ΓÇö no reset button is rendered.
-    section.appendChild(buildSectionHeader("Experiments", ""));
-    section.appendChild(infoRow("Experiments run up to 6 cells concurrently. Per-experiment overrides are not available."));
-    return section;
-  }
-
   // ΓöÇΓöÇ 6. Interface ΓöÇΓöÇ
   function buildInterfaceSection() {
-    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "interface" });
+    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "interface", "data-settings-tab": "interface", id: "settings-panel-interface", role: "tabpanel", "aria-labelledby": "settings-tab-interface" });
     section.appendChild(buildSectionHeader("Interface", "settings-reset-interface"));
+
+    const columnsSelect = el("select", { class: "comfymodal-input", "data-testid": "settings-history-columns" });
+    for (let n = 2; n <= 8; n++) columnsSelect.appendChild(el("option", { value: String(n), text: String(n) }));
+    let savedColumns = 6;
+    try { savedColumns = parseInt(localStorage.getItem("comfymodal-studio-history-columns"), 10) || 6; } catch (_) {}
+    columnsSelect.value = String(savedColumns >= 2 && savedColumns <= 8 ? savedColumns : 6);
+    columnsSelect.addEventListener("change", () => { try { localStorage.setItem("comfymodal-studio-history-columns", columnsSelect.value); } catch (_) {} });
+    section.appendChild(controlRow("History grid columns", columnsSelect, "Number of columns in the run history grid.", "history history grid columns"));
+
+    const inventoryRefresh = selectWithOptions(REMOTE_INVENTORY_REFRESH_OPTIONS, "settings-remote-inventory-refresh");
+    let savedInventoryRefresh = REMOTE_INVENTORY_REFRESH_DEFAULT;
+    try {
+      const stored = localStorage.getItem("comfymodal_remote_inventory_refresh_interval_s");
+      if (REMOTE_INVENTORY_REFRESH_OPTIONS.some(([value]) => value === stored)) savedInventoryRefresh = stored;
+    } catch (_) {}
+    inventoryRefresh.value = savedInventoryRefresh;
+    inventoryRefresh.addEventListener("change", () => {
+      try { localStorage.setItem("comfymodal_remote_inventory_refresh_interval_s", inventoryRefresh.value); } catch (_) {}
+    });
+    section.appendChild(controlRow(
+      "Remote inventory refresh",
+      inventoryRefresh,
+      "Refreshes lightweight remote inventory only while Studio is open and this browser page is visible and focused.",
+      "remote inventory refresh visible focused polling",
+    ));
 
     const resetLayoutBtn = el("button", {
       type: "button",
@@ -577,7 +685,7 @@ export function renderSettings(state, context) {
 
   // ΓöÇΓöÇ 7. Advanced ΓöÇΓöÇ
   function buildAdvancedSection() {
-    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "advanced" });
+    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "advanced", "data-settings-tab": "advanced", id: "settings-panel-advanced", role: "tabpanel", "aria-labelledby": "settings-tab-advanced" });
     section.appendChild(buildSectionHeader("Advanced", "settings-reset-advanced"));
 
     // Heavy tracing (server-backed via /profile/level, local key for the selection)
@@ -586,7 +694,7 @@ export function renderSettings(state, context) {
       ["summary", "Summary"],
       ["detailed", "Detailed"],
       ["trace", "Trace"],
-      ["trace_verbose", "Trace verbose"],
+       ["trace_verbose", "Verbose trace"],
     ], "settings-heavy-tracing");
     const storedTracing = localStorage.getItem("comfymodal_heavy_tracing") || "off";
     tracingSelect.value = HEAVY_TRACING_LEVELS.indexOf(storedTracing) !== -1 ? storedTracing : "off";
@@ -619,19 +727,6 @@ export function renderSettings(state, context) {
     })));
     runtimeGroup.appendChild(deployWrap);
 
-    // Credentials live here in Settings: the Modal connection badge plus the
-    // HuggingFace / Civitai token blocks. They were the Backend > Credentials
-    // tab, which is gone.
-    const credentialsWrap = el("div", {
-      class: "comfymodal-settings-control",
-      "data-search": "credentials token huggingface civitai modal account",
-    });
-    credentialsWrap.appendChild(settingsRow("Credentials", el("span", {
-      class: "comfymodal-studio-settings-row-value",
-      text: "Modal account \u00b7 HuggingFace \u00b7 Civitai tokens",
-    })));
-    runtimeGroup.appendChild(credentialsWrap);
-    renderCredentialsSection(credentialsWrap, (context && context.apiBase) || "/comfymodal");
 
     const backendLinkWrap = el("div", { class: "comfymodal-settings-control", "data-search": "open manage modal" });
     const backendLink = el("a", {
@@ -679,20 +774,21 @@ export function renderSettings(state, context) {
 
     section.appendChild(runtimeGroup);
 
-    const goldenProfileWrap = el("div", {
-      class: "comfymodal-settings-control",
-      "data-search": "golden profile owner method deployed undeployed runtime",
-    });
-    goldenProfileWrap.appendChild(settingsRow("Golden profile", el("div", {
-      "data-testid": "settings-golden-profile-host",
-      style: "width:100%;",
-    })));
-    goldenProfileWrap.appendChild(el("div", {
-      class: "comfymodal-studio-settings-hint",
-      text: "Select a server-catalogued Golden profile. Undeployed profiles must be deployed before use; Studio will not fall back to another profile.",
-    }));
-    section.appendChild(goldenProfileWrap);
+    const resetAllWrap = el("div", { class: "comfymodal-settings-control", "data-search": "reset all settings preferences defaults" });
+    resetAllWrap.appendChild(el("p", { class: "comfymodal-studio-settings-hint", text: "Reset every preference managed by this page. Credentials and user data are not affected." }));
+    resetAllWrap.appendChild(el("button", { type: "button", class: "comfymodal-destructive-btn comfymodal-settings-reset-all-btn", "data-testid": "settings-reset-all", text: "Reset all settings", onclick: runResetAll }));
+    section.appendChild(resetAllWrap);
 
+    return section;
+  }
+
+  function buildAccountsSection() {
+    const section = el("div", { class: "comfymodal-studio-settings-section", "data-section": "accounts", "data-settings-tab": "accounts", id: "settings-panel-accounts", role: "tabpanel", "aria-labelledby": "settings-tab-accounts" });
+    section.appendChild(buildSectionHeader("Accounts & Tokens", ""));
+    const credentialsWrap = el("div", { class: "comfymodal-settings-control", "data-search": "credentials token huggingface civitai modal account workspace" });
+    credentialsWrap.appendChild(el("p", { class: "comfymodal-studio-settings-hint", text: "Connection status and model-provider tokens. Credentials are never included in reset actions." }));
+    renderCredentialsSection(credentialsWrap, (context && context.apiBase) || "/comfymodal");
+    section.appendChild(credentialsWrap);
     return section;
   }
 
@@ -700,28 +796,13 @@ export function renderSettings(state, context) {
 
   function buildSections() {
     const sections = [
-      buildGeneralSection(),
       buildGenerationSection(),
       buildOutputsSection(),
-      buildHistorySection(),
-      buildExperimentsSection(),
+      buildAccountsSection(),
       buildInterfaceSection(),
       buildAdvancedSection(),
     ];
-    const footer = el("div", { class: "comfymodal-settings-footer-inner" }, [
-      el("p", {
-        class: "comfymodal-settings-footer-note",
-        text: "Reset all Studio settings to defaults. The GPU selection resets to the default. User data (workflows, history, drafts, assets) is preserved.",
-      }),
-      el("button", {
-        type: "button",
-        class: "comfymodal-destructive-btn comfymodal-settings-reset-all-btn",
-        "data-testid": "settings-reset-all",
-        text: "Reset all settings",
-        onclick: runResetAll,
-      }),
-    ]);
-    return { sections: sections, footer: footer };
+    return { sections: sections, footer: null };
   }
 
   function rebuildPage() {
@@ -729,7 +810,7 @@ export function renderSettings(state, context) {
     while (footerEl.firstChild) footerEl.removeChild(footerEl.firstChild);
     const { sections, footer } = buildSections();
     for (const s of sections) sectionsHost.appendChild(s);
-    footerEl.appendChild(footer);
+    if (footer) footerEl.appendChild(footer);
     applyFilter();
     refreshEngineMigrationNotice(apiBase);
     refreshGpuConfig(apiBase);
@@ -765,23 +846,31 @@ export function renderSettings(state, context) {
   // ΓöÇΓöÇ GPU refresh (server truth first; localStorage as cache only) ΓöÇΓöÇ
   function refreshGpuConfig(base) {
     const gpuSelect = sectionsHost.querySelector('[data-testid="settings-gpu"]');
+    const gpuStatus = sectionsHost.querySelector('[data-testid="settings-gpu-status"]');
     if (!gpuSelect) return;
 
     fetch(base + "/config")
       .then((r) => r.json())
       .then((cfg) => {
-        const options = Array.isArray(cfg && cfg.available_gpus) ? cfg.available_gpus : [];
+        const options = Array.isArray(cfg && cfg.available_gpus)
+          ? cfg.available_gpus.filter((o) => o && typeof o.value === "string" && o.value)
+          : [];
         const values = new Set(options.map((o) => o.value));
         const serverGpu = (cfg && cfg.gpu) || "";
         const storedGpu = localStorage.getItem("comfymodal_gpu") || "";
-        // The server-reported GPU wins over the localStorage cache so a stale
-        // browser value can never mask current server state. LS is consulted
-        // only when the server reports no usable value.
+        const defaultGpu = (cfg && cfg.default_gpu) || "rtx-pro-6000";
+        // The server-reported GPU wins when it is in the catalog. An unknown
+        // server value must not be assigned to the select: that produces the
+        // browser's blank selection and falsely looks like missing state.
         const selected = serverGpu && values.has(serverGpu)
           ? serverGpu
-          : storedGpu && values.has(storedGpu)
+          : !serverGpu && storedGpu && values.has(storedGpu)
             ? storedGpu
-            : (serverGpu || (cfg && cfg.default_gpu) || "rtx-pro-6000");
+            : values.has(defaultGpu)
+              ? defaultGpu
+              : options.length
+                ? options[0].value
+                : "rtx-pro-6000";
         while (gpuSelect.firstChild) gpuSelect.removeChild(gpuSelect.firstChild);
         if (options.length === 0) {
           gpuSelect.appendChild(el("option", { value: "rtx-pro-6000", text: "rtx-pro-6000 (default)" }));
@@ -791,6 +880,17 @@ export function renderSettings(state, context) {
           });
         }
         gpuSelect.value = selected;
+        if (gpuStatus) {
+          if (serverGpu && !values.has(serverGpu)) {
+            gpuStatus.textContent = options.length === 0
+              ? "GPU options are unavailable. Showing the default without changing the server value (reported: " + serverGpu + ")."
+              : "Server reports " + serverGpu + ", which is not available here. Showing " + selected + "; choose a GPU to save a change.";
+            gpuStatus.style.display = "block";
+          } else {
+            gpuStatus.textContent = "";
+            gpuStatus.style.display = "none";
+          }
+        }
       })
       .catch(() => {});
 
@@ -940,43 +1040,6 @@ export function renderSettings(state, context) {
           });
           host.appendChild(controlRow("Save metadata JSON sidecar", sidecar, "Write a JSON sidecar file with generation metadata.", "metadata sidecar json"));
 
-          // Preview codec (global, server-backed)
-          const previewCodec = selectWithOptions([["webp", "WebP"]], "settings-preview-codec");
-          previewCodec.value = preview.preview_codec;
-          previewCodec.addEventListener("change", () => {
-            const previous = preview.preview_codec;
-            setPreviewPrefs({ preview_codec: previewCodec.value }).catch(() => {
-              previewCodec.value = previous;
-            });
-          });
-          host.appendChild(controlRow("Preview codec", previewCodec, "Codec used for preview thumbnails.", "preview codec"));
-
-          // Preview quality (new, local-only)
-          const previewQuality = el("input", {
-            type: "range",
-            min: "1",
-            max: "100",
-            step: "1",
-            value: String(preview.preview_quality),
-            class: "comfymodal-settings-range",
-            "data-testid": "settings-preview-quality",
-            "aria-label": "Preview quality",
-          });
-          const previewQualityVal = el("span", {
-            class: "comfymodal-settings-range-value",
-            "data-testid": "settings-preview-quality-value",
-            text: String(preview.preview_quality),
-          });
-          previewQuality.addEventListener("input", () => { previewQualityVal.textContent = previewQuality.value; });
-          previewQuality.addEventListener("change", () => {
-            const previous = preview.preview_quality;
-            setPreviewPrefs({ preview_quality: parseInt(previewQuality.value, 10) || 70 }).catch(() => {
-              previewQuality.value = String(previous);
-              previewQualityVal.textContent = String(previous);
-            });
-          });
-          host.appendChild(controlRow("Preview quality", el("div", { class: "comfymodal-settings-range-wrap" }, [previewQuality, previewQualityVal]), "Compression quality for preview thumbnails (1-100).", "preview quality"));
-
           // Open output folder
           const openFolderBtn = el("button", {
             type: "button",
@@ -1015,10 +1078,10 @@ export function renderSettings(state, context) {
             syncValue("settings-auto-save-local", (n) => { n.checked = fresh.auto_save_local; });
             syncValue("settings-save-folder", (n) => { n.value = fresh.save_folder; });
             syncValue("settings-save-metadata-sidecar", (n) => { n.checked = fresh.save_metadata_sidecar; });
-            syncValue("settings-preview-default", (n) => { n.value = freshPreview.preview_default; });
-            syncValue("settings-preview-codec", (n) => { n.value = freshPreview.preview_codec; });
-            syncValue("settings-preview-quality", (n) => { n.value = String(freshPreview.preview_quality); });
-            syncValue("settings-preview-quality-value", (n) => { n.textContent = String(freshPreview.preview_quality); });
+             syncValue("settings-preview-default", (n) => { n.value = freshPreview.preview_default; });
+             syncValue("settings-preview-codec", (n) => { n.value = freshPreview.preview_codec; });
+             syncValue("settings-preview-quality", (n) => { n.value = String(freshPreview.preview_quality); });
+             syncValue("settings-preview-quality-value", (n) => { n.textContent = String(freshPreview.preview_quality); });
           };
           window.addEventListener("comfymodal:output-preferences-changed", _outputPrefsListener);
           // The outputs rows are added asynchronously, after the initial
@@ -1107,6 +1170,8 @@ export function renderSettings(state, context) {
   function refreshGoldenProfiles(base) {
     const host = sectionsHost.querySelector('[data-testid="settings-golden-profile-host"]');
     if (!host) return;
+    goldenDeployGeneration += 1;
+    activeGoldenDeployPoll = null;
     while (host.firstChild) host.removeChild(host.firstChild);
     host.appendChild(el("p", {
       class: "comfymodal-studio-settings-hint",
@@ -1126,7 +1191,7 @@ export function renderSettings(state, context) {
         if (!response.ok) return {};
         return response.json();
       }).catch(() => ({})),
-    ]).then(([catalog, config]) => {
+    ]).then(async ([catalog, config]) => {
       if (!host.isConnected) return;
       goldenProfiles = catalog.profiles.filter((profile) => profile && typeof profile.name === "string" && profile.name);
       goldenProfilesError = null;
@@ -1139,7 +1204,11 @@ export function renderSettings(state, context) {
         : names.has(localSelected) ? localSelected
           : names.has(catalog.defaultProfile) ? catalog.defaultProfile : "";
       if (selected) saveGoldenProfileSelection(selected);
-      renderGoldenProfileHost(host, base, selected);
+      const deployState = selected
+        ? await getGoldenProfileDeployStatus(base, selected)
+        : null;
+      if (!host.isConnected) return;
+      renderGoldenProfileHost(host, base, selected, deployState);
     }).catch((error) => {
       if (!host.isConnected) return;
       goldenProfiles = [];
@@ -1153,7 +1222,85 @@ export function renderSettings(state, context) {
     });
   }
 
-  function renderGoldenProfileHost(host, base, selected) {
+  function refreshFromWorkspaceChange() {
+    if (!container.isConnected) {
+      if (_workspaceChangedCleanup) _workspaceChangedCleanup();
+      return;
+    }
+    refreshGoldenProfiles(apiBase);
+  }
+
+  // Activation is a browser event for same-tab mounts and a Studio sync
+  // message for other tabs. Both paths re-read the server-owned catalog.
+  const workspaceChangedListener = refreshFromWorkspaceChange;
+  const hasWindow = typeof window !== "undefined";
+  if (hasWindow) window.addEventListener("workspace-changed", workspaceChangedListener);
+  const unsubscribeWorkspaceSync = subscribeStudioSync("workspace", refreshFromWorkspaceChange);
+  _workspaceChangedCleanup = function cleanupWorkspaceChanged() {
+    if (hasWindow) window.removeEventListener("workspace-changed", workspaceChangedListener);
+    unsubscribeWorkspaceSync();
+    if (_workspaceChangedCleanup === cleanupWorkspaceChanged) _workspaceChangedCleanup = null;
+  };
+
+  function startGoldenDeployPoll(base, name, status, button, host) {
+    if (activeGoldenDeployPoll
+        && activeGoldenDeployPoll.name === name
+        && activeGoldenDeployPoll.owner === goldenDeployPageOwner
+        && activeGoldenDeployPoll.generation === goldenDeployGeneration) {
+      return activeGoldenDeployPoll.promise;
+    }
+    const generation = goldenDeployGeneration;
+    const promise = pollGoldenDeploy(base, name, status, button, host, generation);
+    activeGoldenDeployPoll = {
+      name: name,
+      owner: goldenDeployPageOwner,
+      generation: generation,
+      promise: promise,
+    };
+    promise.then(() => {
+      if (activeGoldenDeployPoll && activeGoldenDeployPoll.promise === promise) activeGoldenDeployPoll = null;
+    }, () => {
+      if (activeGoldenDeployPoll && activeGoldenDeployPoll.promise === promise) activeGoldenDeployPoll = null;
+    });
+    return promise;
+  }
+
+  async function pollGoldenDeploy(base, name, status, button, host, generation) {
+    for (let attempt = 0; attempt < 900; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      if (_goldenDeployPageOwner !== goldenDeployPageOwner
+          || generation !== goldenDeployGeneration
+          || !host.isConnected) return;
+      const payload = await getGoldenProfileDeployStatus(base, name);
+      if (_goldenDeployPageOwner !== goldenDeployPageOwner
+          || generation !== goldenDeployGeneration
+          || !host.isConnected) return;
+      if (payload && payload.state === "done") {
+        status.textContent = "Deploy finished.";
+        button.disabled = false;
+        refreshGoldenProfiles(base);
+        return;
+      }
+      if (payload && payload.state === "failed") {
+        const tail = String(payload.output || "").trim().split("\n").pop();
+        status.textContent = "Deploy failed: " + (tail || "see v2ctl output");
+        button.disabled = false;
+        return;
+      }
+    }
+    if (_goldenDeployPageOwner === goldenDeployPageOwner
+        && generation === goldenDeployGeneration
+        && host.isConnected) {
+      status.textContent = "Deploy still running. Reopen Settings to check its status.";
+      button.disabled = false;
+    }
+  }
+
+  function renderGoldenProfileHost(host, base, selected, deployState) {
+    if (activeGoldenDeployPoll && activeGoldenDeployPoll.name !== selected) {
+      goldenDeployGeneration += 1;
+      activeGoldenDeployPoll = null;
+    }
     while (host.firstChild) host.removeChild(host.firstChild);
     if (goldenProfilesError) {
       host.appendChild(el("p", {
@@ -1220,14 +1367,20 @@ export function renderSettings(state, context) {
     const selectedProfile = goldenProfiles.find(
       (item) => item.name === (selected || "")
     );
-    if (selectedProfile && selectedProfile.deployed !== true) {
+    const isDeploying = (deployState && deployState.state === "running")
+      || (activeGoldenDeployPoll
+        && activeGoldenDeployPoll.name === selectedProfile?.name
+        && activeGoldenDeployPoll.owner === goldenDeployPageOwner);
+    if (selectedProfile && (selectedProfile.deployed !== true || isDeploying)) {
       const selTarget = selectedProfile.target && typeof selectedProfile.target === "object"
         ? selectedProfile.target
         : {};
       const deployStatus = el("p", {
         class: "comfymodal-studio-settings-hint",
         "data-testid": "settings-golden-profile-deploy-status",
-        text: selTarget.app
+        text: isDeploying
+          ? "Deploying " + selectedProfile.name + "\u2026"
+          : selTarget.app
           ? "Not deployed. Deploying runs v2ctl for " + selectedProfile.name
             + " (" + selTarget.app + ")."
           : "Not deployed.",
@@ -1237,6 +1390,7 @@ export function renderSettings(state, context) {
         "data-testid": "settings-golden-profile-deploy",
         "data-profile-name": selectedProfile.name,
         text: "Deploy " + selectedProfile.name,
+        disabled: !!isDeploying,
         onclick: async () => {
           deployButton.disabled = true;
           deployStatus.textContent = "Deploying " + selectedProfile.name + "\u2026";
@@ -1250,7 +1404,7 @@ export function renderSettings(state, context) {
             if (!started.ok || payload.status !== "ok") {
               throw new Error(payload.error || "HTTP " + started.status);
             }
-            await pollGoldenDeploy(base, selectedProfile.name, deployStatus, deployButton);
+            await startGoldenDeployPoll(base, selectedProfile.name, deployStatus, deployButton, host);
           } catch (error) {
             deployStatus.textContent =
               "Deploy failed: " + (error.message || "request failed");
@@ -1260,33 +1414,13 @@ export function renderSettings(state, context) {
       });
       host.appendChild(deployStatus);
       host.appendChild(deployButton);
-    }
-
-    // Deploys are long-running, so the UI polls job state instead of holding the
-    // request open. Success is never inferred: the catalog is re-read when the
-    // job finishes, so deployed state comes from the backend.
-    async function pollGoldenDeploy(base, name, status, button) {
-      for (let attempt = 0; attempt < 900; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        const response = await fetch(
-          base + "/studio/golden/deploy?profile=" + encodeURIComponent(name)
-        );
-        const payload = await response.json();
-        if (payload && payload.state === "done") {
-          status.textContent = "Deploy finished.";
-          button.disabled = false;
-          refreshGoldenProfiles(base);
-          return;
-        }
-        if (payload && payload.state === "failed") {
-          const tail = String(payload.output || "").trim().split("\n").pop();
-          status.textContent = "Deploy failed: " + (tail || "see v2ctl output");
-          button.disabled = false;
-          return;
-        }
+      if (isDeploying) {
+        startGoldenDeployPoll(base, selectedProfile.name, deployStatus, deployButton, host).catch((error) => {
+          if (_goldenDeployPageOwner !== goldenDeployPageOwner || !host.isConnected) return;
+          deployStatus.textContent = "Deploy failed: " + (error.message || "request failed");
+          deployButton.disabled = false;
+        });
       }
-      status.textContent = "Deploy still running. Reopen Settings to check its status.";
-      button.disabled = false;
     }
 
     const catalogList = el("div", {

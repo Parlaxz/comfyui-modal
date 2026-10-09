@@ -254,12 +254,12 @@ test("I1 recon sweep: five pages x viewports + a11y + A/B targets", async ({ pag
     if ((await img.count()) > 0) {
       await img.click({ force: true }).catch(() => {});
       await page.waitForTimeout(600);
-      const previewOpen = await page.evaluate(() => !!document.querySelector(".comfymodal-studio-preview-overlay"));
+      const previewOpen = await page.evaluate(() => !!document.querySelector(".comfymodal-studio-viewer-overlay"));
       audit.historyDetail.sharedPreviewOverlayOpened = previewOpen;
       if (previewOpen) {
         await page.screenshot({ path: path.join(ART_DIR, "shared-image-preview-overlay.png") });
         audit.historyDetail.previewOverlayStructure = await page.evaluate(() => {
-          const pv = document.querySelector(".comfymodal-studio-preview-overlay");
+        const pv = document.querySelector(".comfymodal-studio-viewer-overlay");
           return {
             role: pv.getAttribute("role"),
             ariaModal: pv.getAttribute("aria-modal"),

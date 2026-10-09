@@ -83,8 +83,6 @@ python tools/v2ctl.py doctor --profile golden_p1 --app <experimental-app>
 
 python tools/v2ctl.py golden deploy --app <experimental-app>
 
-python tools/v2ctl.py --profile golden_p1 --app <experimental-app> source-probe
-
 python tools/v2ctl.py golden run --app <experimental-app>
 
 python tools/v2ctl.py golden run --app <experimental-app> --acknowledge-volume-drift
@@ -94,7 +92,15 @@ python tools/v2ctl.py gate --profile golden_p1 --app <experimental-app>
 python tools/v2ctl.py --profile golden_p1 --app <experimental-app> confirm --from <gate-manifest> --runs 5
 ```
 
-`source-probe` and `confirm` are top-level commands. Their global options must precede the subcommand.
+`confirm` is a top-level command. Its global options must precede the subcommand.
+
+Do not run `source-probe`. It is debug tooling and gates nothing: it starts its
+own container, costs GPU time, and is not part of any documented flow
+(`d018657a`, `e354af1e`). Deployment/source identity comes from the run's own
+telemetry (`source_generation_identity`, the executed-code SHA the request
+reports) plus the immutable deployment receipt the run binds. If you find
+yourself following an older revision of this skill that lists `source-probe` as
+a step, that revision is stale — current source wins.
 
 Do not directly use:
 
@@ -109,8 +115,8 @@ If the public Golden interface breaks, fix the public interface instead of bypas
 
 `--acknowledge-volume-drift` deliberately skips only the exact-content
 publisher preflight gate (`require_ready`) on `golden run`. The run still
-binds the immutable deployment receipt, still requires source-probe evidence,
-and records `COMFYMODAL_V2CTL_ACKNOWLEDGED_VOLUME_DRIFT=1` in the run
+binds the immutable deployment receipt and the same-request deployment
+identity, and records `COMFYMODAL_V2CTL_ACKNOWLEDGED_VOLUME_DRIFT=1` in the run
 manifest. Use it only when the operator explicitly accepts that the shared
 custom-nodes Volume may not match the local tree (e.g. another authorized lane
 is writing publishable files mid-cohort). It never overrides the deployment
@@ -122,13 +128,12 @@ fingerprint, the receipt, or the output contract.
 2. Run `doctor` / `golden status`.
 3. Freeze the deploy-relevant source/configuration.
 4. Run `golden deploy`.
-5. Run `source-probe`.
-6. Run `golden status` and `doctor` again.
-7. Require matching source/deployment identity, verified runtime health, no unintended overrides, and `ready=True`.
-8. Run exactly ONE `golden run`.
-9. Inspect its structural classification and evidence.
-10. If valid, run only the additional observations the experiment needs, normally 1–2 more, separately and serially.
-11. Use `gate` / `confirm` only when the experiment explicitly requires a larger confirmation cohort.
+5. Run `golden status` and `doctor` again.
+6. Require matching deployment identity, verified runtime health, no unintended overrides, and `ready=True`.
+7. Run exactly ONE `golden run`.
+8. Inspect its structural classification and evidence.
+9. If valid, run only the additional observations the experiment needs, normally 1–2 more, separately and serially.
+10. Use `gate` / `confirm` only when the experiment explicitly requires a larger confirmation cohort.
 
 Never launch Golden experiment requests concurrently.
 
@@ -191,7 +196,7 @@ An accepted Golden observation must structurally prove the current Golden contra
 - `run_golden_serial_stream`
 - exactly one Golden request / terminal result
 - no generic `run_plan_stream` execution
-- current deployment/source identity
+- current deployment identity, as reported by the request itself
 - expected workflow/model identity
 - `restore_count == 1`
 - `request_count == 1`
@@ -211,7 +216,7 @@ Single-use containers, `min_containers=0`, scaledown, or a long delay are not pr
 
 ## Source freeze and redeploy
 
-Deployment fingerprint/source identity is authoritative.
+Deployment fingerprint is authoritative.
 
 Prefer a committed deploy-relevant source state. If intentionally deploying a dirty tree, retain the exact dirty source hash/fingerprint in the deployment manifest.
 
@@ -284,14 +289,12 @@ python tools/v2ctl.py golden profile --app <experimental-app>
 ```
 
 That single command does the whole loop: deploy with tracing flags, verify the
-deployment actually landed via source-probe, run one request, resolve the trace
+deployment identity is current, run one request, resolve the trace
 id, download and SHA-verify the bundle, analyze it, and write the decision
 documents. It prints the final report path when done.
 
 - It performs a **real deploy and a real run**. That costs GPU time. Use
   `--dry-run` first if you only want to see the plan.
-- It **aborts if source-probe does not report `RESULT=PASS`**, so a stale
-  deployment is never profiled.
 - Tracing flags are added automatically; do not pass them yourself:
   `COMFYMODAL_V2_FULL_TRACE=1`, `COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER=1`,
   `COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN=1`, and `COMFYMODAL_V2_GOLDEN_DEEP_TRACE=1`
@@ -375,17 +378,17 @@ Do not turn unrelated repository-secret hygiene into a Golden deployment prerequ
 
 Local startup-test dependency failures are not remote Golden evidence. Record
 the exact import/version error, run the focused control-plane and runtime-env
-tests relevant to the change, and rely on source-probe plus the authoritative
-remote run artifact for deployment conclusions.
+tests relevant to the change, and rely on the authoritative remote run artifact
+for deployment conclusions.
 
 For worker-thread diagnostics, verify both the request trace and per-lane trace
 context paths. A wrapper that sees no request context may legally no-op even
 when its deploy flag and source are correct; the remote artifact must prove the
 worker-side event was emitted.
 
-For experiment-owned runtime modules, source-probe should also prove the remote
-`__file__`/hash, effective diagnostic level, wrapper registration, and concrete
-dispatch owner before a full Golden request. If source identity passes but the
+For experiment-owned runtime modules, the remote run artifact must prove the
+executed code's own SHA (`source_generation_identity`), the effective
+diagnostic level, wrapper registration, and the concrete dispatch owner. If the
 first eligible artifact contains none of the experiment events, stop and add a
 module/execution-path probe instead of repeatedly redeploying blind.
 
@@ -419,7 +422,6 @@ R0 proved this operating model on isolated app:
 
 with:
 
-- source probe `PASS / MATCH`
 - verified runtime health
 - `ready=True`
 - no runtime overrides

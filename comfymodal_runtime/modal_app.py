@@ -4871,12 +4871,14 @@ def _resolve_single_use_containers() -> bool:
 # COMFYMODAL_V2_REGION pins the deployment to a single Modal region so cold
 # A/B comparisons can isolate region-pool behavior.  Only allowlisted region
 # strings are accepted (a typo must fail loudly, never silently deploy
-# unpinned).  AWS regions use dashes (us-east-2); GCP regions use no dashes
-# (us-east4).  Default (unset) preserves the existing multi-region behavior.
+# unpinned). Modal's broad container-region labels include us-central; retain
+# the historical provider-specific pins for compatibility with older profiles.
+# Default (unset) preserves the existing multi-region behavior.
 _REGION_PIN_ALLOWLIST = frozenset({
+    "us", "us-east", "us-central", "us-south", "us-west",
     "us-east-1", "us-east-2", "us-west-2", "eu-west-1", "eu-central-1",
     "ap-northeast-1", "ap-southeast-1", "ap-southeast-2", "ca-central-1",
-    "sa-east-1", "us-east4", "us-west1", "us-central1", "us-west4",
+    "sa-east-1", "us-east4", "us-west1", "us-west4",
     "europe-west1", "europe-west4", "asia-east1", "asia-southeast1",
 })
 

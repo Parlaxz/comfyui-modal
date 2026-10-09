@@ -537,9 +537,9 @@ test.describe("Studio ZIT E2E", () => {
     await expect(dialog).toContainText("75739920976641");
     // Favorite star + note box use class hooks (proven pattern in the
     // history-v2 annotation specs); testid variants kept as fallback.
-    const favBtn = dialog.locator('.comfymodal-studio-history-v2-fav, [data-testid="history-v2-favorite"], [data-testid="history-favorite"]').first();
+    const favBtn = dialog.locator('.comfymodal-studio-viewer-favorite, [data-testid="history-v2-favorite"], [data-testid="history-favorite"]').first();
     if (await favBtn.count()) await favBtn.click();
-    const noteInput = dialog.locator('textarea.comfymodal-studio-history-v2-notes, [data-testid="history-v2-note-input"], [data-testid="history-note-input"], textarea').first();
+    const noteInput = dialog.locator('textarea.comfymodal-studio-viewer-note, [data-testid="history-v2-note-input"], [data-testid="history-note-input"], textarea').first();
     if (await noteInput.count()) {
       await noteInput.fill("zit e2e note");
       const noteSave = dialog.getByRole("button", { name: "Save note" });

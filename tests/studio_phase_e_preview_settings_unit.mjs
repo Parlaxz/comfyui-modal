@@ -190,9 +190,10 @@ try {
   detachModernExperiment(state);
   section("4. One frozen Experiment options object, one POST, no fanout/concurrency");
 
-  // 5. The active Settings surface no longer presents an inert concurrency input.
+  // 5. The active five-tab Settings surface no longer presents the retired
+  // Experiments/inert concurrency controls.
   assert.equal(settingsSource.includes('data-testid": "settings-global-concurrency"'), false);
-  assert.equal(settingsSource.includes("Experiments run up to 6 cells concurrently"), true);
+  assert.equal(settingsSource.includes("Experiments run up to 6 cells concurrently"), false);
   assert.equal(settingsSource.includes('data-testid": "settings-preview-auto-save"'), false);
   assert.equal(configSource.includes('"preview_default"'), true);
   assert.equal(configSource.includes('"preview_codec"'), true);
@@ -206,9 +207,11 @@ try {
   appendIfPresent(parent, null);
   appendIfPresent(parent, { nodeType: 1 });
   assert.equal(parent.children.length, 1);
-  assert.equal(detailSource.includes("appendIfPresent(col, buildParamsSection(record))"), true);
+  // Sparse-section null filtering lives in the detail _section helper (the
+  // right-column composition itself is the one shared viewer in studio-ui.js).
+  assert.equal(detailSource.includes("(rows || []).filter(function (r) { return r != null; })"), true);
   assert.equal(detailSource.includes('text: "No outputs"'), true);
-  assert.equal(detailSource.includes("No image"), true);
+  assert.equal(detailSource.includes("Preview pending"), true);
   assert.equal(detailSource.includes("Original generation failed"), true);
   section("6. Sparse, empty, and failed detail records keep safe placeholders");
 } finally {

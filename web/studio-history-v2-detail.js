@@ -8,9 +8,9 @@
 // Appended to document.body; Escape closes via registerLayerHandler
 // (layer 3, matching the shared preview overlay).  All DOM via el().
 
-import { el, registerLayerHandler } from "./studio-ui.js";
+import { el, registerLayerHandler, buildViewerShell } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
-import { _formatDuration } from "./studio-run-normalizer.js";
+import { _formatDuration, resolveViewerInput } from "./studio-run-normalizer.js";
 import {
   buildAddToCompareItem,
   openComparePair,
@@ -54,35 +54,15 @@ const STATUS_TONES = {
   running: "running",
 };
 
-const PARAM_KEYS = [
-  ["seed", "Seed"],
-  ["steps", "Steps"],
-  ["cfg", "CFG"],
-  ["guidance", "Guidance"],
-  ["sampler", "Sampler"],
-  ["scheduler", "Scheduler"],
-  ["denoise", "Denoise"],
-  ["width", "Width"],
-  ["height", "Height"],
-];
-
-const TIMING_ROWS = [
-  ["endToEndMs", "End-to-end"],
-  ["modelLoadMs", "Model load"],
-  ["clipEncodeMs", "Prompt encoding"],
-  ["samplingMs", "Sampling"],
-  ["vaeDecodeMs", "VAE decode"],
-];
-
 export function appendIfPresent(parent, child) {
   if (child) parent.appendChild(child);
 }
 
+// Kept as the History-facing name; the policy itself now lives with the
+// other viewer-input logic (studio-run-normalizer.js) so History and the
+// Playground preview resolve the displayed asset through one implementation.
 export function selectGenerationDetailAsset(record) {
-  const feat = record && record.featuredOutput ? record.featuredOutput : {};
-  return selectDetailAsset(Object.assign({}, feat, {
-    originalAvailable: !!(feat.originalAvailable || (record && record.originalAvailable)),
-  }));
+  return resolveViewerInput(record).output;
 }
 
 export function historyAttemptPurposeLabel(mode) {
@@ -130,19 +110,19 @@ function _previewBadge() {
 
 export async function renderGenerationDetail(generationId, repo, callbacks) {
   const cbs = callbacks || {};
-
-  const overlay = el("div", {
-    class: "comfymodal-studio-history-v2-overlay",
-    role: "dialog",
-    "aria-modal": "true",
-    "aria-label": "Generation detail",
+  // History and Playground mount this exact same shell with data only
+  // (record, imageUrl, timing) plus a behavioral persistence adapter.
+  // There are no cosmetic opts: fav star, note editor, and timing section
+  // are fixed in studio-ui.js so the two surfaces cannot drift apart.
+  const sharedShell = buildViewerShell({
+    persistence: {
+      setFavorite: function (rec, next) { return repo.setFavorite(rec.id, next); },
+      setNote: function (rec, text) { return repo.setNote(rec.id, text); },
+      onChanged: function () { if (typeof cbs.onChanged === "function") cbs.onChanged(); },
+    },
   });
-
-  const backdrop = el("div", { class: "comfymodal-studio-history-v2-overlay-backdrop" });
-  overlay.appendChild(backdrop);
-
-  const content = el("div", { class: "comfymodal-studio-history-v2-overlay-content" });
-  overlay.appendChild(content);
+  const overlay = sharedShell.overlay;
+  const content = sharedShell.contentEl;
 
   // ── Focus-in / restore plumbing (I1 §3.1 gap) ────────────────────────────
   //
@@ -216,10 +196,15 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       _pageAnchorObserver.disconnect();
       _pageAnchorObserver = null;
     }
-    if (overlay.parentNode) overlay.remove();
+    sharedShell.close(false);
     _restoreInvokerFocus();
     if (notify !== false && typeof cbs.onClose === "function") cbs.onClose();
   }
+
+  // The shared shell owns the actual DOM close behavior; these listeners
+  // keep History's polling/menu/focus lifecycle in sync with it.
+  sharedShell.closeButton.addEventListener("click", function () { close(); });
+  sharedShell.backdrop.addEventListener("click", function () { close(); });
 
   _layerUnreg = registerLayerHandler(3, {
     escape: function () {
@@ -233,16 +218,8 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     },
   });
 
-  backdrop.addEventListener("click", function () { close(); });
-
   function makeCloseBtn() {
-    return el("button", {
-      class: "comfymodal-studio-history-v2-overlay-close",
-      "aria-label": "Close",
-      type: "button",
-      text: "\u00d7",
-      onclick: function () { close(); },
-    });
+    return sharedShell.closeButton;
   }
 
   function clearContent() {
@@ -419,69 +396,6 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     return el("div", { class: "comfymodal-studio-history-v2-section" }, [
       el("div", { class: "comfymodal-studio-history-v2-section-title", text: title }),
     ].concat(children));
-  }
-
-  function _favStar(record) {
-    const star = el("button", {
-      type: "button",
-      class: "comfymodal-studio-history-v2-fav",
-      "aria-label": record.favorite ? "Remove from favorites" : "Add to favorites",
-      "aria-pressed": record.favorite ? "true" : "false",
-      title: record.favorite ? "Remove from favorites" : "Add to favorites",
-      text: record.favorite ? "\u2605" : "\u2606",
-    });
-    star.addEventListener("click", async function () {
-      const next = !record.favorite;
-      try {
-        await repo.setFavorite(record.id, next);
-        record.favorite = next;
-      } catch (err) { /* keep current state on failure */ }
-      star.textContent = record.favorite ? "\u2605" : "\u2606";
-      star.setAttribute("aria-pressed", record.favorite ? "true" : "false");
-      star.setAttribute("aria-label", record.favorite ? "Remove from favorites" : "Add to favorites");
-      if (typeof cbs.onChanged === "function") cbs.onChanged();
-    });
-    return star;
-  }
-
-  function buildNotesSection(record) {
-    const sec = el("div", { class: "comfymodal-studio-history-v2-section" }, [
-      el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Note" }),
-    ]);
-    const textarea = el("textarea", {
-      class: "comfymodal-studio-history-v2-notes",
-      "aria-label": "Note for this generation",
-    });
-    textarea.value = record.note || "";
-    const statusEl = el("span", {
-      class: "comfymodal-studio-history-v2-action-note",
-      // The download/export/generate statuses carry testids; the note-save
-      // status needs one too so it can be targeted without colliding with
-      // the other three elements that share this class.
-      "data-testid": "history-v2-note-status",
-      role: "status",
-    });
-    const saveBtn = el("button", {
-      class: "comfymodal-secondary-btn",
-      type: "button",
-      text: "Save note",
-      onclick: async function () {
-        saveBtn.disabled = true;
-        try {
-          await repo.setNote(record.id, textarea.value);
-          record.note = textarea.value;
-          statusEl.textContent = "Saved";
-        } catch (err) {
-          statusEl.textContent = "Save failed";
-        }
-        saveBtn.disabled = false;
-        if (typeof cbs.onChanged === "function") cbs.onChanged();
-      },
-    });
-    const row = el("div", { class: "comfymodal-studio-history-v2-action-row" }, [saveBtn, statusEl]);
-    sec.appendChild(textarea);
-    sec.appendChild(row);
-    return sec;
   }
 
   function buildOutputsRow(record) {
@@ -730,95 +644,6 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     }));
 
     return slots;
-  }
-
-  function buildLeftColumn(record) {
-    const col = el("div", { class: "comfymodal-studio-history-v2-overlay-left" });
-    const feat = record.featuredOutput || {};
-    const displayed = selectGenerationDetailAsset(record);
-    if (displayed.url) {
-      const imageWrap = el("div", { class: "comfymodal-studio-history-v2-featured-wrap" }, [el("img", {
-        class: "comfymodal-studio-history-v2-featured-img",
-        src: displayed.url,
-        alt: record.prompt || "Featured output",
-        onerror: _hideOnError,
-      })]);
-      if (displayed.kind === "preview") imageWrap.appendChild(_previewBadge());
-      col.appendChild(imageWrap);
-    } else {
-      col.appendChild(el("div", {
-        class: "comfymodal-studio-history-v2-featured-tile comfymodal-studio-history-v2-noimage",
-        "data-asset-kind": displayed.kind,
-      }, [el("span", { text: displayed.label || "No image" })]));
-    }
-    if (feat.originalFailed) {
-      col.appendChild(el("div", {
-        class: "comfymodal-studio-history-v2-badge",
-        "data-testid": "history-v2-original-failed-badge",
-        text: "Original failed \u2014 preview retained",
-      }));
-    }
-    col.appendChild(buildOutputsRow(record));
-    col.appendChild(buildPreviewOriginalSlots(record));
-    return col;
-  }
-
-  function buildParamsSection(record) {
-    const params = record.params && typeof record.params === "object" ? record.params : {};
-    const items = [];
-    PARAM_KEYS.forEach(function (entry) {
-      const v = params[entry[0]];
-      if (v == null || v === "") return;
-      items.push(el("div", { class: "comfymodal-studio-history-v2-param" }, [
-        el("div", { class: "comfymodal-studio-history-v2-param-key", text: entry[1] }),
-        el("div", { class: "comfymodal-studio-history-v2-param-value", text: String(v) }),
-      ]));
-    });
-    if (items.length === 0) return null;
-    return el("div", { class: "comfymodal-studio-history-v2-section" }, [
-      el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Parameters" }),
-      el("div", { class: "comfymodal-studio-history-v2-params-table" }, items),
-    ]);
-  }
-
-  function buildTimingSection(record) {
-    const timing = record.timing;
-    const placeholder = el("div", {
-      class: "comfymodal-studio-history-v2-timing-placeholder",
-      "data-testid": "history-v2-timing-placeholder",
-      text: "Diagnostics pending",
-    });
-    if (!timing || typeof timing !== "object") {
-      return el("div", { class: "comfymodal-studio-history-v2-section" }, [
-        el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Timing" }),
-        placeholder,
-      ]);
-    }
-    let rows = [];
-    if (Array.isArray(timing.stages) && timing.stages.length > 0) {
-      rows = timing.stages.map(function (s) {
-        if (!s || !s.label) return null;
-        if (s.durationMs == null) return null;
-        return _row(s.label, _formatDuration(s.durationMs));
-      }).filter(function (r) { return r != null; });
-    }
-    if (rows.length === 0) {
-      rows = TIMING_ROWS.map(function (entry) {
-        const v = timing[entry[0]];
-        if (v == null) return null;
-        return _row(entry[1], _formatDuration(v));
-      }).filter(function (r) { return r != null; });
-    }
-    return el("div", { class: "comfymodal-studio-history-v2-section" }, [
-      el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Timing" }),
-    ].concat(rows.length > 0 ? rows : [placeholder]));
-  }
-
-  function _exportStateLabel(value) {
-    if (value == null || value === "") return "";
-    if (value === "none") return "Not exported";
-    const s = String(value).replace(/[_-]+/g, " ");
-    return s.charAt(0).toUpperCase() + s.slice(1);
   }
 
   // ── Generate / Retry Original (E4C/E4D) ─────────────────────────────────
@@ -1178,47 +1003,16 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     ]);
   }
 
-  function buildRightColumn(record) {
-    const col = el("div", { class: "comfymodal-studio-history-v2-overlay-right" });
-
-    // 1. Status + timestamp + duration
-    const runLine = el("div", { class: "comfymodal-studio-history-v2-run-line" }, [
-      _statusChip(record.status),
-      record.startedAt ? el("span", { class: "comfymodal-studio-history-v2-row-value", text: _shortDateTime(record.startedAt) }) : null,
-      record.durationMs != null ? el("span", { class: "comfymodal-studio-history-v2-row-value", text: _formatDuration(record.durationMs) }) : null,
-    ]);
-    col.appendChild(el("div", { class: "comfymodal-studio-history-v2-section" }, [
-      el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Run" }),
-      runLine,
-    ]));
-
-    // 2. Workflow
-    // Version labels arrive both bare ("3") and pre-prefixed ("v3"), so the
-    // "v" is normalized here instead of blindly prepended (which rendered
-    // "vv3").
-    const rawVersion = record.workflowVersion ? String(record.workflowVersion).trim() : "";
-    const versionLabel = rawVersion ? (/^v/i.test(rawVersion) ? rawVersion : "v" + rawVersion) : "";
-    const wf = (record.workflow || "") + (versionLabel ? " " + versionLabel : "");
-    appendIfPresent(col, _section("Workflow", [
-      _row("Workflow", wf),
-    ]));
-
-    // 3. Parameters
-    appendIfPresent(col, buildParamsSection(record));
-
-    // 4. Exact metadata
-    appendIfPresent(col, _section("Metadata", [
-      _row("Run ID", record.runId || record.id),
-      _row("Models", Array.isArray(record.models) ? record.models.join(", ") : ""),
-      _row("Tags", Array.isArray(record.tags) ? record.tags.join(", ") : ""),
-      _row("Started", record.startedAt),
-      _row("Completed", record.completedAt),
-    ]));
-
-    // 5. Attempt history
+  // Full-width overflow sections: attempt history, errors, and the Generate
+  // Original action sit below the timing flow, spanning the overlay body.
+  // (The Run / Run Data / Metadata right column and the zoom stage both come
+  // from the one shared viewer in studio-ui.js — there is no second overlay
+  // implementation here.)
+  function buildOverflowSections(record) {
+    const sections = [];
     const attempts = Array.isArray(record.attempts) ? record.attempts : [];
     if (attempts.length > 0) {
-      appendIfPresent(col, _section("Attempts", attempts.map(function (a, i) {
+      const sec = _section("Attempts", attempts.map(function (a, i) {
         return el("div", { class: "comfymodal-studio-history-v2-attempt" }, [
           el("div", { class: "comfymodal-studio-history-v2-attempt-line" }, [
             el("span", { class: "comfymodal-studio-history-v2-attempt-purpose", text: historyAttemptPurposeLabel(a.mode || a.purpose) }),
@@ -1228,16 +1022,15 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
           ]),
           a.error ? el("div", { class: "comfymodal-studio-history-v2-attempt-error", text: String(a.error) }) : null,
         ]);
-      })));
+      }));
+      if (sec) { sec.classList.add("comfymodal-studio-history-v2-overflow-section"); sections.push(sec); }
     }
-
-    // 6. Errors
     const errors = Array.isArray(record.errors) ? record.errors : [];
     if (errors.length > 0) {
       // NOTE: children must be a FLAT array (like _section's .concat pattern);
       // el() only flattens one level, so a nested errors.map() array would
       // throw "parameter 1 is not of type 'Node'" and blank the overlay.
-      col.appendChild(el("div", { class: "comfymodal-studio-history-v2-section comfymodal-studio-history-v2-section-error" }, [
+      sections.push(el("div", { class: "comfymodal-studio-history-v2-section comfymodal-studio-history-v2-section-error comfymodal-studio-history-v2-overflow-section" }, [
         el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Errors" }),
       ].concat(errors.map(function (e) {
         const code = (e && e.code) ? e.code : "error";
@@ -1247,42 +1040,23 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
            message ? el("span", { class: "comfymodal-studio-history-v2-row-value", text: message }) : null]);
       }))));
     }
-
-    // 7. Export state
-    const exportLabel = _exportStateLabel(record.exportState);
-    appendIfPresent(col, _section("Export", [_row("State", exportLabel)]));
-
-    // 8. Notes
-    col.appendChild(buildNotesSection(record));
-
-    // 9. Favorite
-    col.appendChild(el("div", { class: "comfymodal-studio-history-v2-section" }, [
-      el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Favorite" }),
-      el("div", { class: "comfymodal-studio-history-v2-action-row" }, [_favStar(record)]),
-    ]));
-
-    // 10. Timing
-    col.appendChild(buildTimingSection(record));
-
-    // 11. Generate Original
-    col.appendChild(buildGenerateSection(record));
-
-    return col;
-  }
-
-  function buildDetailBody(record) {
-    const body = el("div", { class: "comfymodal-studio-history-v2-overlay-body" });
-    body.appendChild(buildLeftColumn(record));
-    body.appendChild(buildRightColumn(record));
-    return body;
+    const generate = buildGenerateSection(record);
+    generate.classList.add("comfymodal-studio-history-v2-overflow-section");
+    sections.push(generate);
+    return sections;
   }
 
   function _renderDetail(record) {
     currentRecord = record;
     closeAnyMenu();
     clearContent();
-    content.appendChild(makeCloseBtn());
-    content.appendChild(buildDetailBody(record));
+    // Same shared resolver every full-size output surface uses: one record
+    // projection, one image policy, one timing source.
+    const viewer = resolveViewerInput(record);
+    sharedShell.render(viewer.record, {
+      imageUrl: viewer.imageUrl,
+      timing: viewer.timing,
+    });
     _ensureDialogFocus();
   }
 

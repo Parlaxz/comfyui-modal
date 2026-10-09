@@ -128,7 +128,7 @@ test.describe("Studio Phase-E Wave-2 harness (fake backend)", () => {
       await fx.gotoPage("history");
       const overlay = await openGeneration(page, IDS.retry);
       await expect(overlay).toContainText("Original upload failed");
-      await expect(overlay.locator('[data-testid="history-v2-original-failed-badge"]')).toHaveCount(0);
+      await expect(overlay.locator('[data-testid="viewer-render-failed-badge"]')).toHaveCount(0);
       fx.assertNoConsoleErrors();
     } finally {
       fx.guard.dispose();

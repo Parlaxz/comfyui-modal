@@ -14,11 +14,21 @@ import {
 // Presets were removed from the codebase; the legacy preset-driven Playground
 // path below is dead and resolves to an empty preset list. It is retained only
 // until the legacy lane is deleted outright.
-import { runStudioWorkflow, getStudioRunStatus, getGoldenRunProgress, stopExperiment, listModels } from "./studio-backend-api.js";
+import {
+  runStudioWorkflow,
+  getStudioRunStatus,
+  getGoldenRunProgress,
+  stopExperiment,
+  listModels,
+  triggerDeploy,
+  listGoldenProfiles,
+  triggerGoldenProfileDeploy,
+  getGoldenProfileDeployStatus,
+} from "./studio-backend-api.js";
 import { loadModalOptions } from "./studio-output-preferences.js";
 import { goldenProgressResponseAction } from "./studio-golden-progress.js";
 
-import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines, resolveSelectionResultKey } from "./studio-run-normalizer.js";
+import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines, resolveSelectionResultKey, buildViewerRecordFromRun, resolveViewerInput, generationIdForLegacyRunId } from "./studio-run-normalizer.js";
 import {
   saveSelection,
   loadSelection,
@@ -44,6 +54,75 @@ import {
 import { updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
 import { createHistoryRepository } from "./history-v2-repository.js";
 import { requestHistoryRecordFocus } from "./studio-history-v2.js";
+
+const PLAYGROUND_PREVIEW_KEY = "comfymodal.studio.playground-preview.v1";
+const PLAYGROUND_VIEW_KEY = "comfymodal.studio.playground-view.v1";
+
+function _savePlaygroundPreviewId(id) {
+  try {
+    if (typeof sessionStorage !== "undefined") sessionStorage.setItem(PLAYGROUND_PREVIEW_KEY, String(id || ""));
+  } catch (_err) {}
+}
+
+function _readPlaygroundPreviewId() {
+  try {
+    if (typeof sessionStorage === "undefined") return "";
+    return sessionStorage.getItem(PLAYGROUND_PREVIEW_KEY) || "";
+  } catch (_err) {
+    return "";
+  }
+}
+
+function _clearPlaygroundPreviewId() {
+  try {
+    if (typeof sessionStorage !== "undefined") sessionStorage.removeItem(PLAYGROUND_PREVIEW_KEY);
+  } catch (_err) {}
+}
+
+function _savePlaygroundView(state) {
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(PLAYGROUND_VIEW_KEY, JSON.stringify({
+        experimentMode: !!(state && state.playground && state.playground.experimentMode),
+      }));
+    }
+  } catch (_err) {}
+}
+
+function _loadPlaygroundView() {
+  try {
+    if (typeof sessionStorage === "undefined") return null;
+    const saved = JSON.parse(sessionStorage.getItem(PLAYGROUND_VIEW_KEY) || "null");
+    return saved && typeof saved.experimentMode === "boolean" ? saved : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+/**
+ * Modal can return the app lookup failure either as a stable error code or as
+ * provider text. Keep this check narrow so other "not found" run errors do not
+ * suggest a deployment fix.
+ */
+export function isModalAppNotFoundError(result) {
+  if (!result || typeof result !== "object") return false;
+  const codes = [
+    result.error_code,
+    result.error && result.error.code,
+  ].filter((value) => value != null).map((value) => String(value).toUpperCase());
+  if (codes.some((code) => /(?:MODAL_)?APP(?:LICATION)?_NOT_FOUND/.test(code))) return true;
+
+  const messages = [
+    result.message,
+    result.error,
+    result.error && result.error.message,
+    result.error && result.error.detail,
+    result._error_detail,
+  ].filter((value) => typeof value === "string");
+  return messages.some((message) =>
+    /\b(?:modal\s+)?app(?:lication)?\b[\s\S]{0,80}\bnot found\b/i.test(message)
+      || /\bnot found\b[\s\S]{0,80}\b(?:modal\s+)?app(?:lication)?\b/i.test(message));
+}
 
 export async function buildStudioModalOptions(apiBase) {
   const options = await loadModalOptions(apiBase);
@@ -99,7 +178,7 @@ export async function loadExperimentIntoPlayground(state, context, experimentId)
   context.setPage("history");
   return { ok: true };
 }
-import { el, createZoomableImageEl, createImagePreviewOverlay, renderEmptyState } from "./studio-ui.js";
+import { el, buildViewerShell, viewerFirst, renderEmptyState } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
 import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
 import { FIELD_BLOCKS } from "./studio-field-blocks.js";
@@ -446,6 +525,65 @@ function _getRecentRunsRepo(apiBase) {
   return _recentRunsRepoPromise;
 }
 
+// The History V2 record the History detail overlay renders for a run.  A run
+// id is NOT a generation id and nothing else links the two, so resolution
+// works down this chain — every step returns the SAME durable record History
+// shows, and a miss falls through to the next:
+//   1. the run's bridged generation id (stamped at record time; no fetch),
+//   2. the id as-is (a selected run that already carries a record id),
+//   3. the legacy history entry for the run id, whose internal run id maps
+//      onto the durable record (covers every run ever recorded, no restart
+//      or response field needed),
+//   4. the feed (a projection that does expose a run id).
+// Returns null when History V2 has no record for the run at all.
+async function _resolveHistoryViewerRecord(repo, runId, run, apiBase) {
+  if (!repo || !runId) return null;
+  const _usable = function (rec) {
+    return rec && !(Array.isArray(rec.errors) && rec.errors.some(function (e) {
+      return e && (e.code === "load_failed" || e.code === "not_found");
+    })) ? rec : null;
+  };
+  const _detail = async function (id) {
+    if (!id) return null;
+    try { return _usable(await repo.getGeneration(id)); } catch (err) { return null; }
+  };
+
+  const bridged = run && (run.generationId || run.historyGenerationId || run.history_generation_id);
+  const viaBridge = await _detail(bridged ? String(bridged) : null);
+  if (viaBridge) return viaBridge;
+
+  const direct = await _detail(runId);
+  if (direct) return direct;
+
+  try {
+    const entry = await _fetchSameRunHistoryEntry(apiBase, runId);
+    const derived = await generationIdForLegacyRunId(entry && entry.run_id, entry && entry.kind);
+    const viaEntry = await _detail(derived);
+    if (viaEntry) return viaEntry;
+  } catch (err) { /* fall through to the feed scan */ }
+
+  try {
+    const feed = await repo.listFeed({ limit: 200, kinds: ["generation"], sort: "newest" });
+    const wanted = {};
+    [runId, run && run.id, run && run.runId, run && run.experimentId].forEach(function (value) {
+      if (value != null && value !== "") wanted[String(value)] = true;
+    });
+    const items = (feed && Array.isArray(feed.items)) ? feed.items : [];
+    let match = null;
+    for (let i = 0; i < items.length && !match; i++) {
+      const item = items[i] || {};
+      const keys = [item.id, item.runId, item.experimentId];
+      for (let k = 0; k < keys.length; k++) {
+        if (keys[k] != null && wanted[String(keys[k])]) { match = item; break; }
+      }
+    }
+    if (!match || !match.id) return null;
+    return (await _detail(match.id)) || match;
+  } catch (err) {
+    return null;
+  }
+}
+
 export async function refreshRecentRuns(apiBase, outputOverride) {
   try {
     const repo = await _getRecentRunsRepo(apiBase);
@@ -518,6 +656,9 @@ export async function refreshRecentRuns(apiBase, outputOverride) {
           id: rec.id,
           experimentId: "",
           runId: rec.runId || rec.id,
+          // Feed records already ARE durable records; keep their id under the
+          // bridge name too so every consumer resolves them the same way.
+          generationId: rec.id,
           prompt: rec.prompt || "",
           presetId: rec.preset || "",
           presetLabel: "",
@@ -555,6 +696,7 @@ export async function refreshRecentRuns(apiBase, outputOverride) {
           id: outputOverride.id || outputOverride.runId || outputOverride.experimentId,
           experimentId: outputOverride.experimentId || "",
           runId: outputOverride.runId || outputOverride.id || "",
+          generationId: outputOverride.generationId || "",
           prompt: outputOverride.prompt || "",
           presetId: outputOverride.presetId || "",
           presetLabel: outputOverride.presetLabel || "",
@@ -844,6 +986,8 @@ function renderControlPanel(state, context) {
   // initial render shows the correct backend selection without needing
   // a hydration-triggered re-render that would close an open <select>.
   if (!state.playground._hydrationDone) {
+    const savedView = _loadPlaygroundView();
+    if (savedView) state.playground.experimentMode = savedView.experimentMode;
     const saved = loadSelection();
     if (saved) {
       if (saved.featureId) state.playground.featureId = saved.featureId;
@@ -891,6 +1035,8 @@ function renderControlPanel(state, context) {
   // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Workflow Selector (modern workflow-driven runs) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   // Empty-state only until a workflow is chosen.
   panel.appendChild(renderWorkflowSelector(state, context, actions));
+
+  _renderGoldenDeployNotice(panel, context);
 
   // Shelf field cards (Studio Workflow effort, leaf 1.2.2): bound field
   // cards for the selected Workflow. Prompt fixed at top; output stays the
@@ -1040,6 +1186,7 @@ function buildActions(state, context) {
     },
     setExperimentMode(enabled) {
       state.playground.experimentMode = enabled;
+      _savePlaygroundView(state);
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -1162,10 +1309,19 @@ function buildActions(state, context) {
          }
         // Refresh recent runs and try to select finalized normalized run
         const apiBase = (context && context.apiBase) || "/comfymodal";
+        const _justFinished = state.playground && state.playground._selectedRun;
         refreshRecentRuns(apiBase, {
           id: runState.experimentId,
+          // The override item must carry the RUN id (not the experiment id)
+          // or it shadows the durable record with an unresolvable identity.
+          runId: (_justFinished && (_justFinished.runId || _justFinished.id)) || "",
           experimentId: runState.experimentId,
           imageUrl: runState.primaryOutput,
+          // The just-finished run may already know its durable record (a
+          // direct result carries the backend-stamped generation id); hand it
+          // to the override item so the preview resolves the same record
+          // History shows instead of a locally assembled one.
+          generationId: (_justFinished && _justFinished.generationId) || "",
         }).then(function (runs) {
           const experimentId = runState.experimentId;
           let matched = null;
@@ -1393,7 +1549,7 @@ function workflowGatingInfo(store, wf, state) {
 function _workflowSelectEl(state, actions, context) {
   const store = state && state.playground && state.playground._workflowRun;
   const select = el("select", {
-    class: "comfymodal-input comfymodal-studio-select",
+    class: "comfymodal-input comfymodal-studio-workflow-select",
     "data-testid": "workflow-selector",
   });
   if (!store) {
@@ -1414,6 +1570,114 @@ function _workflowSelectEl(state, actions, context) {
     _handleWorkflowChange(state, context, actions, select.value);
   });
   return select;
+}
+
+function _workflowTypeLabel(state) {
+  const store = state && state.playground && state.playground._workflowRun;
+  const ctx = store && store.runContext;
+  const workflow = ctx && ctx.workflow;
+  const raw = (ctx && (ctx.workflow_type || ctx.workflowType || ctx.type))
+    || (workflow && (workflow.workflow_type || workflow.workflowType || workflow.type))
+    || (store && (store.workflowType || store.featureId))
+    || (state && state.playground && state.playground.featureId);
+  const key = String(raw || "").toLowerCase();
+  const labels = {
+    t2i: "Text to image",
+    txt2img: "Text to image",
+    text_to_image: "Text to image",
+    i2i: "Image to image",
+    img2img: "Image to image",
+    image_to_image: "Image to image",
+    inpaint: "Inpainting",
+    upscale: "Upscaling",
+  };
+  return labels[key] || (raw ? String(raw).replace(/[._-]+/g, " ") : "Not specified");
+}
+
+function _renderGoldenDeployNotice(container, context) {
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  if (!container) return;
+  listGoldenProfiles(apiBase).then(async (catalog) => {
+    if (!container.isConnected || !catalog || catalog.status !== "ok" || !Array.isArray(catalog.profiles)) return;
+    const local = loadGoldenProfileSelection();
+    const selected = catalog.profiles.find((profile) => profile && profile.name === local)
+      || catalog.profiles.find((profile) => profile && profile.name === catalog.defaultProfile);
+    if (!selected) return;
+    // The catalog is durable server state, while the deploy job is in-memory
+    // state. Read both so a page remount can recover an in-flight deployment.
+    const deployState = await getGoldenProfileDeployStatus(apiBase, selected.name);
+    if (!container.isConnected) return;
+    if (selected.deployed === true && (!deployState || deployState.state !== "running")) return;
+
+    const activeHost = el("div", {
+      class: "comfymodal-studio-playground-deploy-notice",
+      "data-testid": "playground-golden-profile-deploy-host",
+    });
+    container.appendChild(activeHost);
+    const target = selected.target && typeof selected.target === "object" ? selected.target : {};
+    const isDeploying = deployState && deployState.state === "running";
+    const status = el("p", {
+      class: "comfymodal-studio-settings-hint",
+      "data-testid": "playground-golden-profile-deploy-status",
+      text: isDeploying
+        ? "Deploying " + selected.name + "\u2026"
+        : target.app
+        ? "Not deployed. Deploying runs v2ctl for " + selected.name + " (" + target.app + ")."
+        : "Not deployed.",
+    });
+    const button = el("button", {
+      type: "button",
+      class: "comfymodal-primary-btn",
+      "data-testid": "playground-golden-profile-deploy",
+      "data-profile-name": selected.name,
+      text: "Deploy " + selected.name,
+    });
+    button.disabled = !!isDeploying;
+
+    async function pollGoldenDeploy() {
+      for (let attempt = 0; attempt < 900 && activeHost.isConnected; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        if (!activeHost.isConnected) return;
+        const current = await getGoldenProfileDeployStatus(apiBase, selected.name);
+        if (!activeHost.isConnected) return;
+        if (current && current.state === "done") {
+          // Re-read the catalog so the deployed marker comes from backend
+          // truth, then remove the notice as the existing UI does.
+          await listGoldenProfiles(apiBase);
+          if (activeHost.isConnected) activeHost.remove();
+          return;
+        }
+        if (current && current.state === "failed") {
+          const tail = String(current.output || "").trim().split("\n").pop();
+          throw new Error(tail || "see v2ctl output");
+        }
+      }
+    }
+
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      status.textContent = "Deploying " + selected.name + "\u2026";
+      try {
+        const started = await triggerGoldenProfileDeploy(apiBase, selected.name);
+        if (!started || started.status !== "ok") throw new Error((started && (started.message || started.error)) || "Deploy request failed");
+        await pollGoldenDeploy();
+      } catch (error) {
+        if (activeHost.isConnected) {
+          status.textContent = "Deploy failed: " + (error && error.message ? error.message : "request failed");
+          button.disabled = false;
+        }
+      }
+    });
+    activeHost.replaceChildren(status, button);
+    if (isDeploying) {
+      pollGoldenDeploy().catch((error) => {
+        if (activeHost.isConnected) {
+          status.textContent = "Deploy failed: " + (error && error.message ? error.message : "request failed");
+          button.disabled = false;
+        }
+      });
+    }
+  }).catch(() => {});
 }
 
 function _workflowGatingLineEl(state, wf, context) {
@@ -1460,7 +1724,19 @@ function _populateWorkflowSelectorInner(container, state, context, actions) {
   const store = state && state.playground && state.playground._workflowRun;
   const wf = state && state.playground && state.playground._workflowRunModule;
 
-  container.appendChild(_workflowSelectEl(state, actions, context));
+  const workflowRow = el("div", { class: "comfymodal-studio-workflow-select-row" });
+  workflowRow.appendChild(el("label", {
+    class: "comfymodal-studio-workflow-label",
+    text: "Workflow",
+  }));
+  workflowRow.appendChild(_workflowSelectEl(state, actions, context));
+  container.appendChild(workflowRow);
+
+  workflowRow.appendChild(el("span", {
+    class: "comfymodal-studio-workflow-type",
+    "data-testid": "workflow-type",
+    text: "Type: " + _workflowTypeLabel(state),
+  }));
   container.appendChild(_workflowGatingLineEl(state, wf, context));
 
   if (store && store.handoff) {
@@ -1568,9 +1844,12 @@ async function initWorkflowRun(state, context, actions) {
       const apiBase = (context && context.apiBase) || "/comfymodal";
       _preloadStudioModalOptions(apiBase);
 
-      // The library must be present for resolveHandoffSelection and the
-      // saved-selection restore to validate the requested entities.
+      // Paint the selector from the store immediately. The library request is
+      // intentionally started before handoff/restore, but it must not delay
+      // the first selector paint.
+      _rerenderWorkflowSection(state, context, actions);
       await wf.loadWorkflowLibrary(apiBase, store);
+      _rerenderWorkflowSection(state, context, actions);
 
       // a) One-shot handoff from the Workflows page. The frozen
       //    resolveHandoffSelection validates against loaded data (library,
@@ -1972,7 +2251,9 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   ctrl.mark("build_end");
 
   ctrl.mark("http_invoked");
-  _startGoldenProgressPolling(state, context, requestId, ctrl);
+  if (payload.profile_name) {
+    _startGoldenProgressPolling(state, context, requestId, ctrl);
+  }
   const result = await runStudioWorkflow(apiBase, payload);
   ctrl.mark("backend_ack");
 
@@ -2018,7 +2299,11 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
       if (btn) { btn.disabled = false; btn.textContent = "Run"; }
       return;
     }
-    const errMsg = (result && result.message) || "Run failed.";
+    const errMsg = (result && result.message)
+      ? (Array.isArray(result.reasons) && result.reasons.length
+        ? result.message + ": " + result.reasons.join("; ")
+        : result.message)
+      : "Run failed.";
     if (result && result.error_code) {
       console.error("[Studio run] execution failed", {
         error_code: result.error_code,
@@ -2026,6 +2311,17 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
       });
     }
     if (ctrl) ctrl.applyLocalError(errMsg);
+    // The canonical controller keeps the user-facing message, while this
+    // small projection preserves the provider error identity needed by the
+    // recovery affordance below.
+    if (isModalAppNotFoundError(result) && actions && actions.setRunState) {
+      actions.setRunState({
+        status: "error",
+        message: errMsg,
+        error_code: result.error_code || (result.error && result.error.code) || "MODAL_APP_NOT_FOUND",
+        error: result.error || null,
+      });
+    }
     if (btn) { btn.disabled = false; btn.textContent = "Run"; }
   }
 }
@@ -2524,6 +2820,10 @@ function _handleDirectRunResult(result, state, context, actions, controls, calle
   var rawRun = {
     id: result.runId || result.runHistoryId || result.run_history_id || result.history_id || meta.experiment_id || "",
     experiment_id: result.experimentId || meta.experiment_id || "",
+    // Bridge to the durable record: the backend stamps the run's History V2
+    // generation id on the response because nothing else links a run id to
+    // the record History renders for it.
+    history_generation_id: result.historyGenerationId || result.history_generation_id || "",
     status: "completed",
     output_path: result.output_path || (outputPaths.length > 0 ? outputPaths[0] : ""),
     primary_asset_id: primaryAssetId,
@@ -2613,10 +2913,12 @@ function renderRunButton(state, context, actions) {
     });
     _cb.addEventListener("click", async function () {
       if (rs._cancelling) return;
-      rs._cancelling = true;
-      _cb.textContent = "Cancelling\u2026";
-      _cb.disabled = true;
-      var _eid = rs.experimentId || rs.runId;
+       rs._cancelling = true;
+       _cb.textContent = "Cancelling\u2026";
+       _cb.disabled = true;
+       var _goldenPoll = state.playground && state.playground._goldenProgressPoll;
+       if (_goldenPoll) _stopGoldenProgressPolling(state, _goldenPoll.requestId);
+       var _eid = rs.experimentId || rs.runId;
       if (_eid) {
         try { await stopExperiment(apiBase, _eid); } catch (e) {}
       }
@@ -2740,6 +3042,33 @@ function renderRunButton(state, context, actions) {
       text: runState.message || "Run failed. Try again.",
       style: "font-size:var(--font-size-sm);color:var(--color-danger);margin:0 0 4px;",
     }));
+
+    if (isModalAppNotFoundError(runState)) {
+      const redeployBtn = el("button", {
+        class: "comfymodal-primary-btn",
+        text: "Redeploy Modal app",
+        "data-testid": "run-redeploy-app-btn",
+        title: "Redeploy the Modal app, then run again",
+        style: "font-size:10px;padding:3px 9px;margin:0 4px 4px 0;",
+      });
+      redeployBtn.addEventListener("click", async function () {
+        if (redeployBtn.disabled) return;
+        redeployBtn.disabled = true;
+        redeployBtn.textContent = "Redeploying\u2026";
+        let response = null;
+        try { response = await triggerDeploy(apiBase); } catch { response = null; }
+        if (response && (response.status === "started" || response.status === "already_deploying")) {
+          redeployBtn.textContent = response.status === "already_deploying" ? "Redeploy in progress" : "Redeploy started";
+          redeployBtn.title = "Wait for deployment to finish, then run again";
+          return;
+        }
+        redeployBtn.disabled = false;
+        redeployBtn.textContent = "Redeploy Modal app";
+        redeployBtn.title = (response && (response.message || response.error)) || "Redeploy failed — try again";
+      });
+      reason.appendChild(redeployBtn);
+    }
+
     // Dismiss action: clears error without triggering re-run
     const dismissBtn = el("button", {
       class: "comfymodal-secondary-btn",
@@ -2780,7 +3109,18 @@ function renderRunButton(state, context, actions) {
   // Gating is driven entirely by the modern workflow run store: there are
   // no backend presets to load, so no async preset fetch and no legacy
   // fallback branch.
-  if (container.isConnected) {
+  //
+  // Apply it HERE, to this freshly built button, rather than leaving it to a
+  // later document-wide sync. This runs synchronously while `container` is
+  // still detached, so the previous `container.isConnected` guard was always
+  // false and the button kept its constructed state: disabled, empty title,
+  // empty reason div. That only self-healed when something afterwards called
+  // _rerenderWorkflowSection (once, right after initWorkflowRun). Every later
+  // full re-render built a new disabled Run button that nothing re-enabled -
+  // notably the setPage("playground") that _loadPersistedSelectionResult fires
+  // after refreshing recent runs when a prior image exists. The button then
+  // read as permanently unclickable with no stated reason.
+  if (_isModernRunSelected(state)) {
     while (reason.firstChild) reason.removeChild(reason.firstChild);
     _applyModernRunButtonState(state, context, actions, btn, reason);
   }
@@ -2796,7 +3136,7 @@ function renderRunButton(state, context, actions) {
 
 function renderProgressSection(state, context) {
   const section = el("div", {
-    class: "comfymodal-studio-metadata-section",
+    class: "comfymodal-studio-progress-section",
     "data-testid": "progress-section",
     style: "display:none;",
   });
@@ -2807,22 +3147,17 @@ function renderProgressSection(state, context) {
     // section evidences completion instead of going blank. Completed and
     // error detail continues to render in the metadata section.
     if (runState) {
-      var terminalLabel = "Completed";
-      if (runState.status === "error") terminalLabel = "Error";
-      else if (runState.status === "canceled") terminalLabel = "Canceled";
-      else if (runState.status === "interrupted") terminalLabel = "Interrupted";
       section.style.display = "block";
-      section.appendChild(el("span", {
-        "data-testid": "progress-stage",
-        style: "font-size:10px;color:#aaa;",
-        text: "Stage: " + terminalLabel,
-      }));
+      // Terminal runs show just the annotated bar plus one compact total -
+      // no "Stage: Completed" caption, no per-stage rows. Segment labels
+      // carry final names and timings; tooltips carry the lane breakdown.
+      _goldenTickStop();
       // The terminal branch must build the same bar skeleton the live branch
       // does. _appendGoldenProgress only fills segments when a
       // progress-bar-segments container already exists, so without this the
       // annotated bar vanished the moment the run finished - exactly when the
       // finished stage breakdown matters most.
-      section.appendChild(el("div", {
+      var terminalBar = el("div", {
         class: "comfymodal-studio-progress-bar",
         "data-testid": "progress-bar",
       }, [
@@ -2835,7 +3170,18 @@ function renderProgressSection(state, context) {
           class: "comfymodal-studio-progress-segments",
           "data-testid": "progress-bar-segments",
         }),
-      ]));
+      ]);
+      var _terminalStages = runState.goldenProgress && runState.goldenProgress.stages;
+      var _terminalTotal = _goldenRunTotalMs(runState, _terminalStages);
+      var terminalTotal = el("div", {
+        "data-testid": "progress-golden-total",
+        class: "comfymodal-studio-progress-total",
+        text: "Total: " + (_terminalTotal != null ? _formatDuration(_terminalTotal) : "—"),
+      });
+      var terminalRow = el("div", { class: "comfymodal-studio-progress-bar-row" });
+      terminalRow.appendChild(terminalTotal);
+      terminalRow.appendChild(terminalBar);
+      section.insertBefore(terminalRow, section.firstChild);
       _appendGoldenProgress(section, runState);
     }
     return section;
@@ -2879,7 +3225,15 @@ function renderProgressSection(state, context) {
   info.appendChild(stepEl);
   info.appendChild(queueEl);
 
-  section.appendChild(barContainer);
+  var liveTotal = el("div", {
+    "data-testid": "progress-golden-total",
+    class: "comfymodal-studio-progress-total",
+    text: "Total: " + _formatDuration(runState.elapsedMs),
+  });
+  var barRow = el("div", { class: "comfymodal-studio-progress-bar-row" });
+  barRow.appendChild(liveTotal);
+  barRow.appendChild(barContainer);
+  section.appendChild(barRow);
   section.appendChild(info);
 
   // Determine stage display text
@@ -2936,80 +3290,249 @@ function renderProgressSection(state, context) {
   return section;
 }
 
-function _formatGoldenTiming(ms) {
-  if (ms == null || !Number.isFinite(Number(ms))) return "timing pending";
-  return "duration: " + _formatDuration(Number(ms));
+// Golden stage groups shown in the progress bar. Raw telemetry reports a
+// dozen fine-grained stages; the bar collapses them into six viewer-facing
+// groups so relative widths stay meaningful without the noise. Parallel
+// lanes (UNet load vs CLIP forward, sampling vs VAE load) share one segment
+// whose width is the slower lane - wall-clock time, not the sum of both.
+var _GOLDEN_PROGRESS_GROUPS = [
+  { key: "pre", label: "Pre-container", stages: ["golden_restore", "golden_request_setup"] },
+  { key: "clip", label: "Clip Load", stages: ["golden_clip_load"] },
+  {
+    key: "unet", label: "Unet Load ‖ Clip forward", parallel: true,
+    lanes: [
+      { label: "Unet", stages: ["golden_unet_load"] },
+      { label: "Clip forward", stages: ["golden_clip_forward"] },
+    ],
+  },
+  {
+    key: "sample", label: "Sampling ‖ VAE Load", parallel: true,
+    lanes: [
+      { label: "Sampling", stages: ["golden_sampler_prepare", "golden_sampling", "golden_sampler_tail"] },
+      { label: "VAE load", stages: ["golden_vae_load"] },
+    ],
+  },
+  { key: "decode", label: "VAE Decode", stages: ["golden_vae_decode"] },
+  { key: "post", label: "Post Pipeline", stages: ["golden_output", "golden_teardown"] },
+];
+
+function _goldenStageDuration(stage) {
+  var d = Number(stage && stage.durationMs);
+  return Number.isFinite(d) && d > 0 ? d : 0;
 }
 
-function _formatGoldenNs(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? (n / 1e6).toFixed(1) + "ms" : "pending";
+// Ticking format for in-flight stages: always tenths - 0.0s, 0.1s, 1.7s.
+// Completed stages keep _formatDuration ("2.1s", "433ms").
+function _formatTickMs(ms) {
+  var s = Math.max(0, Number(ms) || 0) / 1000;
+  if (s < 60) return s.toFixed(1) + "s";
+  var m = Math.floor(s / 60);
+  var rest = (s % 60).toFixed(1);
+  return m + "m " + (Number(rest) < 10 ? "0" : "") + rest + "s";
 }
 
-function _goldenStageTimingText(stage) {
-  // Absolute monotonic timestamps are useful for diagnostics, not for people
-  // reading a progress panel. Golden already computes the meaningful delta.
-  return _formatGoldenTiming(stage && stage.durationMs);
+function _goldenLanePhase(byName, names) {
+  var members = names.map(function (n) { return byName[n]; }).filter(Boolean);
+  if (members.some(function (m) { return m.phase === "failed"; })) return "failed";
+  if (members.length && members.every(function (m) { return m.phase === "completed"; })) return "completed";
+  return "active";
+}
+
+// Live value of one telemetry stage. Completed/failed stages report their
+// authoritative durationMs. In-flight stages tick from the client-side
+// observation clock (server wall clocks live on remote Modal containers, so
+// they cannot drive a tenths ticker); the value snaps to the authoritative
+// duration the moment the stage completes.
+function _goldenMemberLive(byName, name, live) {
+  var rec = byName[name];
+  var dur = _goldenStageDuration(rec);
+  if (dur > 0) return { duration: dur, final: dur, text: _formatDuration(dur), running: false };
+  if (rec && rec.phase !== "completed" && rec.phase !== "failed" &&
+      live && live.starts && live.starts[name] != null) {
+    var e = Math.max(0, live.now - live.starts[name]);
+    return { duration: e, final: 0, text: _formatTickMs(e), running: true };
+  }
+  return { duration: 0, final: 0, text: "pending", running: false };
+}
+
+function _groupGoldenStages(stages, live) {
+  var byName = {};
+  (stages || []).forEach(function (s) { if (s && s.stage) byName[s.stage] = s; });
+  function laneFor(names, label) {
+    var members = names.map(function (n) { return _goldenMemberLive(byName, n, live); });
+    var duration = members.reduce(function (s, m) { return s + m.duration; }, 0);
+    var final = members.reduce(function (s, m) { return s + m.final; }, 0);
+    var phase = _goldenLanePhase(byName, names);
+    var running = members.some(function (m) { return m.running; });
+    var text = (phase === "completed" || !running)
+      ? (duration > 0 ? _formatDuration(duration) : "pending")
+      : _formatTickMs(duration);
+    return { label: label, duration: duration, final: final, phase: phase, text: text, running: running };
+  }
+  return _GOLDEN_PROGRESS_GROUPS.map(function (g, i) {
+    var phase, duration, timeText, detail, members, running;
+    if (g.parallel) {
+      var lanes = g.lanes.map(function (lane) { return laneFor(lane.stages, lane.label); });
+      duration = lanes.reduce(function (m, l) { return Math.max(m, l.duration); }, 0);
+      phase = lanes.some(function (l) { return l.phase === "failed"; }) ? "failed"
+        : (lanes.length && lanes.every(function (l) { return l.phase === "completed"; })) ? "completed" : "active";
+      running = lanes.some(function (l) { return l.running; });
+      timeText = lanes.map(function (l) { return l.text; }).join(" ‖ ");
+      detail = lanes.map(function (l) {
+        return l.label + " " + (l.final > 0 ? _formatDuration(l.final) : "timing pending");
+      }).join(" ‖ ") + " (parallel)";
+      members = [];
+      g.lanes.forEach(function (lane) { members = members.concat(lane.stages); });
+    } else {
+      var single = laneFor(g.stages, g.label);
+      duration = single.duration;
+      phase = single.phase;
+      running = single.running;
+      timeText = single.text;
+      detail = g.label + ": " + (single.final > 0 ? _formatDuration(single.final) : "timing pending");
+      members = g.stages.slice();
+    }
+    return {
+      key: g.key, label: g.label, phase: phase, duration: duration,
+      timeText: timeText, detail: detail, members: members, index: i, running: running,
+    };
+  });
+}
+
+// ── Golden live ticker ─────────────────────────────────────────────
+// One shared 100ms interval drives the in-flight segment timers
+// (Clip Load 0.0s → 0.1s → …) and the Elapsed readout between backend
+// polls. Poll patches rebuild the segments with fresh snapshots; the
+// ticker only touches text/widths in place. Stops itself at terminal,
+// when every group completes, or when the section leaves the DOM.
+var _goldenTick = { timer: null, runKey: null, starts: {}, snapshot: null, runStartWall: null };
+
+function _goldenTickNow() {
+  if (typeof performance !== "undefined" && performance.now) return performance.now();
+  return Date.now();
+}
+
+function _goldenTickStop() {
+  if (_goldenTick.timer) {
+    clearInterval(_goldenTick.timer);
+    _goldenTick.timer = null;
+  }
+}
+
+function _goldenTickSync(runState) {
+  var golden = runState && runState.goldenProgress;
+  if (!golden || typeof document === "undefined" || typeof setInterval === "undefined") return;
+  var runKey = (golden.requestId != null && String(golden.requestId)) || "run";
+  if (_goldenTick.runKey !== runKey) {
+    _goldenTick.runKey = runKey;
+    _goldenTick.starts = {};
+    _goldenTick.runStartWall = null;
+  }
+  var stages = Array.isArray(golden.stages) ? golden.stages : [];
+  var t = _goldenTickNow();
+  stages.forEach(function (s) {
+    if (s && s.stage && s.phase !== "completed" && s.phase !== "failed" &&
+        _goldenTick.starts[s.stage] == null) {
+      _goldenTick.starts[s.stage] = t;
+    }
+  });
+  if (_goldenTick.runStartWall == null) {
+    _goldenTick.runStartWall = (runState._localStartTime != null)
+      ? runState._localStartTime
+      : Date.now();
+  }
+  var terminal = LEGACY_TERMINAL_STATUSES.indexOf(runState.status) !== -1;
+  _goldenTick.snapshot = {
+    stages: stages,
+    terminal: terminal,
+    runStartPerf: t - (Date.now() - _goldenTick.runStartWall),
+  };
+  if (terminal) {
+    _goldenTickStop();
+    return;
+  }
+  if (!_goldenTick.timer) {
+    _goldenTick.timer = setInterval(_goldenTickBeat, 100);
+  }
+}
+
+function _goldenTickBeat() {
+  if (typeof document === "undefined") {
+    _goldenTickStop();
+    return;
+  }
+  var snap = _goldenTick.snapshot;
+  var section = document.querySelector('[data-testid="progress-section"]');
+  if (!snap || !section || snap.terminal) {
+    _goldenTickStop();
+    return;
+  }
+  var groups = _groupGoldenStages(snap.stages, { now: _goldenTickNow(), starts: _goldenTick.starts });
+  var knownTotal = groups.reduce(function (sum, g) { return sum + g.duration; }, 0);
+  var anyRunning = false;
+  groups.forEach(function (g) {
+    if (g.running) anyRunning = true;
+    var seg = section.querySelector('[data-stage="' + g.key + '"]');
+    if (!seg) return;
+    var timeEl = seg.querySelector(".comfymodal-studio-progress-segment-time");
+    if (timeEl && timeEl.textContent !== g.timeText) timeEl.textContent = g.timeText;
+    if (knownTotal > 0 && g.duration > 0) {
+      var w = ((g.duration / knownTotal) * 100).toFixed(3) + "%";
+      if (seg.style.width !== w) seg.style.width = w;
+    }
+  });
+  var elapsedEl = document.querySelector('[data-testid="progress-elapsed"]');
+  if (elapsedEl && snap.runStartPerf != null) {
+    var elapsedText = "Elapsed: " + _formatTickMs(Math.max(0, _goldenTickNow() - snap.runStartPerf));
+    if (elapsedEl.textContent !== elapsedText) elapsedEl.textContent = elapsedText;
+  }
+  if (!anyRunning) _goldenTickStop();
+}
+
+// Terminal total: client elapsed clock first (covers queue through output),
+// falling back to the sum of authoritative stage durations.
+function _goldenRunTotalMs(runState, stages) {
+  var e = runState && runState.elapsedMs != null ? Number(runState.elapsedMs) : NaN;
+  if (Number.isFinite(e) && e >= 0) return e;
+  var sum = 0;
+  (stages || []).forEach(function (s) { sum += _goldenStageDuration(s); });
+  return sum > 0 ? sum : null;
 }
 
 function _appendGoldenProgress(section, runState) {
   const golden = runState && runState.goldenProgress;
   if (!golden) return;
+  _goldenTickSync(runState);
   const stages = Array.isArray(golden.stages) ? golden.stages : [];
+  const groups = _groupGoldenStages(stages, { now: _goldenTickNow(), starts: _goldenTick.starts });
   const segmentBar = section.querySelector('[data-testid="progress-bar-segments"]');
   if (segmentBar) {
     while (segmentBar.firstChild) segmentBar.removeChild(segmentBar.firstChild);
-    const knownTotal = stages.reduce(function (sum, stage) {
-      const duration = Number(stage && stage.durationMs);
-      return sum + (Number.isFinite(duration) && duration > 0 ? duration : 0);
-    }, 0);
-    stages.forEach(function (stage) {
-      const duration = Number(stage && stage.durationMs);
-      const hasDuration = Number.isFinite(duration) && duration > 0;
-      const phase = stage.phase === "failed" ? "failed" : stage.phase === "completed" ? "completed" : "active";
+    const knownTotal = groups.reduce(function (sum, g) { return sum + g.duration; }, 0);
+    groups.forEach(function (g) {
       const segment = el("div", {
-        class: "comfymodal-studio-progress-segment is-" + phase,
-        "data-stage": stage.stage,
-        "data-duration-known": hasDuration ? "true" : "false",
-        "aria-label": stage.stage + ": " + (hasDuration ? _formatDuration(duration) : "timing pending"),
+        class: "comfymodal-studio-progress-segment is-" + g.phase + (g.index % 2 === 1 ? " is-alt" : ""),
+        "data-stage": g.key,
+        "data-duration-known": g.duration > 0 ? "true" : "false",
+        "aria-label": g.detail,
+        title: g.label + " — " + g.detail,
       });
-      if (hasDuration && knownTotal > 0) {
-        segment.style.width = ((duration / knownTotal) * 100).toFixed(3) + "%";
+      if (g.duration > 0 && knownTotal > 0) {
+        segment.style.width = ((g.duration / knownTotal) * 100).toFixed(3) + "%";
       } else {
         segment.style.width = "0%";
       }
-      if (stage.stage === golden.currentStage || (stage.phase === "failed" && stage.stage === golden.failedStage)) {
+      const isCurrent = g.members.indexOf(golden.currentStage) !== -1 ||
+        (golden.failedStage && g.members.indexOf(golden.failedStage) !== -1);
+      if (isCurrent) {
         segment.classList.add("is-current");
         segment.setAttribute("aria-current", "step");
       }
-      segment.appendChild(el("span", { class: "comfymodal-studio-progress-segment-label", text: stage.stage }));
+      segment.appendChild(el("span", { class: "comfymodal-studio-progress-segment-label", text: g.label }));
+      segment.appendChild(el("span", { class: "comfymodal-studio-progress-segment-time", text: g.timeText }));
       segmentBar.appendChild(segment);
     });
   }
-  // Total first: the per-stage rows below only sum stage time, which excludes
-  // submission, container start and output transfer, so the total is reported
-  // from the run's own elapsed clock rather than derived from the rows.
-  var _totalMs = runState && runState.elapsedMs != null ? runState.elapsedMs : null;
-  section.appendChild(el("div", {
-    "data-testid": "progress-golden-total",
-    text: "Total: " + _formatDuration(_totalMs),
-    class: "comfymodal-studio-progress-total",
-  }));
-  const list = el("div", {
-    "data-testid": "progress-golden-stages",
-    class: "comfymodal-studio-progress-stages",
-  });
-  stages.forEach((stage) => {
-    const phaseText = stage.phase === "failed" ? "Failed" : stage.phase === "completed" ? "Completed" : "In progress";
-    const stateMark = stage.phase === "failed" ? "[!]" : stage.phase === "completed" ? "[done]" : "[active]";
-    list.appendChild(el("div", {
-      "data-testid": "progress-golden-stage-row",
-      "data-stage": stage.stage,
-      class: "comfymodal-studio-progress-stage-row is-" + (stage.phase === "failed" ? "failed" : stage.phase === "completed" ? "completed" : "active"),
-      text: stateMark + "  " + stage.stage + " - " + phaseText + " - " + _goldenStageTimingText(stage),
-    }));
-  });
-  section.appendChild(list);
   if (golden.error) {
     section.appendChild(el("div", {
       "data-testid": "progress-golden-stage-error",
@@ -3078,13 +3601,10 @@ function _domPatchProgress(state) {
     elapsedEl.textContent = "Elapsed: " + _formatDuration(rs.elapsedMs);
   }
 
-  // Keep the Golden total in sync. The progress section is built once and then
-  // only DOM-patched, so a total appended at build time goes stale (it showed
-  // "Total: 14.3s" next to "Elapsed: 42.0s").
-  var goldenTotalEl = document.querySelector('[data-testid="progress-golden-total"]');
-  if (goldenTotalEl) {
-    goldenTotalEl.textContent = "Total: " + _formatDuration(
-      rs && rs.elapsedMs != null ? rs.elapsedMs : null);
+  var totalEl = document.querySelector('[data-testid="progress-golden-total"]');
+  if (totalEl) {
+    var totalMs = _goldenRunTotalMs(rs, rs.goldenProgress && rs.goldenProgress.stages);
+    totalEl.textContent = "Total: " + _formatDuration(totalMs != null ? totalMs : rs.elapsedMs);
   }
 
   var stepEl = document.querySelector('[data-testid="progress-step"]');
@@ -3126,10 +3646,8 @@ function _domPatchProgress(state) {
   if (rs.goldenProgress) {
     var progressSection = document.querySelector('[data-testid="progress-section"]');
     if (progressSection) {
-      ["progress-golden-total", "progress-golden-stages", "progress-golden-stage-error"].forEach(function (testId) {
-        var oldEl = progressSection.querySelector('[data-testid="' + testId + '"]');
-        if (oldEl) oldEl.remove();
-      });
+      var oldErr = progressSection.querySelector('[data-testid="progress-golden-stage-error"]');
+      if (oldErr) oldErr.remove();
       _appendGoldenProgress(progressSection, rs);
     }
   }
@@ -3326,17 +3844,11 @@ function renderWorkspace(state, context) {
   // canvas, progress, metadata, recent filmstrip) ΓÇö never a movable card.
   const workspace = el("div", { class: "comfymodal-studio-workspace", "data-testid": "workspace", "data-shelf-output-panel": "true" });
 
-  // Feature tabs
-  workspace.appendChild(renderFeatureTabs(state, context));
-
   // Canvas area
   workspace.appendChild(renderCanvas(state, context));
 
   // Progress section (shared progress display)
   workspace.appendChild(renderProgressSection(state, context));
-
-  // Metadata section
-  workspace.appendChild(renderMetadataSection(state, context));
 
   // Recent runs filmstrip
   workspace.appendChild(renderFilmstrip(state, context));
@@ -3347,7 +3859,7 @@ function renderWorkspace(state, context) {
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Feature Tabs ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
 function renderFeatureTabs(state, context) {
-  const tabs = el("div", { class: "comfymodal-studio-feature-tabs", "data-testid": "feature-tabs" });
+  const tabs = el("div", { class: "comfymodal-studio-feature-tabs-legacy", "data-testid": "feature-tabs-legacy" });
 
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
 
@@ -3421,72 +3933,107 @@ function renderCanvas(state, context) {
     img.setAttribute("role", "button");
     img.setAttribute("tabindex", "0");
     img.setAttribute("aria-label", "Open generated image preview");
-    var _openPreview = function () {
-       // The image is the invoking control; restore focus here rather than to
-       // whichever element happened to be active before a pointer click.
-       var _prevFocus = img;
-      var _run = (state.playground && state.playground._selectedRun) || null;
-      // opts.sections takes DOM Nodes appended verbatim, not {label, value}
-      // descriptors - plain objects throw on appendChild.
-      var _sectionEl = function (label, value) {
-        if (value == null || value === "") return null;
-        return el("div", { style: "margin-top:6px;" }, [
-          el("div", { style: "color:#888;font-size:10px;text-transform:uppercase;", text: label }),
-          el("div", { style: "color:#e5e5e5;word-break:break-word;white-space:pre-wrap;", text: String(value) }),
-        ]);
-      };
-      var _previewSections = [
-        _sectionEl("Prompt", _run && _run.prompt),
-        _sectionEl("Negative prompt", _run && _run.negativePrompt),
-        _sectionEl("Output", (_run && _run.outputPath) || outputUrl),
-        _sectionEl("Duration", _run && _run.durationMs != null ? _formatDuration(_run.durationMs) : null),
-      ].filter(Boolean);
-      var _preview;
-      try {
-        // opts.sideColumn is an ELEMENT the overlay styles and appends, not a
-        // boolean flag - passing true threw on `sideCol.style.cssText`.
-        var _sideCol = el("div", {
-          class: "comfymodal-studio-preview-overlay-side",
-          style: "padding:10px;font-size:11px;color:#ddd;overflow:auto;",
-        }, [
-          el("div", {
-            style: "font-weight:600;margin-bottom:6px;color:#fff;",
-            text: "Details",
-          }),
-        ]);
-        var _ctl = _run && _run.resolvedControls;
-        if (_ctl && typeof _ctl === "object") {
-          _sideCol.appendChild(el("div", {
-            style: "color:#999;",
-            text: Object.keys(_ctl).length + " resolved controls",
-          }));
-        }
-        _preview = createImagePreviewOverlay({
-          imageUrl: outputUrl,
-          alt: "Generated image",
-          focusTrap: true,
-          sideColumn: _sideCol,
-          sections: _previewSections,
-          onClose: function () {
-            try { if (_prevFocus && _prevFocus.focus) _prevFocus.focus(); } catch (e) {}
-          },
-        });
-      } catch (e) {
+     var _openPreview = async function () {
+       var _run = (state.playground && state.playground._selectedRun) || null;
+       var _apiBase = (context && context.apiBase) || "/comfymodal";
+       var _runId = viewerFirst(_run && _run.runId, _run && _run.id);
+       if (!_runId) return;
+       _savePlaygroundPreviewId(_runId);
+       if (state.playground) state.playground._previewOpen = true;
+       // The zoom stage, right-column cards, and timing flow are the shared
+       // viewer composition (studio-ui.js).  The record is resolved from the
+       // History backend first — the same source the History detail overlay
+       // renders — so prompt, params, image variant, and timing can never
+       // disagree between the two surfaces.  The canonical local run record is
+       // only the fallback for a run History V2 has no projection of.
+       // Prefer the run id over the item id: override/carousel items key
+       // themselves by experiment id, but only the run id resolves.
+       var _preview;
+       try {
+          var _record = null;
+          var _historyRepo = null;
+          if (_runId) {
+            try {
+              _historyRepo = await createHistoryRepository({ apiBase: _apiBase });
+              _record = await _resolveHistoryViewerRecord(_historyRepo, _runId, _run, _apiBase);
+            } catch (err) { /* local run remains a truthful fallback */ }
+          }
+          if (!_record) {
+            _historyRepo = null;
+            _record = buildViewerRecordFromRun(_run, outputUrl);
+          }
+          if (!_record) return;
+
+          // Annotation writes follow the record's authority: a History-sourced
+          // record writes through History V2 (the durable owner of favorites
+          // and notes, exactly like the History overlay's own star/editor).
+          function _writeAnnotation(field, value) {
+            if (_historyRepo) {
+              return field === "favorite"
+                ? _historyRepo.setFavorite(_record.id, value)
+                : _historyRepo.setNote(_record.id, value);
+            }
+            if (_run && _run._historyKind) {
+              return _getRecentRunsRepo(_apiBase).then(function (repo) {
+                return field === "favorite"
+                  ? repo.setFavorite(_run.id, value)
+                  : repo.setNote(_run.id, value);
+              });
+            }
+            var patch = {};
+            patch[field] = value;
+            return updateRunAnnotation(_apiBase, _runId, patch);
+          }
+
+          var _viewer = resolveViewerInput(_record, outputUrl);
+           _preview = buildViewerShell({
+             record: _viewer.record,
+             imageUrl: _viewer.imageUrl,
+             timing: _viewer.timing,
+             onClose: function () {
+               if (state.playground) state.playground._previewOpen = false;
+               _clearPlaygroundPreviewId();
+             },
+             persistence: {
+              setFavorite: function (rec, next) {
+                if (!_runId) return Promise.resolve();
+                return _writeAnnotation("favorite", next);
+              },
+              setNote: function (rec, text) {
+                if (!_runId) return Promise.resolve();
+                return _writeAnnotation("note", text);
+              },
+              onChanged: null,
+            },
+          });
+       } catch (e) {
         // Do not swallow: a silent failure here looks like "click does nothing".
-        console.error("comfymodal: image preview overlay failed to open", e);
-        return;
+         console.error("comfymodal: image preview overlay failed to open", e);
+         if (state.playground) state.playground._previewOpen = false;
+         return;
       }
       document.body.appendChild(_preview.overlay);
     };
     img.addEventListener("click", _openPreview);
-    img.addEventListener("keydown", function (e) {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        _openPreview();
-      }
-    });
-    canvas.appendChild(img);
-    const runState = state.playground && state.playground.runState;
+     img.addEventListener("keydown", function (e) {
+       if (e.key === "Enter" || e.key === " ") {
+         e.preventDefault();
+         _openPreview();
+       }
+     });
+     canvas.appendChild(img);
+     var _pendingPreviewId = _readPlaygroundPreviewId();
+     var _currentPreviewId = viewerFirst(
+       state.playground && state.playground._selectedRun && state.playground._selectedRun.runId,
+       state.playground && state.playground._selectedRun && state.playground._selectedRun.id
+     );
+     if (_pendingPreviewId && _pendingPreviewId === String(_currentPreviewId || "")
+       && state.playground && !state.playground._previewResumeAttempted
+       && !state.playground._previewOpen) {
+       state.playground._previewResumeAttempted = true;
+       setTimeout(function () { _openPreview(); }, 0);
+     }
+     const runState = state.playground && state.playground.runState;
     const hasActiveRun = runState && runState.status
       && runState.status !== "idle"
       && LEGACY_TERMINAL_STATUSES.indexOf(runState.status) === -1;
@@ -3535,8 +4082,8 @@ function renderLiveReturnControl(state, context) {
 
 function renderMetadataSection(state, context) {
   const section = el("div", {
-    class: "comfymodal-studio-metadata-section",
-    "data-testid": "metadata-section",
+    class: "comfymodal-studio-preview-details-legacy",
+    "data-testid": "preview-details-legacy",
   });
 
   const apiBase = (context && context.apiBase) || "/comfymodal";
@@ -4094,48 +4641,55 @@ function renderFilmstrip(state, context) {
     }
 
     // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Header row with actions ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
-    const header = el("div", { class: "comfymodal-studio-carousel-header" });
-    header.appendChild(el("span", {
-      class: "comfymodal-studio-carousel-header-label",
-      text: "Recent runs",
-    }));
-
-    const actions = el("div", { class: "comfymodal-studio-carousel-actions" });
-
-    // Clear button ├óΓé¼ΓÇ¥ removes all cached and persisted runs
-    actions.appendChild(el("button", {
-      type: "button",
-      class: "comfymodal-studio-carousel-btn danger",
-      text: "Clear",
-      title: "Remove all recent runs",
-      onclick: function () {
-        clearRecentRunsCache();
-        clearAllRunResults();
-        setCarouselCleared(true);
-        rerender();
-      },
-    }));
-
-    // Close button ├óΓé¼ΓÇ¥ hides the carousel (per-session)
-    actions.appendChild(el("button", {
-      type: "button",
-      class: "comfymodal-studio-carousel-btn close-btn",
-      text: "\u2715",
-      "aria-label": "Hide recent runs",
-      title: "Hide recent runs",
-      onclick: function () {
-        if (state.playground) {
-          state.playground._carouselHidden = true;
-          rerender();
-        }
-      },
-    }));
-
-    header.appendChild(actions);
-    carousel.appendChild(header);
-
-    // Carousel track for horizontal scrolling
     const track = el("div", { class: "comfymodal-studio-carousel-track" });
+    const trackId = "comfymodal-recent-runs-track";
+    track.id = trackId;
+    const leftArrow = el("button", {
+      type: "button",
+      class: "comfymodal-studio-carousel-accordion-arrow",
+      text: "↑",
+      "aria-label": "Collapse recent runs",
+      "aria-controls": trackId,
+    });
+    const rightArrow = el("button", {
+      type: "button",
+      class: "comfymodal-studio-carousel-accordion-arrow",
+      text: "↑",
+      "aria-label": "Collapse recent runs",
+      "aria-controls": trackId,
+    });
+    const toggle = function () {
+      state.playground._carouselCollapsed = !state.playground._carouselCollapsed;
+      track.hidden = state.playground._carouselCollapsed;
+      const arrow = track.hidden ? "↓" : "↑";
+      const label = track.hidden ? "Expand recent runs" : "Collapse recent runs";
+      leftArrow.textContent = arrow;
+      rightArrow.textContent = arrow;
+      leftArrow.setAttribute("aria-label", label);
+      rightArrow.setAttribute("aria-label", label);
+      leftArrow.setAttribute("aria-expanded", String(!track.hidden));
+      rightArrow.setAttribute("aria-expanded", String(!track.hidden));
+    };
+    leftArrow.addEventListener("click", toggle);
+    rightArrow.addEventListener("click", toggle);
+    const accordion = el("div", { class: "comfymodal-studio-carousel-accordion" }, [
+      leftArrow,
+      el("span", { class: "comfymodal-studio-carousel-accordion-label", text: "Recent runs" }),
+      rightArrow,
+    ]);
+    accordion.addEventListener("click", function (event) {
+      if (!event.target.closest("button")) toggle();
+    });
+    carousel.appendChild(accordion);
+    track.hidden = !!(state.playground && state.playground._carouselCollapsed);
+    const initialArrow = track.hidden ? "↓" : "↑";
+    const initialLabel = track.hidden ? "Expand recent runs" : "Collapse recent runs";
+    leftArrow.textContent = initialArrow;
+    rightArrow.textContent = initialArrow;
+    leftArrow.setAttribute("aria-label", initialLabel);
+    rightArrow.setAttribute("aria-label", initialLabel);
+    leftArrow.setAttribute("aria-expanded", String(!track.hidden));
+    rightArrow.setAttribute("aria-expanded", String(!track.hidden));
 
     // Phase I8: unique, context-bearing accessible names (time + status +
     // run type; short id only when the base name collides).
@@ -4270,6 +4824,71 @@ var _SHELF_TYPE = "t2i";
 // invited a second, conflicting place to change the model stack.
 var _SHELF_HIDDEN_ROLES = ["model_unet", "clip", "vae", "model", "model_clip", "model_vae"];
 var _SHELF_SAVE_DELAY_MS = 300;
+var _shelfPointerDrag = null;
+
+function _shelfClearDropIndicators() {
+  Array.prototype.forEach.call(document.querySelectorAll(
+    ".comfymodal-studio-shelf-card.is-drop-before, .comfymodal-studio-shelf-card.is-drop-after, "
+      + ".comfymodal-studio-shelf-row.is-drop-above, .comfymodal-studio-shelf-row.is-drop-below"
+  ), function (node) {
+    node.classList.remove("is-drop-before", "is-drop-after", "is-drop-above", "is-drop-below");
+  });
+}
+
+function _shelfRowRoles(row) {
+  return Array.prototype.map.call(row.querySelectorAll("[data-testid^='shelf-field-']"), function (node) {
+    return node.getAttribute("data-role");
+  }).filter(Boolean);
+}
+
+function _shelfDropAtPoint(draggedRole, clientX, clientY) {
+  var hit = document.elementFromPoint(clientX, clientY);
+  var target = hit && hit.closest ? hit.closest("[data-testid^='shelf-field-']") : null;
+  if (target && target.getAttribute("data-role") !== draggedRole) {
+    var targetRow = target.closest(".comfymodal-studio-shelf-row");
+    var rowCards = targetRow ? targetRow.querySelectorAll("[data-testid^='shelf-field-']") : [];
+    var rect = target.getBoundingClientRect();
+    var after = rowCards.length > 1
+      ? clientX >= rect.left + rect.width / 2
+      : clientY >= rect.top + rect.height / 2;
+    return {
+      mode: rowCards.length > 1 ? (after ? "after" : "before") : (after ? "row-after" : "row-before"),
+      targetRole: target.getAttribute("data-role"),
+      row: targetRow,
+      targetRow: targetRow ? Number(targetRow.getAttribute("data-row")) : 0,
+    };
+  }
+
+  var rows = Array.prototype.slice.call(document.querySelectorAll(".comfymodal-studio-shelf-row"));
+  for (var i = 0; i < rows.length - 1; i++) {
+    var upper = rows[i].getBoundingClientRect();
+    var lower = rows[i + 1].getBoundingClientRect();
+    if (clientY >= upper.bottom && clientY <= lower.top) {
+      var upperRoles = _shelfRowRoles(rows[i]);
+      var lowerRoles = _shelfRowRoles(rows[i + 1]);
+      if (upperRoles.length && lowerRoles.length) {
+        var midpoint = upper.bottom + (lower.top - upper.bottom) / 2;
+        if (clientY < midpoint) {
+          return { mode: "row-before", targetRole: lowerRoles[0], row: rows[i + 1], targetRow: Number(rows[i + 1].getAttribute("data-row")) };
+        }
+        return { mode: "row-after", targetRole: upperRoles[upperRoles.length - 1], row: rows[i], targetRow: Number(rows[i].getAttribute("data-row")) };
+      }
+    }
+  }
+  if (rows.length) {
+    var first = rows[0].getBoundingClientRect();
+    var last = rows[rows.length - 1].getBoundingClientRect();
+    var firstRoles = _shelfRowRoles(rows[0]);
+    var lastRoles = _shelfRowRoles(rows[rows.length - 1]);
+    if (clientY < first.top && firstRoles.length) {
+      return { mode: "row-before", targetRole: firstRoles[0], row: rows[0], targetRow: Number(rows[0].getAttribute("data-row")) };
+    }
+    if (clientY > last.bottom && lastRoles.length) {
+      return { mode: "row-after", targetRole: lastRoles[lastRoles.length - 1], row: rows[rows.length - 1], targetRow: Number(rows[rows.length - 1].getAttribute("data-row")) };
+    }
+  }
+  return null;
+}
 
 function _shelfStore(state) {
   return (state && state.playground && state.playground._workflowRun) || null;
@@ -4536,23 +5155,57 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
     var grip = el("span", {
       class: "comfymodal-studio-shelf-drag",
       "data-testid": "shelf-drag-" + role,
-      text: "\u22ee\u22ee",
+      text: "⋮⋮",
       title: "Drag to reorder",
     });
-    grip.setAttribute("draggable", "true");
+    grip.setAttribute("role", "button");
+    grip.setAttribute("tabindex", "0");
     grip.setAttribute("aria-label", "Drag to reorder " + _shelfDisplayName(role, entry));
-    grip.addEventListener("dragstart", function (ev) {
-      try {
-        ev.dataTransfer.setData("text/shelf-role", role);
-        ev.dataTransfer.effectAllowed = "move";
-      } catch (e) { /* clipboard-less DnD still works via drop target */ }
+    grip.setAttribute("aria-grabbed", "false");
+    grip.addEventListener("pointerdown", function (ev) {
+      if (ev.button !== 0 || _shelfPointerDrag) return;
+      ev.preventDefault();
+      _shelfPointerDrag = { role: role, card: card, state: state, context: context, actions: actions, pointerId: ev.pointerId };
+      grip.setAttribute("aria-grabbed", "true");
       card.classList.add("is-dragging");
-    });
-    grip.addEventListener("dragend", function () {
-      card.classList.remove("is-dragging");
-      Array.prototype.forEach.call(document.querySelectorAll(".comfymodal-studio-shelf-card.is-drop-target"), function (n) {
-        n.classList.remove("is-drop-target");
-      });
+      document.body.classList.add("comfymodal-studio-shelf-dragging");
+
+      function onMove(moveEvent) {
+        if (!_shelfPointerDrag || moveEvent.pointerId !== ev.pointerId) return;
+        _shelfClearDropIndicators();
+        var drop = _shelfDropAtPoint(role, moveEvent.clientX, moveEvent.clientY);
+        _shelfPointerDrag.drop = drop;
+        if (!drop) return;
+        if (drop.mode === "before" || drop.mode === "after") {
+          drop.row && drop.row.querySelector('[data-role="' + drop.targetRole + '"]')
+            .classList.add(drop.mode === "before" ? "is-drop-before" : "is-drop-after");
+        } else if (drop.row) {
+          drop.row.classList.add(drop.mode === "row-before" ? "is-drop-above" : "is-drop-below");
+        }
+      }
+      function onUp(upEvent) {
+        if (!_shelfPointerDrag || upEvent.pointerId !== ev.pointerId) return;
+        document.removeEventListener("pointermove", onMove, true);
+        document.removeEventListener("pointerup", onUp, true);
+        document.removeEventListener("pointercancel", onUp, true);
+        _shelfClearDropIndicators();
+        card.classList.remove("is-dragging");
+        grip.setAttribute("aria-grabbed", "false");
+        document.body.classList.remove("comfymodal-studio-shelf-dragging");
+        var drop = _shelfPointerDrag.drop || _shelfDropAtPoint(role, upEvent.clientX, upEvent.clientY);
+        _shelfPointerDrag = null;
+        if (!drop || !drop.targetRole) return;
+        if (drop.mode === "before") {
+          _shelfMoveBefore(state, context, actions, role, drop.targetRole, drop.targetRow);
+        } else if (drop.mode === "after") {
+          _shelfMoveAfter(state, context, actions, role, drop.targetRole, drop.targetRow);
+        } else if (drop.mode === "row-before" || drop.mode === "row-after") {
+          _shelfMoveToRow(state, context, actions, role, drop.targetRole, drop.mode === "row-before" ? "before" : "after");
+        }
+      }
+      document.addEventListener("pointermove", onMove, true);
+      document.addEventListener("pointerup", onUp, true);
+      document.addEventListener("pointercancel", onUp, true);
     });
     head.appendChild(grip);
   }
@@ -4588,25 +5241,6 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
     head.appendChild(advBtn);
   }
   card.appendChild(head);
-
-  card.addEventListener("dragover", function (ev) {
-    if (fixed) return;
-    ev.preventDefault();
-    try { ev.dataTransfer.dropEffect = "move"; } catch (e) {}
-    card.classList.add("is-drop-target");
-  });
-  card.addEventListener("dragleave", function () {
-    card.classList.remove("is-drop-target");
-  });
-  card.addEventListener("drop", function (ev) {
-    if (fixed) return;
-    ev.preventDefault();
-    ev.stopPropagation();
-    var dragged = "";
-    try { dragged = ev.dataTransfer.getData("text/shelf-role"); } catch (e) {}
-    card.classList.remove("is-drop-target");
-    if (dragged && dragged !== role) _shelfMoveBefore(state, context, actions, dragged, role);
-  });
 
   var body = el("div", { class: "comfymodal-studio-shelf-card-body" });
   body.appendChild(_shelfRenderInput(role, entry, value, function (next) {
@@ -4666,6 +5300,46 @@ function _shelfMoveBefore(state, context, actions, dragged, before, targetRow) {
   _refreshShelfSection(state, context, actions);
 }
 
+function _shelfMoveAfter(state, context, actions, dragged, after, targetRow) {
+  var entries = _shelfEntries(state);
+  var promptRole = _shelfPromptRole(entries);
+  if (!dragged || !after || dragged === after || dragged === promptRole || after === promptRole) return;
+  var layout = _shelfLayoutFor(entries, promptRole);
+  var order = layout.order.filter(function (r) { return r !== dragged; });
+  var at = order.indexOf(after);
+  if (at === -1) order.push(dragged);
+  else order.splice(at + 1, 0, dragged);
+  layout.order = order;
+  if (targetRow != null && Number.isFinite(Number(targetRow))) {
+    layout.rows[dragged] = Number(targetRow);
+  }
+  _shelfPersistLayout(layout);
+  _refreshShelfSection(state, context, actions);
+}
+
+function _shelfMoveToRow(state, context, actions, dragged, anchor, position) {
+  var entries = _shelfEntries(state);
+  var promptRole = _shelfPromptRole(entries);
+  if (!dragged || !anchor || dragged === anchor || dragged === promptRole || anchor === promptRole) return;
+  var layout = _shelfLayoutFor(entries, promptRole);
+  var order = layout.order.filter(function (r) { return r !== dragged; });
+  var anchorIndex = order.indexOf(anchor);
+  if (anchorIndex === -1) return;
+  var anchorRow = Number(layout.rows[anchor]);
+  if (!Number.isFinite(anchorRow)) anchorRow = 0;
+  var newRow = position === "before" ? anchorRow : anchorRow + 1;
+  Object.keys(layout.rows).forEach(function (role) {
+    if (role !== dragged && Number(layout.rows[role]) >= newRow) layout.rows[role] = Number(layout.rows[role]) + 1;
+  });
+  if (position === "before") order.splice(anchorIndex, 0, dragged);
+  else order.splice(anchorIndex + 1, 0, dragged);
+  layout.order = order;
+  layout.rows[dragged] = newRow;
+  layout.maxRow += 1;
+  _shelfPersistLayout(layout);
+  _refreshShelfSection(state, context, actions);
+}
+
 function renderShelfSection(state, context, actions) {
   var section = el("div", {
     class: "comfymodal-studio-shelf",
@@ -4686,33 +5360,6 @@ function _populateShelfSection(section, state, context, actions) {
     }));
     return;
   }
-
-  var head = el("div", { class: "comfymodal-studio-shelf-head" });
-  head.appendChild(el("span", {
-    class: "comfymodal-studio-shelf-workflow-name",
-    "data-testid": "shelf-workflow-name",
-    text: store.workflowName || store.workflowId,
-  }));
-  var switchBtn = el("button", {
-    type: "button",
-    class: "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn",
-    "data-testid": "shelf-workflow-switch",
-    text: "Change",
-    title: "Switch Workflow via the shared picker",
-  });
-  switchBtn.addEventListener("click", function () {
-    _openShelfPickerDialog(state, context, actions);
-  });
-  head.appendChild(switchBtn);
-  // Subtle autosaved indicator ΓÇö layout and values persist automatically,
-  // so the Shelf never renders a Save button.
-  head.appendChild(el("span", {
-    class: "comfymodal-studio-shelf-autosaved",
-    "data-testid": "shelf-autosaved",
-    text: "Autosaved",
-    title: "Field layout and values save automatically ΓÇö no Save button needed.",
-  }));
-  section.appendChild(head);
 
   var ready = _shelfReady(state);
   if (!ready) {
@@ -4914,8 +5561,27 @@ async function _confirmShelfSwitch(state, context, actions, nextId) {
   var currentRoles = ready ? Object.keys(ready.wf.getControlSchema(ready.store)) : [];
   var nextRoles = [];
   try {
-    var mod = await import("./studio-backend-api.js");
-    var ctxRes = await mod.getWorkflowRunContext(apiBase, nextId);
+    var target = ready && (ready.store.library || []).find(function (row) {
+      return row && String(row.workflow_id) === String(nextId);
+    });
+    var targetVersionId = target && target.latest_version_id;
+    var cached = ready && ready.store.runContext;
+    var cachedWorkflowId = cached && cached.workflow && cached.workflow.workflow_id != null
+      ? cached.workflow.workflow_id
+      : (ready && ready.store.workflowId);
+    var cachedVersionId = cached && cached.version && cached.version.workflow_version_id != null
+      ? cached.version.workflow_version_id
+      : (ready && ready.store.workflowVersionId);
+    var ctxRes = cached
+      && targetVersionId
+      && String(cachedWorkflowId) === String(nextId)
+      && String(cachedVersionId) === String(targetVersionId)
+      ? cached
+      : null;
+    if (!ctxRes) {
+      var mod = await import("./studio-backend-api.js");
+      ctxRes = await mod.getWorkflowRunContext(apiBase, nextId);
+    }
     var rawSchema = (ctxRes && ctxRes.control_schema) || {};
     // Array-shaped (mock) or role-keyed (backend) ΓÇö accept both.
     nextRoles = Array.isArray(rawSchema)

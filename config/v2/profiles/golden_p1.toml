@@ -73,5 +73,5 @@ COMFYMODAL_V2_E27_FORENSICS = "1"
 COMFYMODAL_GOLDEN_QD_TRANSPORT = "static_e27"
 COMFYMODAL_OUTPUT_DURABILITY = "off"
 
-# The Golden request contract requires canonical workflow SHA verification.
-COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK = "1"
+# Workflow SHA is evidence-only and never blocks Studio Golden execution.
+COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK = "0"

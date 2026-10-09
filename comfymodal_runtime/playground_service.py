@@ -550,6 +550,13 @@ async def _default_save_history(
             meta=meta,
         )
         actual_run_id = record.get("run_id", run_history_id) if record else run_history_id
+        # Bridge the run to its History V2 generation for the frontend (see
+        # experiment_service.RunHistoryService.record_run): attached onto the
+        # result dict so it flows into the run response below.
+        if isinstance(result, dict) and isinstance(record, dict):
+            _bridged_gen_id = record.get("history_generation_id")
+            if _bridged_gen_id:
+                result["history_generation_id"] = str(_bridged_gen_id)
 
         update_kwargs: dict[str, Any] = {
             "status": status,
@@ -993,6 +1000,9 @@ class PlaygroundService:
             "runId": run_history_id,
             "experimentId": exp_id,
             "runHistoryId": run_history_id,
+            # Bridge to the History V2 generation for this run (set by the
+            # save hook when the durable record exists; "" otherwise).
+            "historyGenerationId": result.get("history_generation_id", "") if isinstance(result, dict) else "",
             "completed_at": completed_at,
             "output_paths": output_paths,
             "output_path": output_paths[0] if output_paths else "",

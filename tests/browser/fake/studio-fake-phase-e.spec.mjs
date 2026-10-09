@@ -99,7 +99,7 @@ test.describe("Studio Phase-E contract harness (fake backend)", () => {
 
       await fx.gotoPage("history");
       const overlay = await openGenerationDetail(page, PHASE_E_IDS.failedOriginal);
-      await expect(overlay.getByTestId("history-v2-original-failed-badge")).toContainText("Original failed");
+      await expect(overlay.getByTestId("viewer-render-failed-badge")).toContainText("Original failed");
       await expect(overlay).toContainText("preview retained");
       fx.assertNoConsoleErrors();
     } finally {

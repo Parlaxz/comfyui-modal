@@ -16,6 +16,9 @@ import {
   isGraphNodeAvailable,
   clearNodeViewHighlight,
   findCanvasNodeTargets,
+  isLiveGraphEqualTo,
+  loadGraphIntoComfy,
+  snapshotLiveGraph,
 } from "./studio-graph-binding.js";
 import { captureCurrentComfyGraph } from "./studio-backend-capture.js";
 import {
@@ -30,6 +33,7 @@ import {
 import {
   getWorkflowVersion,
   createMapping,
+  createMappingRevision,
   getVersionDependencies,
   batchInstallModels,
   rescanModels,
@@ -250,6 +254,11 @@ export function isValidConcreteBinding(val) {
 
 let _wizardState = null;
 let _wizardRoot = null;
+// The live canvas graph that was open before this wizard replaced it with
+// the version's graph. Restored on a real close so the wizard never
+// destroys the user's own workflow session. Null when the canvas was
+// untouched (graph unavailable, already showing the version, load failed).
+let _canvasRestoreSnapshot = null;
 
 function makeInitialState(options) {
   const state = {
@@ -288,26 +297,35 @@ function makeInitialState(options) {
     // Server responses
     snapshotResult: null,
     presetResult: null,
+    mappingResult: null,
+    revisionVersion: null,
     errorMessage: "",
-    // The wizard is only ever opened for one unmapped workflow version
-    // (version-setup mode, below). There is no preset/snapshot record to
-    // pre-fill or edit any more.
+    // Version-setup mode is bound to one workflow version (usually unmapped;
+    // the detail-page Edit mapping action reopens it for an already-mapped
+    // version, in which case save creates a revision). There is no
+    // preset/snapshot record to pre-fill or edit any more.
     isVersionSetup: false,
     workflowId: "",
     workflowVersionId: "",
   };
 
   // ── Workflow-version setup mode (leaf 1.2.1) ────────────────────────
-  // Bound to one unmapped workflow version. The step flow, T2I save gate,
+  // Bound to one workflow version. The step flow, T2I save gate,
   // suggestions, and explicit confirmation are identical to preset mode,
-  // but save persists a version mapping through the existing mapping POST
-  // route — never a Backend snapshot or preset — and no Backend/Preset
-  // concepts appear in copy or navigation.
+  // but save persists a version mapping — POST for a first mapping, revision
+  // for an already-mapped version — never a Backend snapshot or preset —
+  // and no Backend/Preset concepts appear in copy or navigation.
   const versionOpt = (options && typeof options === "object") ? options : {};
   if (versionOpt.workflowVersionId) {
     state.isVersionSetup = true;
     state.workflowId = versionOpt.workflowId || "";
     state.workflowVersionId = versionOpt.workflowVersionId;
+    // The detail-page Edit mapping action is a deep link into the binding
+    // page. Keep the normal setup flow unchanged for new mappings.
+    if (versionOpt.initialStep === "bindings") {
+      state.selectedFeatures = ["txt2img"];
+      state.step = "bindings";
+    }
   }
 
   return state;
@@ -326,7 +344,7 @@ function _setStudioHeaderWizardMode(on) {
 // ── Public API ───────────────────────────────────────────────────────────
 
 export function openWorkflowSetupWizard(onDone, apiBase, options) {
-  closeWorkflowSetupWizard({ keepDraft: true }); // Clean up any existing wizard first
+  closeWorkflowSetupWizard({ keepDraft: true, internal: true }); // Clean up any existing wizard first
 
   _wizardState = makeInitialState(options);
   _wizardState._onDone = onDone;
@@ -388,6 +406,11 @@ export function openWorkflowSetupWizard(onDone, apiBase, options) {
 
 export function closeWorkflowSetupWizard(options) {
   const keepDraft = !!(options && options.keepDraft);
+  // `internal` marks the cleanup at the start of openWorkflowSetupWizard
+  // (re-opening, e.g. a reload resume): the canvas we loaded must stay so
+  // the reopened wizard keeps binding against the version's graph. A real
+  // close restores whatever graph the user had open before the wizard.
+  const internal = !!(options && options.internal);
   // Clean up graph binding capture + transient node highlight
   cancelGraphBinding();
   clearNodeViewHighlight();
@@ -419,6 +442,8 @@ export function closeWorkflowSetupWizard(options) {
 
   _wizardRoot = null;
   _wizardState = null;
+
+  if (!internal) _restoreCanvasGraph();
 
   // Notify modal layer that wizard has closed so it can restore
   // background inertness (if the parent modal is still open).
@@ -835,6 +860,16 @@ function renderBindingsStep(body, state) {
   });
   body.appendChild(desc);
 
+  // When the wizard put the version's graph on the canvas for you, say so
+  // — otherwise "the graph behind the wizard changed" looks like a bug.
+  if (state.canvasGraphLoaded) {
+    body.appendChild(el("p", {
+      "data-testid": "wizard-canvas-loaded",
+      style: "font-size:10px;color:#4ade80;margin:0 0 8px;",
+      text: "This workflow's graph is open on the ComfyUI canvas — bind each row against it. Your previous graph is restored when the wizard closes.",
+    }));
+  }
+
   const graphContext = getComfyGraphContext();
   const graphOk = graphContext.ok || state.graphCaptured;
 
@@ -1128,6 +1163,7 @@ function renderDependenciesStep(body, state) {
   // identical (dependency-status, dependency-model-row, dependency-node-row).
   const depSection = renderDependencySection(null, deps, null, {
     apiBase: state._apiBase,
+    useAdvancedAccordions: false,
     workflowId: state.workflowId || "",
     nonessentialKeys: _userNonessentialKeys(deps),
     onNonessentialChanged: (keys) => {
@@ -1343,7 +1379,7 @@ async function downloadMissingModels(state) {
   }
   const items = models.map((m) => ({
     url: _modelDownloadUrl(m, managerModels),
-    filename: m.filename || "",
+    filename: _basename(m.filename || ""),
     save_path: _modelSavePath(m, managerModels),
   }));
   const skipped = _missingModelsWithoutUrl(deps, managerModels).length;
@@ -2131,17 +2167,26 @@ function renderSavedStep(body, state) {
   // mapping POST response.
   if (state.isVersionSetup) {
     const mappingId = state.mappingResult && state.mappingResult.mapping_id;
+    const revisionId = state.revisionVersion && state.revisionVersion.workflow_version_id;
     const success = el("div", { style: "text-align:center;padding:16px;" }, [
-      el("div", { text: "\u2713", style: "font-size:32px;color:#4ade80;" }),
-      el("h4", { text: "Setup Complete", style: "margin:8px 0;color:#d0d0d0;" }),
+      el("div", { text: "✓", style: "font-size:32px;color:#4ade80;" }),
+      el("h4", { text: revisionId ? "New Version Created" : "Setup Complete", style: "margin:8px 0;color:#d0d0d0;" }),
       el("p", {
-        text: "This workflow version is now mapped.",
+        text: revisionId
+          ? "This version already had a mapping, so your changes were saved as a new workflow version."
+          : "This workflow version is now mapped.",
         style: "font-size:12px;color:#888;margin:0 0 8px;",
       }),
     ]);
     if (mappingId) {
       success.appendChild(el("p", {
         text: `Mapping: ${mappingId}`,
+        style: "font-size:11px;color:#888;margin:4px 0;",
+      }));
+    }
+    if (revisionId) {
+      success.appendChild(el("p", {
+        text: `Version: ${revisionId}`,
         style: "font-size:11px;color:#888;margin:4px 0;",
       }));
     }
@@ -2210,10 +2255,10 @@ async function executeSave(state) {
 
   try {
     // ── Workflow-version setup flow (leaf 1.2.1) ──────────────────────
-    // Persists the confirmed catalog bindings as the version's initial
-    // mapping through the existing mapping POST route. The T2I save gate
-    // is re-checked here (never trust the button state alone); no
-    // snapshot or preset is created.
+    // Persists the confirmed catalog bindings as the version's mapping:
+    // POST for a first mapping, revision (new immutable version) when the
+    // version already has one. The T2I save gate is re-checked here (never
+    // trust the button state alone); no snapshot or preset is created.
     if (state.isVersionSetup) {
       if (!checkAllRequiredBindings(state)) {
         state.step = "error";
@@ -2227,14 +2272,34 @@ async function executeSave(state) {
         return;
       }
       const mappingResp = await createMapping(apiBase, state.workflowVersionId, mappingPayload);
-      if (!mappingResp || mappingResp.status === "error" || !mappingResp.mapping) {
-        state.step = "error";
-        state.errorMessage = (mappingResp && (mappingResp.message || mappingResp.error))
-          || "Server rejected mapping creation";
+      if (mappingResp && mappingResp.status !== "error" && mappingResp.mapping) {
+        state.mappingResult = mappingResp.mapping;
+        state.revisionVersion = null;
+        state.step = "saved";
         return;
       }
-      state.mappingResult = mappingResp.mapping;
-      state.step = "saved";
+      // The version already has an immutable mapping (Edit mapping entry
+      // point, double-submit race, or concurrent save). Saving must create a
+      // new immutable version instead of surfacing a 409 to the user.
+      if (_isMappingAlreadyExists(mappingResp)) {
+        const revisionResp = await createMappingRevision(apiBase, state.workflowVersionId, mappingPayload);
+        const revisionVersion = revisionResp && revisionResp.version ? revisionResp.version : null;
+        if (revisionResp && revisionResp.status !== "error" && revisionVersion) {
+          state.mappingResult = (revisionVersion.mapping
+            && revisionVersion.mapping.mapping_id) ? revisionVersion.mapping : null;
+          state.revisionVersion = revisionVersion;
+          state.workflowVersionId = revisionVersion.workflow_version_id || state.workflowVersionId;
+          state.step = "saved";
+          return;
+        }
+        state.step = "error";
+        state.errorMessage = (revisionResp && (revisionResp.message || revisionResp.error))
+          || "Server rejected mapping revision";
+        return;
+      }
+      state.step = "error";
+      state.errorMessage = (mappingResp && (mappingResp.message || mappingResp.error))
+        || "Server rejected mapping creation";
       return;
     }
 
@@ -2278,6 +2343,43 @@ async function executeSave(state) {
  * imported earlier). Best-effort: on any failure the wizard keeps working
  * through the live-graph "Suggest from current graph" button.
  */
+/**
+ * Put the bound version's graph on the live ComfyUI canvas so binding
+ * capture operates on the workflow's own nodes. Skipped when no canvas is
+ * available or the version's graph is already open; the replaced graph is
+ * snapshotted (once) and restored when the wizard really closes.
+ */
+async function _showVersionGraphOnCanvas(state, graph) {
+  if (!isGraphAvailable()) return;
+  if (isLiveGraphEqualTo(graph)) {
+    state.canvasGraphLoaded = true;
+    return;
+  }
+  const snapshot = snapshotLiveGraph();
+  const res = await loadGraphIntoComfy(graph);
+  if (_wizardState !== state) {
+    // Closed while loading: undo immediately so the canvas is not left
+    // holding a graph for a wizard that no longer exists.
+    if (snapshot) { try { await loadGraphIntoComfy(snapshot); } catch (e) { /* best-effort */ } }
+    return;
+  }
+  if (!res.ok) return; // suggestions + manual capture still work on the open graph
+  if (!_canvasRestoreSnapshot) _canvasRestoreSnapshot = snapshot;
+  state.canvasGraphLoaded = true;
+}
+
+/** Restore the graph the user had open before the wizard replaced it. */
+function _restoreCanvasGraph() {
+  const snapshot = _canvasRestoreSnapshot;
+  _canvasRestoreSnapshot = null;
+  if (!snapshot || !isGraphAvailable()) return;
+  // Fire-and-forget: close is synchronous and the restore is best-effort.
+  try {
+    const p = loadGraphIntoComfy(snapshot);
+    if (p && typeof p.catch === "function") p.catch(() => { /* best-effort */ });
+  } catch (e) { /* best-effort */ }
+}
+
 async function prefetchVersionSetupGraph(state) {
   const apiBase = state._apiBase;
   const versionId = state.workflowVersionId;
@@ -2295,6 +2397,11 @@ async function prefetchVersionSetupGraph(state) {
   if (!graph) return;
   state.graphJson = graph;
   state.graphCaptured = true;
+  // The canvas must show THIS version's graph: "Use Selected Node" and the
+  // canvas-capture path bind against the live canvas, so binding against a
+  // different workflow's graph would store nodes the version does not have.
+  await _showVersionGraphOnCanvas(state, graph);
+  if (_wizardState !== state) return;
   try {
     state.suggestedTargets = suggestAllBindings(graph);
     const found = Object.values(state.suggestedTargets).filter((t) => t && t.length).length;
@@ -2326,6 +2433,14 @@ function _versionMappingControlKind(key) {
  * confirmed widget/input/output field) persist — same rule as the preset
  * nodeBindings builder.
  */
+function _isMappingAlreadyExists(resp) {
+  if (!resp || resp.status !== "error") return false;
+  if (resp._httpStatus === 409) return true;
+  const msg = String(resp.message || resp.error || "").toLowerCase();
+  return msg.indexOf("immutable mapping") !== -1
+    || msg.indexOf("already has") !== -1;
+}
+
 function buildVersionMappingPayload(state) {
   const bindings = (state && state.bindings) || {};
   const outputBinding = bindings[OUTPUT_BINDING.key];

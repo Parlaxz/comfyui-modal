@@ -106,6 +106,83 @@ function stubVersionGraph(page, version, graphJson) {
   );
 }
 
+// Version graph the edit-mapping deep link must place on the canvas: one
+// node with a single seed widget (the selected node) and one plain loader.
+const EDIT_WIZARD_VERSION_GRAPH = {
+  nodes: [
+    { id: 700, type: "SomeUNETLoader", title: "Load UNET", inputs: [], outputs: [{ name: "MODEL", type: "MODEL" }] },
+    {
+      id: 701, type: "PixaromaSeed", title: "Pixaroma Seed 701", inputs: [], outputs: [],
+      widgets: [{ name: "seed", type: "number", options: {} }],
+    },
+  ],
+  links: [],
+};
+
+/**
+ * Stub the ComfyUI host as a canvas holding the USER's own graph, with a
+ * recording loadGraphData that makes the canvas "show" whatever graph was
+ * loaded last. The real graph is never touched: loads and the restore
+ * snapshot are observable via window.__graphLoads / __serializeCalls.
+ */
+async function stubCanvasAppWithUserGraph(page) {
+  return page.evaluate(() => {
+    const app = window.app || window.__comfymodal_comfy_app;
+    if (!app) return { ok: false, reason: "no-app" };
+    window.__comfymodal_comfy_app = app;
+    window.__graphLoads = [];
+    window.__serializeCalls = 0;
+    const userNode = { id: 900, type: "UserOwnGraph", pos: [0, 0], size: [120, 80], widgets: [], inputs: [], outputs: [] };
+    app.loadGraphData = async (graph) => {
+      window.__graphLoads.push(JSON.parse(JSON.stringify(graph)));
+      app.graph.nodes = (graph && graph.nodes) || [];
+      app.graph._nodes_by_id = {};
+      (app.graph.nodes || []).forEach((n) => { app.graph._nodes_by_id[n.id] = n; });
+    };
+    if (!app.graph) app.graph = {};
+    app.graph.serialize = () => {
+      window.__serializeCalls += 1;
+      return { last_node_id: 900, last_link_id: 0, nodes: [userNode], links: [], groups: [], config: {}, extra: {}, version: 0.4 };
+    };
+    app.graph.nodes = [userNode];
+    app.graph._nodes_by_id = { 900: userNode };
+    app.canvas = app.canvas || {};
+    app.canvas.selected_nodes = {};
+    // Hijack decoy: any canvas-position lookup returns this node. If a
+    // wizard-UI click (e.g. "Use Selected Node") is ever mistaken for a
+    // canvas click, the binding becomes this decoy and the test fails.
+    const decoy = { id: 999, type: "HijackDecoy", pos: [0, 0], size: [10, 10], title: "Hijack Decoy", widgets: [{ name: "decoy_widget", type: "string", options: {} }], inputs: [], outputs: [] };
+    app.graph.getNodeOnPos = () => decoy;
+    return { ok: true, hasWindowApp: !!window.app };
+  });
+}
+
+/** Open "Edit mapping" on the mapped Portrait Pro version (deep link → bindings). */
+async function openEditMappingWizard(page, beforeOpen) {
+  const pp = wfMock.getWorkflow("Portrait Pro");
+  const version = wfMock.getVersions(pp.workflow_id).slice().sort((a, b) => b.version_number - a.version_number)[0];
+  if (typeof beforeOpen === "function") await beforeOpen({ wf: pp, version });
+  await page.locator(`[data-testid="workflow-card"][data-workflow-id="${pp.workflow_id}"]`).click();
+  await expect(page.locator('[data-testid="workflow-detail"]')).toBeVisible({ timeout: 10000 });
+  await page.getByRole("button", { name: "Edit mapping" }).click();
+  const panel = page.locator(".comfymodal-studio-wizard-panel");
+  await expect(panel).toBeVisible({ timeout: 10000 });
+  // The detail-page Edit mapping action is a deep link into the bindings step.
+  await expect(panel.locator('[data-testid="wizard-required-bindings"]')).toBeVisible({ timeout: 10000 });
+  return { panel, version };
+}
+
+/** Put a fake node on the (stubbed) canvas as the current selection. */
+function selectStubCanvasNode(page, node) {
+  return page.evaluate((n) => {
+    const app = window.__comfymodal_comfy_app;
+    app.graph.nodes = [n];
+    app.graph._nodes_by_id = { [n.id]: n };
+    app.canvas.selected_nodes = { [n.id]: n };
+    return { id: n.id, type: n.type };
+  }, node);
+}
+
 /**
  * Stub the live canvas with one fake node and record centering calls.
  * The original getNodeById is preserved for every other id.
@@ -494,6 +571,61 @@ test.describe("Studio wizard QoL", () => {
 
       await panel.locator('[data-testid="wizard-dependencies-continue"]').click();
       await expect(panel.locator('[data-testid="wizard-required-bindings"]')).toBeVisible({ timeout: 10000 });
+
+      guard.assertNoErrors(APP_NOISE_PATTERNS);
+      api.assertNoUnhandledCalls();
+    } finally {
+      if (guard) guard.dispose();
+    }
+  });
+
+  // ── Edit mapping deep link: canvas shows the VERSION's graph ──────────
+  // Regression: the detail-page "Edit mapping" deep link opened the wizard
+  // against whatever graph the user had open, so "Use Selected Node" bound
+  // nodes from a foreign workflow. The wizard must load the version's graph
+  // onto the canvas, and restore the user's graph when it closes.
+  test("4. edit mapping loads the version graph onto the canvas and restores the user's graph on close", async ({ page }) => {
+    let guard;
+    try {
+      guard = installConsoleGuard(page);
+
+      // The canvas holds the USER's own graph before the wizard opens.
+      const stub = await stubCanvasAppWithUserGraph(page);
+      expect(stub.ok).toBe(true);
+      expect(await page.evaluate(() => window.__graphLoads.length)).toBe(0);
+
+      const { panel } = await openEditMappingWizard(page, async ({ version }) => {
+        await stubVersionGraph(page, version, EDIT_WIZARD_VERSION_GRAPH);
+      });
+
+      // The canvas now shows THIS workflow version's graph — capturing
+      // binds against the live canvas, so a foreign graph would store
+      // foreign node ids (the exact wrongness this pins).
+      await expect(panel.locator('[data-testid="wizard-canvas-loaded"]')).toBeVisible({ timeout: 10000 });
+      await expect.poll(() => page.evaluate(() => window.__graphLoads.length)).toBe(1);
+      const versionLoad = (await page.evaluate(() => window.__graphLoads))[0];
+      expect((versionLoad.nodes || []).map((n) => n.id)).toEqual([700, 701]);
+
+      // "Use Selected Node" binds the node the user ACTUALLY selected on
+      // the canvas (701), even though the click lands on the wizard panel:
+      // the canvas-capture listener used to intercept the button click and
+      // bind whatever node happened to sit under the wizard UI.
+      const seedRow = panel.locator('[data-testid="wizard-binding-row"][data-binding-key="seed"]');
+      await seedRow.click(); // enter capture mode
+      const useBtn = panel.getByRole("button", { name: "Use Selected Node" });
+      await expect(useBtn).toBeVisible();
+      const selected = await selectStubCanvasNode(page, EDIT_WIZARD_VERSION_GRAPH.nodes[1]);
+      expect(selected).toEqual({ id: 701, type: "PixaromaSeed" });
+      await useBtn.click();
+      await expect(seedRow.locator(".comfymodal-studio-wizard-binding-status span").first())
+        .toHaveText("Pixaroma Seed 701 \u2192 widget: seed");
+
+      // Closing the wizard restores the graph the user had open.
+      await panel.locator('[data-testid="wizard-back-to-studio"]').click();
+      await expect(page.locator(".comfymodal-studio-wizard-panel")).toHaveCount(0);
+      await expect.poll(() => page.evaluate(() => window.__graphLoads.length)).toBe(2);
+      const restoreLoad = (await page.evaluate(() => window.__graphLoads)).at(-1);
+      expect((restoreLoad.nodes || []).map((n) => n.id)).toEqual([900]);
 
       guard.assertNoErrors(APP_NOISE_PATTERNS);
       api.assertNoUnhandledCalls();

@@ -12,6 +12,12 @@
 //
 // Returns null when no image source exists on the run.
 
+// The canonical generation record / detail-asset projection is defined once
+// in the History V2 repository.  Importing it here keeps ONE producer of the
+// shared viewer contract instead of a second, drifting copy.  Pure data
+// module — no DOM access, no cycle back into this one.
+import { normalizeFeedItem, normalizeHistoryOutput, selectDetailAsset } from "./history-v2-repository.js";
+
 // ── Nullish-safe helpers ─────────────────────────────────────────────────
 //
 // These preserve zero/0.0/false values that truthiness checks would hide.
@@ -1014,6 +1020,15 @@ export function normalizeStudioRun(rawRun, apiBase) {
     id: id,
     kind: kind,
     experimentId: experimentId,
+    // Bridge to the durable record for this run: the backend stamps the
+    // run's generation id here at record time, because nothing else on the
+    // wire links a run id to the record History renders for it.
+    generationId: nilOrEmptyTo(
+      run.history_generation_id,
+      nilOrEmptyTo(run.historyGenerationId,
+        nilOrEmptyTo(run.generationId,
+          nilOrEmptyTo(extra.history_generation_id,
+            nilOrEmptyTo(extra.historyGenerationId, extra.generationId))))) || "",
     status: status,
     imageUrl: imageUrl,
     outputPath: outputPath,
@@ -1049,4 +1064,120 @@ export function normalizeStudioRun(rawRun, apiBase) {
     advancedTiming: advancedTimingDiagnostics,
     _timingQuality: advancedTimingDiagnostics.timingQuality,
   };
+}
+
+// ── Shared image-viewer record contract ──────────────────────────────────
+//
+// studio-ui.js buildSharedViewerOverlay() renders ONE record contract for
+// both surfaces that show a single output at full size: the History
+// generation detail and the Playground canvas preview.  These helpers are
+// the only producers of that contract, so neither surface can grow its own
+// idea of "what the viewer shows" again.  A caller resolves a record, then
+// resolves the viewer inputs and hands them to buildViewerShell().
+
+/**
+ * Resolve the inputs the shared image viewer renders, from a canonical record.
+ *
+ * The record is projected onto the viewer's neutral contract — the viewer
+ * knows nothing about where a record came from — including the displayed
+ * image variant, which follows the display policy: the preview derivative
+ * first, the full-quality original only when a real materialized image sits
+ * beside a capped thumbnail, and never an eager original-only fetch (that
+ * stays a truthful placeholder).  `fallbackImageUrl` covers a record that
+ * projects no variant at all: a run whose only image is the one the caller
+ * already resolved.
+ *
+ * @param {object} record canonical record from any surface's data source
+ * @param {string} [fallbackImageUrl] caller-known URL when no variant projects
+ * @returns {{record: object, output: object, imageUrl: string, timing: object}}
+ */
+export function resolveViewerInput(record, fallbackImageUrl) {
+  const rec = record || {};
+  const feat = rec.featuredOutput && typeof rec.featuredOutput === "object" ? rec.featuredOutput : {};
+  const output = selectDetailAsset(Object.assign({}, feat, {
+    originalAvailable: !!(feat.originalAvailable || rec.originalAvailable),
+  }));
+  const fallback = fallbackImageUrl != null && fallbackImageUrl !== "" ? String(fallbackImageUrl) : "";
+  return {
+    record: Object.assign({}, rec, {
+      controls: rec.controls,
+      fullRenderFailed: !!(feat.originalFailed || rec.originalFailed),
+    }),
+    output: output,
+    imageUrl: output.url || fallback,
+    timing: rec.timing && typeof rec.timing === "object" ? rec.timing : {},
+  };
+}
+
+/**
+ * The durable record id for a legacy run-history id.
+ *
+ * The durable backend keys every ordinary generation off the internal run id
+ * it generated at record time ("gen_" + sha256("v2gen:" + run_id)[:12]).
+ * That internal id is NOT the id the run response hands the frontend — but
+ * the legacy run-history entry carries both, so a run the backend never
+ * bridged explicitly can still resolve to the exact record History renders.
+ * Returns null for experiment cells (different derivation), for missing
+ * crypto, or on any failure — callers fall through to the next resolution.
+ *
+ * @param {string} legacyRunId the internal run id from a legacy history entry
+ * @param {string} [kind] the entry kind; experiment cells are skipped
+ * @returns {Promise<string|null>}
+ */
+export async function generationIdForLegacyRunId(legacyRunId, kind) {
+  if (!legacyRunId || kind === "experiment_cell") return null;
+  try {
+    const subtle = globalThis.crypto && globalThis.crypto.subtle;
+    if (!subtle) return null;
+    const bytes = new TextEncoder().encode("v2gen:" + String(legacyRunId));
+    const digest = await subtle.digest("SHA-256", bytes);
+    const hex = Array.from(new Uint8Array(digest))
+      .map(function (byte) { return byte.toString(16).padStart(2, "0"); })
+      .join("");
+    return "gen_" + hex.slice(0, 12);
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Build the viewer's record from a normalized Studio run — the path for a run
+ * whose record the durable backend has no projection of.  Identity, status,
+ * timestamps, prompt, and annotations come from the SAME canonical mapping the
+ * durable feed projects, so status text, workflow label, and dates read
+ * identically on every surface; the run contributes its controls, timings,
+ * annotations, and output image.
+ *
+ * @param {object} run normalized run (or a canonical record — passed through)
+ * @param {string} [imageUrl] the run's resolved output image URL
+ * @returns {object|null} viewer record, or null without a run
+ */
+export function buildViewerRecordFromRun(run, imageUrl) {
+  if (!run) return null;
+  // Already a canonical record: keep its projected assets, and only fill in a
+  // caller-known image when the record projects no variant at all.
+  if (run.featuredOutput && typeof run.featuredOutput === "object") {
+    const feat = run.featuredOutput;
+    const empty = !feat.previewUrl && !feat.thumbUrl && !feat.originalUrl;
+    if (!(empty && imageUrl)) return run;
+    return Object.assign({}, run, {
+      featuredOutput: normalizeHistoryOutput({ preview_url: imageUrl }, 0),
+    });
+  }
+  const raw = run.raw && typeof run.raw === "object" ? run.raw : run;
+  const canonical = normalizeFeedItem(raw);
+  const timing = Object.assign({}, canonical.timing || {}, run.timings || {}, run.rawTiming || {});
+  if (timing.timingStages == null && Array.isArray(run.timingStages) && run.timingStages.length > 0) {
+    timing.timingStages = run.timingStages;
+  }
+  return Object.assign({}, canonical, {
+    runId: nilOrEmptyTo(run.id, nilOrEmptyTo(run.runId, canonical.runId)),
+    controls: nilOrEmptyTo(run.requestedControls, nilOrEmptyTo(run.resolvedControls, canonical.params)),
+    fullRenderFailed: false,
+    timing: timing,
+    // The run carries exactly one output image; project it as the preview
+    // variant so image selection behaves exactly as it does for a durable
+    // record (Preview first — no thumbnail/original guesswork).
+    featuredOutput: normalizeHistoryOutput({ preview_url: imageUrl || "" }, 0),
+  });
 }

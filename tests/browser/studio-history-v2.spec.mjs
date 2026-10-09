@@ -280,7 +280,7 @@ test.describe("History V2", () => {
       await expect(paramsSection.locator(".comfymodal-studio-history-v2-param", { hasText: "Steps" })).toContainText("28");
 
       // Fixture records carry timing → timing rows, not the diagnostics placeholder.
-      await expect(dialog.locator('[data-testid="history-v2-timing-placeholder"]')).toHaveCount(0);
+      await expect(dialog.locator('[data-testid="viewer-timing-placeholder"]')).toHaveCount(0);
       await expect(dialog.locator(".comfymodal-studio-history-v2-section", { hasText: "Timing" })).toBeVisible();
       await expect(dialog.locator(".comfymodal-studio-history-v2-row-key", { hasText: "End-to-End Total" })).toBeVisible();
 
@@ -393,7 +393,7 @@ test.describe("History V2", () => {
       await notes.fill("e2e test note");
       await dialog.getByRole("button", { name: "Save note" }).click();
       await expect(
-        dialog.getByTestId("history-v2-note-status", { hasText: "Saved" })
+        dialog.getByTestId("viewer-note-status", { hasText: "Saved" })
       ).toBeVisible({ timeout: 10000 });
 
       // Close and reopen — the fixture repository persists in memory, so the

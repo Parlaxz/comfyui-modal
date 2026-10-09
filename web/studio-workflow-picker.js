@@ -5,10 +5,10 @@
 // (select-many). Folder/search list behavior lives ONLY here — callers
 // supply their own mode-specific actions, never a second picker UI.
 //
-// The picker fetches the workflow list ONCE (unfiltered) and narrows it
-// locally on every keystroke/selection. This keeps the dialog on the exact
-// list URL the library already uses — no per-keystroke query-string list
-// requests — so search/folder narrowing behaves identically against the
+// The picker uses the shared short-lived workflow list cache (unfiltered) and
+// narrows it locally on every keystroke/selection. This keeps the dialog on
+// the exact list URL the library already uses — no per-keystroke query-string
+// list requests — so search/folder narrowing behaves identically against the
 // real backend and test doubles.
 //
 // Role display names come from the verified bindable-input catalog
@@ -33,6 +33,41 @@
 import { el } from "./studio-ui.js";
 import { listWorkflows, listWorkflowFolders } from "./studio-backend-api.js";
 import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
+
+// Empty-list requests are shared by the library, picker, and run flow.  Keep
+// the cache deliberately short-lived: it removes duplicate navigation fetches
+// without turning the browser into a second inventory authority.
+const WORKFLOW_LIST_CACHE_TTL_MS = 20_000;
+const _workflowListCache = new Map();
+const _workflowListInFlight = new Map();
+
+export function listCachedWorkflows(apiBase) {
+  const key = apiBase || "/comfymodal";
+  const now = Date.now();
+  const cached = _workflowListCache.get(key);
+  if (cached && now - cached.at < WORKFLOW_LIST_CACHE_TTL_MS) {
+    return Promise.resolve(cached.response);
+  }
+
+  const pending = _workflowListInFlight.get(key);
+  if (pending) return pending;
+
+  const request = listWorkflows(key, {}).then((response) => {
+    if (response && response.status !== "error") {
+      _workflowListCache.set(key, { at: Date.now(), response });
+    }
+    return response;
+  }).finally(() => {
+    if (_workflowListInFlight.get(key) === request) _workflowListInFlight.delete(key);
+  });
+  _workflowListInFlight.set(key, request);
+  return request;
+}
+
+export function invalidateCachedWorkflows(apiBase) {
+  const key = apiBase || "/comfymodal";
+  _workflowListCache.delete(key);
+}
 
 // Catalog-owned role name. Unknown keys fall back to the raw key — never a
 // second hardcoded name table.
@@ -221,7 +256,7 @@ export function renderWorkflowPicker(options) {
       "data-testid": "workflow-picker-loading",
       text: "Loading workflows\u2026",
     }));
-    const resp = await listWorkflows(apiBase, {});
+    const resp = await listCachedWorkflows(apiBase);
     if (token !== requestToken) return;
     allWorkflows = _unwrapList(resp, "workflows");
     applyFilter();

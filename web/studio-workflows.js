@@ -44,7 +44,6 @@ import {
   listWorkflowTags,
   getWorkflowRunContext,
   listWorkflowVersions,
-  captureWorkflowVersion,
   getWorkflowVersion,
   getVersionState,
   getMapping,
@@ -62,8 +61,13 @@ import {
   getManagerModels,
   listManagerInstalled,
 } from "./studio-backend-api.js";
+import * as studioBackendApi from "./studio-backend-api.js";
 import { subscribeStudioSync } from "./studio-sync.js";
-import { renderWorkflowPicker } from "./studio-workflow-picker.js";
+import {
+  invalidateCachedWorkflows,
+  listCachedWorkflows,
+  renderWorkflowPicker,
+} from "./studio-workflow-picker.js";
 
 // ── Module-level view state ────────────────────────────────────────────────
 // Persists across shell re-renders so navigating away and back preserves
@@ -77,7 +81,6 @@ const _view = {
 
   detailEditing: false,
   revisionConfirm: false,          // mapping immutability confirmation open
-  capturingVersion: false,
   importMode: "",                  // "" | "graph" | "manual" (dialog section)
   selectionMode: false,
   selectedWorkflowIds: new Set(),
@@ -163,13 +166,49 @@ const _view = {
   },
 };
 
+const WORKFLOW_VIEW_STATE_KEY = "comfymodal.studio.workflow-view.v1";
+let _workflowViewRestored = false;
+
+function _restoreWorkflowViewState() {
+  if (_workflowViewRestored) return;
+  _workflowViewRestored = true;
+  try {
+    if (typeof sessionStorage === "undefined") return;
+    const saved = JSON.parse(sessionStorage.getItem(WORKFLOW_VIEW_STATE_KEY) || "null");
+    if (!saved || !["library", "detail", "models"].includes(saved.mode)) return;
+    _view.mode = saved.mode;
+    _view.selectedWorkflowId = typeof saved.workflowId === "string" ? saved.workflowId : "";
+    _view.selectedVersionId = typeof saved.versionId === "string" ? saved.versionId : "";
+    _view.editorMode = saved.editorMode === "mapping" ? "mapping" : "";
+    if (_view.mode === "detail" && !_view.selectedWorkflowId) _view.mode = "library";
+  } catch (_err) {}
+}
+
+function _persistWorkflowViewState() {
+  try {
+    if (typeof sessionStorage === "undefined") return;
+    sessionStorage.setItem(WORKFLOW_VIEW_STATE_KEY, JSON.stringify({
+      mode: _view.mode,
+      workflowId: _view.selectedWorkflowId || "",
+      versionId: _view.selectedVersionId || "",
+      editorMode: _view.editorMode || "",
+    }));
+  } catch (_err) {}
+}
+
 let _currentToken = 0;
 let _searchTimer = null;
 let _importEscHandler = null;
+let _activeInventoryPollerCleanup = null;
 // One setup-wizard resume per page load: a real reload may mount Workflows
 // more than once, but reopening the wizard on every re-mount would hijack the
 // user's navigation.
 let _wizardResumeAttempted = false;
+
+const REMOTE_INVENTORY_REFRESH_KEY = "comfymodal_remote_inventory_refresh_interval_s";
+const REMOTE_INVENTORY_REFRESH_DEFAULT_SECONDS = 300;
+const REMOTE_INVENTORY_REFRESH_ALLOWED_SECONDS = new Set([0, 60, 300, 900, 1800]);
+const LIBRARY_PAGE_SIZE = 50;
 
 /**
  * True when this document load came from a real browser reload/back-forward
@@ -422,6 +461,8 @@ function _showStatus(statusEl, text, isError) {
 // ── Main render entry point ───────────────────────────────────────────────
 
 export function renderWorkflows(state, context) {
+  _restoreWorkflowViewState();
+  if (_activeInventoryPollerCleanup) _activeInventoryPollerCleanup();
   const apiBase = (context && context.apiBase) || "/comfymodal";
   const setPage = (context && context.setPage) || function () {};
   const token = ++_currentToken;
@@ -436,12 +477,121 @@ export function renderWorkflows(state, context) {
 
   // Mount-local rendering refs
   let gridEl = null;
+  let libraryObserver = null;
+  let libraryFiltered = [];
+  let libraryRenderedCount = 0;
+  let libraryRenderLimit = LIBRARY_PAGE_SIZE;
+  let libraryReloadTimer = null;
+  let libraryLoadInFlight = null;
   let mappingControls = {};
 
+  let inventoryPollTimer = null;
+  let inventoryPollInFlight = false;
+  let inventoryPollCleaned = false;
 
-  const expandedVersions = new Set();
+  function remoteInventoryRefreshSeconds() {
+    let raw = null;
+    try { raw = localStorage.getItem(REMOTE_INVENTORY_REFRESH_KEY); } catch (_) {}
+    const seconds = Number(raw);
+    return REMOTE_INVENTORY_REFRESH_ALLOWED_SECONDS.has(seconds)
+      ? seconds : REMOTE_INVENTORY_REFRESH_DEFAULT_SECONDS;
+  }
+
+  function studioModalVisible() {
+    const overlay = root.closest(".comfymodal-testing-overlay");
+    if (!overlay || !overlay.isConnected) return false;
+    if (overlay.hidden || overlay.getAttribute("aria-hidden") === "true") return false;
+    try {
+      const style = getComputedStyle(overlay);
+      return style.display !== "none" && style.visibility !== "hidden";
+    } catch (_) {
+      return true;
+    }
+  }
+
+  function inventoryPollEligible() {
+    return root.isConnected
+      && studioModalVisible()
+      && document.visibilityState === "visible"
+      && document.hasFocus();
+  }
+
+  function stopInventoryPollTimer() {
+    if (inventoryPollTimer !== null) {
+      clearTimeout(inventoryPollTimer);
+      inventoryPollTimer = null;
+    }
+  }
+
+  function cleanupInventoryPoller() {
+    if (inventoryPollCleaned) return;
+    inventoryPollCleaned = true;
+    stopInventoryPollTimer();
+    document.removeEventListener("visibilitychange", reconcileInventoryPoller);
+    window.removeEventListener("focus", reconcileInventoryPoller);
+    window.removeEventListener("blur", reconcileInventoryPoller);
+    if (_activeInventoryPollerCleanup === cleanupInventoryPoller) _activeInventoryPollerCleanup = null;
+  }
+
+  async function runInventoryPoll() {
+    inventoryPollTimer = null;
+    if (!inventoryPollEligible()) {
+      if (!root.isConnected) cleanupInventoryPoller();
+      return;
+    }
+    if (remoteInventoryRefreshSeconds() === 0 || inventoryPollInFlight) {
+      reconcileInventoryPoller();
+      return;
+    }
+    inventoryPollInFlight = true;
+    try {
+      if (typeof studioBackendApi.refreshRemoteInventory === "function") {
+        const refreshed = await studioBackendApi.refreshRemoteInventory(apiBase);
+        if (refreshed && refreshed.status !== "error" && !stale() && root.isConnected) {
+          // The refresh route only updates the server-side snapshot. Reuse the
+          // existing sync reload so visible workflow/dependency labels read it.
+          refreshFromSync();
+        }
+      }
+    } finally {
+      inventoryPollInFlight = false;
+      reconcileInventoryPoller();
+    }
+  }
+
+  function reconcileInventoryPoller() {
+    if (inventoryPollCleaned) return;
+    if (!root.isConnected) {
+      cleanupInventoryPoller();
+      return;
+    }
+    const seconds = remoteInventoryRefreshSeconds();
+    if (!inventoryPollEligible() || seconds === 0) {
+      stopInventoryPollTimer();
+      return;
+    }
+    if (inventoryPollTimer === null && !inventoryPollInFlight) {
+      inventoryPollTimer = setTimeout(runInventoryPoll, seconds * 1000);
+    }
+  }
+
+  document.addEventListener("visibilitychange", reconcileInventoryPoller);
+  window.addEventListener("focus", reconcileInventoryPoller);
+  window.addEventListener("blur", reconcileInventoryPoller);
+  _activeInventoryPollerCleanup = cleanupInventoryPoller;
+
 
   function stale() { return token !== _currentToken; }
+
+  // The shell removes this root on navigation/modal close. The poller's
+  // connectivity check then owns its listener/timer cleanup without touching
+  // workflow rendering or selection state.
+  // renderWorkflows returns a detached root; the shell mounts it immediately
+  // after this function returns. Start only after that mount so eligibility
+  // checks can succeed on the first reconciliation.
+  queueMicrotask(() => {
+    if (!inventoryPollCleaned) reconcileInventoryPoller();
+  });
 
   function refreshFromSync() {
     if (!root.isConnected) {
@@ -451,6 +601,7 @@ export function renderWorkflows(state, context) {
     }
     workflowsStale = true;
     root.dataset.syncStale = "true";
+    invalidateCachedWorkflows(apiBase);
     if (_view.mode === "detail") {
       loadDetailData().finally(function () {
         workflowsStale = false;
@@ -463,16 +614,21 @@ export function renderWorkflows(state, context) {
       workflowsStale = false;
       root.dataset.syncStale = "false";
     } else {
-      loadLibrary().finally(function () {
-        workflowsStale = false;
-        root.dataset.syncStale = "false";
-      });
+      if (libraryReloadTimer !== null) clearTimeout(libraryReloadTimer);
+      libraryReloadTimer = setTimeout(function () {
+        libraryReloadTimer = null;
+        loadLibrary().finally(function () {
+          workflowsStale = false;
+          root.dataset.syncStale = "false";
+        });
+      }, 500);
     }
   }
 
   unsubscribeWorkflowsSync = subscribeStudioSync("workflows", refreshFromSync);
 
   function render() {
+    _persistWorkflowViewState();
     while (root.firstChild) root.removeChild(root.firstChild);
     if (_view.mode === "detail") {
       root.appendChild(renderDetailView());
@@ -524,7 +680,7 @@ export function renderWorkflows(state, context) {
   // Already-mapped versions keep the legacy "Edit mapping" revision path
   // untouched. A missing version context falls back to the detail page.
 
-  function openVersionSetupWizard(wfId, versionId, notice) {
+  function openVersionSetupWizard(wfId, versionId, notice, initialStep) {
     import("./studio-workflow-setup-wizard.js").then(({ openWorkflowSetupWizard }) => {
       if (stale()) return;
       if (!wfId || !versionId) {
@@ -533,7 +689,11 @@ export function renderWorkflows(state, context) {
       }
       openWorkflowSetupWizard(() => {
         openWorkflowDetail(wfId, versionId, notice);
-      }, apiBase, { workflowId: wfId, workflowVersionId: versionId });
+      }, apiBase, {
+        workflowId: wfId,
+        workflowVersionId: versionId,
+        initialStep: initialStep || "features",
+      });
     }).catch(() => {
       openWorkflowDetail(wfId, versionId, notice);
     });
@@ -603,14 +763,67 @@ export function renderWorkflows(state, context) {
     });
   }
 
-  function refreshGrid() {
+  function disconnectLibraryObserver() {
+    if (libraryObserver) libraryObserver.disconnect();
+    libraryObserver = null;
+  }
+
+  function appendLibraryWindow() {
+    if (!gridEl || !libraryFiltered.length) return;
+    disconnectLibraryObserver();
+    const sentinel = gridEl.querySelector('[data-testid="workflow-grid-sentinel"]');
+    if (sentinel) sentinel.remove();
+
+    const end = Math.min(libraryRenderLimit, libraryFiltered.length);
+    while (libraryRenderedCount < end) {
+      gridEl.appendChild(renderWorkflowCard(libraryFiltered[libraryRenderedCount]));
+      libraryRenderedCount += 1;
+    }
+    if (libraryRenderedCount >= libraryFiltered.length) return;
+
+    const nextPage = () => {
+      libraryRenderLimit += LIBRARY_PAGE_SIZE;
+      appendLibraryWindow();
+    };
+    const loadMore = el("div", {
+      "data-testid": "workflow-grid-sentinel",
+      "aria-hidden": "true",
+      style: "height:1px;",
+    });
+    gridEl.appendChild(loadMore);
+    if (typeof IntersectionObserver === "function") {
+      libraryObserver = new IntersectionObserver((entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) nextPage();
+      });
+      libraryObserver.observe(loadMore);
+    } else {
+      // Older browsers still get incremental rendering without making the
+      // initial grid pay the full DOM construction cost.
+      loadMore.removeAttribute("aria-hidden");
+      loadMore.style.height = "auto";
+      loadMore.appendChild(el("button", {
+        type: "button",
+        class: "comfymodal-secondary-btn",
+        text: "Show more",
+        onclick: nextPage,
+      }));
+    }
+  }
+
+  function renderLibraryCards(filtered, reset) {
     if (!gridEl) { render(); return; }
-    while (gridEl.firstChild) gridEl.removeChild(gridEl.firstChild);
-    const wfs = _view.data.workflows;
-    if (!Array.isArray(wfs)) return;
-    const filtered = applyFilters(wfs);
-    if (filtered.length === 0) gridEl.appendChild(renderLibraryEmpty(wfs.length === 0));
-    else filtered.forEach((w) => gridEl.appendChild(renderWorkflowCard(w)));
+    if (reset) {
+      disconnectLibraryObserver();
+      while (gridEl.firstChild) gridEl.removeChild(gridEl.firstChild);
+      libraryFiltered = filtered;
+      libraryRenderedCount = 0;
+      libraryRenderLimit = LIBRARY_PAGE_SIZE;
+    }
+    if (libraryFiltered.length === 0) {
+      gridEl.appendChild(renderLibraryEmpty((_view.data.workflows || []).length === 0));
+      return;
+    }
+    appendLibraryWindow();
   }
 
   function renderLibraryEmpty(noWorkflowsAtAll) {
@@ -846,7 +1059,7 @@ export function renderWorkflows(state, context) {
       ? { text: "Could not delete " + failed.length + " workflow" + (failed.length === 1 ? "" : "s") + ".", error: true }
       : { text: "Workflows deleted", error: false };
     clearDeleteConfirmation();
-    await loadLibrary();
+    await loadLibrary(true);
   }
 
   async function bulkFavoriteWorkflows() {
@@ -911,7 +1124,7 @@ export function renderWorkflows(state, context) {
       ids.forEach((id) => _view.selectedWorkflowIds.delete(id));
       _view.folderMove = { open: false, workflowId: "", workflowIds: [], busy: false, error: "" };
       _maybeRemoveDialogEscHandler();
-      await loadLibrary();
+       await loadLibrary(true);
     } catch (err) {
       if (stale()) return;
       _view.folderMove.busy = false;
@@ -1113,7 +1326,7 @@ export function renderWorkflows(state, context) {
       type: "button",
       class: "comfymodal-studio-workflows-folder-item" + (!_view.filters.folder ? " active" : ""),
       text: "All folders",
-      onclick: () => { _view.filters.folder = ""; render(); },
+       onclick: () => { _view.filters.folder = ""; loadLibrary(); },
     }));
     appendFolderNodes(container, tree.children, 0);
     return container;
@@ -1150,7 +1363,7 @@ export function renderWorkflows(state, context) {
       }
       _view.folderCreate = { open: false, path: "", busy: false, error: "" };
       _maybeRemoveDialogEscHandler();
-      await loadLibrary();
+       await loadLibrary(true);
     } catch (err) {
       if (stale()) return;
       _view.folderCreate.busy = false;
@@ -1198,7 +1411,7 @@ export function renderWorkflows(state, context) {
         class: "comfymodal-studio-workflows-folder-item" + (_view.filters.folder === path ? " active" : ""),
         text: name,
         style: "padding-left:" + (8 + depth * 14) + "px;",
-        onclick: () => { _view.filters.folder = _view.filters.folder === path ? "" : path; render(); },
+         onclick: () => { _view.filters.folder = _view.filters.folder === path ? "" : path; loadLibrary(); },
       }));
       appendFolderNodes(container, node.children, depth + 1);
     });
@@ -1284,7 +1497,7 @@ export function renderWorkflows(state, context) {
         if (_searchTimer) clearTimeout(_searchTimer);
         _searchTimer = setTimeout(() => {
           _view.filters.query = value;
-          refreshGrid();
+          loadLibrary();
         }, 250);
       },
     });
@@ -1293,7 +1506,7 @@ export function renderWorkflows(state, context) {
       class: "comfymodal-studio-workflows-select",
       "data-testid": "workflows-tag-filter",
       "aria-label": "Filter by tag",
-      onchange: (e) => { _view.filters.tag = e.currentTarget.value; render(); },
+      onchange: (e) => { _view.filters.tag = e.currentTarget.value; loadLibrary(); },
     }, [
       el("option", { value: "", text: "All tags" }),
     ]);
@@ -1309,7 +1522,7 @@ export function renderWorkflows(state, context) {
       onclick: () => {
         _view.filters.favoritesOnly = !_view.filters.favoritesOnly;
         favToggle.setAttribute("aria-pressed", _view.filters.favoritesOnly ? "true" : "false");
-        refreshGrid();
+        loadLibrary();
       },
     });
 
@@ -1340,10 +1553,8 @@ export function renderWorkflows(state, context) {
         el("p", { text: _view.data.loadError, style: "color:#f87171;" }),
         el("button", { class: "comfymodal-secondary-btn", text: "Retry", onclick: () => loadLibrary() }),
       ]));
-    } else if (filtered.length === 0) {
-      gridEl.appendChild(renderLibraryEmpty(wfs.length === 0));
     } else {
-      filtered.forEach((w) => gridEl.appendChild(renderWorkflowCard(w)));
+      renderLibraryCards(filtered, true);
     }
 
     viewEl.appendChild(el("div", { class: "comfymodal-studio-workflows-body" }, [sidebar, gridEl]));
@@ -1357,29 +1568,44 @@ export function renderWorkflows(state, context) {
     return viewEl;
   }
 
-  async function loadLibrary() {
-    render();
-    const [wfResp, tagResp, folderResp] = await Promise.all([
-      listWorkflows(apiBase, {}),
-      listWorkflowTags(apiBase),
-      listWorkflowFolders(apiBase),
-    ]);
-    if (stale()) return;
-    const wfs = _unwrap(wfResp, "workflows");
-    if (Array.isArray(wfs)) {
-      _view.data.workflows = wfs;
-      _view.data.loadError = null;
-    } else {
-      _view.data.loadError = "Could not load workflows from the server.";
-    }
-    const tags = _unwrap(tagResp, "tags");
-    const tagSet = new Set(Array.isArray(tags) ? tags : []);
-    if (Array.isArray(wfs)) wfs.forEach((w) => (w.tags || []).forEach((t) => tagSet.add(t)));
-    _view.data.tags = Array.from(tagSet).sort();
-    const folderPaths = [];
-    _collectFolderPaths(_unwrap(folderResp, "folders"), "", folderPaths);
-    _view.data.folders = Array.from(new Set(folderPaths)).sort();
-    render();
+  async function loadLibrary(forceRefresh) {
+    if (libraryLoadInFlight) return libraryLoadInFlight;
+    if (forceRefresh) invalidateCachedWorkflows(apiBase);
+    libraryLoadInFlight = (async function () {
+      render();
+      const filters = _view.filters;
+      const query = {
+        search: (filters.query || "").trim(),
+        tag: filters.tag || "",
+        folder: filters.folder || "",
+        favorite: filters.favoritesOnly,
+      };
+      const hasServerFilters = !!(query.search || query.tag || query.folder || query.favorite);
+      const [wfResp, tagResp, folderResp] = await Promise.all([
+        hasServerFilters ? listWorkflows(apiBase, query) : listCachedWorkflows(apiBase),
+        listWorkflowTags(apiBase),
+        listWorkflowFolders(apiBase),
+      ]);
+      if (stale()) return;
+      const wfs = _unwrap(wfResp, "workflows");
+      if (Array.isArray(wfs)) {
+        _view.data.workflows = wfs;
+        _view.data.loadError = null;
+      } else {
+        _view.data.loadError = "Could not load workflows from the server.";
+      }
+      const tags = _unwrap(tagResp, "tags");
+      const tagSet = new Set(Array.isArray(tags) ? tags : []);
+      if (Array.isArray(wfs)) wfs.forEach((w) => (w.tags || []).forEach((t) => tagSet.add(t)));
+      _view.data.tags = Array.from(tagSet).sort();
+      const folderPaths = [];
+      _collectFolderPaths(_unwrap(folderResp, "folders"), "", folderPaths);
+      _view.data.folders = Array.from(new Set(folderPaths)).sort();
+      render();
+    })().finally(function () {
+      libraryLoadInFlight = null;
+    });
+    return libraryLoadInFlight;
   }
 
   // ── Import dialog ───────────────────────────────────────────────────────
@@ -2181,45 +2407,6 @@ export function renderWorkflows(state, context) {
     void versionId;
   }
 
-  async function captureNewVersion() {
-    if (_view.capturingVersion) return;
-    _view.capturingVersion = true;
-    render();
-    const { captureCurrentComfyGraph } = await import("./studio-backend-capture.js");
-    const capture = await captureCurrentComfyGraph();
-    if (stale()) return;
-    if (!capture || !capture.ok) {
-      _view.capturingVersion = false;
-      _view.data.notice = { text: (capture && capture.reason) || "Could not capture the current ComfyUI graph.", error: true };
-      render();
-      return;
-    }
-    const result = await captureWorkflowVersion(apiBase, _view.selectedWorkflowId, {
-      graph_json: capture.graphJson,
-      api_prompt_json: capture.apiPromptJson,
-    });
-    if (stale()) return;
-    _view.capturingVersion = false;
-    if (!result || result.status === "error") {
-      _view.data.notice = { text: "Could not capture a new version: " + _errorText(result), error: true };
-      render();
-      return;
-    }
-    const newVerId = (result.version && result.version.workflow_version_id)
-      || result.workflow_version_id
-      || result.version_id
-      || "";
-    _view.data.notice = { text: "Version captured", error: false };
-    const verResp = await listWorkflowVersions(apiBase, _view.selectedWorkflowId);
-    if (stale()) return;
-    const versions = _unwrap(verResp, "versions");
-    _view.data.versions = Array.isArray(versions) ? versions : [];
-    if (newVerId) _view.selectedVersionId = newVerId;
-    else if (_view.data.versions.length) _view.selectedVersionId = _view.data.versions[_view.data.versions.length - 1].workflow_version_id;
-    render();
-    await loadVersionData();
-  }
-
   // ── Detail view ─────────────────────────────────────────────────────────
 
   function renderNotice() {
@@ -2267,10 +2454,9 @@ export function renderWorkflows(state, context) {
     if (_view.data.notice) wrap.appendChild(renderNotice());
     wrap.appendChild(renderDetailHeader(wf));
     wrap.appendChild(renderRunBar(version, mapping));
-    wrap.appendChild(renderVersionsSection(wf));
+    wrap.appendChild(renderMappingSection(wf, version));
     if (version) wrap.appendChild(renderDependenciesSection(version));
     if (version) wrap.appendChild(renderPortabilitySection(version));
-    wrap.appendChild(renderMappingSection(wf, version));
     return wrap;
   }
 
@@ -2506,76 +2692,6 @@ export function renderWorkflows(state, context) {
     if (win && top) win.scrollTo(0, top);
   }
 
-  function renderVersionsSection(wf) {
-    const versions = _view.data.versions || [];
-    const section = el("div", { class: "comfymodal-studio-section" });
-    // A workflow has one version, so there is nothing to choose between. The
-    // current version is still shown (number, state, reasons) so an incomplete
-    // capture is as diagnosable as it was when it was one row in a list.
-    section.appendChild(el("div", { class: "comfymodal-studio-section-head" }, [
-      el("h3", { class: "comfymodal-studio-section-title", text: "Version" }),
-      el("button", {
-        class: "comfymodal-secondary-btn",
-        "data-testid": "version-capture-button",
-        text: _view.capturingVersion ? "Capturing\u2026" : "Capture new version",
-        disabled: !!_view.capturingVersion,
-        onclick: captureNewVersion,
-      }),
-    ]));
-
-    const list = el("div", { class: "comfymodal-studio-version-list", "data-testid": "version-list" });
-    if (versions.length === 0) {
-      list.appendChild(el("p", { class: "comfymodal-studio-dependencies-note", text: "No versions yet. Capture the current ComfyUI graph to create the first version." }));
-    } else {
-      const latest = versions.find((v) => v.workflow_version_id === _view.selectedVersionId)
-        || versions[versions.length - 1];
-      list.appendChild(renderVersionItem(latest, true));
-    }
-    section.appendChild(list);
-    return section;
-  }
-
-  function renderVersionItem(v, single) {
-    const active = single === true || v.workflow_version_id === _view.selectedVersionId;
-    const state = v.state || null;
-    const incomplete = state && state.status === "incomplete";
-    const reasons = incomplete && Array.isArray(state.reasons) ? state.reasons : [];
-    const expanded = expandedVersions.has(v.workflow_version_id);
-
-    const main = el("div", { class: "comfymodal-studio-version-item-main" }, [
-      _stateBadge(state, "version-item-state"),
-      el("span", { class: "comfymodal-studio-version-sub", text: _shortDate(v.created_at) }),
-      v.graph_hash ? el("span", { class: "comfymodal-studio-version-sub", text: _shortHash(v.graph_hash) }) : null,
-      el("span", { class: "comfymodal-studio-version-sub", text: v.mapping_id ? "Mapped" : "Not mapped" }),
-    ]);
-    if (incomplete) {
-      main.appendChild(el("button", {
-        type: "button",
-        class: "comfymodal-studio-version-reasons-toggle",
-        text: expanded ? "Hide reasons" : "Show reasons",
-        onclick: (e) => {
-          e.stopPropagation();
-          if (expanded) expandedVersions.delete(v.workflow_version_id);
-          else expandedVersions.add(v.workflow_version_id);
-          render();
-        },
-      }));
-    }
-
-    const item = el("div", {
-      class: "comfymodal-studio-version-item" + (active ? " active" : ""),
-      "data-testid": "version-item",
-      "data-version-id": v.workflow_version_id,
-    }, [main]);
-
-    if (expanded) {
-      item.appendChild(el("div", { class: "comfymodal-studio-version-reasons" }, [
-        _reasonList(reasons),
-      ]));
-    }
-    return item;
-  }
-
   /** Keys the user explicitly marked unnecessary, so a toggle can replace the
    *  whole set without needing a second fetch of the stored overrides. */
   function _nonessentialKeys(deps) {
@@ -2595,6 +2711,7 @@ export function renderWorkflows(state, context) {
     const mgr = _view.data.manager;
     return renderDependencySection(version, _view.data.dependencies, refreshDependencies, {
       apiBase,
+      useAdvancedAccordions: true,
       workflowId: String((version && version.workflow_id) || _view.data.workflowId || ""),
       nonessentialKeys: _nonessentialKeys(_view.data.dependencies),
       onNonessentialChanged: (keys) => {
@@ -2981,7 +3098,7 @@ export function renderWorkflows(state, context) {
         el("button", {
           class: "comfymodal-secondary-btn",
           text: "Edit mapping",
-          onclick: () => { _view.editorMode = "mapping"; render(); ensureMappingEditorData(); },
+           onclick: () => openVersionSetupWizard(_view.selectedWorkflowId, _view.selectedVersionId, null, "bindings"),
         }),
       ]));
     } else {

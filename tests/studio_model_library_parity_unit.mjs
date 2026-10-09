@@ -1246,6 +1246,17 @@ async function mountLibrary(router) {
     librarySource.indexOf("performManagerInstall(installPlan)") !== -1,
     "shared row performs the resolved plan on explicit click"
   );
+  // A settled install offers reboot beside the row note, click-only: the
+  // helper is referenced only from the reboot control's own click handler,
+  // never on render and never from the workflow-detail host module.
+  assert.ok(
+    librarySource.indexOf("dependency-node-reboot") !== -1,
+    "shared row exposes a click-gated reboot control"
+  );
+  assert.ok(
+    librarySource.indexOf("managerRebootAndWait({") !== -1,
+    "reboot waits for reconnect through the shared probe helper"
+  );
   section("16. Workflow-detail Manager context is lazy, reused, and click-only");
 }
 

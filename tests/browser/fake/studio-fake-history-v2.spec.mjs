@@ -61,8 +61,8 @@ test.describe("Studio History V2 (fake backend, real adapter)", () => {
 
       // Attempt history (1 attempt) + note/favorite controls present.
       await expect(overlay.locator(".comfymodal-studio-history-v2-attempt")).toHaveCount(1);
-      await expect(overlay.locator("textarea.comfymodal-studio-history-v2-notes")).toBeVisible();
-      await expect(overlay.locator(".comfymodal-studio-history-v2-fav")).toBeVisible();
+      await expect(overlay.locator("textarea.comfymodal-studio-viewer-note")).toBeVisible();
+      await expect(overlay.locator(".comfymodal-studio-viewer-favorite")).toBeVisible();
 
       // Featured image is a served PNG that actually loads.
       const featured = overlay.locator(".comfymodal-studio-history-v2-featured-img");

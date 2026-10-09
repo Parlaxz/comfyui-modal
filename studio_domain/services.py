@@ -19,13 +19,15 @@ import copy
 from typing import Any, Callable, Optional
 
 from .graph import (
+    INPUT_BINDING_KINDS,
     derive_mapping_candidates,
     extract_dependency_metadata,
     extract_executable_prompt,
+    find_binding_candidates,
     graph_hash_from_capture,
-    input_exists,
     is_ui_workflow_format,
     node_exists,
+    resolve_binding_target,
     ui_graph_to_api_prompt,
 )
 from .models import (
@@ -218,6 +220,77 @@ class WorkflowDomainService:
             entry.semantic_role = role
             entry_objects[role] = entry
         return entry_objects
+
+    def _validate_entries_against_graph(
+        self,
+        entries: dict[str, MappingEntry],
+        version: dict[str, Any],
+    ) -> None:
+        """Reject input bindings that cannot resolve against the version's
+        graph — fail fast at save time instead of at run-gating time.
+
+        Every entry whose kind binds a node input must name an
+        ``input_name`` present in that node's executable ``inputs`` (the
+        single location gating and execution read and write). A name that
+        exists only as node-def or UI-widget state (e.g. a pure-widget or
+        hidden-state value that never reaches the executable prompt) is
+        rejected with resolvable alternatives, so an un-runnable mapping
+        like ``seed`` → a seed-producer node can never be stored.
+        """
+        executable = version.get("executable_prompt") or {}
+        ui_graph = version.get("graph_json")
+        problems: list[str] = []
+        for role, entry in entries.items():
+            if entry.kind not in INPUT_BINDING_KINDS:
+                continue
+            node_id = str(entry.node_id or "")
+            input_name = str(entry.input_name or "")
+            if not node_id or not input_name:
+                problems.append(
+                    f"binding {role!r} must name one concrete node input/widget"
+                )
+                continue
+            target = resolve_binding_target(
+                executable,
+                node_id,
+                input_name,
+                ui_graph=ui_graph,
+                node_def_provider=self._node_def_provider,
+            )
+            if target.get("resolvable"):
+                continue
+            if not target.get("node_present"):
+                problems.append(
+                    f"mapped entry {role!r} node {node_id} not present in graph"
+                )
+                continue
+            message = (
+                f"mapped entry {role!r} input {input_name!r} "
+                f"not present on node {node_id}"
+            )
+            location = target.get("location")
+            if location in ("node_def", "ui_widget"):
+                message += (
+                    " (found only as widget/hidden state, not as an "
+                    "executable input; bind the downstream consumer input instead)"
+                )
+            candidates = find_binding_candidates(
+                executable,
+                input_name,
+                ui_graph=ui_graph,
+                node_def_provider=self._node_def_provider,
+            )
+            executable_hits = [c for c in candidates if c.get("via") == "inputs"]
+            if executable_hits:
+                hints = ", ".join(
+                    f"node {c['node_id']} input {c['input_name']!r}"
+                    + (f" (linked to node {c['upstream_node_id']})" if c.get("linked") else "")
+                    for c in executable_hits
+                )
+                message += f"; resolvable bindings for {input_name!r}: {hints}"
+            problems.append(message)
+        if problems:
+            raise WorkflowDomainValidationError("; ".join(problems))
 
     # ── Workflow ─────────────────────────────────────────────────────────
 
@@ -681,6 +754,8 @@ class WorkflowDomainService:
                 f"workflow {source.get('workflow_id', '')!r} not found"
             )
         now = now_iso()
+        normalized = self._normalize_entries(entries)
+        self._validate_entries_against_graph(normalized, source)
         versions = self.store.list_versions_for_workflow(
             str(source.get("workflow_id", ""))
         )
@@ -708,7 +783,7 @@ class WorkflowDomainService:
             created_at=now,
             updated_at=now,
             output_node_id=str(output_node_id or ""),
-            entries=self._normalize_entries(entries),
+            entries=normalized,
         )
         self.store.insert_mapping(mapping)
 
@@ -777,15 +852,21 @@ class WorkflowDomainService:
                         f"mapped entry {role!r} node {node_id} not present in graph"
                     )
                     continue
-                if kind in ("node_input", "widget"):
+                if kind in INPUT_BINDING_KINDS:
                     input_name = str(raw_entry.get("input_name", ""))
-                    if node_id and input_name and not input_exists(
-                        executable, node_id, input_name
-                    ):
-                        reasons.append(
-                            f"mapped entry {role!r} input {input_name!r} "
-                            f"not present on node {node_id}"
+                    if node_id and input_name:
+                        target = resolve_binding_target(
+                            executable,
+                            node_id,
+                            input_name,
+                            ui_graph=version.get("graph_json"),
+                            node_def_provider=self._node_def_provider,
                         )
+                        if not target.get("resolvable"):
+                            reasons.append(
+                                f"mapped entry {role!r} input {input_name!r} "
+                                f"not present on node {node_id}"
+                            )
             output_node_id = str(mapping.get("output_node_id", ""))
             if not output_node_id or not node_exists(executable, output_node_id):
                 reasons.append("no output node")
@@ -843,13 +924,15 @@ class WorkflowDomainService:
                 "a new version with a changed mapping"
             )
         now = now_iso()
+        normalized = self._normalize_entries(entries)
+        self._validate_entries_against_graph(normalized, version)
         mapping = Mapping(
             mapping_id=make_mapping_id(),
             workflow_version_id=workflow_version_id,
             created_at=now,
             updated_at=now,
             output_node_id=str(output_node_id or ""),
-            entries=self._normalize_entries(entries),
+            entries=normalized,
         )
         stored = self.store.insert_mapping(mapping)
         raw_workflow = self.store.get_workflow(str(version.get("workflow_id", "")))

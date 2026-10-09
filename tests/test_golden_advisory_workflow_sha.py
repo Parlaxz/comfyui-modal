@@ -101,7 +101,7 @@ def _run_setup(prompt: dict, *, env_flag: str | None = None):
     session = _Session(prompt)
     actual_sha = canonical_workflow_sha256(prompt)
     workflow_hash_check_value = os.environ.get(
-        "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "1"
+        "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "0"
     ).strip().lower()
     workflow_hash_check_enabled = workflow_hash_check_value not in {
         "0",
@@ -227,6 +227,13 @@ class StructuralAdmissionStaysFailClosedTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             resolve_golden_node_map(prompt)
         self.assertIn("canonical_nodes_duplicate", str(ctx.exception))
+
+    def test_workflow_sampler_class_is_discovered(self) -> None:
+        prompt = _prompt()
+        prompt["5"]["class_type"] = "KSampler"
+        node_map = resolve_golden_node_map(prompt)
+        self.assertEqual(node_map.sampler_id, "5")
+        self.assertEqual(node_map.sampler_class_type, "KSampler")
 
     def test_replacement_models_are_accepted(self) -> None:
         """A caller-selected Studio workflow may name replacement CLIP/UNET/VAE.

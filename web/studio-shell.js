@@ -138,6 +138,7 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
       ...context,
       setPage,
       clearRouteFocus,
+      setRouteFocus,
       // Pages route through the shell's single authority so no page writes
       // history itself. Use this for deep links that carry a focus identity
       // (e.g. Settings → Manage Modal → Workspaces); plain page switches
@@ -235,6 +236,15 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
     _syncUrl(prevRoute, _managedRoute);
   }
 
+  function setRouteFocus(focus) {
+    const nextFocus = typeof focus === "string" && focus ? focus : null;
+    const prevRoute = { page: _managedRoute.page, focus: _managedRoute.focus };
+    if (prevRoute.focus === nextFocus) return;
+    _managedRoute = { page: prevRoute.page, focus: nextFocus };
+    _routeSeeded = true;
+    _syncUrl(prevRoute, _managedRoute);
+  }
+
   /**
    * Apply a parsed Studio route through the same single authority.
    * opts.passive — the browser already navigated (Back/Forward); do not
@@ -247,6 +257,7 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
     const page = route.page;
     const focus =
       route && typeof route.focus === "string" && route.focus ? route.focus : null;
+    if (page === "settings" && focus) state.settings.activeSection = _settingsTabForFocus(focus);
     const prevRoute = { page: _managedRoute.page, focus: _managedRoute.focus };
 
     // Focus seams run BEFORE the page renders so mount-time consumers
@@ -329,12 +340,23 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
   // Settings section focus (deep links): same presentation behavior as the
   // comfymodal.open-section handler — scroll to [data-section] and flash a
   // short outline. Unknown ids resolve nothing: Settings opens normally.
+  function _settingsTabForFocus(sectionId) {
+    if (sectionId === "history") return "interface";
+    if (["accounts", "account", "credentials", "tokens"].includes(sectionId)) return "accounts";
+    if (["generation", "outputs", "interface", "advanced"].includes(sectionId)) return sectionId;
+    if (["profile", "golden", "golden-profile", "golden_profile"].includes(sectionId)) return "generation";
+    return "generation";
+  }
+
   function _scheduleSettingsSectionFocus(sectionId) {
-    setTimeout(function () {
+    const normalized = _settingsTabForFocus(sectionId);
+    const tab = pageContainer.querySelector("#settings-tab-" + normalized);
+    if (tab && typeof tab.click === "function") tab.click();
+    {
       const sections = pageContainer.querySelectorAll("[data-section]");
       let sectionEl = null;
       for (let i = 0; i < sections.length; i++) {
-        if (sections[i].getAttribute("data-section") === sectionId) {
+        if (sections[i].getAttribute("data-section") === normalized || (normalized === "interface" && sectionId === "history" && sections[i].getAttribute("data-section") === "interface")) {
           sectionEl = sections[i];
           break;
         }
@@ -345,7 +367,7 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
       setTimeout(function () {
         sectionEl.style.outline = "";
       }, 2000);
-    }, 150);
+    }
   }
 
   // Assemble shell
@@ -355,6 +377,7 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
   // Initial render — honor the resolved initial route (explicit opener
   // intent or copied/reloaded URL hash) before first paint.
   state.activePage = initialRoute.page;
+  if (initialRoute.page === "settings" && initialRoute.focus) state.settings.activeSection = _settingsTabForFocus(initialRoute.focus);
   if (initialRoute.focus && initialRoute.page === "history") {
     requestHistoryRecordFocus(initialRoute.focus, "generation");
   }
@@ -365,6 +388,7 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
   }
 
   const shellApi = {
+    nav,
     destroy() {
       if (typeof window !== "undefined") {
         window.removeEventListener("hashchange", _handleHashChange);
@@ -376,6 +400,8 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
     applyRoute,
     /** Drop the focus identity from the managed route (I9A). */
     clearRouteFocus,
+    /** Update focus identity without remounting the current page. */
+    setRouteFocus,
     /** Current managed route snapshot ({page, focus}). */
     getRoute() {
       return { page: _managedRoute.page, focus: _managedRoute.focus };

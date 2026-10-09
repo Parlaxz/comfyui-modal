@@ -73,18 +73,31 @@ class LocalPlaceholderTests(unittest.TestCase):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
             invalid_cases = [
-                ("text_encoders", "../evil.safetensors"),
-                ("text_encoders", "..\\evil.safetensors"),
-                ("text_encoders", "C:\\Users\\parla\\evil.safetensors"),
-                ("text_encoders", "/etc/passwd"),
                 ("folder/subfolder", "name.safetensors"),
-                ("text_encoders", "nested/name.safetensors"),
             ]
 
             for folder, filename in invalid_cases:
                 with self.subTest(folder=folder, filename=filename):
                     with self.assertRaises(ValueError):
                         module.create_local_placeholder(tmp, folder, filename)
+
+    def test_flattens_subfolder_relative_filenames_to_basename(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = [
+                ("text_encoders", "../evil.safetensors", "evil.safetensors"),
+                ("text_encoders", "..\\evil.safetensors", "evil.safetensors"),
+                ("text_encoders", "C:\\Users\\parla\\evil.safetensors", "evil.safetensors"),
+                ("text_encoders", "/etc/passwd", "passwd"),
+                ("text_encoders", "nested/name.safetensors", "name.safetensors"),
+                ("text_encoders", "krea2\\krea2_turbo_fp8_scaled.safetensors", "krea2_turbo_fp8_scaled.safetensors"),
+            ]
+            for folder, filename, expected in cases:
+                with self.subTest(folder=folder, filename=filename):
+                    result = module.create_local_placeholder(tmp, folder, filename)
+                    # Flattening keeps the install inside the model folder.
+                    self.assertEqual(result["filename"], expected)
+                    self.assertEqual(result["folder"], folder)
 
     def test_batch_creation_supports_requested_examples(self):
         module = load_module()

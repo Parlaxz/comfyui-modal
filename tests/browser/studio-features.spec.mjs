@@ -280,16 +280,16 @@ test.describe("Studio focused features (primary copy)", () => {
         const col = document.querySelector(".comfymodal-studio-experiment-grid-detail-axes");
         const wrap = document.querySelector(".comfymodal-studio-zoom-wrap");
         const content = document.querySelector(".comfymodal-studio-preview-overlay-content");
+        const stage = document.querySelector(".comfymodal-studio-preview-overlay-stage");
         return {
           position: col && getComputedStyle(col).position,
-          right: col && getComputedStyle(col).right,
           isChildOfContent: content.contains(col),
-          wrapIsSiblingOfCol: wrap && col ? wrap.parentElement === content : null,
+          wrapIsInStage: stage && wrap ? stage.contains(wrap) : false,
         };
       });
-      expect(sideColStyle.position).toBe("absolute");
-      expect(sideColStyle.right).toBe("0px");
+      expect(sideColStyle.position).toBe("static");
       expect(sideColStyle.isChildOfContent).toBe(true);
+      expect(sideColStyle.wrapIsInStage).toBe(true);
 
       guard.assertNoErrors(APP_NOISE_PATTERNS);
       api.assertNoUnhandledCalls();

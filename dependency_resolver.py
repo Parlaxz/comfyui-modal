@@ -8,6 +8,7 @@ states and every public method is guarded so it never raises.
 
 from __future__ import annotations
 
+import json
 import re
 import math
 from pathlib import Path
@@ -33,9 +34,11 @@ from workflow_metadata import (
 # "missing" so they never inflate the attention count or block readiness.
 _CLASS_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Frontend-only virtual nodes are never installable dependencies. ComfyUI
-# drops them from the executable prompt, but skip them defensively so they can
-# never become a fake "missing pack" row.
+# ComfyUI-native virtual constructs (reroute lines, notes, primitives,
+# subgraphs) are never backend dependencies. They predate the resolver and
+# stay skipped here. Every other class is judged by backend evidence, not by
+# name: a class no known backend provides is reported as unresolvable
+# advisory (see _catalog_provides_class), never Missing.
 _VIRTUAL_NODE_CLASSES = frozenset({
     "reroute",
     "note",
@@ -45,6 +48,11 @@ _VIRTUAL_NODE_CLASSES = frozenset({
     "subgraph",
     "groupnode",
 })
+
+# Manager's class -> pack catalog (extension-node-map.json): the ecosystem
+# authority on which node classes have a real backend provider. It lives next
+# to the custom nodes it describes and is read-only here.
+_MANAGER_CATALOG_PARTS = ("custom_nodes", "comfyui-manager", "extension-node-map.json")
 
 
 def _is_resolvable_class_name(value: Any) -> bool:
@@ -100,81 +108,6 @@ def _merge_identity(
     return merged
 
 
-def _has_nonempty_collection(value: Any) -> bool:
-    """True when a UI graph node's inputs/outputs field carries content."""
-    if isinstance(value, (list, tuple, dict)):
-        return len(value) > 0
-    return False
-
-
-def _graph_virtual_class_names(version: dict[str, Any]) -> set[str]:
-    """Class types whose stored UI graph node is a frontend-only virtual node.
-
-    A node qualifies only when it records no ``cnr_id``/``aux_id`` pack
-    identity AND both its UI ``inputs`` and ``outputs`` are empty. ComfyUI
-    serialises JS-only virtual panels (``isVirtualNode`` registrations) exactly
-    that way, while any node that consumes or produces data carries a
-    non-empty collection. This is a shape classifier, not a class allowlist,
-    so a new virtual panel is handled without code changes. Nested
-    group/subgraph nodes are classified too.
-    """
-    if not isinstance(version, dict):
-        return set()
-    virtual: set[str] = set()
-    real: set[str] = set()
-    for key in ("graph_json", "static_graph"):
-        for node in iter_graph_nodes(version.get(key)):
-            node_type = node.get("type")
-            if not isinstance(node_type, str) or not node_type:
-                continue
-            if _pack_identity_of_node(node):
-                real.add(node_type)  # has pack identity: never a virtual panel
-                continue
-            if _has_nonempty_collection(node.get("inputs")):
-                real.add(node_type)
-                continue
-            if _has_nonempty_collection(node.get("outputs")):
-                real.add(node_type)
-                continue
-            virtual.add(node_type)
-    return virtual - real
-
-
-def _executable_class_names(version: dict[str, Any]) -> set[str]:
-    """Class types actually present in the version's executable API prompt."""
-    out: set[str] = set()
-    prompt = (version or {}).get("executable_prompt") or {}
-    if isinstance(prompt, dict):
-        for node in prompt.values():
-            if isinstance(node, dict) and node.get("class_type"):
-                out.add(str(node["class_type"]))
-    return out
-
-
-def _executable_consuming_classes(version: dict[str, Any]) -> set[str]:
-    """Executable classes that actually consume an input binding.
-
-    UI-only virtual panels can survive capture as no-op API prompt entries
-    with empty ``inputs`` (ComfyUI serialises ``isVirtualNode`` registrations
-    that way). A class whose every executable entry is input-free is treated
-    as non-consuming so the graph shape classifier can still recognise the
-    panel; a class with at least one real input binding is never dropped.
-    """
-    out: set[str] = set()
-    prompt = (version or {}).get("executable_prompt") or {}
-    if isinstance(prompt, dict):
-        for node in prompt.values():
-            if not isinstance(node, dict):
-                continue
-            class_type = node.get("class_type")
-            if not class_type:
-                continue
-            inputs = node.get("inputs")
-            if isinstance(inputs, dict) and inputs:
-                out.add(str(class_type))
-    return out
-
-
 def _stored_graph_node_classes(version: dict[str, Any]) -> list[str]:
     """Class types recorded on a stored version's UI/static graph nodes.
 
@@ -205,8 +138,8 @@ def _version_node_classes(version: dict[str, Any]) -> list[str]:
     prompt, so UI-only / unknown / missing-code nodes never appear there.
     Captures now union the graph at extraction time, but older stored versions
     predate both that union and ``custom_node_requirements``; their persisted
-    UI/static graph still records the node types, so merge them here. True
-    virtual empty panels are still excluded downstream by the shape classifier.
+    UI/static graph still records the node types, so merge them here. Classes
+    no known backend provides are excluded downstream by catalog evidence.
     """
     out: list[str] = []
     seen: set[str] = set()
@@ -244,31 +177,6 @@ def _class_identity_from_metadata(
         cnr_id = str(graph_identity.get("cnr_id") or "")
         aux_id = str(graph_identity.get("aux_id") or "")
     return cnr_id, aux_id
-
-
-def _is_virtual_workflow_class(
-    cls: str,
-    *,
-    executable_classes: set[str],
-    graph_virtual_classes: set[str],
-    core: set[str],
-    has_identity: bool,
-    record_exists: bool,
-) -> bool:
-    """True for a valid class that is only a frontend virtual panel.
-
-    The class must be absent from the executable prompt, core, registry and
-    pack identities, and its stored graph node must match the empty
-    inputs/outputs virtual shape. Such panels are not installable dependencies
-    and must never inflate missing/attention.
-    """
-    return (
-        not has_identity
-        and not record_exists
-        and cls not in core
-        and cls not in executable_classes
-        and cls in graph_virtual_classes
-    )
 
 
 def _class_pack_identities_from_graph(
@@ -567,6 +475,8 @@ class DependencyResolver:
         self._node_discovery = CustomNodeDiscovery(self.library_root)
         self._overrides = DependencyOverrideStore(self.library_root)
         self._discovery_cache: Optional[tuple[list, set[str]]] = None
+        # (mtime, size, lowercased catalog class names) — see _catalog_provides.
+        self._catalog_cache: Optional[tuple[tuple[float, int], frozenset[str]]] = None
 
     # ── model refs ────────────────────────────────────────────────────────
 
@@ -830,6 +740,51 @@ class DependencyResolver:
             self._discovery_cache = (records, core)
         return self._discovery_cache
 
+    def _catalog_provides(self, cls: str) -> bool | None:
+        """Whether Manager's class catalog knows a backend for *cls*.
+
+        Reads ``<comfyui_root>/custom_nodes/comfyui-manager/
+        extension-node-map.json`` (pack -> [class names]) and answers from
+        its class names. The parsed set is cached per file identity
+        (mtime + size), so repeated resolutions cost one dict lookup.
+
+        Returns ``True`` (a backend exists somewhere), ``False`` (catalog
+        loaded fine and knows no such class), or ``None`` (catalog missing
+        or unreadable — the caller must fail closed). Never raises.
+        """
+        try:
+            path = Path(self.comfyui_root).joinpath(*_MANAGER_CATALOG_PARTS)
+            stat = path.stat()
+            key = (stat.st_mtime, stat.st_size)
+        except OSError:
+            return None
+        cached = self._catalog_cache
+        if cached is not None and cached[0] == key:
+            names = cached[1]
+        else:
+            try:
+                raw = json.loads(path.read_bytes().decode("utf-8", errors="replace"))
+            except (OSError, ValueError):
+                return None
+            collected: set[str] = set()
+            try:
+                values = raw.values() if isinstance(raw, dict) else []
+                for entry in values:
+                    listed = entry[0] if isinstance(entry, list) and entry else []
+                    if not isinstance(listed, list):
+                        continue
+                    for name in listed:
+                        if isinstance(name, str) and name:
+                            collected.add(name.casefold())
+            except Exception:
+                return None
+            names = frozenset(collected)
+            self._catalog_cache = (key, names)
+        try:
+            return cls.casefold() in names
+        except Exception:
+            return None
+
     def resolve_custom_nodes(
         self,
         version: dict[str, Any],
@@ -837,15 +792,15 @@ class DependencyResolver:
     ) -> list[dict[str, Any]]:
         """Resolve required node classes, grouped one row per pack.
 
-        Graph artifacts (non-identifier class strings) are excluded here
-        and reported via unresolvable_classes instead.
+        Graph artifacts (non-identifier class strings) and classes no
+        known backend provides are excluded here and reported via
+        unresolvable_classes instead, so neither can block readiness.
         """
         remote_lookup = _remote_lookup(remote)
         dependency_metadata = (version or {}).get("dependency_metadata") or {}
         # Union declared classes with the stored graph node types so UI-only
         # nodes and covers from old captures (predating the metadata union)
-        # still resolve. The shape classifier below still excludes true virtual
-        # panels from missing/attention.
+        # still resolve. Explicitly denylisted virtual classes are skipped below.
         node_classes = _version_node_classes(version)
         requirements = dependency_metadata.get("custom_node_requirements") or {}
         if not isinstance(requirements, dict):
@@ -855,11 +810,6 @@ class DependencyResolver:
         # it so classes sharing a pack group into one missing row instead of
         # six.
         graph_identity_by_class = _class_pack_identities_from_graph(version)
-        # Only classes that consume an input count as "executable" for the
-        # virtual-panel shape check: a no-op prompt entry with empty inputs is
-        # the live signature of a UI-only panel (DonutLatestPreview etc.).
-        executable_classes = _executable_consuming_classes(version)
-        graph_virtual_classes = _graph_virtual_class_names(version)
         _records, core = self._ensure_discovery()
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -932,18 +882,13 @@ class DependencyResolver:
                     }
                 )
                 continue
-            # A valid class that only exists in the UI graph as an empty
-            # inputs/outputs panel with no pack identity is a frontend virtual
-            # node, not an installable dependency. Report it via
-            # unresolvable_classes instead of a fake missing pack row.
-            if _is_virtual_workflow_class(
-                cls,
-                executable_classes=executable_classes,
-                graph_virtual_classes=graph_virtual_classes,
-                core=core,
-                has_identity=bool(cnr_id or aux_id),
-                record_exists=False,
-            ):
+            # No local backend provides this class. Consult the ecosystem
+            # catalog before calling it Missing: a class no known pack
+            # provides (UI notes, JS-only Set/Get panels) is not an
+            # installable dependency, so it stays out of results and is
+            # reported via unresolvable_classes instead. A catalog miss
+            # (None) fails closed to Missing, exactly as before.
+            if self._catalog_provides(cls) is False:
                 continue
             results.append(
                 {
@@ -963,12 +908,15 @@ class DependencyResolver:
     def unresolvable_classes(self, version: dict[str, Any]) -> list[dict[str, Any]]:
         """Class strings that can never resolve to a pack.
 
-        Two kinds qualify: non-identifier graph artifacts (UUIDs from
-        frontend-only proxy/subgraph nodes, display titles recorded as types)
-        and valid class names whose stored UI graph node is an empty
-        inputs/outputs virtual panel with no pack identity and which never
-        appear in the executable prompt, core set, or registry. Neither is an
-        installable dependency, so both stay out of missing/attention counts.
+        Two kinds qualify, and neither blocks readiness. Non-identifier
+        graph artifacts (UUIDs from frontend-only proxy/subgraph nodes,
+        display titles recorded as types) are not node classes at all.
+        Identifier-shaped classes no known backend provides — absent from
+        the live registry and ComfyUI core, and unknown to Manager's
+        class catalog — are UI-only leftovers (notes, JS-only Set/Get
+        panels) or stale references, not installable dependencies.
+        Explicitly denylisted platform virtuals are skipped by both
+        resolution paths and do not appear here.
         Never raises.
         """
         try:
@@ -980,8 +928,6 @@ class DependencyResolver:
             if not isinstance(requirements, dict):
                 requirements = {}
             graph_identity_by_class = _class_pack_identities_from_graph(version)
-            executable_classes = _executable_class_names(version)
-            graph_virtual_classes = _graph_virtual_class_names(version)
             _records, core = self._ensure_discovery()
             out: list[dict[str, Any]] = []
             seen: set[str] = set()
@@ -1001,7 +947,7 @@ class DependencyResolver:
                     continue
                 if cls.lower() in _VIRTUAL_NODE_CLASSES:
                     continue
-                if cls in core or cls in executable_classes:
+                if cls in core:
                     continue
                 cnr_id, aux_id = _class_identity_from_metadata(
                     cls, requirements, graph_identity_by_class
@@ -1012,21 +958,25 @@ class DependencyResolver:
                     # Unreadable registry is not proof of absence: leave the
                     # class to resolve_custom_nodes (conservative missing).
                     continue
-                if _is_virtual_workflow_class(
-                    cls,
-                    executable_classes=executable_classes,
-                    graph_virtual_classes=graph_virtual_classes,
-                    core=core,
-                    has_identity=bool(cnr_id or aux_id),
-                    record_exists=record_exists,
-                ):
+                if record_exists:
+                    continue
+                if self._catalog_provides(cls) is False:
+                    claimed = cnr_id or aux_id
+                    reason = "no known backend provides this class"
+                    if claimed:
+                        reason += f" (workflow metadata claims '{claimed}')"
+                    else:
+                        reason += " (no pack identity recorded)"
                     out.append(
                         {
                             "name": cls,
                             "classes": [cls],
-                            "reason": "workflow-only virtual node, not an installable node class",
+                            "reason": reason,
                         }
                     )
+                    continue
+                # Otherwise the class has a real provider somewhere (or the
+                # catalog is unavailable): resolve_custom_nodes reports it.
             return out
         except Exception:
             return []

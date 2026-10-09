@@ -38,12 +38,11 @@ For a Golden run, one command does the whole profiling loop:
 python tools/v2ctl.py golden profile --app <experimental-app>
 ```
 
-It deploys with tracing, verifies the deployment landed via source-probe, runs
+It deploys with tracing, verifies the deployment identity is current, runs
 one request, then downloads and SHA-verifies the bundle, analyzes it and writes
 the decision report, printing the final path. It performs a real deploy and run,
 so it costs GPU time; `--dry-run` prints the plan without invoking anything. It
-aborts if source-probe does not report `RESULT=PASS`, so a stale deployment is
-never profiled.
+does not run `source-probe`: that command is debug tooling and gates nothing.
 
 To analyse an already-downloaded trace without spending GPU time:
 

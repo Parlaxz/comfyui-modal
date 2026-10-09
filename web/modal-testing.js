@@ -66,6 +66,102 @@ const TAB_SETTINGS = "settings";
 const PREFIX = "[comfymodal.testing]";
 const HOST_CLASS = "comfymodal-testing-host";
 
+// ── Studio open persistence (refresh remembers last page) ───────────────
+// sessionStorage survives a browser refresh/reload in the same tab but not a
+// new tab or an explicit close: open sets the flag, close clears it. On
+// extension setup a real reload with the flag set reopens the Studio modal;
+// the shell's initialRoute then honors the #comfymodal=<page> hash, so the
+// last page (playground/history/workflows/backend/settings) is restored. A
+// persisted wizard draft forces the Workflows page so the existing
+// maybeResumeSetupWizard flow can reopen the wizard at its saved step.
+const STUDIO_OPEN_KEY = "comfymodal.studio.open.v1";
+const WIZARD_DRAFT_STORAGE_KEY = "comfymodal.studio.wizard.draft.v1";
+
+function _rememberStudioOpen() {
+  try {
+    if (typeof sessionStorage !== "undefined") sessionStorage.setItem(STUDIO_OPEN_KEY, "1");
+  } catch (_err) { /* persistence is best-effort */ }
+}
+
+function _forgetStudioOpen() {
+  try {
+    if (typeof sessionStorage !== "undefined") sessionStorage.removeItem(STUDIO_OPEN_KEY);
+  } catch (_err) { /* persistence is best-effort */ }
+}
+
+function _studioWasOpen() {
+  try {
+    if (typeof sessionStorage === "undefined") return false;
+    return sessionStorage.getItem(STUDIO_OPEN_KEY) === "1";
+  } catch (_err) {
+    return false;
+  }
+}
+
+function _wizardDraftPending() {
+  try {
+    if (typeof sessionStorage === "undefined") return false;
+    const raw = sessionStorage.getItem(WIZARD_DRAFT_STORAGE_KEY);
+    return typeof raw === "string" && raw !== "";
+  } catch (_err) {
+    return false;
+  }
+}
+
+function _pageWasReloaded() {
+  try {
+    if (typeof performance === "undefined") return false;
+    const entries =
+      typeof performance.getEntriesByType === "function"
+        ? performance.getEntriesByType("navigation")
+        : [];
+    const type = entries && entries[0] && entries[0].type;
+    if (type) return type === "reload" || type === "back_forward";
+    const legacy = performance.navigation;
+    return !!legacy && legacy.type !== 0;
+  } catch (_err) {
+    return false;
+  }
+}
+
+// True only on a real reload when there is something to restore: an open
+// Studio (flag) or a pending wizard draft. A route hash alone never opens the
+// modal, so explicitly closing Studio remains respected.
+function _shouldAutoReopenStudio() {
+  try {
+    if (!_pageWasReloaded()) return false;
+    if (_studioWasOpen()) return true;
+    if (_wizardDraftPending()) return true;
+    return false;
+  } catch (_err) {
+    return false;
+  }
+}
+
+function _autoReopenStudioIfNeeded() {
+  if (!_shouldAutoReopenStudio()) return;
+  try {
+    const shell = open_testing_modal();
+    // The wizard only lives on the Workflows page. If the hash was lost
+    // (ComfyUI's graph loader can overwrite it) but a draft is pending, land
+    // on Workflows so maybeResumeSetupWizard can reopen the same wizard step.
+    if (_wizardDraftPending() && shell && shell._studioApi) {
+      const route = typeof shell._studioApi.getRoute === "function"
+        ? shell._studioApi.getRoute()
+        : null;
+      if (!route || route.page !== "workflows") {
+        if (typeof shell._studioApi.applyRoute === "function") {
+          shell._studioApi.applyRoute({ page: "workflows", focus: null }, { rerender: true });
+        } else if (typeof shell._studioApi.setPage === "function") {
+          shell._studioApi.setPage("workflows");
+        }
+      }
+    }
+  } catch (_err) {
+    console.warn(PREFIX, "studio auto-reopen failed:", _err);
+  }
+}
+
 // Guard for comfymodal.open-section listener (prevents duplicate registration)
 let _openSectionRegistered = false;
 
@@ -105,27 +201,28 @@ function buildShell() {
     "aria-modal": "true",
     "aria-labelledby": "comfymodal-studio-heading",
   });
-  const header = el("div", { class: "comfymodal-studio-header" }, [
-    el("h1", { id: "comfymodal-studio-heading", text: "Modal GPU" }),
-    el("div", { class: "comfymodal-studio-header-actions" }, [
-      el("button", {
-        class: "comfymodal-studio-help",
-        "aria-label": "Open documentation",
-        title: "Open documentation",
-        text: "?",
-      }),
-      el("button", {
-        class: "comfymodal-testing-close",
-        "aria-label": "Close modal",
-        text: "✕",
-      }),
-    ]),
+  const heading = el("h1", {
+    id: "comfymodal-studio-heading",
+    text: "Modal GPU",
+    class: "comfymodal-studio-topnav-heading",
+  });
+  const topnavActions = el("div", { class: "comfymodal-studio-topnav-actions" }, [
+    el("button", {
+      class: "comfymodal-studio-help",
+      "aria-label": "Open documentation",
+      title: "Open documentation",
+      text: "?",
+    }),
+    el("button", {
+      class: "comfymodal-testing-close",
+      "aria-label": "Close modal",
+      text: "✕",
+    }),
   ]);
   const body = el("div", { class: "comfymodal-studio-body", "data-testid": "body" });
-  modal.appendChild(header);
   modal.appendChild(body);
   overlay.appendChild(modal);
-  return { overlay, modal, header, body };
+  return { overlay, modal, heading, topnavActions, body };
 }
 
 let _hostEl = null;
@@ -214,6 +311,8 @@ export function open_testing_modal(tabName) {
   // Store the current active element for focus restoration on close
   _triggerEl = document.activeElement;
 
+  _rememberStudioOpen();
+
   // Body scroll lock (replaces :has() pseudo-class)
   document.body.classList.add("comfymodal-body-scroll-lock");
 
@@ -264,8 +363,8 @@ export function open_testing_modal(tabName) {
   _shellCache = shell;
 
   // Close handler
-  shell.header.querySelector(".comfymodal-testing-close").addEventListener("click", close_testing_modal);
-  shell.header.querySelector(".comfymodal-studio-help").addEventListener("click", () => {
+  shell.topnavActions.querySelector(".comfymodal-testing-close").addEventListener("click", close_testing_modal);
+  shell.topnavActions.querySelector(".comfymodal-studio-help").addEventListener("click", () => {
     window.open("/extensions/comfyui-modal/docs.html?v=" + Date.now(), "_blank", "noopener,noreferrer");
   });
   shell.overlay.addEventListener("click", (e) => {
@@ -303,6 +402,9 @@ export function open_testing_modal(tabName) {
     : {};
   const studioApi = mountStudioShell(shell.body, studioContext, mountOptions);
   shell._studioApi = studioApi;
+  studioApi.nav.insertBefore(shell.heading, studioApi.nav.firstChild);
+  studioApi.nav.appendChild(shell.topnavActions);
+  shell.nav = studioApi.nav;
 
   // Navigate to initial page if specified
   if (tabName) {
@@ -329,6 +431,7 @@ export function open_testing_modal(tabName) {
 }
 
 function close_testing_modal() {
+  _forgetStudioOpen();
   if (_shellCache && _hostEl && _hostEl.contains(_shellCache.overlay)) {
     _shellCache.overlay.style.display = "none";
     // Clean up layer keyboard handler (idempotent)
@@ -430,17 +533,9 @@ function ensureFallbackLauncher() {
 function handleOpenSection(ev) {
   const sectionId = ev.detail && ev.detail.section;
   open_testing_modal(TAB_SETTINGS);
-  // After the settings page renders, scroll to the matching section
-  setTimeout(() => {
-    const body = _shellCache && _shellCache.body;
-    if (!body) return;
-    const sectionEl = body.querySelector(`[data-section="${sectionId}"]`);
-    if (sectionEl) {
-      sectionEl.scrollIntoView({ behavior: "smooth", block: "start" });
-      sectionEl.style.outline = "2px solid var(--color-accent)";
-      setTimeout(() => { sectionEl.style.outline = ""; }, 2000);
-    }
-  }, 150);
+  if (_shellCache && _shellCache._studioApi && typeof _shellCache._studioApi.applyRoute === "function") {
+    _shellCache._studioApi.applyRoute({ page: "settings", focus: sectionId }, { rerender: true });
+  }
 }
 
 window.__comfyModalTestingMarkSecondaryLauncherRegistered = function __comfyModalTestingMarkSecondaryLauncherRegistered() {
@@ -515,5 +610,7 @@ app.registerExtension({
 
     updateDiag("setupCompleted", true);
     console.log(PREFIX, "extension setup complete");
+
+    _autoReopenStudioIfNeeded();
   },
 });

@@ -17,6 +17,7 @@ import { createHistoryRepository, selectFeedAsset } from "./history-v2-repositor
 import { subscribeStudioSync } from "./studio-sync.js";
 import { loadHistoryViewState, saveHistoryViewState, DEFAULT_HIDDEN_STATUSES } from "./history-v2-view-state.js";
 import { _formatDuration } from "./studio-run-normalizer.js";
+import { getOutputPreferences, normalizeOutputSaveFolder } from "./studio-output-preferences.js";
 import { renderGenerationDetail } from "./studio-history-v2-detail.js";
 import { renderExperimentDetail } from "./studio-history-v2-experiment.js";
 
@@ -694,6 +695,7 @@ export function renderHistoryV2(state, context) {
 
   // ── Detail navigation ───────────────────────────────────────────────────
   function openGeneration(id) {
+    if (typeof context.setRouteFocus === "function") context.setRouteFocus(String(id));
     renderGenerationDetail(id, repo, {
       onClose: function () {
         // Route truth (I9A): closing a focused detail drops the stale focus
@@ -758,7 +760,7 @@ export function renderHistoryV2(state, context) {
   function renderToolbar() {
     const toolbar = el("div", { class: "comfymodal-studio-history-v2-toolbar" });
 
-    // Row 1: search, mode banner, result count, sort, clear all.
+    // Row 1: search, mode banner, result count, sort, open folder, clear all.
     const row1 = el("div", { class: "comfymodal-studio-history-v2-toolbar-row" });
 
     searchInput = el("input", {
@@ -806,6 +808,25 @@ export function renderHistoryV2(state, context) {
       sortSelect.appendChild(el("option", { value: opt[0], text: opt[1] }));
     });
     row1.appendChild(sortSelect);
+
+    // Opens the local output folder in the OS file manager through the same
+    // server endpoint Settings → Outputs uses, so the History toolbar reaches
+    // the files behind the feed without duplicating the allow-list logic.
+    const apiBase = (context && context.apiBase) || "/comfymodal";
+    row1.appendChild(el("button", {
+      class: "comfymodal-studio-history-v2-open-folder",
+      type: "button",
+      "data-testid": "history-v2-open-folder",
+      text: "Open folder",
+      onclick: function () {
+        const folder = normalizeOutputSaveFolder(getOutputPreferences().save_folder);
+        fetch(apiBase + "/open-folder", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: folder }),
+        }).catch(function () {});
+      },
+    }));
 
     row1.appendChild(el("button", {
       class: "comfymodal-studio-history-v2-clear-all",
