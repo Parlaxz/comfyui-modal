@@ -294,7 +294,10 @@ def resolve_golden_profile(
     resolver = _resolver(root)
     try:
         resolved = profiles.resolve(name)
-        config = resolver.resolve(profile_name=name)
+        config = _with_destination(
+            root,
+            resolver.resolve(profile_name=name),
+        )
     except (ProfileError, FlagError, OSError, ValueError, TypeError) as exc:
         raise GoldenProfileError(f"Golden profile {name!r} is unreadable") from exc
     projected = _project(root, resolved, config)
