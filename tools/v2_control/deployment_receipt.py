@@ -360,17 +360,18 @@ def latest_deployment_receipt(
                 "ambiguous deployment receipts: multiple receipts have the same "
                 f"app/version ({app}/{version})"
             )
-    versions = {}
-    for item in matches:
-        versions.setdefault(item[1].deployment_version, []).append(item)
-    newest_version = max(versions)
-    newest = versions[newest_version]
-    if len(newest) != 1:
-        raise GateError(
-            "ambiguous deployment receipts: multiple receipts have the same "
-            f"app/version ({newest_version})"
-        )
-    return newest[0]
+    def _created_at(item: tuple[Path, DeploymentReceipt]) -> tuple[datetime, int, str]:
+        path, receipt = item
+        try:
+            created = datetime.fromisoformat(str(receipt.created_at).replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            created = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        return created, int(receipt.deployment_version), path.name
+
+    newest = max(matches, key=_created_at)
+    return newest
 
 
 def manifest_digest(path: Path) -> str:

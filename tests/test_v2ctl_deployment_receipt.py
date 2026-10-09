@@ -182,6 +182,33 @@ def test_unrelated_same_version_receipt_does_not_block_target_selection(tmp_path
     assert selected.target["app"] == config.target.app
 
 
+def test_latest_receipt_uses_created_at_across_workspace_version_sequences(tmp_path):
+    config = _config()
+    old = _receipt(config, version=24)
+    new = DeploymentReceipt(**{
+        **_receipt(config, version=7).__dict__,
+        "deploy_id": "b" * 64,
+        "deploy_fingerprint": "d" * 64,
+        "created_at": "2026-10-09T15:00:00+00:00",
+    })
+    write_deployment_receipt(tmp_path, old)
+    new_path = write_deployment_receipt(tmp_path, new)
+
+    result = latest_deployment_receipt(
+        tmp_path,
+        profile=config.profile_name,
+        target={
+            "app": config.target.app,
+            "class": config.target.class_name,
+            "method": config.target.method,
+        },
+    )
+    assert result is not None
+    selected_path, selected = result
+    assert selected_path == new_path
+    assert selected.deployment_version == 7
+
+
 
 
 def test_source_probe_uses_deployed_expected_source_and_fails_mismatch():
