@@ -35,7 +35,6 @@ from .golden_serial import (
     golden_sampling,
     golden_sampling_vae_window,
     golden_teardown,
-    golden_torch_numpy_cpu_bridge,
     golden_unet_load,
     golden_vae_decode,
     golden_vae_load,
@@ -350,8 +349,6 @@ async def golden_parallel_execute(
     # Bound before the try so the finally always has a root to close, even if
     # entering the span itself is what failed.
     golden_root: Any = nullcontext()
-    numpy_bridge = golden_torch_numpy_cpu_bridge()
-    numpy_bridge.__enter__()
     try:
         # Experimental loader-process modes (both disabled by default):
         # - request-time worker (COMFYMODAL_GOLDEN_LOADER_PROCESS): one
@@ -558,10 +555,7 @@ async def golden_parallel_execute(
         _GOLDEN_QD_ARM_CONTEXT.reset(transport_arm_token)
         # Close the authoritative Golden root last: teardown and loader-worker
         # release are request-side work, telemetry persistence is not.
-        try:
-            golden_root.__exit__(None, None, None)
-        finally:
-            numpy_bridge.__exit__(None, None, None)
+        golden_root.__exit__(None, None, None)
 
     try:
         _hb("telemetry_persist_begin")

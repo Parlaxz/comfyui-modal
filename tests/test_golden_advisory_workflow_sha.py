@@ -32,6 +32,7 @@ from comfymodal_runtime.golden_serial import (  # noqa: E402
     CANONICAL_VAE_NAME,
     GoldenWorkflowContract,
     canonical_workflow_sha256,
+    derive_golden_workflow_plan,
     resolve_golden_node_map,
 )
 
@@ -234,6 +235,30 @@ class StructuralAdmissionStaysFailClosedTests(unittest.TestCase):
         node_map = resolve_golden_node_map(prompt)
         self.assertEqual(node_map.sampler_id, "5")
         self.assertEqual(node_map.sampler_class_type, "KSampler")
+
+    def test_workflow_plan_derives_sampler_closure_and_terminals(self) -> None:
+        prompt = _prompt()
+        node_map = resolve_golden_node_map(prompt)
+        plan = derive_golden_workflow_plan(prompt, node_map)
+        self.assertEqual(plan.output_node_id, "6")
+        self.assertIn("5", plan.sampler_dependency_ids)
+        self.assertIn("4", plan.conditioning_ids)
+        self.assertTrue(plan.canonical_fast_path)
+
+    def test_sampler_selection_uses_terminal_frontier(self) -> None:
+        prompt = _prompt()
+        prompt["5"]["class_type"] = "KSampler"
+        prompt["7"] = {
+            "class_type": "KSampler",
+            "inputs": {
+                "model": ["1", 0],
+                "positive": ["4", 0],
+                "latent_image": ["5", 0],
+            },
+        }
+        prompt["6"]["inputs"]["samples"] = ["7", 0]
+        node_map = resolve_golden_node_map(prompt)
+        self.assertEqual(node_map.sampler_id, "7")
 
     def test_replacement_models_are_accepted(self) -> None:
         """A caller-selected Studio workflow may name replacement CLIP/UNET/VAE.

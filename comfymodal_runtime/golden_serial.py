@@ -790,28 +790,6 @@ def canonical_workflow_sha256(prompt: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-@contextlib.contextmanager
-def golden_torch_numpy_cpu_bridge():
-    """Make legacy CPU-only NumPy bridges safe for one Golden request."""
-    original = torch.Tensor.numpy
-    if getattr(original, "_comfymodal_cpu_bridge", False):
-        yield
-        return
-
-    def _numpy(self: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-        if self.device.type != "cpu":
-            return original(self.detach().cpu(), *args, **kwargs)
-        return original(self, *args, **kwargs)
-
-    _numpy._comfymodal_cpu_bridge = True
-    torch.Tensor.numpy = _numpy
-    try:
-        yield
-    finally:
-        if torch.Tensor.numpy is _numpy:
-            torch.Tensor.numpy = original
-
-
 # ── Frozen contracts ──────────────────────────────────────────────────────
 
 
@@ -1414,6 +1392,17 @@ class GoldenNodeMap:
     unet_name: str = ""
     vae_name: str = ""
     sampler_class_type: str = CANONICAL_SAMPLER_CLASS
+
+
+@dataclass(frozen=True)
+class GoldenWorkflowPlan:
+    """Graph-derived stage terminals and dependency identities."""
+
+    node_map: GoldenNodeMap
+    conditioning_ids: tuple[str, ...] = ()
+    sampler_dependency_ids: tuple[str, ...] = ()
+    output_node_id: str = ""
+    canonical_fast_path: bool = False
 
 
 @dataclass(frozen=True, init=False)
@@ -8472,6 +8461,7 @@ class GoldenSession:
         self.output_root = os.path.abspath(requested_output_root)
         self.runner: Optional[GoldenSerialRunner] = None
         self.node_map: Optional[GoldenNodeMap] = None
+        self.workflow_plan: Optional[GoldenWorkflowPlan] = None
         self.model_paths: dict[str, str] = {}
         self.clip_paths: list[str] = []
         self.model_transport: Any = None
@@ -9203,37 +9193,6 @@ class GoldenSerialRunner:
                 self._golden_futures.discard(value)
         return value
 
-    @staticmethod
-    def _cpu_numpy_compat_value(value: Any) -> tuple[Any, bool]:
-        if isinstance(value, torch.Tensor):
-            if value.device.type == "cpu":
-                return value, False
-            return value.detach().cpu(), True
-        if isinstance(value, dict):
-            converted = False
-            result = {}
-            for key, item in value.items():
-                result[key], item_converted = GoldenSerialRunner._cpu_numpy_compat_value(item)
-                converted = converted or item_converted
-            return result, converted
-        if isinstance(value, list):
-            result = []
-            converted = False
-            for item in value:
-                converted_item, item_converted = GoldenSerialRunner._cpu_numpy_compat_value(item)
-                result.append(converted_item)
-                converted = converted or item_converted
-            return result, converted
-        if isinstance(value, tuple):
-            result = []
-            converted = False
-            for item in value:
-                converted_item, item_converted = GoldenSerialRunner._cpu_numpy_compat_value(item)
-                result.append(converted_item)
-                converted = converted or item_converted
-            return tuple(result), converted
-        return value, False
-
     def assert_quiescent(self) -> None:
         self._observe_tasks()
         pending = [f for f in self._golden_futures if not f.done()]
@@ -9245,7 +9204,6 @@ class GoldenSerialRunner:
 
     async def _call_node(self, unique_id: str, obj: Any, inputs: dict) -> Any:
         class_def = type(obj)
-        stage_class = classify_node(self.prompt[unique_id].get("class_type", ""))
         func_name = obj.FUNCTION
         if self._is_v3_class(class_def):
             from comfy_api.internal import make_locked_method_func
@@ -9292,28 +9250,7 @@ class GoldenSerialRunner:
             return await self._resolve(func(**call_inputs))
 
         try:
-            try:
-                return await invoke(inputs)
-            except Exception as first_exc:
-                compat_inputs, converted = self._cpu_numpy_compat_value(inputs)
-                if stage_class != "prepare" or not converted:
-                    raise
-                try:
-                    result = await invoke(compat_inputs)
-                except Exception as retry_exc:
-                    raise first_exc from retry_exc
-                recorder = self.trace_recorder
-                if recorder is not None:
-                    try:
-                        recorder.event(
-                            "golden_external_cpu_compat_retry",
-                            node_id=str(unique_id),
-                            node_class=str(class_type),
-                            original_error=f"{type(first_exc).__name__}: {first_exc}"[:500],
-                        )
-                    except BaseException:
-                        pass
-                return result
+            return await invoke(inputs)
         finally:
             if sampler_call:
                 self.sampler_call_end = time.monotonic_ns()
@@ -9536,11 +9473,11 @@ def resolve_golden_node_map(
             if isinstance(node_info, Mapping):
                 _count_links(node_info.get("inputs") or {})
 
-        consumers: dict[str, set[str]] = {node_id: set() for node_id, _ in sampler_candidates}
+        consumers: dict[str, set[str]] = {str(node_id): set() for node_id in prompt}
 
         def _collect_links(value: Any, consumer_id: str) -> None:
-            if _is_link(value) and str(value[0]) in consumers:
-                consumers[str(value[0])].add(consumer_id)
+            if _is_link(value):
+                consumers.setdefault(str(value[0]), set()).add(consumer_id)
             elif isinstance(value, Mapping):
                 for nested in value.values():
                     _collect_links(nested, consumer_id)
@@ -9567,18 +9504,42 @@ def resolve_golden_node_map(
                         frontier.append((child, depth + 1))
             return False, -1
 
-        def _sampler_score(item: tuple[str, str]) -> tuple[int, int, int, bool, str]:
-            node_id, class_type = item
-            reaches_decode, depth = _reaches_decode(node_id)
-            return (
-                int(reaches_decode),
-                int(depth >= 0),
-                referenced[node_id],
-                class_type == "KSampler",
-                node_id,
-            )
+        terminal_candidates = [
+            item for item in sampler_candidates if _reaches_decode(item[0])[0]
+        ]
+        terminal_ids = {node_id for node_id, _ in terminal_candidates}
 
-        chosen_id, chosen_class = max(sampler_candidates, key=_sampler_score)
+        def _reaches_sampler(source: str, target: str) -> bool:
+            frontier = list(consumers.get(source, set()))
+            visited = {source}
+            while frontier:
+                current = frontier.pop(0)
+                if current == target:
+                    return True
+                if current in visited:
+                    continue
+                visited.add(current)
+                frontier.extend(consumers.get(current, set()))
+            return False
+
+        frontier_candidates = [
+            item for item in terminal_candidates
+            if not any(
+                other_id != item[0] and _reaches_sampler(item[0], other_id)
+                for other_id in terminal_ids
+            )
+        ]
+        if len(frontier_candidates) > 1:
+            raise RuntimeError(
+                "canonical_sampler_ambiguous:"
+                + repr([node_id for node_id, _ in frontier_candidates])
+            )
+        if len(frontier_candidates) == 1:
+            chosen_id, chosen_class = frontier_candidates[0]
+        elif len(sampler_candidates) == 1:
+            chosen_id, chosen_class = sampler_candidates[0]
+        else:
+            raise RuntimeError("canonical_sampler_terminal_unresolved")
         matches["sampler"] = [chosen_id]
         sampler_class_type = chosen_class
     else:
@@ -9631,6 +9592,89 @@ def resolve_golden_node_map(
         unet_name=declared["unet_name"],
         vae_name=declared["vae_name"],
         sampler_class_type=sampler_class_type,
+    )
+
+
+def derive_golden_workflow_plan(
+    prompt: Mapping[str, Any],
+    node_map: GoldenNodeMap,
+    contract: Optional[GoldenWorkflowContract] = None,
+) -> GoldenWorkflowPlan:
+    """Derive stage terminals and closures from graph connectivity."""
+    contract = contract or GoldenWorkflowContract()
+    consumers: dict[str, set[str]] = {}
+    links_by_node: dict[str, list[str]] = {}
+
+    def collect(value: Any, consumer_id: str) -> None:
+        if _is_link(value):
+            source = str(value[0])
+            consumers.setdefault(source, set()).add(consumer_id)
+            links_by_node.setdefault(consumer_id, []).append(source)
+        elif isinstance(value, Mapping):
+            for nested in value.values():
+                collect(nested, consumer_id)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                collect(nested, consumer_id)
+
+    for node_id, info in prompt.items():
+        if isinstance(info, Mapping):
+            collect(info.get("inputs") or {}, str(node_id))
+
+    def reaches(source: str, targets: set[str]) -> bool:
+        queue = [source]
+        seen = {source}
+        while queue:
+            current = queue.pop(0)
+            if current in targets:
+                return True
+            for child in consumers.get(current, set()):
+                if child not in seen:
+                    seen.add(child)
+                    queue.append(child)
+        return False
+
+    sampler_id = str(node_map.sampler_id)
+    dependency_ids: set[str] = set()
+    stack = [sampler_id]
+    while stack:
+        node_id = stack.pop()
+        if node_id in dependency_ids:
+            continue
+        dependency_ids.add(node_id)
+        stack.extend(links_by_node.get(node_id, ()))
+
+    conditioning_ids = tuple(
+        sorted(
+            node_id
+            for node_id in dependency_ids
+            if node_id != sampler_id
+            and (
+                "encode" in str(prompt.get(node_id, {}).get("class_type", "")).lower()
+                or "conditioning" in str(prompt.get(node_id, {}).get("class_type", "")).lower()
+            )
+        )
+    )
+    output_node_id = str(node_map.vae_decode_id)
+    canonical_fast_path = (
+        node_map.sampler_class_type == contract.sampler_class_type
+        and len(conditioning_ids) == 1
+        and all(
+            str(prompt.get(node_id, {}).get("class_type", "")) == expected
+            for node_id, expected in (
+                (node_map.clip_loader_id, "CLIPLoader"),
+                (node_map.unet_loader_id, "UNETLoader"),
+                (node_map.vae_loader_id, "VAELoader"),
+                (node_map.vae_decode_id, "VAEDecode"),
+            )
+        )
+    )
+    return GoldenWorkflowPlan(
+        node_map=node_map,
+        conditioning_ids=conditioning_ids,
+        sampler_dependency_ids=tuple(sorted(dependency_ids)),
+        output_node_id=output_node_id,
+        canonical_fast_path=canonical_fast_path,
     )
 
 
@@ -10391,6 +10435,11 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
             allow_replacements=session.request.studio_advisory,
         )
         session.node_map = node_map
+        session.workflow_plan = derive_golden_workflow_plan(
+            session.request.prompt,
+            node_map,
+            contract,
+        )
 
         import folder_paths  # upstream ComfyUI module (allowed import)
 
@@ -10429,6 +10478,14 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
         session.canonical_models = canonical_models
         contract = session.effective_contract
         spec = effective_clip_spec
+        if session.workflow_plan is not None:
+            rec.event(
+                "golden_workflow_plan",
+                conditioning_ids=list(session.workflow_plan.conditioning_ids),
+                sampler_dependency_ids=list(session.workflow_plan.sampler_dependency_ids),
+                output_node_id=session.workflow_plan.output_node_id,
+                canonical_fast_path=session.workflow_plan.canonical_fast_path,
+            )
 
         clip_paths = [
             folder_paths.get_full_path_or_raise(spec.folder, name)
@@ -13876,22 +13933,11 @@ async def golden_unet_load(
             if any(".scaled_fp8" in name for name, *_ in entries):
                 raise RuntimeError("scaled_fp8_rejected")
             dtype_names = {dtype_str for _, dtype_str, *_ in entries}
-            source_dtypes = {
-                dtype_name: _TORCH_DTYPE.get(dtype_name)
-                for dtype_name in dtype_names
-            }
-            if any(dtype is None for dtype in source_dtypes.values()):
-                raise RuntimeError(
-                    f"unknown_dtype:{sorted(dtype_names)}"
-                )
-            view_dtype = next(iter(source_dtypes.values())) if len(dtype_names) == 1 else None
-            if len(dtype_names) > 1:
-                rec.event(
-                    "unet_mixed_source_dtype_admitted",
-                    source_dtypes=sorted(dtype_names),
-                    tensor_count=len(entries),
-                    policy="per_tensor_source_dtype_selected_compute_dtype",
-                )
+            if len(dtype_names) != 1:
+                raise RuntimeError(f"non_uniform_dtype:{sorted(dtype_names)}")
+            view_dtype = _TORCH_DTYPE.get(next(iter(dtype_names)))
+            if view_dtype is None:
+                raise RuntimeError("unknown_dtype")
 
             meta_sd = {
                 name: torch.empty(tuple(shape), dtype=_TORCH_DTYPE[dtype_str], device="meta")
@@ -14206,12 +14252,26 @@ async def golden_sampler_prepare(session: GoldenSession) -> dict:
             full_trace_phases,
             phase="prepare_dependency_closure",
         ):
-            runner.begin_scope(set())  # only 'prepare' classes permitted
-            executed_start = len(runner.executed)
-            try:
-                await runner.run_closure(node_map.sampler_id, include_target=False)
-            finally:
-                runner.end_scope()
+            # Upstream samplers that feed the selected terminal sampler are
+            # part of the same sampler dependency closure.  They execute here
+            # in graph order; the selected terminal sampler runs in the next
+            # stage.
+            requested_prepare_backend = getattr(session.request, "attention_backend", None)
+            prepare_attention_scope = (
+                attention_backend_scope(
+                    _sampler_bound_patcher(session),
+                    normalize_attention_backend(requested_prepare_backend),
+                )
+                if requested_prepare_backend is not None
+                else contextlib.nullcontext()
+            )
+            with prepare_attention_scope:
+                runner.begin_scope({"prepare", "sampling"})
+                executed_start = len(runner.executed)
+                try:
+                    await runner.run_closure(node_map.sampler_id, include_target=False)
+                finally:
+                    runner.end_scope()
         with _golden_trace_phase(
             "golden.sampler_prepare.prepare_quiescence",
             full_trace_phases,
@@ -15227,7 +15287,9 @@ async def _resolve_golden_output_images(
         for nid, info in session.request.prompt.items()
         if str(info.get("class_type")) == "SaveImage"
     ]
-    if len(save_nodes) != 1:
+    if len(save_nodes) > 1:
+        raise RuntimeError(f"saveimage_node_ambiguous:{len(save_nodes)}")
+    if not save_nodes:
         images = getattr(session, "images", None)
         if images is None or not hasattr(images, "cpu"):
             raise RuntimeError("workflow_image_terminal_missing")
@@ -15244,6 +15306,17 @@ async def _resolve_golden_output_images(
     images_link = (save_info.get("inputs") or {}).get("images")
     if not _is_link(images_link) or int(images_link[1]) != 0:
         raise RuntimeError("saveimage_images_link_mismatch")
+    if str(images_link[0]) == str(node_map.vae_decode_id):
+        images = getattr(session, "images", None)
+        if images is None or not hasattr(images, "cpu"):
+            raise RuntimeError("workflow_image_terminal_missing")
+        rec.event(
+            "output_direct_vae_decode",
+            output_node_id=str(node_map.vae_decode_id),
+            saveimage_node=str(save_id),
+            reason="direct_saveimage_decoder_link",
+        )
+        return images
     switch_id = str(images_link[0])
     switch_info = session.request.prompt.get(switch_id)
     if switch_info is None:
@@ -16290,8 +16363,6 @@ async def golden_serial_execute(
     # arm captured by GoldenSession in this task's context for every stage
     # read, even if the environment changes mid-request.
     transport_arm_token = _GOLDEN_QD_ARM_CONTEXT.set(session.qd_transport_arm)
-    numpy_bridge = golden_torch_numpy_cpu_bridge()
-    numpy_bridge.__enter__()
     try:
         with _golden_trace_span("golden_restore"):
             await golden_restore(session)
@@ -16345,10 +16416,7 @@ async def golden_serial_execute(
         else:
             session.recorder.event(EVENT_TEARDOWN_COMPLETE, request_id=request.request_id)
     finally:
-        try:
-            _GOLDEN_QD_ARM_CONTEXT.reset(transport_arm_token)
-        finally:
-            numpy_bridge.__exit__(None, None, None)
+        _GOLDEN_QD_ARM_CONTEXT.reset(transport_arm_token)
 
     # This is the sole final telemetry write for either outcome.  On success
     # it necessarily follows TEARDOWN_COMPLETE; on failure it preserves the
