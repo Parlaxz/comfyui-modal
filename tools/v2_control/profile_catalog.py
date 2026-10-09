@@ -143,8 +143,13 @@ def _matching_receipt(
 ) -> DeploymentReceipt | None:
     """Return a receipt only when target, resources, and config identity agree."""
     try:
+        raw_destination = profile.config.modal_destination
+        destination = raw_destination if isinstance(raw_destination, Mapping) else {}
         found = latest_deployment_receipt(
-            root, profile=profile.name, target=profile.target,
+            root,
+            profile=profile.name,
+            target=profile.target,
+            workspace_id=str(destination.get("workspace_id") or "") or None,
         )
     except (GateError, OSError, ValueError):
         # A corrupt authority is never replaced by an older receipt.
@@ -260,7 +265,10 @@ def catalog_golden_profiles(repo_root: Path | None = None) -> list[GoldenProfile
     for name in profiles.available():
         try:
             resolved = profiles.resolve(name)
-            config = resolver.resolve(profile_name=name)
+            config = _with_destination(
+                root,
+                resolver.resolve(profile_name=name),
+            )
             projected = _project(root, resolved, config)
         except (ProfileError, FlagError, OSError, ValueError, TypeError):
             projected = None
