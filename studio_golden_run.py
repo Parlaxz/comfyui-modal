@@ -375,6 +375,21 @@ def _golden_stage_timings(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {"_run_type": "golden", "stages": stages}
 
 
+def _canonical_golden_fast_path(workflow: Mapping[str, Any]) -> bool:
+    """Return true only for the proven canonical Golden graph family."""
+    try:
+        from comfymodal_runtime.golden_serial import (
+            derive_golden_workflow_plan,
+            resolve_golden_node_map,
+        )
+
+        node_map = resolve_golden_node_map(dict(workflow), allow_replacements=False)
+        plan = derive_golden_workflow_plan(dict(workflow), node_map)
+        return bool(plan.canonical_fast_path)
+    except Exception:
+        return False
+
+
 def _golden_history_meta(
     request_id: str,
     profile: GoldenProfile,
@@ -508,6 +523,7 @@ async def run_golden_workflow(
     # this preserves version/preset ownership and verbatim control mapping.
     from studio_workflow_run import (
         apply_workflow_values_to_prompt,
+        build_workflow_execution_plan,
         merge_workflow_controls,
         _normalize_model_loader_names,
         resolve_workflow_run_bundle,
@@ -543,6 +559,7 @@ async def run_golden_workflow(
             "message": str(applied["error"]),
         }
     _normalize_model_loader_names(applied["workflow"])
+    use_generic_executor = not _canonical_golden_fast_path(applied["workflow"])
 
     event_store.start(request_id)
     # The deployed C0 source owner is a deploy-baked arm, and Golden requires
@@ -598,18 +615,30 @@ async def run_golden_workflow(
             if handle_factory is not None
             else _default_handle_factory(profile, workspace)
         )
-        # Studio MUST go through the dedicated Studio adapter.  Calling the
-        # profile's own Golden method would put the stage-progress bridge
-        # (observer, queue, extra task) inside the ordinary v2ctl path, which
-        # is exactly what that path must never contain.  The profile's target
-        # still decides the real Golden class/mode and is reported verbatim.
-        remote_method = getattr(handle, STUDIO_STREAM_METHOD)
-        remote_gen = getattr(remote_method, "remote_gen", None)
-        if remote_gen is None or not callable(getattr(remote_gen, "aio", None)):
-            raise GoldenRunError(
-                f"Studio adapter {STUDIO_STREAM_METHOD!r} is not a stream"
+        if use_generic_executor:
+            plan, plan_error = build_workflow_execution_plan(
+                bundle,
+                merged["values"],
+                modal_options={},
+                comfyui_root=str(node_dir),
             )
-        stream = remote_gen.aio(payload)
+            if plan_error is not None or plan is None:
+                raise GoldenRunError(str(plan_error or "generic_execution_plan_failed"))
+            remote_method = getattr(handle, "run_plan_stream")
+            remote_gen = getattr(remote_method, "remote_gen", None)
+            if remote_gen is None or not callable(getattr(remote_gen, "aio", None)):
+                raise GoldenRunError("generic Studio executor is not a stream")
+            stream = remote_gen.aio(plan.to_dict(), request_id=request_id)
+        else:
+            # Canonical Studio workflows keep the dedicated Golden adapter and
+            # its bounded stage-progress bridge.
+            remote_method = getattr(handle, STUDIO_STREAM_METHOD)
+            remote_gen = getattr(remote_method, "remote_gen", None)
+            if remote_gen is None or not callable(getattr(remote_gen, "aio", None)):
+                raise GoldenRunError(
+                    f"Studio adapter {STUDIO_STREAM_METHOD!r} is not a stream"
+                )
+            stream = remote_gen.aio(payload)
         if hasattr(stream, "__await__"):
             stream = await stream
         terminal: dict[str, Any] | None = None

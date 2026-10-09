@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -146,8 +147,9 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
     captured: dict = {}
 
     class RemoteGenerator:
-        def aio(self, payload):
+        def aio(self, payload, **kwargs):
             captured["payload"] = payload
+            captured["kwargs"] = kwargs
 
             async def events():
                 yield {"type": "stage", "sequence": 8, "name": "decode"}
@@ -155,11 +157,9 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
 
             return events()
 
-    # Studio must reach Golden through the dedicated Studio adapter, never
-    # through the profile's own method: the ordinary method must stay free of
-    # the progress bridge.
     handle = SimpleNamespace(
-        run_golden_studio_stream=SimpleNamespace(remote_gen=RemoteGenerator())
+        run_golden_studio_stream=SimpleNamespace(remote_gen=RemoteGenerator()),
+        run_plan_stream=SimpleNamespace(remote_gen=RemoteGenerator()),
     )
     bundle = {
         "status": "ok",
@@ -170,6 +170,7 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
         "control_schema": {
             "strength": {"node_id": "1", "input_name": "strength", "type": "number"},
         },
+        "mapping": {"output_node_id": "2"},
         "executable_prompt": {
             "1": {"class_type": "TestNode", "inputs": {"strength": 1}},
             "2": {
@@ -179,6 +180,21 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
         },
     }
     import studio_workflow_run
+    def fake_build_plan(bundle_arg, values, *args, **kwargs):
+        workflow = copy.deepcopy(bundle_arg["executable_prompt"])
+        workflow["1"]["inputs"]["strength"] = values["strength"]
+        workflow["2"]["inputs"]["unet_name"] = "krea2_turbo_fp8_scaled.safetensors"
+        return (
+            SimpleNamespace(
+                to_dict=lambda: {
+                    "workflow": workflow,
+                    "output_node_ids": ["2"],
+                }
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(studio_workflow_run, "build_workflow_execution_plan", fake_build_plan)
     monkeypatch.setattr(
         studio_workflow_run,
         "resolve_workflow_run_bundle",
@@ -198,7 +214,7 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
         handle_factory=lambda *_args: handle,
     )
     assert result["status"] == "ok"
-    assert captured["payload"]["prompt"]["1"]["inputs"]["strength"] == 7
-    assert captured["payload"]["prompt"]["2"]["inputs"]["unet_name"] == "krea2_turbo_fp8_scaled.safetensors"
-    assert captured["payload"]["golden_mode"] == "parallel"
+    assert captured["payload"]["workflow"]["1"]["inputs"]["strength"] == 7
+    assert captured["payload"]["workflow"]["2"]["inputs"]["unet_name"] == "krea2_turbo_fp8_scaled.safetensors"
+    assert captured["kwargs"]["request_id"] == "studio-test"
     assert store.read("studio-test")["terminal"] is True
