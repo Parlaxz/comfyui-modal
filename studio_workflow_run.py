@@ -51,6 +51,29 @@ _BUNDLE_EXCLUDED_KEYS = frozenset({
     "sampler", "scheduler", "denoise",
 })
 
+_MODEL_LOADER_INPUTS = {
+    "CheckpointLoaderSimple": ("ckpt_name",),
+    "CLIPLoader": ("clip_name",),
+    "DualCLIPLoader": ("clip_name1", "clip_name2"),
+    "UNETLoader": ("unet_name",),
+    "VAELoader": ("vae_name",),
+}
+
+
+def _normalize_model_loader_names(workflow: dict[str, Any]) -> None:
+    """Match model-library installs, which flatten loader subfolder names."""
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        fields = _MODEL_LOADER_INPUTS.get(str(node.get("class_type", "")), ())
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for field in fields:
+            value = inputs.get(field)
+            if isinstance(value, str) and ("/" in value or "\\" in value):
+                inputs[field] = value.replace("\\", "/").rsplit("/", 1)[-1]
+
 
 # ── Domain service construction (mirrors studio_workflow_routes.py) ──────
 
@@ -614,6 +637,7 @@ def build_workflow_execution_plan(
         # (same helpers as _default_build_execution_plan / build_single_run_spec).
         _repair_missing_clip_inputs(workflow)
         _repair_missing_vae_inputs(workflow)
+        _normalize_model_loader_names(workflow)
 
         # ── Prompt bundle (custom, mirrors _default_build_execution_plan) ──
         # The modern role for the positive prompt is ``positive_prompt``; map

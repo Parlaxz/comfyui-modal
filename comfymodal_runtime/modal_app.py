@@ -49,6 +49,43 @@ from .contracts import (
     stable_hash,
 )
 from . import contracts as _contracts_mod
+
+
+_STUDIO_MODEL_LOADER_INPUTS = {
+    "CheckpointLoaderSimple": ("ckpt_name",),
+    "CLIPLoader": ("clip_name",),
+    "DualCLIPLoader": ("clip_name1", "clip_name2"),
+    "UNETLoader": ("unet_name",),
+    "VAELoader": ("vae_name",),
+}
+
+
+def _normalize_studio_golden_prompt(prompt: Any) -> Any:
+    """Flatten model-library subfolder names at the remote execution boundary."""
+    if not isinstance(prompt, Mapping):
+        return prompt
+    normalized = copy.deepcopy(dict(prompt))
+    for node_id, node in normalized.items():
+        if not isinstance(node, Mapping):
+            continue
+        fields = _STUDIO_MODEL_LOADER_INPUTS.get(str(node.get("class_type", "")), ())
+        inputs = node.get("inputs")
+        if not fields or not isinstance(inputs, Mapping):
+            continue
+        updated_inputs = dict(inputs)
+        changed = False
+        for field in fields:
+            value = updated_inputs.get(field)
+            if isinstance(value, str) and ("/" in value or "\\" in value):
+                updated_inputs[field] = value.replace("\\", "/").rsplit("/", 1)[-1]
+                changed = True
+        if changed:
+            updated_node = dict(node)
+            updated_node["inputs"] = updated_inputs
+            normalized[node_id] = updated_node
+    return normalized
+
+
 from .deployment_spec import (
     DEPLOYMENT_HASH_NAMESPACE,
     build_deployment_identity,  # compatibility export for legacy test doubles
@@ -23081,6 +23118,9 @@ class ModalRuntimeEntrypoint:
                     pass
 
         studio_request = dict(request)
+        studio_request["prompt"] = _normalize_studio_golden_prompt(
+            studio_request.get("prompt")
+        )
         # Streaming is selected by the METHOD, never by a payload key.  There is
         # deliberately no request flag that can turn the ordinary adapter into
         # a streaming one.

@@ -166,11 +166,16 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
         "workflow": {"workflow_id": "wf"},
         "version": {"workflow_version_id": "wv"},
         "preset": {"preset_id": "preset", "values": {"strength": 1}},
+        "defaults": {"strength": 1},
         "control_schema": {
             "strength": {"node_id": "1", "input_name": "strength", "type": "number"},
         },
         "executable_prompt": {
             "1": {"class_type": "TestNode", "inputs": {"strength": 1}},
+            "2": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": "krea2\\krea2_turbo_fp8_scaled.safetensors"},
+            },
         },
     }
     import studio_workflow_run
@@ -194,5 +199,6 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
     )
     assert result["status"] == "ok"
     assert captured["payload"]["prompt"]["1"]["inputs"]["strength"] == 7
+    assert captured["payload"]["prompt"]["2"]["inputs"]["unet_name"] == "krea2_turbo_fp8_scaled.safetensors"
     assert captured["payload"]["golden_mode"] == "parallel"
     assert store.read("studio-test")["terminal"] is True

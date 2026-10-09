@@ -776,6 +776,17 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         self.assertNotIn("studio_snapshot_id", meta)
         self.assertNotIn("studio_preset_label", meta)
 
+        nested_model_values = dict(merged["values"], model="krea2\\krea2_turbo_fp8_scaled.safetensors")
+        nested_plan, nested_err = swr.build_workflow_execution_plan(
+            bundle, nested_model_values,
+            modal_options={"production": {"enabled": False}},
+        )
+        self.assertIsNone(nested_err)
+        self.assertEqual(
+            nested_plan.workflow["4"]["inputs"]["ckpt_name"],
+            "krea2_turbo_fp8_scaled.safetensors",
+        )
+
         # Mapping with no output node id → hard error.
         broken = dict(bundle)
         broken["mapping"] = dict(bundle["mapping"], output_node_id="")

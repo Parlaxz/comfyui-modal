@@ -42,6 +42,39 @@ test.describe("Studio UI overhaul", () => {
     }
   });
 
+  test("places Redeploy beside the selected Golden profile dropdown", async ({ page }) => {
+    let deployPosts = 0;
+    await page.route("**/comfymodal/studio/golden/deploy", async (route) => {
+      if (route.request().method() === "POST") {
+        deployPosts += 1;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ status: "ok", profile: "golden_p1_parallel_c0_p8_h100" }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ status: "ok", state: "done" }),
+      });
+    });
+    const fx = await setupFakeTest(page);
+    try {
+      await fx.gotoPage("settings");
+      const bar = page.locator('[data-testid="settings-golden-profile-bar"]');
+      await expect(bar.locator('[data-testid="settings-golden-profile"]')).toBeVisible();
+      const redeploy = bar.locator('[data-testid="settings-golden-profile-deploy"]');
+      await expect(redeploy).toHaveText("Redeploy");
+      await redeploy.click();
+      await expect.poll(() => deployPosts).toBe(1);
+      fx.assertNoConsoleErrors();
+    } finally {
+      fx.guard.dispose();
+    }
+  });
+
   test("keeps Run disabled when the selected workflow version is unrunnable", async ({ page }) => {
     const runPosts = [];
     page.on("request", (request) => {

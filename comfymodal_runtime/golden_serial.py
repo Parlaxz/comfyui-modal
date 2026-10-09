@@ -790,6 +790,28 @@ def canonical_workflow_sha256(prompt: dict) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+@contextlib.contextmanager
+def golden_torch_numpy_cpu_bridge():
+    """Make legacy CPU-only NumPy bridges safe for one Golden request."""
+    original = torch.Tensor.numpy
+    if getattr(original, "_comfymodal_cpu_bridge", False):
+        yield
+        return
+
+    def _numpy(self: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        if self.device.type != "cpu":
+            return original(self.detach().cpu(), *args, **kwargs)
+        return original(self, *args, **kwargs)
+
+    _numpy._comfymodal_cpu_bridge = True
+    torch.Tensor.numpy = _numpy
+    try:
+        yield
+    finally:
+        if torch.Tensor.numpy is _numpy:
+            torch.Tensor.numpy = original
+
+
 # ── Frozen contracts ──────────────────────────────────────────────────────
 
 
@@ -801,10 +823,10 @@ class ClipLoadSpec:
     ``embedding_directory`` overrides the default embeddings folders when
     non-None; ``model_options_overrides`` is merged over native empty
     ``model_options`` (the canonical spec keeps it empty).  ``initial_device``
-    is reserved for the scoped Golden seam below.  ``dtype_policy`` is
-    ``"uniform"`` only — mixed-dtype sources are an explicit opt-in that does
-    not exist yet and fail closed.  Validation runs at construction; there is
-    no repair/fallback path.
+    is reserved for the scoped Golden seam below.  ``dtype_policy`` remains
+    ``"uniform"`` for the zero-copy proof contract; mixed-dtype sources use
+    native ComfyUI construction with an observable proof downgrade instead of
+    being rejected before construction.
     """
 
     checkpoint_names: tuple[str, ...]
@@ -2467,6 +2489,8 @@ def _start_clip_skeleton_overlap(session: Any, *, spec: Any, rec: Any) -> Option
             cache_details.append(details)
             if state is None:
                 return {"outcome": "refused", "reason": reason}
+            if len({str(view.dtype) for view in state.values()}) > 1:
+                return {"outcome": "refused", "reason": "mixed_source_dtype"}
             meta.append(state)
         meta_ms = (time.monotonic_ns() - started) / 1e6
         try:
@@ -6995,6 +7019,7 @@ def _read_file_preplanned_gpu(
     extent_arena = torch.empty(
         max(1, int(h2d_inflight_depth)) * int(h2d_copy_bytes),
         dtype=torch.uint8,
+        device="cpu",
         pin_memory=True,
     )
     extent_buffers = tuple(
@@ -7506,7 +7531,9 @@ def read_file_qd_gpu(
             worker_start_events: list = []
             for _slot in range(2):
                 try:
-                    slot = torch.empty(block_bytes, dtype=torch.uint8, pin_memory=True)
+                    slot = torch.empty(
+                        block_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
+                    )
                 except Exception as exc:
                     raise RuntimeError(f"pin_allocation_failed:{type(exc).__name__}") from exc
                 if not bool(getattr(slot, "is_pinned", lambda: False)()):
@@ -9176,6 +9203,37 @@ class GoldenSerialRunner:
                 self._golden_futures.discard(value)
         return value
 
+    @staticmethod
+    def _cpu_numpy_compat_value(value: Any) -> tuple[Any, bool]:
+        if isinstance(value, torch.Tensor):
+            if value.device.type == "cpu":
+                return value, False
+            return value.detach().cpu(), True
+        if isinstance(value, dict):
+            converted = False
+            result = {}
+            for key, item in value.items():
+                result[key], item_converted = GoldenSerialRunner._cpu_numpy_compat_value(item)
+                converted = converted or item_converted
+            return result, converted
+        if isinstance(value, list):
+            result = []
+            converted = False
+            for item in value:
+                converted_item, item_converted = GoldenSerialRunner._cpu_numpy_compat_value(item)
+                result.append(converted_item)
+                converted = converted or item_converted
+            return result, converted
+        if isinstance(value, tuple):
+            result = []
+            converted = False
+            for item in value:
+                converted_item, item_converted = GoldenSerialRunner._cpu_numpy_compat_value(item)
+                result.append(converted_item)
+                converted = converted or item_converted
+            return tuple(result), converted
+        return value, False
+
     def assert_quiescent(self) -> None:
         self._observe_tasks()
         pending = [f for f in self._golden_futures if not f.done()]
@@ -9187,6 +9245,7 @@ class GoldenSerialRunner:
 
     async def _call_node(self, unique_id: str, obj: Any, inputs: dict) -> Any:
         class_def = type(obj)
+        stage_class = classify_node(self.prompt[unique_id].get("class_type", ""))
         func_name = obj.FUNCTION
         if self._is_v3_class(class_def):
             from comfy_api.internal import make_locked_method_func
@@ -9227,17 +9286,34 @@ class GoldenSerialRunner:
         # excludes input decoration above, but includes complete async result
         # resolution below.
         trace_node_start_ns = time.monotonic_ns() if _full_trace_active() else None
-        try:
+        async def invoke(call_inputs: dict) -> Any:
             if inspect.iscoroutinefunction(func):
-                # Await inline: a task is never left pending across nodes.  The
-                # boundary stays open through the await, not just coroutine
-                # creation.
-                return await func(**inputs)
-            result = func(**inputs)
-            # A synchronous entry point may still return a coroutine/future;
-            # preserve the existing resolver while keeping the target boundary
-            # around its complete asynchronous result.
-            return await self._resolve(result)
+                return await func(**call_inputs)
+            return await self._resolve(func(**call_inputs))
+
+        try:
+            try:
+                return await invoke(inputs)
+            except Exception as first_exc:
+                compat_inputs, converted = self._cpu_numpy_compat_value(inputs)
+                if stage_class != "prepare" or not converted:
+                    raise
+                try:
+                    result = await invoke(compat_inputs)
+                except Exception as retry_exc:
+                    raise first_exc from retry_exc
+                recorder = self.trace_recorder
+                if recorder is not None:
+                    try:
+                        recorder.event(
+                            "golden_external_cpu_compat_retry",
+                            node_id=str(unique_id),
+                            node_class=str(class_type),
+                            original_error=f"{type(first_exc).__name__}: {first_exc}"[:500],
+                        )
+                    except BaseException:
+                        pass
+                return result
         finally:
             if sampler_call:
                 self.sampler_call_end = time.monotonic_ns()
@@ -12126,10 +12202,24 @@ async def golden_clip_load(
                 },
                 selected_tensor_count=source_tensor_count,
             )
-        source_dtype = uniform_source_dtype_across(state_dicts, tag="clip_source")
+        source_dtypes = sorted({
+            str(view.dtype)
+            for state_dict in state_dicts
+            for view in state_dict.values()
+        })
+        if not source_dtypes:
+            raise RuntimeError("clip_source_state_dict_empty")
+        mixed_source_dtype = len(source_dtypes) > 1
+        source_dtype = source_dtypes[0] if not mixed_source_dtype else "mixed"
+        if mixed_source_dtype:
+            rec.event(
+                "clip_mixed_source_dtype_native_path",
+                source_dtypes=source_dtypes,
+                proof_status="NATIVE_CONSTRUCTION_NO_ZERO_COPY_PROOF",
+            )
         _set_ra9h_telemetry(session, source_dtype=str(source_dtype))
 
-        if residency == "fp32_cast_once":
+        if residency == "fp32_cast_once" and not mixed_source_dtype:
             # RA9G owns the source and transformed mappings from this point
             # until the actual bind, proof, and source-reference retirement.
             ra9g = _ra9h_clip_module()
@@ -12254,7 +12344,7 @@ async def golden_clip_load(
             # the control arm.
             transformed_state_dicts = state_dicts
 
-        if residency == "fp32_cast_once":
+        if residency == "fp32_cast_once" and not mixed_source_dtype:
             set_clip_lifecycle_phase("constructor_preflight")
 
         import comfy.sd  # upstream ComfyUI module (allowed import)
@@ -12272,7 +12362,8 @@ async def golden_clip_load(
         # than a model option (which would change native policy selection).
         # Validate constructor input, but publish residency only from the
         # post-bind selected-scope snapshot below.
-        uniform_source_dtype_across(transformed_state_dicts, tag="clip")
+        if not mixed_source_dtype:
+            uniform_source_dtype_across(transformed_state_dicts, tag="clip")
         model_options = {}
         if spec.model_options_overrides:
             model_options.update(dict(spec.model_options_overrides))
@@ -12337,6 +12428,15 @@ async def golden_clip_load(
                 model_management.text_encoder_initial_device = native_initial_device
         if clip is None:
             raise RuntimeError("clip_construct_failed")
+        if mixed_source_dtype:
+            model_management.load_models_gpu([getattr(clip, "patcher", clip)])
+            session.clip_residency_record.update({
+                "actual": "native_mixed_dtype",
+                "status": "FALLBACK",
+                "fallback": True,
+                "fallback_reason": "mixed_source_dtype",
+            })
+            session.recorder.clip_residency_record = dict(session.clip_residency_record)
         cache_details = list(getattr(overlap_construct, "metadata_cache_details", []) or [])
         if cache_details:
             session.metadata_cache_telemetry.update({
@@ -12445,7 +12545,12 @@ async def golden_clip_load(
             set_clip_lifecycle_phase("adoption")
         adoption_started_ns = time.monotonic_ns()
         with clip_timing.span("storage_adoption"):
-            adoption = select_and_validate_qd_adoption_scope("clip", cond_model, combined_views)
+            adoption = select_and_validate_qd_adoption_scope(
+                "clip",
+                cond_model,
+                combined_views,
+                allow_unproven=mixed_source_dtype,
+            )
         adoption_end_ns = time.monotonic_ns()
         selected_scope = next(
             (module for path, module in cond_model.named_modules()
@@ -12460,7 +12565,7 @@ async def golden_clip_load(
             compute_identity = _clip_compute_identity(
                 selected_scope, adoption, getattr(clip, "patcher", None)
             )
-        if not compute_identity["compute_ready"]:
+        if not compute_identity["compute_ready"] and not mixed_source_dtype:
             raise RuntimeError(f"clip_compute_scope_not_ready:{compute_identity}")
         if clip_transfer is not None:
             # Keep source mappings and their owner alive through BOTH RA9G's
@@ -13419,6 +13524,7 @@ def select_and_validate_qd_adoption_scope(
     device_prefix: str = "cuda",
     max_outer_extra_count: int = _CLIP_ADOPTION_OUTER_EXTRA_MAX_COUNT,
     max_outer_extra_bytes: int = _CLIP_ADOPTION_OUTER_EXTRA_MAX_BYTES,
+    allow_unproven: bool = False,
 ) -> dict:
     """Generic fail-closed CLIP checkpoint-adoption proof (wrapper-shape agnostic).
 
@@ -13487,6 +13593,26 @@ def select_and_validate_qd_adoption_scope(
         if {int(t.data_ptr()) for t in tensors.values()} == view_ptr_set:
             candidates.append((str(path), module))
     if not candidates:
+        if allow_unproven:
+            return {
+                "status": "native_mixed_dtype_fallback",
+                "tensor_count": 0,
+                "same_storage_count": 0,
+                "copied_storage_count": 1,
+                "matched_count": 0,
+                "view_count": len(views),
+                "selected_scope": "",
+                "scope_candidates": [],
+                "outer_extra_count": 0,
+                "outer_extra_bytes": 0,
+                "outer_extra_names": [],
+                "outer_extra_devices": [],
+                "outer_extra_dtypes": [],
+                "outer_extra_limits": {
+                    "max_count": int(max_outer_extra_count),
+                    "max_bytes": int(max_outer_extra_bytes),
+                },
+            }
         raise RuntimeError(f"{tag}_adoption_no_scope_matches_view_pointer_set")
 
     ordered = sorted(candidates, key=lambda item: (item[0].count("."), item[0]))
@@ -13711,11 +13837,22 @@ async def golden_unet_load(
             if any(".scaled_fp8" in name for name, *_ in entries):
                 raise RuntimeError("scaled_fp8_rejected")
             dtype_names = {dtype_str for _, dtype_str, *_ in entries}
-            if len(dtype_names) != 1:
-                raise RuntimeError(f"non_uniform_dtype:{sorted(dtype_names)}")
-            view_dtype = _TORCH_DTYPE.get(next(iter(dtype_names)))
-            if view_dtype is None:
-                raise RuntimeError("unknown_dtype")
+            source_dtypes = {
+                dtype_name: _TORCH_DTYPE.get(dtype_name)
+                for dtype_name in dtype_names
+            }
+            if any(dtype is None for dtype in source_dtypes.values()):
+                raise RuntimeError(
+                    f"unknown_dtype:{sorted(dtype_names)}"
+                )
+            view_dtype = next(iter(source_dtypes.values())) if len(dtype_names) == 1 else None
+            if len(dtype_names) > 1:
+                rec.event(
+                    "unet_mixed_source_dtype_admitted",
+                    source_dtypes=sorted(dtype_names),
+                    tensor_count=len(entries),
+                    policy="per_tensor_source_dtype_selected_compute_dtype",
+                )
 
             meta_sd = {
                 name: torch.empty(tuple(shape), dtype=_TORCH_DTYPE[dtype_str], device="meta")
@@ -13741,7 +13878,7 @@ async def golden_unet_load(
             )
 
             selected = mm.unet_dtype(supported_dtypes=list(model_config.supported_inference_dtypes))
-            if selected != view_dtype:
+            if view_dtype is not None and selected != view_dtype:
                 raise RuntimeError(f"inference_dtype_mismatch:{selected}!={view_dtype}")
             manual_cast = mm.unet_manual_cast(
                 selected, mm.get_torch_device(), model_config.supported_inference_dtypes
@@ -16104,6 +16241,8 @@ async def golden_serial_execute(
     # arm captured by GoldenSession in this task's context for every stage
     # read, even if the environment changes mid-request.
     transport_arm_token = _GOLDEN_QD_ARM_CONTEXT.set(session.qd_transport_arm)
+    numpy_bridge = golden_torch_numpy_cpu_bridge()
+    numpy_bridge.__enter__()
     try:
         with _golden_trace_span("golden_restore"):
             await golden_restore(session)
@@ -16157,7 +16296,10 @@ async def golden_serial_execute(
         else:
             session.recorder.event(EVENT_TEARDOWN_COMPLETE, request_id=request.request_id)
     finally:
-        _GOLDEN_QD_ARM_CONTEXT.reset(transport_arm_token)
+        try:
+            _GOLDEN_QD_ARM_CONTEXT.reset(transport_arm_token)
+        finally:
+            numpy_bridge.__exit__(None, None, None)
 
     # This is the sole final telemetry write for either outcome.  On success
     # it necessarily follows TEARDOWN_COMPLETE; on failure it preserves the

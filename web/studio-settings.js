@@ -1296,6 +1296,26 @@ export function renderSettings(state, context) {
     }
   }
 
+  async function deployGoldenProfile(base, host, name, status, button) {
+    button.disabled = true;
+    status.textContent = "Deploying " + name + "\u2026";
+    try {
+      const started = await fetch(base + "/studio/golden/deploy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ profile: name }),
+      });
+      const payload = await started.json();
+      if (!started.ok || payload.status !== "ok") {
+        throw new Error(payload.error || "HTTP " + started.status);
+      }
+      await startGoldenDeployPoll(base, name, status, button, host);
+    } catch (error) {
+      status.textContent = "Deploy failed: " + (error.message || "request failed");
+      button.disabled = false;
+    }
+  }
+
   function renderGoldenProfileHost(host, base, selected, deployState) {
     if (activeGoldenDeployPoll && activeGoldenDeployPoll.name !== selected) {
       goldenDeployGeneration += 1;
@@ -1362,16 +1382,19 @@ export function renderSettings(state, context) {
         if (errorEl) errorEl.textContent = "Could not save Golden profile: " + (error.message || "request failed");
       }
     });
-    host.appendChild(select);
-
     const selectedProfile = goldenProfiles.find(
       (item) => item.name === (selected || "")
     );
     const isDeploying = (deployState && deployState.state === "running")
       || (activeGoldenDeployPoll
-        && activeGoldenDeployPoll.name === selectedProfile?.name
-        && activeGoldenDeployPoll.owner === goldenDeployPageOwner);
-    if (selectedProfile && (selectedProfile.deployed !== true || isDeploying)) {
+         && activeGoldenDeployPoll.name === selectedProfile?.name
+         && activeGoldenDeployPoll.owner === goldenDeployPageOwner);
+    const profileBar = el("div", {
+      class: "comfymodal-studio-settings-golden-profile-bar",
+      "data-testid": "settings-golden-profile-bar",
+      style: "display:flex;align-items:center;gap:8px;width:100%;",
+    }, [select]);
+    if (selectedProfile) {
       const selTarget = selectedProfile.target && typeof selectedProfile.target === "object"
         ? selectedProfile.target
         : {};
@@ -1380,40 +1403,27 @@ export function renderSettings(state, context) {
         "data-testid": "settings-golden-profile-deploy-status",
         text: isDeploying
           ? "Deploying " + selectedProfile.name + "\u2026"
-          : selTarget.app
-          ? "Not deployed. Deploying runs v2ctl for " + selectedProfile.name
-            + " (" + selTarget.app + ")."
-          : "Not deployed.",
+          : selectedProfile.deployed !== true
+          ? selTarget.app
+            ? "Not deployed. Deploying runs v2ctl for " + selectedProfile.name
+              + " (" + selTarget.app + ")."
+            : "Not deployed."
+          : "",
       });
       const deployButton = el("button", {
         class: "comfymodal-primary-btn",
         "data-testid": "settings-golden-profile-deploy",
         "data-profile-name": selectedProfile.name,
-        text: "Deploy " + selectedProfile.name,
+        text: selectedProfile.deployed === true ? "Redeploy" : "Deploy " + selectedProfile.name,
+        title: selectedProfile.deployed === true
+          ? "Redeploy the selected Golden profile"
+          : "Deploy the selected Golden profile",
         disabled: !!isDeploying,
-        onclick: async () => {
-          deployButton.disabled = true;
-          deployStatus.textContent = "Deploying " + selectedProfile.name + "\u2026";
-          try {
-            const started = await fetch(base + "/studio/golden/deploy", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ profile: selectedProfile.name }),
-            });
-            const payload = await started.json();
-            if (!started.ok || payload.status !== "ok") {
-              throw new Error(payload.error || "HTTP " + started.status);
-            }
-            await startGoldenDeployPoll(base, selectedProfile.name, deployStatus, deployButton, host);
-          } catch (error) {
-            deployStatus.textContent =
-              "Deploy failed: " + (error.message || "request failed");
-            deployButton.disabled = false;
-          }
-        },
+        onclick: () => deployGoldenProfile(base, host, selectedProfile.name, deployStatus, deployButton),
       });
+      profileBar.appendChild(deployButton);
+      host.appendChild(profileBar);
       host.appendChild(deployStatus);
-      host.appendChild(deployButton);
       if (isDeploying) {
         startGoldenDeployPoll(base, selectedProfile.name, deployStatus, deployButton, host).catch((error) => {
           if (_goldenDeployPageOwner !== goldenDeployPageOwner || !host.isConnected) return;
@@ -1421,6 +1431,8 @@ export function renderSettings(state, context) {
           deployButton.disabled = false;
         });
       }
+    } else {
+      host.appendChild(profileBar);
     }
 
     const catalogList = el("div", {

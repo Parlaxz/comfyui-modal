@@ -509,6 +509,7 @@ async def run_golden_workflow(
     from studio_workflow_run import (
         apply_workflow_values_to_prompt,
         merge_workflow_controls,
+        _normalize_model_loader_names,
         resolve_workflow_run_bundle,
     )
 
@@ -541,6 +542,7 @@ async def run_golden_workflow(
             "error_code": "WORKFLOW_CONTROL_APPLICATION",
             "message": str(applied["error"]),
         }
+    _normalize_model_loader_names(applied["workflow"])
 
     event_store.start(request_id)
     # The deployed C0 source owner is a deploy-baked arm, and Golden requires
