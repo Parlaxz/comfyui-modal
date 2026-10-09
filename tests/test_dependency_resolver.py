@@ -1164,6 +1164,46 @@ class DependencyResolverTestCase(unittest.TestCase):
         )
         self.assertIn("donutnodes", unres["DonutWorkflowPanel"])
 
+    def test_executable_unknown_pack_identity_is_required(self):
+        """A real executable node keeps its captured pack dependency even when Manager lacks it."""
+        version = {
+            "workflow_version_id": "wv_krea_missing_pack",
+            "executable_prompt": {
+                "207": {
+                    "class_type": "ComfyUI-Krea2T-Enhancer",
+                    "inputs": {"model": ["194", 0]},
+                },
+            },
+            "graph_json": {
+                "nodes": [
+                    {
+                        "id": 207,
+                        "type": "ComfyUI-Krea2T-Enhancer",
+                        "inputs": [{"name": "model", "link": 1}],
+                        "outputs": [{"name": "model", "type": "MODEL", "links": [2]}],
+                        "properties": {
+                            "cnr_id": "ComfyUI-Krea2T-Enhancer",
+                            "ver": "cf8895005540680306cd46e1faaf75f8902db794",
+                        },
+                    },
+                ]
+            },
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": ["ComfyUI-Krea2T-Enhancer"],
+                "custom_node_requirements": {
+                    "ComfyUI-Krea2T-Enhancer": {
+                        "cnr_id": "ComfyUI-Krea2T-Enhancer",
+                        "version": "cf8895005540680306cd46e1faaf75f8902db794",
+                    }
+                },
+            },
+        }
+        nodes = self.resolver.resolve_custom_nodes(version, remote={})
+        assert len(nodes) == 1
+        assert nodes[0]["state"] == "missing"
+        assert nodes[0]["cnr_id"] == "ComfyUI-Krea2T-Enhancer"
+
     def test_graph_real_shape_node_absent_from_executable_stays_missing(self):
         """Without a catalog the resolver fails closed to Missing."""
         version = {

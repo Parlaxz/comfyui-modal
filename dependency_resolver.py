@@ -161,6 +161,24 @@ def _version_node_classes(version: dict[str, Any]) -> list[str]:
     return out
 
 
+def _classes_with_runtime_evidence(version: dict[str, Any]) -> set[str]:
+    """Return classes represented by executable or shaped graph nodes."""
+    evidenced: set[str] = set()
+    executable = (version or {}).get("executable_prompt") or {}
+    if isinstance(executable, dict):
+        for node in executable.values():
+            if isinstance(node, dict) and node.get("class_type"):
+                evidenced.add(str(node["class_type"]))
+    for graph_key in ("graph_json", "static_graph"):
+        for node in iter_graph_nodes((version or {}).get(graph_key)):
+            node_type = node.get("type")
+            if not isinstance(node_type, str) or not node_type:
+                continue
+            if node.get("inputs") or node.get("outputs"):
+                evidenced.add(node_type)
+    return evidenced
+
+
 def _class_identity_from_metadata(
     cls: str,
     requirements: dict[str, Any],
@@ -245,6 +263,34 @@ def _normalized_install_path(value: Any) -> str:
     if len(text) > 1:
         text = text.rstrip("/")
     return text.casefold()
+
+
+def _pack_identity_installed(records: list[dict[str, Any]], cnr_id: str, aux_id: str) -> bool:
+    """Whether an explicitly claimed pack is already installed locally."""
+    identities = {
+        _normalized_identity(value)
+        for value in (cnr_id, aux_id)
+        if _normalized_identity(value)
+    }
+    if not identities:
+        return False
+    for record in records:
+        if not isinstance(record, dict) or not record_is_installed(record):
+            continue
+        values = {
+            _normalized_identity(record.get("name")),
+            _normalized_identity(record.get("cnr_id")),
+            _normalized_identity(record.get("aux_id")),
+            _normalized_identity(record.get("repo_url")),
+            _normalized_identity(Path(str(record.get("install_path") or "")).name),
+        }
+        values.discard("")
+        if identities.intersection(values):
+            return True
+        for identity in identities:
+            if identity.rsplit("/", 1)[-1] in values:
+                return True
+    return False
 
 
 def _pack_group_key(row: dict[str, Any]) -> tuple[str, str]:
@@ -805,12 +851,23 @@ class DependencyResolver:
         requirements = dependency_metadata.get("custom_node_requirements") or {}
         if not isinstance(requirements, dict):
             requirements = {}
+        declared_classes = {
+            str(item)
+            for item in (dependency_metadata.get("node_classes") or [])
+            if isinstance(item, str)
+        }
+        runtime_evidence_classes = _classes_with_runtime_evidence(version)
         # Older stored versions captured before custom_node_requirements
         # existed still carry pack identity on the persisted UI graph; recover
         # it so classes sharing a pack group into one missing row instead of
         # six.
         graph_identity_by_class = _class_pack_identities_from_graph(version)
         _records, core = self._ensure_discovery()
+        try:
+            registry_records = self._registry.list_records()
+        except (StudioStoreError, OSError):
+            registry_records = []
+        identity_records = list(_records) + list(registry_records)
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
         for class_type in node_classes:
@@ -818,10 +875,6 @@ class DependencyResolver:
             if cls in seen:
                 continue
             seen.add(cls)
-            if not _is_resolvable_class_name(cls):
-                continue  # graph artifact; reported via unresolvable_classes
-            if cls.lower() in _VIRTUAL_NODE_CLASSES:
-                continue  # frontend-only virtual node; never a pack dependency
             req = requirements.get(cls) or {}
             if not isinstance(req, dict):
                 req = {}
@@ -829,6 +882,24 @@ class DependencyResolver:
             cnr_id, aux_id = _class_identity_from_metadata(
                 cls, requirements, graph_identity_by_class
             )
+            pack_version = str(
+                req.get("version")
+                or (graph_identity_by_class.get(cls) or {}).get("version")
+                or ""
+            )
+            explicit_pack_identity = bool(
+                (cnr_id or aux_id or req.get("repository"))
+                and cls in declared_classes
+                and bool(pack_version)
+            )
+            if explicit_pack_identity and _pack_identity_installed(
+                identity_records, cnr_id, aux_id
+            ):
+                explicit_pack_identity = False
+            if not _is_resolvable_class_name(cls) and not explicit_pack_identity:
+                continue  # graph artifact; reported via unresolvable_classes
+            if cls.lower() in _VIRTUAL_NODE_CLASSES and not explicit_pack_identity:
+                continue  # frontend-only virtual node; never a pack dependency
             display_name = (
                 req.get("name") or req.get("repository") or cnr_id or aux_id or cls
             )
@@ -888,7 +959,11 @@ class DependencyResolver:
             # installable dependency, so it stays out of results and is
             # reported via unresolvable_classes instead. A catalog miss
             # (None) fails closed to Missing, exactly as before.
-            if self._catalog_provides(cls) is False:
+            # A captured workflow identity is authoritative evidence of the
+            # required pack even when the current Manager catalog is stale or
+            # does not know the class yet.  Only metadata-free unknown classes
+            # are safe to classify as non-installable UI leftovers.
+            if self._catalog_provides(cls) is False and not explicit_pack_identity:
                 continue
             results.append(
                 {
@@ -927,8 +1002,19 @@ class DependencyResolver:
             requirements = dependency_metadata.get("custom_node_requirements") or {}
             if not isinstance(requirements, dict):
                 requirements = {}
+            declared_classes = {
+                str(item)
+                for item in (dependency_metadata.get("node_classes") or [])
+                if isinstance(item, str)
+            }
+            runtime_evidence_classes = _classes_with_runtime_evidence(version)
             graph_identity_by_class = _class_pack_identities_from_graph(version)
             _records, core = self._ensure_discovery()
+            try:
+                registry_records = self._registry.list_records()
+            except (StudioStoreError, OSError):
+                registry_records = []
+            identity_records = list(_records) + list(registry_records)
             out: list[dict[str, Any]] = []
             seen: set[str] = set()
             for class_type in node_classes:
@@ -936,7 +1022,27 @@ class DependencyResolver:
                 if cls in seen:
                     continue
                 seen.add(cls)
-                if not _is_resolvable_class_name(cls):
+                req = requirements.get(cls) or {}
+                if not isinstance(req, dict):
+                    req = {}
+                cnr_id, aux_id = _class_identity_from_metadata(
+                    cls, requirements, graph_identity_by_class
+                )
+                pack_version = str(
+                    req.get("version")
+                    or (graph_identity_by_class.get(cls) or {}).get("version")
+                    or ""
+                )
+                explicit_pack_identity = bool(
+                    (cnr_id or aux_id or req.get("repository"))
+                    and cls in declared_classes
+                    and bool(pack_version)
+                )
+                if explicit_pack_identity and _pack_identity_installed(
+                    identity_records, cnr_id, aux_id
+                ):
+                    explicit_pack_identity = False
+                if not _is_resolvable_class_name(cls) and not explicit_pack_identity:
                     out.append(
                         {
                             "name": cls,
@@ -945,13 +1051,10 @@ class DependencyResolver:
                         }
                     )
                     continue
-                if cls.lower() in _VIRTUAL_NODE_CLASSES:
+                if cls.lower() in _VIRTUAL_NODE_CLASSES and not explicit_pack_identity:
                     continue
                 if cls in core:
                     continue
-                cnr_id, aux_id = _class_identity_from_metadata(
-                    cls, requirements, graph_identity_by_class
-                )
                 try:
                     record_exists = self._registry.record_by_class(cls) is not None
                 except (StudioStoreError, OSError):
@@ -960,7 +1063,7 @@ class DependencyResolver:
                     continue
                 if record_exists:
                     continue
-                if self._catalog_provides(cls) is False:
+                if self._catalog_provides(cls) is False and not explicit_pack_identity:
                     claimed = cnr_id or aux_id
                     reason = "no known backend provides this class"
                     if claimed:
