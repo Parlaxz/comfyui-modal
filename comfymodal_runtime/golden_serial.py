@@ -12006,6 +12006,96 @@ def _classify_unet_dtype_source(entries: Any, metadata: Any) -> str:
     return "mixed"
 
 
+def build_mixed_source_plan(entries: Any) -> dict[str, Any]:
+    """Build a metadata-only source plan for mixed nonquantized UNET sources.
+
+    Pure logic over the same ``(key, dtype_str, shape, offset, length)``
+    entries preflight validated: per-tensor header dtype (torch dtype
+    object), shape, offset, length; empty bindings (derived post
+    detection); no quant layers or markers.  Rejects duplicate keys,
+    unsupported dtypes, empty coverage, zero-length entries, and any
+    quant descriptors (nonquant unit only) with explicit reasons.
+    Raises RuntimeError on rejection (stage fail-closed style).
+    """
+    try:
+        items = list(entries or [])
+    except Exception:
+        raise RuntimeError("unet_source_plan_entries_invalid")
+    source_specs: dict[str, dict[str, Any]] = {}
+    for item in items:
+        try:
+            key = str(item[0])
+            dtype_name = str(item[1])
+            shape = tuple(int(v) for v in item[2])
+            offset = int(item[3])
+            length = int(item[4])
+        except Exception:
+            raise RuntimeError("unet_source_plan_entry_malformed")
+        if not key or key in source_specs:
+            raise RuntimeError(f"unet_source_plan_key:{key or 'empty'}")
+        torch_dtype = _TORCH_DTYPE.get(dtype_name)
+        if torch_dtype is None:
+            raise RuntimeError(f"unet_source_plan_dtype:{dtype_name}")
+        if key.endswith(".comfy_quant"):
+            raise RuntimeError(f"unet_mixed_quant_marker_unsupported:{key}")
+        if length <= 0:
+            raise RuntimeError(f"unet_source_plan_zero_length:{key}")
+        source_specs[key] = {
+            "dtype_name": dtype_name,
+            "torch_dtype": torch_dtype,
+            "shape": shape,
+            "offset": offset,
+            "length": length,
+        }
+    if not source_specs:
+        raise RuntimeError("unet_source_plan_empty")
+    return {
+        "kind": "mixed",
+        "source_specs": source_specs,
+        "bindings": {},
+        "quant_layers": {},
+        "marker_keys": (),
+    }
+
+
+def derive_mixed_plan_bindings(
+    source_plan: Any, prefix: Any
+) -> dict[str, Any]:
+    """Resolve model-key -> source-key bindings by detected prefix.
+
+    Pure logic: strips the detected prefix (the same rule transport
+    dictionary processing applies when it builds adopted views), so the
+    proof compares exactly the tensors adoption will bind.  Requires a
+    bijection (every source maps once; empty or colliding results
+    reject loudly — the proof would fail them anyway, this names the
+    cause earlier).  Returns a NEW plan dict; the input is untouched.
+    Raises RuntimeError on any defect (stage fail-closed style).
+    """
+    if not isinstance(source_plan, Mapping):
+        raise RuntimeError("unet_plan_invalid")
+    specs = source_plan.get("source_specs", {})
+    if not isinstance(specs, dict) or not specs:
+        raise RuntimeError("unet_plan_empty_specs")
+    prefix_str = str(prefix or "")
+    bindings: dict[str, str] = {}
+    seen_model: set[str] = set()
+    for source_key in specs:
+        model_key = (
+            source_key[len(prefix_str):]
+            if prefix_str and source_key.startswith(prefix_str)
+            else source_key
+        )
+        if not model_key:
+            raise RuntimeError(f"unet_plan_binding_empty:{source_key}")
+        if model_key in seen_model:
+            raise RuntimeError(f"unet_plan_binding_collision:{model_key}")
+        seen_model.add(model_key)
+        bindings[model_key] = str(source_key)
+    plan = dict(source_plan)
+    plan["bindings"] = bindings
+    return plan
+
+
 def _session_source_policy(session: Any) -> str:
     """Session-local source-read policy (default: canonical behavior).
 
@@ -13551,6 +13641,7 @@ def validate_unet_binding(
     expected_count: int = EXPECTED_UNET_TENSOR_COUNT,
     expected_dtype: Optional[torch.dtype] = torch.bfloat16,
     device_prefix: str = "cuda",
+    source_plan: Any = None,
 ) -> dict:
     """Strict 453/453 pointer-identity binding validation.
 
@@ -13559,7 +13650,22 @@ def validate_unet_binding(
     unexpected/leftover, or copied tensors are rejected.  (``device_prefix``
     exists solely so offline synthetic tests can exercise the validator on
     CPU-shared-storage fakes; production uses the default 'cuda'.)
+
+    When ``source_plan`` (from :func:`build_mixed_source_plan`) is given,
+    each model tensor is checked against its own header-derived dtype and
+    shape instead of the single ``expected_dtype``; coverage is proved
+    against the plan inventory (every source spec consumed exactly once,
+    every model tensor mapped to a spec).  All other strictness —
+    shape, device, pointer identity, missing/leftover accounting — is
+    unchanged.
     """
+    if source_plan is not None:
+        return validate_planned_unet_binding(
+            model,
+            views,
+            source_plan=source_plan,
+            device_prefix=device_prefix,
+        )
     inner = getattr(model, "diffusion_model", model)
     named = dict(inner.named_parameters())
     named.update(dict(inner.named_buffers()))
@@ -13590,6 +13696,84 @@ def validate_unet_binding(
         same_storage += 1
         ptr_map[name] = int(tensor.data_ptr())
     missing = sorted(set(views) - set(named))
+    if missing:
+        raise RuntimeError(f"bind_missing:{missing[:8]}")
+    if leftover:
+        raise RuntimeError(f"bind_leftover:{leftover}")
+    return {
+        "tensor_count": len(named),
+        "same_storage_count": same_storage,
+        "copied_storage_count": copied,
+        "unexpected_device_count": unexpected_device,
+        "unexpected_dtype_count": unexpected_dtype,
+        "leftover_count": leftover,
+        "ptr_map": ptr_map,
+    }
+
+
+def validate_planned_unet_binding(
+    model: Any,
+    views: dict,
+    *,
+    source_plan: Any,
+    device_prefix: str = "cuda",
+) -> dict:
+    """Per-tensor proof against a header-derived source plan.
+
+    ``source_plan`` carries ``source_specs`` (source key -> header dtype
+    object, shape) and ``bindings`` (model key -> source key; empty means
+    identity).  Each live tensor must match its own spec dtype/shape,
+    reside on the required device, and share storage with its source
+    view; every spec is consumed exactly once and every model tensor is
+    mapped.  Anything else fails loudly — a plan never weakens proof.
+    """
+    if not isinstance(source_plan, Mapping):
+        raise RuntimeError("unet_plan_invalid")
+    specs = source_plan.get("source_specs", {})
+    if not isinstance(specs, dict) or not specs:
+        raise RuntimeError("unet_plan_empty_specs")
+    bindings = source_plan.get("bindings", {})
+    if not isinstance(bindings, dict):
+        raise RuntimeError("unet_plan_invalid_bindings")
+    inner = getattr(model, "diffusion_model", model)
+    named = dict(inner.named_parameters())
+    named.update(dict(inner.named_buffers()))
+    same_storage = copied = leftover = 0
+    unexpected_device = unexpected_dtype = 0
+    ptr_map: dict = {}
+    seen_sources: set = set()
+    for name, tensor in named.items():
+        source_key = bindings.get(name, name)
+        spec = specs.get(source_key)
+        if not isinstance(spec, dict):
+            raise RuntimeError(f"unet_plan_unmapped:{name}")
+        if source_key in seen_sources:
+            raise RuntimeError(f"unet_plan_duplicate:{source_key}")
+        seen_sources.add(source_key)
+        src = views.get(name)
+        if src is None:
+            leftover += 1
+            continue
+        try:
+            expected_shape = tuple(int(v) for v in (spec.get("shape") or ()))
+        except Exception:
+            raise RuntimeError(f"unet_plan_shape:{name}")
+        if tuple(tensor.shape) != expected_shape:
+            raise RuntimeError(f"bind_shape:{name}")
+        if tensor.dtype != spec.get("torch_dtype"):
+            raise RuntimeError(f"bind_dtype:{name}:{tensor.dtype}")
+        if not str(tensor.device).startswith(device_prefix):
+            raise RuntimeError(f"bind_device:{name}:{tensor.device}")
+        try:
+            same_ptr = int(tensor.data_ptr()) == int(src.data_ptr())
+        except Exception:
+            raise RuntimeError(f"bind_pointer:{name}")
+        if not same_ptr:
+            copied += 1
+            raise RuntimeError(f"bind_copied_storage:{name}")
+        same_storage += 1
+        ptr_map[name] = int(tensor.data_ptr())
+    missing = sorted(k for k in specs if k not in seen_sources)
     if missing:
         raise RuntimeError(f"bind_missing:{missing[:8]}")
     if leftover:
@@ -13995,6 +14179,7 @@ async def golden_unet_load(
             shared_transport_task = asyncio.create_task(shared_transport.load(unet_path, role="unet"))
             await asyncio.sleep(0)
 
+        source_plan = None
         with _golden_trace_span("golden.unet.header_config_preflight"):
             if shared_transport is not None:
                 header = shared_layout.header
@@ -14020,13 +14205,28 @@ async def golden_unet_load(
             if len(dtype_names) != 1:
                 _dtype_plan_class = _classify_unet_dtype_source(entries, metadata)
                 _dtype_plan_mode = _unet_dtype_plan_mode()
-                if (_dtype_plan_class == "mixed"
-                        and _dtype_plan_mode in ("mixed", "scaled_fp8")) or (
-                        _dtype_plan_class == "quant_fp8"
+                if _dtype_plan_class == "mixed" and _dtype_plan_mode in ("mixed", "scaled_fp8"):
+                    source_plan = build_mixed_source_plan(entries)
+                    rec.event(
+                        "unet_dtype_plan",
+                        kind="mixed",
+                        status="admitted",
+                        requested_mode=_dtype_plan_mode,
+                        tensor_count=len(source_plan["source_specs"]),
+                    )
+                elif (_dtype_plan_class == "quant_fp8"
                         and _dtype_plan_mode == "scaled_fp8"):
+                    rec.event(
+                        "unet_dtype_plan",
+                        kind="quant_fp8",
+                        status="deferred",
+                        requested_mode=_dtype_plan_mode,
+                        tensor_count=len(entries),
+                    )
                     raise RuntimeError(
                         f"unet_dtype_plan_not_built:{_dtype_plan_class}")
-                raise RuntimeError(f"non_uniform_dtype:{sorted(dtype_names)}")
+                else:
+                    raise RuntimeError(f"non_uniform_dtype:{sorted(dtype_names)}")
             view_dtype = _TORCH_DTYPE.get(next(iter(dtype_names)))
             if view_dtype is None:
                 raise RuntimeError("unknown_dtype")
@@ -14053,14 +14253,33 @@ async def golden_unet_load(
                 prefix=str(prefix),
                 raw_key_count=len(meta_sd),
             )
-
-            selected = mm.unet_dtype(supported_dtypes=list(model_config.supported_inference_dtypes))
-            if view_dtype is not None and selected != view_dtype:
-                raise RuntimeError(f"inference_dtype_mismatch:{selected}!={view_dtype}")
-            manual_cast = mm.unet_manual_cast(
-                selected, mm.get_torch_device(), model_config.supported_inference_dtypes
-            )
-            model_config.set_inference_dtype(selected, manual_cast)
+            if source_plan is not None:
+                # Mixed plan: resolve model->source bindings with the
+                # detected prefix, then use native nonquantized inference
+                # selection (parameter count + predominant storage dtype).
+                # No single-view-dtype comparison: per-tensor expectations
+                # live in the plan and the proof enforces them.
+                source_plan = derive_mixed_plan_bindings(source_plan, prefix)
+                _plan_params = cu.calculate_parameters(detect_sd)
+                _plan_weight_dtype = cu.weight_dtype(detect_sd)
+                _plan_device = mm.get_torch_device()
+                selected = mm.unet_dtype(
+                    model_params=_plan_params,
+                    supported_dtypes=list(model_config.supported_inference_dtypes),
+                    weight_dtype=_plan_weight_dtype,
+                )
+                manual_cast = mm.unet_manual_cast(
+                    selected, _plan_device, model_config.supported_inference_dtypes
+                )
+                model_config.set_inference_dtype(selected, manual_cast, device=_plan_device)
+            else:
+                selected = mm.unet_dtype(supported_dtypes=list(model_config.supported_inference_dtypes))
+                if view_dtype is not None and selected != view_dtype:
+                    raise RuntimeError(f"inference_dtype_mismatch:{selected}!={view_dtype}")
+                manual_cast = mm.unet_manual_cast(
+                    selected, mm.get_torch_device(), model_config.supported_inference_dtypes
+                )
+                model_config.set_inference_dtype(selected, manual_cast)
         # This identity must hold before constructing even the meta skeleton;
         # otherwise assign=True adoption is not a trustworthy contract.
         dynamic_core = require_dynamic_core_model_patcher(tag="unet")
@@ -14218,6 +14437,7 @@ async def golden_unet_load(
                     if getattr(session, "effective_contract", None) is not None
                     else contract.expected_unet_tensor_count
                 ),
+                source_plan=source_plan,
             )
         adoption_end_ns = time.monotonic_ns()
         adoption_wall_ms = (adoption_end_ns - adoption_started_ns) / 1e6

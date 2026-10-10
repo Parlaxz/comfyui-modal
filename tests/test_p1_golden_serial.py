@@ -3397,6 +3397,13 @@ def _dtype_entries(pairs):
             for i, dtype in enumerate(pairs)]
 
 
+def _mixed_entries():
+    return [
+        ("blk.a.weight", "BF16", (4, 4), 0, 64),
+        ("blk.b.weight", "F32", (4, 4), 64, 128),
+    ]
+
+
 def test_classify_unet_uniform():
     assert gs._classify_unet_dtype_source(_dtype_entries(["BF16"] * 3), {}) == "uniform"
     assert gs._classify_unet_dtype_source(_dtype_entries(["F32"]), None) == "uniform"
@@ -3441,3 +3448,68 @@ def test_unet_dtype_plan_mode_defaults_off(monkeypatch):
 def test_unet_dtype_plan_mode_values(monkeypatch, raw, expected):
     monkeypatch.setenv("COMFYMODAL_GOLDEN_UNET_DTYPE_PLAN", raw)
     assert gs._unet_dtype_plan_mode() == expected
+
+
+# ── UNET mixed source-plan builder + binding derivation (Unit 1) ──
+
+def _mixed_entries():
+    return [
+        ("blk.a.weight", "BF16", (4, 4), 0, 64),
+        ("blk.b.weight", "F32", (4, 4), 64, 128),
+    ]
+
+
+def test_build_mixed_source_plan_shape():
+    plan = gs.build_mixed_source_plan(_mixed_entries())
+    assert plan["kind"] == "mixed"
+    assert set(plan["source_specs"]) == {"blk.a.weight", "blk.b.weight"}
+    assert plan["source_specs"]["blk.a.weight"]["dtype_name"] == "BF16"
+    assert plan["source_specs"]["blk.a.weight"]["shape"] == (4, 4)
+    assert plan["bindings"] == {}
+    assert plan["quant_layers"] == {}
+    assert plan["marker_keys"] == ()
+
+
+def test_build_mixed_source_plan_rejections():
+    with pytest.raises(RuntimeError, match="unet_source_plan_empty"):
+        gs.build_mixed_source_plan([])
+    dup = _mixed_entries() + [("blk.a.weight", "BF16", (4, 4), 128, 192)]
+    with pytest.raises(RuntimeError, match="unet_source_plan_key"):
+        gs.build_mixed_source_plan(dup)
+    with pytest.raises(RuntimeError, match="unet_source_plan_dtype"):
+        gs.build_mixed_source_plan([("x", "NOPE", (4,), 0, 16)])
+    with pytest.raises(RuntimeError, match="unet_mixed_quant_marker_unsupported"):
+        gs.build_mixed_source_plan([("blk.comfy_quant", "U8", (8,), 0, 8)])
+    with pytest.raises(RuntimeError, match="unet_source_plan_zero_length"):
+        gs.build_mixed_source_plan([("blk.w", "BF16", (4,), 0, 0)])
+
+
+def test_derive_mixed_plan_bindings_prefix():
+    plan = gs.build_mixed_source_plan([
+        ("diffusion_model.blk.a", "BF16", (4, 4), 0, 64),
+        ("diffusion_model.blk.b", "F32", (4, 4), 64, 128),
+    ])
+    out = gs.derive_mixed_plan_bindings(plan, "diffusion_model.")
+    assert out["bindings"] == {
+        "blk.a": "diffusion_model.blk.a",
+        "blk.b": "diffusion_model.blk.b",
+    }
+    assert out is not plan
+    assert plan["bindings"] == {}
+
+
+def test_derive_mixed_plan_bindings_identity():
+    plan = gs.build_mixed_source_plan(_mixed_entries())
+    out = gs.derive_mixed_plan_bindings(plan, "")
+    assert out["bindings"] == {
+        "blk.a.weight": "blk.a.weight",
+        "blk.b.weight": "blk.b.weight",
+    }
+
+
+def test_derive_mixed_plan_bindings_rejections():
+    with pytest.raises(RuntimeError, match="unet_plan_binding_collision"):
+        gs.derive_mixed_plan_bindings(
+            {"source_specs": {"p.x": {}, "x": {}}}, "p.")
+    with pytest.raises(RuntimeError, match="unet_plan_invalid"):
+        gs.derive_mixed_plan_bindings(None, "")
