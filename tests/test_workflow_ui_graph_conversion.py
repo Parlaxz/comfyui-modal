@@ -56,6 +56,16 @@ def fake_defs(class_type: str):
         return ({"seed": ("INT", {"min": 0}), "control_after_generate": (["fixed", "random"],)}, {})
     if class_type == "OptionalImageNode":
         return ({"prompt": ("STRING",)}, {"image": ("IMAGE",)})
+    if class_type == "HiddenStateNode":
+        return (
+            {"width": ("INT", {"default": 832})},
+            {},
+            {
+                "SeedState": ("STRING", {"default": "{}"}),
+                "ModeState": ("STRING", {"default": "portrait"}),
+                "NoDefaultState": ("STRING", {}),
+            },
+        )
     if class_type == "DynamicComboNode":
         return ({
             "mode": (
@@ -219,6 +229,55 @@ class TestUiGraphConversion:
             "mode.detail": "inner",
             "mode.detail.amount": 3,
         }
+
+    def test_hidden_inputs_fill_from_properties_then_defaults(self):
+        graph = {
+            "nodes": [{
+                "id": 11,
+                "type": "HiddenStateNode",
+                "inputs": [],
+                "widgets_values": [1704],
+                "properties": {"seedstate": '{"seed":42,"mode":"fixed"}'},
+            }],
+            "links": [],
+        }
+        prompt = ui_graph_to_api_prompt(graph, node_def_provider=fake_defs)
+        inputs = prompt["11"]["inputs"]
+        assert inputs["width"] == 1704
+        assert inputs["SeedState"] == '{"seed":42,"mode":"fixed"}'
+        assert inputs["ModeState"] == "portrait"
+        assert "NoDefaultState" not in inputs
+
+    def test_hidden_inputs_never_consume_widgets(self):
+        graph = {
+            "nodes": [{
+                "id": 11,
+                "type": "HiddenStateNode",
+                "inputs": [],
+                "widgets_values": [1704],
+            }],
+            "links": [],
+        }
+        prompt = ui_graph_to_api_prompt(graph, node_def_provider=fake_defs)
+        assert prompt["11"]["inputs"]["width"] == 1704
+
+    def test_hidden_inputs_never_become_mapping_candidates(self):
+        graph = {
+            "nodes": [{
+                "id": 11,
+                "type": "HiddenStateNode",
+                "inputs": [],
+                "widgets_values": [1704],
+                "properties": {"seedstate": '{"seed":42,"mode":"fixed"}'},
+            }],
+            "links": [],
+        }
+        prompt = ui_graph_to_api_prompt(graph, node_def_provider=fake_defs)
+        entries, _ = derive_mapping_candidates(
+            {"api_prompt_json": prompt}, node_def_provider=fake_defs
+        )
+        assert "SeedState" not in entries
+        assert "ModeState" not in entries
 
     def test_malformed_nodes_are_skipped_never_raise(self):
         graph = {"nodes": [None, "x", {"no": "id"}, {"id": 1, "type": "", "inputs": []}], "links": ["bad", [1]]}

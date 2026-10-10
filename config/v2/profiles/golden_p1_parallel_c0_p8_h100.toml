@@ -51,4 +51,5 @@ class = "ModalRuntimeEntrypointV2"
 method = "run_golden_parallel_stream"
 
 [environment]
-COMFYMODAL_V2_REGION = "us-central"
+# Unpinned (not testing): provider default region for faster scheduling.
+COMFYMODAL_V2_REGION = ""

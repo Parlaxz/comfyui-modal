@@ -11,6 +11,7 @@ from the graph itself (node definitions or the captured widget value).
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Callable, Optional
 
 from production_workflow import _canonical_workflow_hash
@@ -119,7 +120,7 @@ def resolve_binding_target(
     input_name: str,
     *,
     ui_graph: Any = None,
-    node_def_provider: Optional[Callable[[str], Optional[tuple[dict, dict]]]] = None,
+    node_def_provider: Optional[Callable[[str], Optional[tuple]]] = None,
 ) -> dict[str, Any]:
     """Resolve a (node_id, input_name) binding against every place a ComfyUI
     value can live — generically, with no per-node-type knowledge.
@@ -226,7 +227,7 @@ def find_binding_candidates(
     input_name: str,
     *,
     ui_graph: Any = None,
-    node_def_provider: Optional[Callable[[str], Optional[tuple[dict, dict]]]] = None,
+    node_def_provider: Optional[Callable[[str], Optional[tuple]]] = None,
     limit: int = 5,
 ) -> list[dict[str, Any]]:
     """List resolvable (node_id, input_name) bindings for ``input_name``.
@@ -289,12 +290,12 @@ def find_binding_candidates(
 
 def _probe_node_def(
     class_type: str,
-) -> Optional[tuple[dict[str, Any], dict[str, Any]]]:
+) -> Optional[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
     """Lazily probe the ComfyUI node registry for input definitions.
 
-    Returns ``(required, optional)`` dicts of input name → type spec, or
-    ``None`` when the registry is unavailable or the class is unknown.
-    Never raises.
+    Returns ``(required, optional, hidden)`` dicts of input name → type
+    spec, or ``None`` when the registry is unavailable or the class is
+    unknown. Never raises.
     """
     try:
         import nodes  # type: ignore[import-not-found]
@@ -310,6 +311,7 @@ def _probe_node_def(
         return (
             dict(spec.get("required") or {}),
             dict(spec.get("optional") or {}),
+            dict(spec.get("hidden") or {}),
         )
     except Exception:
         return None
@@ -455,7 +457,7 @@ def _is_connection_spec(value: Any) -> bool:
 def derive_mapping_candidates(
     capture: dict[str, Any],
     *,
-    node_def_provider: Optional[Callable[[str], Optional[tuple[dict, dict]]]] = None,
+    node_def_provider: Optional[Callable[[str], Optional[tuple]]] = None,
 ) -> tuple[dict[str, MappingEntry], str]:
     """Derive candidate mapping entries + output node id from a capture.
 
@@ -497,7 +499,9 @@ def derive_mapping_candidates(
         provider = node_def_provider or _probe_node_def
         try:
             probed = provider(class_type)
-            if isinstance(probed, tuple) and len(probed) == 2:
+            # Hidden defs (len-3 providers) never become mapping controls;
+            # only required/optional participate here.
+            if isinstance(probed, tuple) and len(probed) in (2, 3):
                 defs = (dict(probed[0] or {}), dict(probed[1] or {}))
         except Exception:
             defs = None
@@ -767,7 +771,7 @@ def _is_widget_input(ui_entry: Any, type_name: str, options: dict[str, Any]) -> 
 def ui_graph_to_api_prompt(
     graph_json: Any,
     *,
-    node_def_provider: Optional[Callable[[str], Optional[tuple[dict, dict]]]] = None,
+    node_def_provider: Optional[Callable[[str], Optional[tuple]]] = None,
 ) -> dict[str, dict[str, Any]]:
     """Convert a ComfyUI UI-format workflow to an API-format prompt.
 
@@ -840,10 +844,13 @@ def ui_graph_to_api_prompt(
                 return None
 
             defs: tuple[dict, dict] | None = None
+            hidden_defs: dict[str, Any] = {}
             try:
                 probed = provider(class_type_str)
-                if isinstance(probed, tuple) and len(probed) == 2:
+                if isinstance(probed, tuple) and len(probed) in (2, 3):
                     defs = (dict(probed[0] or {}), dict(probed[1] or {}))
+                    if len(probed) == 3 and isinstance(probed[2], dict):
+                        hidden_defs = dict(probed[2] or {})
             except Exception:
                 defs = None
 
@@ -970,6 +977,31 @@ def ui_graph_to_api_prompt(
                     inputs[name] = _next_widget()
                 else:
                     inputs[name] = None
+
+            # Hidden inputs (frontend-injected state such as Pixaroma seed /
+            # orientation state) have no widgets or slots, so nothing above
+            # fills them. Recover them from the UI node's stored
+            # properties (case-insensitive, verbatim — exactly what the
+            # frontend would inject), else from an explicit schema default.
+            # Otherwise leave them missing so downstream validation still
+            # fails closed. Never consumes widgets or invents values.
+            if hidden_defs:
+                properties = node.get("properties")
+                lowered_props = (
+                    {str(k).lower(): v for k, v in properties.items()}
+                    if isinstance(properties, dict) else {}
+                )
+                for hidden_name, hidden_spec in hidden_defs.items():
+                    if hidden_name in inputs:
+                        continue
+                    prop_value = lowered_props.get(str(hidden_name).lower())
+                    if isinstance(prop_value, str):
+                        inputs[hidden_name] = prop_value
+                        continue
+                    _, hidden_options = _parse_type_spec(hidden_spec)
+                    hidden_default = hidden_options.get("default")
+                    if hidden_default is not None:
+                        inputs[hidden_name] = copy.deepcopy(hidden_default)
 
             prompt[node_id_str] = {"class_type": class_type_str, "inputs": inputs}
         except Exception:
