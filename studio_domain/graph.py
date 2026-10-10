@@ -505,6 +505,12 @@ def derive_mapping_candidates(
         for input_name, value in inputs.items():
             if _is_connection_spec(value):
                 continue
+            if (
+                value is None
+                and defs is not None
+                and input_name in defs[1]
+            ):
+                continue
             role = _INPUT_ROLE_HINTS.get(input_name)
             if role is None:
                 if input_name in _TEXT_ROLES:

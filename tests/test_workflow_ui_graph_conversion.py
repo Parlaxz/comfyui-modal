@@ -54,6 +54,8 @@ def fake_defs(class_type: str):
     if class_type == "RandomNoise":
         # Pure-widget node: no linkable slots at all.
         return ({"seed": ("INT", {"min": 0}), "control_after_generate": (["fixed", "random"],)}, {})
+    if class_type == "OptionalImageNode":
+        return ({"prompt": ("STRING",)}, {"image": ("IMAGE",)})
     return None
 
 
@@ -192,6 +194,20 @@ class TestUiGraphConversion:
         )
         assert entries["cfg"].control_kind == "number"
         assert entries["sampler"].enum_options == ["euler", "dpmpp_2m"]
+
+    def test_candidates_skip_unconnected_optional_inputs(self):
+        entries, _ = derive_mapping_candidates(
+            {
+                "api_prompt_json": {
+                    "1": {
+                        "class_type": "OptionalImageNode",
+                        "inputs": {"prompt": "hello", "image": None},
+                    },
+                },
+            },
+            node_def_provider=fake_defs,
+        )
+        assert "source_image" not in entries
 
 
 class TestDependencyMetadataCnr:
