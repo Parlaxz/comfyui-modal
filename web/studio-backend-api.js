@@ -1111,20 +1111,20 @@ export async function importWorkflowManifest(apiBase, body, opts) {
 // removal, so the Studio API must keep exporting them.
 
 export async function getCustomNodeSyncStatus(apiBase) {
-  return apiFetch(apiBase, "/custom-nodes/sync-status");
+  return apiFetch(apiBase, "/studio/custom-nodes/sync-status");
 }
 
 export async function triggerPushPlugins(apiBase) {
-  return apiFetch(apiBase, "/custom-nodes/sync", { method: "POST" });
+  return apiFetch(apiBase, "/studio/custom-nodes/sync", { method: "POST" });
 }
 
 export async function triggerRebuildDependencies(apiBase) {
-  return apiFetch(apiBase, "/custom-nodes/sync/rebuild-dependencies", { method: "POST" });
+  return apiFetch(apiBase, "/studio/custom-nodes/sync/rebuild-dependencies", { method: "POST" });
 }
 
 export async function getCustomNodeSyncOperationStatus(apiBase, syncId) {
   if (!syncId) return null;
-  return apiFetch(apiBase, `/custom-nodes/sync/status/${encodeURIComponent(syncId)}`);
+  return apiFetch(apiBase, `/studio/custom-nodes/sync/status/${encodeURIComponent(syncId)}`);
 }
 
 export async function listGoldenProfiles(apiBase) {
