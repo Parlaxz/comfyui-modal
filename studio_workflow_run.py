@@ -548,6 +548,42 @@ def apply_workflow_values_to_prompt(
     return {"workflow": workflow}
 
 
+def _hydrate_missing_required_widget_defaults(workflow: dict[str, Any]) -> dict[str, Any]:
+    """Fill omitted API-prompt widgets from the live node schema defaults."""
+    hydrated: list[dict[str, str]] = []
+    try:
+        import nodes
+    except Exception:
+        return {"hydrated": hydrated, "unavailable": True}
+    mappings = getattr(nodes, "NODE_CLASS_MAPPINGS", {}) or {}
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        class_def = mappings.get(node.get("class_type"))
+        input_types = getattr(class_def, "INPUT_TYPES", None)
+        if not callable(input_types):
+            continue
+        try:
+            schema = input_types() or {}
+        except Exception:
+            continue
+        inputs = node.setdefault("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        for name, spec in (schema.get("required") or {}).items():
+            if name in inputs or not isinstance(spec, (tuple, list)) or not spec:
+                continue
+            options = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
+            default = options.get("default")
+            if default is None and isinstance(spec[0], (tuple, list)) and spec[0]:
+                default = spec[0][0]
+            if default is None:
+                continue
+            inputs[name] = copy.deepcopy(default)
+            hydrated.append({"node_id": str(node_id), "input": str(name)})
+    return {"hydrated": hydrated, "unavailable": False}
+
+
 # ── Studio metadata (modern identity — no legacy keys) ───────────────────
 
 
@@ -638,6 +674,7 @@ def build_workflow_execution_plan(
         _repair_missing_clip_inputs(workflow)
         _repair_missing_vae_inputs(workflow)
         _normalize_model_loader_names(workflow)
+        _hydrate_missing_required_widget_defaults(workflow)
 
         # ── Prompt bundle (custom, mirrors _default_build_execution_plan) ──
         # The modern role for the positive prompt is ``positive_prompt``; map

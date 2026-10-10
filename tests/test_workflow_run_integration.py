@@ -2385,6 +2385,32 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         self.assertEqual(detail.attempts[0].status, "failed")
         self.assertEqual(len(detail.assets), 0)
 
+def test_schema_defaults_are_hydrated_for_legacy_output_nodes(monkeypatch):
+    fake_nodes = types.ModuleType("nodes")
+
+    class Preview:
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {
+                "required": {
+                    "images": ("IMAGE",),
+                    "filename_prefix": ("STRING", {"default": "img"}),
+                    "save_mode": (["preview", "save"], {"default": "preview"}),
+                }
+            }
+
+    fake_nodes.NODE_CLASS_MAPPINGS = {"PixaromaPreview": Preview}
+    monkeypatch.setitem(sys.modules, "nodes", fake_nodes)
+    workflow = {"1": {"class_type": "PixaromaPreview", "inputs": {"images": ["2", 0]}}}
+
+    evidence = swr._hydrate_missing_required_widget_defaults(workflow)
+
+    assert workflow["1"]["inputs"]["filename_prefix"] == "img"
+    assert workflow["1"]["inputs"]["save_mode"] == "preview"
+    assert {item["input"] for item in evidence["hydrated"]} == {
+        "filename_prefix", "save_mode",
+    }
+
 
 if __name__ == "__main__":
     unittest.main()
