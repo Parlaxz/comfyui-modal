@@ -6949,8 +6949,82 @@ if _server:
     register_workflow_routes(_server, _NODE_DIR, resolver=_dependency_resolver)
     from model_library_routes import register_model_library_routes
 
+    _studio_custom_node_sync_status = {}
+    _studio_custom_node_sync_status_lock = threading.Lock()
+
+    def _studio_sync_status(sync_id):
+        with _studio_custom_node_sync_status_lock:
+            value = _studio_custom_node_sync_status.get(sync_id)
+            return dict(value) if value is not None else None
+
+    def _set_studio_sync_status(sync_id, **updates):
+        with _studio_custom_node_sync_status_lock:
+            current = _studio_custom_node_sync_status.setdefault(sync_id, {"sync_id": sync_id})
+            current.update(updates)
+
+    def _run_studio_custom_node_sync(sync_id, operation, workspace, expected_dependencies):
+        _set_studio_sync_status(sync_id, state="running", status="running")
+        try:
+            if operation == "publish":
+                result = asyncio.run(
+                    _sync_custom_nodes_and_maybe_deploy(_custom_nodes_root(), workspace)
+                )
+                publication = result.get("publication", {}) if isinstance(result, dict) else {}
+                reason = publication.get("reason")
+                if reason == "destructive_custom_node_publication_blocked":
+                    state, outcome = "blocked", "destructive_publication_blocked"
+                elif isinstance(result, dict) and result.get("status") == "ok":
+                    state, outcome = "completed", "published"
+                else:
+                    state, outcome = "error", "publication_failed"
+                _set_studio_sync_status(
+                    sync_id,
+                    state=state,
+                    status=state,
+                    outcome=outcome,
+                    message=(result or {}).get("message", "Custom-node publication finished."),
+                    result=result,
+                )
+                return
+
+            deploy = _start_background_deploy(
+                workspace=workspace,
+                custom_nodes_fingerprint=_build_custom_node_fingerprint(_custom_nodes_root()),
+                reason="studio_custom_node_dependency_rebuild",
+            )
+            if not deploy.get("started"):
+                _set_studio_sync_status(
+                    sync_id,
+                    state="refused",
+                    status="refused",
+                    outcome="deploy_already_running",
+                    message="Dependency rebuild refused: a deploy is already running.",
+                )
+                return
+            while _deploy_status.get("state") == "deploying":
+                time.sleep(0.25)
+            failed = _deploy_status.get("state") == "error"
+            _set_studio_sync_status(
+                sync_id,
+                state="error" if failed else "completed",
+                status="error" if failed else "completed",
+                outcome="dependency_rebuild_failed" if failed else "dependency_rebuilt",
+                message=_deploy_status.get("message", "Dependency rebuild completed."),
+                deploy=dict(_deploy_status),
+            )
+        except Exception as exc:
+            _log.exception("Studio custom-node sync failed")
+            _set_studio_sync_status(
+                sync_id,
+                state="error",
+                status="error",
+                outcome="operation_failed",
+                message=str(exc),
+            )
+        finally:
+            _set_studio_sync_status(sync_id, dependencies_changed=list(expected_dependencies))
+
     def _start_studio_custom_node_sync(operation, expected_dependencies):
-        """Rebuild image-delivered custom nodes through the existing deploy worker."""
         workspace = _active_workspace()
         if workspace is None:
             return {
@@ -6960,25 +7034,33 @@ if _server:
                 "message": "Custom-node operation refused: no active workspace configured.",
                 "_http_status": 400,
             }
-        deploy = _start_background_deploy(
-            workspace=workspace,
-            custom_nodes_fingerprint=_build_custom_node_fingerprint(_custom_nodes_root()),
-            reason=f"studio_custom_node_{operation}",
+        sync_id = str(uuid.uuid4())
+        _set_studio_sync_status(
+            sync_id,
+            sync_id=sync_id,
+            operation=operation,
+            state="queued",
+            status="started",
+            dependencies_changed=list(expected_dependencies),
+            poll_url=f"/comfymodal/studio/custom-nodes/sync/status/{sync_id}",
         )
-        if not deploy.get("started"):
-            return {
-                "status": "refused",
-                "state": "refused",
-                "outcome": deploy.get("reason", "deploy_already_running"),
-                "message": "Custom-node image rebuild refused: a deploy is already running.",
-                "_http_status": 409,
-            }
+        threading.Thread(
+            target=_run_studio_custom_node_sync,
+            kwargs={
+                "sync_id": sync_id,
+                "operation": operation,
+                "workspace": workspace,
+                "expected_dependencies": list(expected_dependencies),
+            },
+            daemon=True,
+        ).start()
         return {
             "status": "started",
-            "state": "started",
+            "state": "queued",
             "operation": operation,
-            "outcome": "image_rebuild_started",
-            "message": "Custom-node image rebuild started through the active workspace deploy.",
+            "sync_id": sync_id,
+            "poll_url": f"/comfymodal/studio/custom-nodes/sync/status/{sync_id}",
+            "_http_status": 202,
         }
 
     register_model_library_routes(
@@ -6987,6 +7069,7 @@ if _server:
         _COMFYUI_ROOT,
         resolver=_dependency_resolver,
         custom_node_sync_start=_start_studio_custom_node_sync,
+        custom_node_sync_status=_studio_sync_status,
     )
 
     # — Studio Backends (legacy compatibility / import-only) —
