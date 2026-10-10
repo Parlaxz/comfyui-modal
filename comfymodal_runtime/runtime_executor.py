@@ -2316,9 +2316,18 @@ def build_prompt_executor_breakdown_line(
     _clean = _num(state.get("opt_exec_clean_unused_ms"))
     _gather = _num(state.get("opt_exec_cache_gather_ms"))
     _gc = _num(state.get("opt_exec_cleanup_gc_ms"))
+    # Preamble gap probe (5j): previously-unattributed spans inside the
+    # execution_start→execution_cached window. Joining the children sum so
+    # the residual shrinks by exactly the attributed amount.
+    _gap_isc = _num(state.get("opt_exec_gap_isc_init_ms"))
+    _gap_elist_init = _num(state.get("opt_exec_gap_execlist_init_ms"))
+    _gap_elist_add = _num(state.get("opt_exec_gap_execlist_add_ms"))
+    _gap_reset = _num(state.get("opt_exec_gap_reset_progress_ms"))
+    _gap_wui = _num(state.get("opt_exec_gap_wui_handler_ms"))
 
     _exec_children = [
-        c for c in [_dynamic, _is_changed, _signature, _seed, _clean, _gather, _gc]
+        c for c in [_dynamic, _is_changed, _signature, _seed, _clean, _gather, _gc,
+                    _gap_isc, _gap_elist_init, _gap_elist_add, _gap_reset, _gap_wui]
         if c is not None
     ]
     _exec_parent = _num(exec_to_cached_ms)
@@ -2375,6 +2384,11 @@ def build_prompt_executor_breakdown_line(
         ("cache_gather_ms", _gather),
         ("cleanup_gc_ms", _gc),
         ("residual_ms", _residual),
+        ("gap_isc_init_ms", _gap_isc),
+        ("gap_execlist_init_ms", _gap_elist_init),
+        ("gap_execlist_add_ms", _gap_elist_add),
+        ("gap_reset_progress_ms", _gap_reset),
+        ("gap_wui_handler_ms", _gap_wui),
         ("c2f_cached_to_first_node_ms", _c2f_parent),
         ("c2f_topo_walk_ms", _topo),
         ("c2f_topo_input_info_ms", _topo_input_info),
@@ -3614,6 +3628,108 @@ def install_pre_sampler_hooks() -> None:
 
                 _TopoSort.get_input_info = _patched_topo_get_input_info
 
+    # ── 5j. Executor-preamble gap probe (residual attribution) ────────
+    # Every named sub-span of the execution_start→execution_cached window
+    # measures ~0ms, yet the residual is ~11s. The remaining UNWRAPPED calls
+    # in upstream execute_async (execution.py:741-780) are: IsChangedCache
+    # construction, ExecutionList construction + add_node loop, progress
+    # reset/handler setup, and the ram-cache release call. Wrap each with a
+    # bounded timer into opt_exec_gap_* so the next run names the 11s
+    # instead of leaving it in residual. Measurement-only; never raises.
+    def _gap_time(state, key, t0):
+        try:
+            if state is not None:
+                state[key] = state.get(key, 0.0) + _ns_ms(t0)
+                state[key.replace("_ms", "_count")] = state.get(key.replace("_ms", "_count"), 0) + 1
+        except Exception:
+            pass
+
+    _isc_cls2 = getattr(_execution, "IsChangedCache", None)
+    _orig_isc_init = getattr(_isc_cls2, "__init__", None) if _isc_cls2 is not None else None
+    if _orig_isc_init is not None and "IsChangedCache.__init__" not in _ORIGINAL_FUNCTIONS:
+        _ORIGINAL_FUNCTIONS["IsChangedCache.__init__"] = _orig_isc_init
+
+        def _patched_isc_init(self, *args: Any, **kwargs: Any):
+            state = _instrumentation_var.get()
+            if state is None:
+                return _orig_isc_init(self, *args, **kwargs)
+            _t0 = time.perf_counter_ns()
+            try:
+                return _orig_isc_init(self, *args, **kwargs)
+            finally:
+                _gap_time(state, "opt_exec_gap_isc_init_ms", _t0)
+
+        _isc_cls2.__init__ = _patched_isc_init
+
+    try:
+        from comfy_execution.graph import ExecutionList as _ExecList2
+    except ImportError:
+        _ExecList2 = None
+    if _ExecList2 is not None:
+        _orig_el_init = getattr(_ExecList2, "__init__", None)
+        if _orig_el_init is not None and "ExecutionList.__init__" not in _ORIGINAL_FUNCTIONS:
+            _ORIGINAL_FUNCTIONS["ExecutionList.__init__"] = _orig_el_init
+
+            def _patched_el_init(self, *args: Any, **kwargs: Any):
+                state = _instrumentation_var.get()
+                if state is None:
+                    return _orig_el_init(self, *args, **kwargs)
+                _t0 = time.perf_counter_ns()
+                try:
+                    return _orig_el_init(self, *args, **kwargs)
+                finally:
+                    _gap_time(state, "opt_exec_gap_execlist_init_ms", _t0)
+
+            _ExecList2.__init__ = _patched_el_init
+        _orig_el_add = getattr(_ExecList2, "add_node", None)
+        if _orig_el_add is not None and "ExecutionList.add_node" not in _ORIGINAL_FUNCTIONS:
+            _ORIGINAL_FUNCTIONS["ExecutionList.add_node"] = _orig_el_add
+
+            def _patched_el_add(self, *args: Any, **kwargs: Any):
+                state = _instrumentation_var.get()
+                if state is None:
+                    return _orig_el_add(self, *args, **kwargs)
+                _t0 = time.perf_counter_ns()
+                try:
+                    return _orig_el_add(self, *args, **kwargs)
+                finally:
+                    _gap_time(state, "opt_exec_gap_execlist_add_ms", _t0)
+
+            _ExecList2.add_node = _patched_el_add
+
+    _orig_reset_progress = getattr(_execution, "reset_progress_state", None)
+    if callable(_orig_reset_progress) and "reset_progress_state" not in _ORIGINAL_FUNCTIONS:
+        _ORIGINAL_FUNCTIONS["reset_progress_state"] = _orig_reset_progress
+
+        def _patched_reset_progress(*args: Any, **kwargs: Any):
+            state = _instrumentation_var.get()
+            if state is None:
+                return _orig_reset_progress(*args, **kwargs)
+            _t0 = time.perf_counter_ns()
+            try:
+                return _orig_reset_progress(*args, **kwargs)
+            finally:
+                _gap_time(state, "opt_exec_gap_reset_progress_ms", _t0)
+
+        _execution.reset_progress_state = _patched_reset_progress
+
+    _wui_cls = getattr(_execution, "WebUIProgressHandler", None)
+    _orig_wui_init = getattr(_wui_cls, "__init__", None) if _wui_cls is not None else None
+    if _orig_wui_init is not None and "WebUIProgressHandler.__init__" not in _ORIGINAL_FUNCTIONS:
+        _ORIGINAL_FUNCTIONS["WebUIProgressHandler.__init__"] = _orig_wui_init
+
+        def _patched_wui_init(self, *args: Any, **kwargs: Any):
+            state = _instrumentation_var.get()
+            if state is None:
+                return _orig_wui_init(self, *args, **kwargs)
+            _t0 = time.perf_counter_ns()
+            try:
+                return _orig_wui_init(self, *args, **kwargs)
+            finally:
+                _gap_time(state, "opt_exec_gap_wui_handler_ms", _t0)
+
+        _wui_cls.__init__ = _patched_wui_init
+
     # ── 6. execution.resolve_map_node_over_list_results (future wait) ───
     _orig_resolve = getattr(_execution, "resolve_map_node_over_list_results", None)
     if _orig_resolve is not None:
@@ -3778,6 +3894,36 @@ def uninstall_pre_sampler_hooks() -> None:
         try:
             import comfy.sd as _comfy_sd
             _comfy_sd.CLIP.encode_from_tokens = _orig_encode
+        except (ImportError, AttributeError):
+            pass
+
+    # Restore preamble gap-probe hooks (5j) and LLM dtype hook (4b)
+    _orig_isc_init = _ORIGINAL_FUNCTIONS.get("IsChangedCache.__init__")
+    if _orig_isc_init is not None:
+        _isc_cls = getattr(_execution, "IsChangedCache", None)
+        if _isc_cls is not None:
+            _isc_cls.__init__ = _orig_isc_init
+    for _el_key, _el_attr in (("ExecutionList.__init__", "__init__"), ("ExecutionList.add_node", "add_node")):
+        _orig_el = _ORIGINAL_FUNCTIONS.get(_el_key)
+        if _orig_el is not None:
+            try:
+                from comfy_execution.graph import ExecutionList as _ExecList
+                setattr(_ExecList, _el_attr, _orig_el)
+            except (ImportError, AttributeError):
+                pass
+    _orig_reset = _ORIGINAL_FUNCTIONS.get("reset_progress_state")
+    if _orig_reset is not None:
+        _execution.reset_progress_state = _orig_reset
+    _orig_wui = _ORIGINAL_FUNCTIONS.get("WebUIProgressHandler.__init__")
+    if _orig_wui is not None:
+        _wui_cls = getattr(_execution, "WebUIProgressHandler", None)
+        if _wui_cls is not None:
+            _wui_cls.__init__ = _orig_wui
+    _orig_llm = _ORIGINAL_FUNCTIONS.get("BaseGenerate.generate")
+    if _orig_llm is not None:
+        try:
+            from comfy.text_encoders.llama import BaseGenerate as _BaseGenerate
+            _BaseGenerate.generate = _orig_llm
         except (ImportError, AttributeError):
             pass
 
