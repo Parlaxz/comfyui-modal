@@ -788,3 +788,84 @@ class TestPhase6SerializedResultBytes:
         size = _measure_json_bytes(payload)
         assert size > 0
         assert isinstance(size, int)
+
+
+# ---------------------------------------------------------------------------
+# Production-mode generic fallback: custom output nodes (e.g. third-party
+# preview/save nodes) never write to the production registry, so the chain
+# must still materialize from executor history + output files. Canonical
+# runs stop at DirectOutputSink and never reach these strategies.
+# ---------------------------------------------------------------------------
+
+class TestProductionGenericFallback:
+    def test_history_fallback_materializes_custom_output_node(self):
+        """Empty registry + custom-node history entries => history success."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fpath = os.path.join(tmp, "img_00001_.png")
+            Path(fpath).write_bytes(_png_bytes())
+            history = {
+                "p1": {
+                    "outputs": {
+                        "199": {
+                            "images": [
+                                {
+                                    "filename": "img_00001_.png",
+                                    "subfolder": "",
+                                    "type": "output",
+                                },
+                            ],
+                        },
+                    },
+                },
+            }
+            results = run_strategy_chain(
+                [
+                    DirectOutputSink(registry={}),
+                    HistoryOutputCollector(history=history),
+                ],
+                prompt_id="p1",
+                output_node_ids=("199",),
+                materials_dir=tmp,
+                stop_after_success=True,
+            )
+            assert len(results) == 2
+            assert not results[0].success
+            assert results[1].success
+            assert results[1].fallback_depth == 1
+            assert results[1].total_items == 1
+            assert results[1].items[0].node_id == "199"
+
+    def test_direct_hit_stops_chain_before_history(self):
+        """A populated registry still wins; history is never consulted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = {
+                "199": {"images": [_entry("out.png", _png_bytes(), node_id="199")]},
+            }
+            history = {
+                "p1": {
+                    "outputs": {
+                        "199": {
+                            "images": [
+                                {
+                                    "filename": "other.png",
+                                    "subfolder": "",
+                                    "type": "output",
+                                },
+                            ],
+                        },
+                    },
+                },
+            }
+            results = run_strategy_chain(
+                [
+                    DirectOutputSink(registry=registry),
+                    HistoryOutputCollector(history=history),
+                ],
+                prompt_id="p1",
+                output_node_ids=("199",),
+                materials_dir=tmp,
+                stop_after_success=True,
+            )
+            assert len(results) == 1
+            assert results[0].success
+            assert results[0].strategy == "direct_output_sink"

@@ -17720,9 +17720,13 @@ class ModalRuntimeEntrypoint:
             if not isinstance(registry, Mapping):
                 registry = {}
             history_result = getattr(executor, "history_result", None)
+            # Generic fallback: executor history is consulted in every mode.
+            # Canonical runs stop at DirectOutputSink (stop_after_success),
+            # so this only ever fires when no production-registry entry
+            # exists — exactly the arbitrary-workflow case.
             history = (
                 {prompt_id: history_result}
-                if not production_enabled and isinstance(history_result, dict)
+                if isinstance(history_result, dict)
                 else {}
             )
             output_dir = Path("/root/comfy/ComfyUI/output")
@@ -17734,8 +17738,10 @@ class ModalRuntimeEntrypoint:
             chain = build_default_chain(
                 registry=registry,
                 history=history,
-                materials_dir=(str(output_dir) if output_dir.is_dir() else "")
-                if not production_enabled else "",
+                # Same generic-fallback rationale as history above: the
+                # filesystem collector only runs when earlier strategies
+                # fail, so canonical runs are unaffected.
+                materials_dir=str(output_dir) if output_dir.is_dir() else "",
             )
             attempts = run_strategy_chain(
                 chain,
