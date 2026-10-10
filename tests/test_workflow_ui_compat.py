@@ -84,6 +84,25 @@ def test_ui_refresh_preserves_aliases_and_refreshes_stale_metadata():
     assert refreshed["mapping"]["output_node_id"] == "213"
 
 
+def test_ui_refresh_preserves_stored_output_node_when_regenerated_graph_contains_it():
+    regenerated = {
+        "6": {"class_type": "SaveImage", "inputs": {}},
+        "7": {"class_type": "SaveImage", "inputs": {}},
+    }
+    bundle = {
+        "version": {"graph_json": {"nodes": [{"id": 6}, {"id": 7}]}},
+        "mapping": {"entries": [], "output_node_id": "7"},
+        "executable_prompt": {},
+        "control_schema": {},
+        "defaults": {},
+    }
+    with patch("studio_domain.graph.ui_graph_to_api_prompt", return_value=regenerated), \
+         patch("studio_domain.graph.derive_mapping_candidates", return_value=({}, "6")):
+        refreshed = swr._refresh_ui_workflow_bundle(bundle)
+
+    assert refreshed["mapping"]["output_node_id"] == "7"
+
+
 def test_sampler_null_override_keeps_regenerated_graph_default():
     schema = {
         "sampler": {

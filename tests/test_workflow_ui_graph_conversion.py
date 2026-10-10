@@ -56,6 +56,28 @@ def fake_defs(class_type: str):
         return ({"seed": ("INT", {"min": 0}), "control_after_generate": (["fixed", "random"],)}, {})
     if class_type == "OptionalImageNode":
         return ({"prompt": ("STRING",)}, {"image": ("IMAGE",)})
+    if class_type == "DynamicComboNode":
+        return ({
+            "mode": (
+                "COMFY_DYNAMICCOMBO_V3",
+                {"options": [
+                    {"key": "scalar", "inputs": {
+                        "required": {"value": ("FLOAT", {})},
+                    }},
+                    {"key": "linked", "inputs": {
+                        "required": {"source": ("IMAGE", {})},
+                    }},
+                    {"key": "nested", "inputs": {
+                        "required": {"detail": (
+                            "COMFY_DYNAMICCOMBO_V3",
+                            {"options": [{"key": "inner", "inputs": {
+                                "required": {"amount": ("INT", {})},
+                            }}]},
+                        )},
+                    }},
+                ]},
+            ),
+        }, {})
     return None
 
 
@@ -162,6 +184,41 @@ class TestUiGraphConversion:
         prompt = ui_graph_to_api_prompt(graph, node_def_provider=lambda _c: None)
         assert prompt["7"]["inputs"]["model"] == ["4", 0]
         assert prompt["7"]["inputs"]["strength"] == 0.5
+
+    def test_dynamic_combo_uses_scalar_and_prefixed_inputs(self):
+        graph = {
+            "nodes": [{
+                "id": 7,
+                "type": "DynamicComboNode",
+                "inputs": [
+                    {"name": "mode", "widget": {"name": "mode"}},
+                    {"name": "mode.source", "link": 1},
+                ],
+                "widgets_values": ["linked"],
+            }],
+            "links": [[1, 4, 0, 7, 1, "IMAGE"]],
+        }
+        prompt = ui_graph_to_api_prompt(graph, node_def_provider=fake_defs)
+        assert prompt["7"]["inputs"] == {
+            "mode": "linked",
+            "mode.source": ["4", 0],
+        }
+
+    def test_dynamic_combo_nested_inputs_are_flattened(self):
+        graph = {
+            "nodes": [{
+                "id": 7,
+                "type": "DynamicComboNode",
+                "inputs": [],
+                "widgets_values": ["nested", "inner", 3],
+            }],
+        }
+        prompt = ui_graph_to_api_prompt(graph, node_def_provider=fake_defs)
+        assert prompt["7"]["inputs"] == {
+            "mode": "nested",
+            "mode.detail": "inner",
+            "mode.detail.amount": 3,
+        }
 
     def test_malformed_nodes_are_skipped_never_raise(self):
         graph = {"nodes": [None, "x", {"no": "id"}, {"id": 1, "type": "", "inputs": []}], "links": ["bad", [1]]}

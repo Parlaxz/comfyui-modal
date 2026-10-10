@@ -849,6 +849,72 @@ def ui_graph_to_api_prompt(
 
             inputs: dict[str, Any] = {}
             consumed_defs: set[str] = set()
+
+            def _ui_entry_for(path: str) -> dict[str, Any] | None:
+                entry = ui_by_name.get(path)
+                if entry is not None:
+                    return entry
+                if "." in path:
+                    return ui_by_name.get(path.rsplit(".", 1)[-1])
+                return None
+
+            def _connection_for(path: str) -> list[Any] | None:
+                ui_entry = _ui_entry_for(path)
+                if not isinstance(ui_entry, dict) or ui_entry.get("link") is None:
+                    return None
+                slot = next(
+                    (s for s, entry in ui_by_slot.items() if entry is ui_entry),
+                    None,
+                )
+                conn = targets.get((node_id_str, slot)) if slot is not None else None
+                return [conn[0], conn[1]] if conn is not None else None
+
+            def _consume_dynamic_input(
+                path: str,
+                spec: Any,
+            ) -> None:
+                type_name, options = _parse_type_spec(spec)
+                ui_entry = _ui_entry_for(path)
+                if isinstance(ui_entry, dict) and ui_entry.get("link") is not None:
+                    if "widget" in ui_entry:
+                        _next_widget()
+                    if options.get("control_after_generate"):
+                        _next_widget()
+                    inputs[path] = _connection_for(path)
+                    return
+
+                if type_name.startswith("COMFY_DYNAMICCOMBO"):
+                    selected = _next_widget()
+                    inputs[path] = selected
+                    selected_option = next(
+                        (
+                            option for option in (options.get("options") or [])
+                            if isinstance(option, dict)
+                            and option.get("key") == selected
+                        ),
+                        None,
+                    )
+                    option_inputs = (
+                        selected_option.get("inputs", {})
+                        if isinstance(selected_option, dict)
+                        else {}
+                    )
+                    for child_defs in (
+                        option_inputs.get("required", {}),
+                        option_inputs.get("optional", {}),
+                    ):
+                        if not isinstance(child_defs, dict):
+                            continue
+                        for child_name, child_spec in child_defs.items():
+                            _consume_dynamic_input(
+                                f"{path}.{child_name}", child_spec
+                            )
+                    return
+
+                inputs[path] = _next_widget()
+                if options.get("control_after_generate"):
+                    _next_widget()
+
             if defs is not None:
                 for defs_dict in defs:
                     for input_name, spec in defs_dict.items():
@@ -878,28 +944,7 @@ def ui_graph_to_api_prompt(
                             else:
                                 inputs[input_name] = None
                         elif type_name.startswith("COMFY_DYNAMICCOMBO"):
-                            selected = _next_widget()
-                            combo: dict[str, Any] = {input_name: selected}
-                            selected_option = next(
-                                (
-                                    option for option in (options.get("options") or [])
-                                    if isinstance(option, dict)
-                                    and option.get("key") == selected
-                                ),
-                                None,
-                            )
-                            option_inputs = (
-                                selected_option.get("inputs", {})
-                                if isinstance(selected_option, dict)
-                                else {}
-                            )
-                            for child_defs in (
-                                option_inputs.get("required", {}),
-                                option_inputs.get("optional", {}),
-                            ):
-                                for child_name in child_defs:
-                                    combo[child_name] = _next_widget()
-                            inputs[input_name] = combo
+                            _consume_dynamic_input(input_name, spec)
                         elif _is_widget_input(ui_entry, type_name, options):
                             inputs[input_name] = _next_widget()
                             if options.get("control_after_generate"):

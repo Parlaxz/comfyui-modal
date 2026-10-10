@@ -345,6 +345,13 @@ def _refresh_ui_workflow_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
                 ):
                     refreshed_entries.append(copy.deepcopy(fresh))
             mapping["entries"] = refreshed_entries
+        stored_output_node_id = str(mapping.get("output_node_id") or "")
+        if stored_output_node_id in regenerated:
+            # A stored mapping may intentionally target a non-first output
+            # node.  Keep that user choice when the regenerated graph still
+            # contains it; only fall back to the fresh candidate if it does
+            # not.
+            output_node_id = stored_output_node_id
         if output_node_id:
             mapping["output_node_id"] = output_node_id
 

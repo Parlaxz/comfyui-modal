@@ -3360,9 +3360,12 @@ async def _sync_custom_nodes_and_maybe_deploy(
     cn_root: str,
     workspace: dict,
     *,
+    allow_destructive: bool = False,
     publication_timeout_s: float | None = None,
 ) -> dict:
-    publication_kwargs: dict[str, Any] = {"allow_destructive": True}
+    publication_kwargs: dict[str, Any] = {
+        "allow_destructive": allow_destructive,
+    }
     if publication_timeout_s is not None:
         publication_kwargs["publication_timeout_s"] = publication_timeout_s
     result = await _publish_custom_nodes_or_skip(cn_root, workspace, **publication_kwargs)
@@ -7064,6 +7067,7 @@ if _server:
                     _sync_custom_nodes_and_maybe_deploy(
                         _custom_nodes_root(),
                         workspace,
+                        allow_destructive=True,
                         publication_timeout_s=_STUDIO_CUSTOM_NODE_PUBLISH_TIMEOUT_S,
                     )
                 )

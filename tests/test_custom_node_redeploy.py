@@ -314,7 +314,9 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
                     "reason": "custom_nodes_changed",
                 }),
             ):
-                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(str(cn_root), workspace))
+                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(
+                    str(cn_root), workspace, allow_destructive=True,
+                ))
 
         self.assertEqual(result["deploy"], {"started": True, "reason": "custom_nodes_changed"})
         self.assertEqual(result["refresh"], {"status": "ok", "scope": "custom_nodes"})
@@ -333,7 +335,9 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
                 }),
                 patch.object(module, "_ensure_modal_deploy_current") as ensure_mock,
             ):
-                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(str(cn_root), workspace))
+                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(
+                    str(cn_root), workspace, allow_destructive=True,
+                ))
 
         self.assertNotIn("deploy", result)
         ensure_mock.assert_not_called()
@@ -375,7 +379,9 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
                 patch.object(module, "_ensure_modal_deploy_current") as deploy_mock,
                 patch.object(module, "resync_runtime") as refresh_mock,
             ):
-                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(str(cn_root), workspace))
+                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(
+                    str(cn_root), workspace, allow_destructive=True,
+                ))
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["publication"]["reason"], "exact_match")
@@ -431,7 +437,9 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
                 }) as deploy_mock,
                 patch.object(module, "resync_runtime", side_effect=fake_refresh) as refresh_mock,
             ):
-                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(str(cn_root), workspace))
+                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(
+                    str(cn_root), workspace, allow_destructive=True,
+                ))
 
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["publication"]["reason"], "published_verified")
@@ -459,7 +467,9 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
         ):
             result = asyncio.run(
                 module._sync_custom_nodes_and_maybe_deploy(
-                    "custom_nodes", {}, publication_timeout_s=0.01
+                    "custom_nodes", {},
+                    allow_destructive=True,
+                    publication_timeout_s=0.01,
                 )
             )
 
