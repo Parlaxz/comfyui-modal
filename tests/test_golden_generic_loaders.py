@@ -279,3 +279,95 @@ class TestComposeLoop:
         ))
         assert results["195"]["actual"] == "cache_hit"
         assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Arm ordering: QD4 demand first, M2 singleton second, native fallback
+# ---------------------------------------------------------------------------
+
+class TestArmOrdering:
+    def test_qd4_success_skips_m2(self, monkeypatch):
+        _install_fake_execution(monkeypatch)
+        m2_calls = []
+
+        async def fake_qd4(**kwargs):
+            return {"ok": True, "clip": object(), "session": None,
+                    "owners": [], "elapsed_ms": 2.0, "reason": "",
+                    "source_arm": "qd4_demand"}
+
+        async def fake_m2(**kwargs):
+            m2_calls.append(kwargs)
+            raise AssertionError("M2 must not run after QD4 success")
+
+        monkeypatch.setattr(ggl, "compose_generic_clip_load_qd4", fake_qd4)
+        monkeypatch.setattr(ggl, "compose_generic_clip_load", fake_m2)
+        holder = ggl.GenericLoaderHolder()
+        cache = _FakeCache({})
+        results = asyncio.run(ggl.compose_loaders_for_workflow(
+            workflow=_workflow(),
+            outputs_cache=cache,
+            cache_key_set=_FakeKeySet({"195"}),
+            holder=holder,
+            request_id="r1",
+        ))
+        assert results["195"]["actual"] == "shared_core"
+        assert results["195"]["source_arm"] == "qd4_demand"
+        assert m2_calls == []
+        assert asyncio.run(cache.get("195")) is not None
+
+    def test_qd4_failure_falls_back_to_m2(self, monkeypatch):
+        _install_fake_execution(monkeypatch)
+        m2_calls = []
+
+        async def fake_qd4(**kwargs):
+            return {"ok": False, "reason": "qd4_gate_disabled",
+                    "elapsed_ms": 0.5, "source_arm": "qd4_demand"}
+
+        async def fake_m2(**kwargs):
+            m2_calls.append(kwargs)
+            return {"ok": True, "clip": object(), "session": object(),
+                    "owners": [], "elapsed_ms": 3.0, "reason": ""}
+
+        monkeypatch.setattr(ggl, "compose_generic_clip_load_qd4", fake_qd4)
+        monkeypatch.setattr(ggl, "compose_generic_clip_load", fake_m2)
+        holder = ggl.GenericLoaderHolder()
+        cache = _FakeCache({})
+        results = asyncio.run(ggl.compose_loaders_for_workflow(
+            workflow=_workflow(),
+            outputs_cache=cache,
+            cache_key_set=_FakeKeySet({"195"}),
+            holder=holder,
+            request_id="r1",
+        ))
+        assert results["195"]["actual"] == "shared_core"
+        assert results["195"]["source_arm"] == "m2_transport"
+        assert len(m2_calls) == 1
+
+    def test_both_arms_fail_falls_back_native_with_combined_reason(
+        self, monkeypatch
+    ):
+        _install_fake_execution(monkeypatch)
+
+        async def fake_qd4(**kwargs):
+            return {"ok": False, "reason": "qd4_gate_disabled",
+                    "elapsed_ms": 0.5, "source_arm": "qd4_demand"}
+
+        async def fake_m2(**kwargs):
+            return {"ok": False, "reason": "PoolPoisonedError:cancelled",
+                    "elapsed_ms": 1.0}
+
+        monkeypatch.setattr(ggl, "compose_generic_clip_load_qd4", fake_qd4)
+        monkeypatch.setattr(ggl, "compose_generic_clip_load", fake_m2)
+        holder = ggl.GenericLoaderHolder()
+        cache = _FakeCache({})
+        results = asyncio.run(ggl.compose_loaders_for_workflow(
+            workflow=_workflow(),
+            outputs_cache=cache,
+            cache_key_set=_FakeKeySet({"195"}),
+            holder=holder,
+            request_id="r1",
+        ))
+        assert results["195"]["actual"] == "native"
+        assert "qd4_gate_disabled" in results["195"]["reason"]
+        assert "PoolPoisonedError" in results["195"]["reason"]
+        assert asyncio.run(cache.get("195")) is None

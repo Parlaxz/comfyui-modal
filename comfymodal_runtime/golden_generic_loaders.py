@@ -23,6 +23,20 @@ Phase 1 covers CLIPLoader only (the slowest loader on measured workloads).
 VAELoader and UNETLoader classify explicitly so their status is observable;
 UNET scaled-FP8 in particular is contractually rejected by the shared core
 and must stay native.
+
+Two shared source-read arms are attempted in order, both imported never
+copied:
+
+* ``qd4_demand`` (first): the canonical ``clip_qd_load`` demand reader —
+  self-contained per call (workers joined before return, no persistent
+  pool), so it is immune to persistent-pool poisoning.  Construction
+  mirrors the native CLIPLoader recipe exactly over the same shared
+  ``comfy.sd.load_text_encoder_state_dicts`` delegation; only the
+  file-read step is fast.
+* ``m2_transport`` (fallback): the persistent M2 singleton via the
+  unmodified ``golden_clip_load`` stage.  Currently fails closed
+  fleet-wide (persistent source pool poisoned by a cancelled dispatcher
+  handoff); kept so a healthy pool is used when available.
 """
 
 from __future__ import annotations
@@ -270,6 +284,121 @@ async def compose_generic_clip_load(
         }
 
 
+async def compose_generic_clip_load_qd4(
+    *,
+    clip_filenames: Sequence[str],
+    clip_type: str,
+    folder: str,
+    request_id: str,
+    path_resolver: Callable[[str, str], str | None] | None = None,
+) -> dict[str, Any]:
+    """Load CLIP via the SHARED QD4 demand reader (canonical clean-lane arm).
+
+    Uses the same ``clip_qd_load`` the canonical clean-lane demand path uses
+    (imported, never copied).  It is self-contained per call — workers are
+    joined before return and it owns no persistent pool — so it is immune
+    to the persistent-pool poisoning that fails the M2 singleton
+    (``PoolPoisonedError:cancelled dispatcher handoff was not completed``).
+
+    Construction mirrors the native CLIPLoader recipe exactly: the same
+    shared ``comfy.sd.load_text_encoder_state_dicts`` delegation with the
+    same ``cached_patcher_init`` shape; only the file-read step is fast.
+    No manifest pipeline is applied (native loads apply none).  QD owners
+    are returned for request-scoped retention; the caller releases them via
+    the holder without touching any shared lifecycle.
+
+    Returns the same outcome shape as :func:`compose_generic_clip_load`
+    plus ``source_arm="qd4_demand"``.  Never raises.
+    """
+    started_ns = time.monotonic_ns()
+    resolve = path_resolver or _default_path_resolver
+    try:
+        names = [str(n) for n in (clip_filenames or []) if str(n or "").strip()]
+        if not names:
+            return {"ok": False, "reason": "clip_filenames_missing",
+                    "source_arm": "qd4_demand"}
+        if len(names) > 1:
+            return {"ok": False, "reason": "qd4_multi_checkpoint_deferred",
+                    "source_arm": "qd4_demand"}
+        path = resolve(folder, names[0])
+        if not path:
+            return {"ok": False,
+                    "reason": f"clip_path_unresolvable:{names[0]}",
+                    "source_arm": "qd4_demand"}
+        from .clip_qd_reader import clip_qd_load, qd_config
+
+        cfg = qd_config() or {}
+        qd_value = int(cfg.get("qd", 0) or 0)
+        block_mib = int(cfg.get("block_mib", 0) or 0)
+        launch_policy = str(cfg.get("launch_policy", "") or "")
+        if not bool(cfg.get("enabled")):
+            return {"ok": False, "reason": "qd4_gate_disabled",
+                    "source_arm": "qd4_demand"}
+        if qd_value != 4:
+            return {"ok": False,
+                    "reason": f"qd4_gate_qd_not_4:{qd_value}",
+                    "source_arm": "qd4_demand"}
+        if block_mib < 1 or not launch_policy:
+            return {"ok": False, "reason": "qd4_gate_config_incomplete",
+                    "source_arm": "qd4_demand"}
+        sd, loader, owner = clip_qd_load(
+            path,
+            qd=qd_value,
+            block_mib=block_mib,
+            trace=None,
+            launch_policy=launch_policy,
+            artifact_path=cfg.get("artifact_path") or None,
+        )
+        import comfy.sd
+        from comfy.utils import convert_old_quants
+
+        # Mirror the native recipe: convert_old_quants runs whenever the
+        # (default, empty) model_options carry no custom_operations.
+        # Native passes real file metadata; none is read here (that would
+        # be a second file open), so the callee default ({}) applies.
+        model_options: dict[str, Any] = {}
+        sd, _qd_metadata = convert_old_quants(sd, model_prefix="", metadata={})
+        clip_type_obj = resolve_clip_type_shared(clip_type)
+        try:
+            import folder_paths
+
+            embedding_directory = folder_paths.get_folder_paths("embeddings")
+        except Exception:
+            embedding_directory = None
+        clip = comfy.sd.load_text_encoder_state_dicts(
+            [sd],
+            embedding_directory=embedding_directory,
+            clip_type=clip_type_obj,
+            model_options=model_options,
+        )
+        try:
+            clip.patcher.cached_patcher_init = (
+                comfy.sd.load_clip_model_patcher,
+                ([path], embedding_directory, clip_type_obj, model_options),
+            )
+        except Exception:
+            pass
+        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        owners = [o for o in (loader, owner) if o is not None]
+        return {
+            "ok": True,
+            "clip": clip,
+            "session": None,
+            "owners": owners,
+            "elapsed_ms": elapsed_ms,
+            "reason": "",
+            "source_arm": "qd4_demand",
+        }
+    except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
+        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        return {
+            "ok": False,
+            "reason": f"{type(exc).__name__}:{str(exc)[:200]}",
+            "elapsed_ms": elapsed_ms,
+            "source_arm": "qd4_demand",
+        }
+
+
 def _cache_entry_for(obj: Any) -> Any | None:
     """Build a CacheEntry shaped exactly like the residency seeder's."""
     try:
@@ -386,13 +515,30 @@ async def compose_loaders_for_workflow(
                     "owners": [], "elapsed_ms": 0.0, "reason": "dedup_within_request",
                 }
             else:
-                outcome = await compose_generic_clip_load(
+                # QD4 demand first (self-contained, pool-poison immune),
+                # M2 singleton second (healthy pool used when available).
+                outcome = await compose_generic_clip_load_qd4(
                     clip_filenames=[clip_name],
                     clip_type=clip_type,
                     folder="text_encoders",
                     request_id=request_id,
                     path_resolver=path_resolver,
                 )
+                if not outcome.get("ok"):
+                    qd4_reason = str(outcome.get("reason") or "qd4_failed")
+                    m2_outcome = await compose_generic_clip_load(
+                        clip_filenames=[clip_name],
+                        clip_type=clip_type,
+                        folder="text_encoders",
+                        request_id=request_id,
+                        path_resolver=path_resolver,
+                    )
+                    m2_outcome.setdefault("source_arm", "m2_transport")
+                    if not m2_outcome.get("ok"):
+                        m2_outcome["reason"] = (
+                            f"{qd4_reason}|{m2_outcome.get('reason')}"
+                        )
+                    outcome = m2_outcome
                 if outcome.get("ok") and outcome.get("clip") is not None:
                     seen_paths[path_key] = outcome["clip"]
             if not outcome.get("ok") or outcome.get("clip") is None:
@@ -401,10 +547,12 @@ async def compose_loaders_for_workflow(
                     "actual": "native",
                     "reason": str(outcome.get("reason") or "compose_failed"),
                     "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+                    "source_arm": str(outcome.get("source_arm") or "unknown"),
                 }
                 _emit("generic_loader_composition", node_id=node_id,
                       role="clip", requested="shared_core", actual="native",
-                      reason=str(outcome.get("reason") or "compose_failed"))
+                      reason=str(outcome.get("reason") or "compose_failed"),
+                      source_arm=str(outcome.get("source_arm") or "unknown"))
                 continue
             if outcome.get("session") is not None:
                 holder.retain(outcome.get("session"), outcome.get("owners"))
@@ -417,6 +565,7 @@ async def compose_loaders_for_workflow(
                     "actual": "shared_core",
                     "reason": "",
                     "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+                    "source_arm": str(outcome.get("source_arm") or "unknown"),
                 }
             else:
                 results[node_id] = {
@@ -424,11 +573,13 @@ async def compose_loaders_for_workflow(
                     "actual": "native",
                     "reason": str(decision.get("decision") or "cache_insert_failed"),
                     "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+                    "source_arm": str(outcome.get("source_arm") or "unknown"),
                 }
             _emit("generic_loader_composition", node_id=node_id,
                   role="clip", requested="shared_core",
                   actual=results[node_id]["actual"],
-                  reason=results[node_id]["reason"])
+                  reason=results[node_id]["reason"],
+                  source_arm=str(outcome.get("source_arm") or "unknown"))
         except Exception as exc:  # noqa: BLE001 - per-node isolation
             try:
                 results[str(raw_nid or "?")] = {
