@@ -59,3 +59,8 @@ COMFYMODAL_V2_REGION = ""
 # lane also switches its source read to this arm when enabled, by design
 # fail-closed to _fastsafe_load with explicit telemetry on any E30 error.
 COMFYMODAL_V2_CLIP_QD_READER = "1"
+# Generic TextGenerate substitution (opt-in proof): TextGenerate nodes run
+# the EOS-batched optimized loop (same model/weights/params, bit-identical
+# tokens) instead of the native per-token-sync loop. Never raises — any
+# failure falls back to native with explicit telemetry.
+COMFYMODAL_V2_TEXT_SUBSTITUTION = "1"
