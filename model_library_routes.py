@@ -571,7 +571,25 @@ def register_model_library_routes(
         nonlocal _core_count
         try:
             records = registry.list_records()
-            if not records:
+            refresh_required = not records
+            if records:
+                try:
+                    import nodes
+
+                    live_classes = set(
+                        str(name)
+                        for name in (getattr(nodes, "NODE_CLASS_MAPPINGS", {}) or {})
+                    )
+                    recorded_classes = {
+                        str(class_name)
+                        for record in records
+                        if isinstance(record, Mapping)
+                        for class_name in (record.get("classes") or [])
+                    }
+                    refresh_required = bool(live_classes - recorded_classes)
+                except Exception:
+                    refresh_required = False
+            if refresh_required:
                 discovered, core = discovery.refresh(comfyui_root)
                 records = discovered
                 _core_count = len(core)
