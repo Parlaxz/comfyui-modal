@@ -1177,16 +1177,36 @@ def install_execution_dispatch_substitution(
     try:
         import execution as _execution_mod
     except Exception:
+        _emit_trace(trace_emit, "generic_dispatch_install", outcome="skipped",
+                    reason="execution_import_failed",
+                    request_id=str(request_id or ""))
         return None
     try:
         original = getattr(_execution_mod, "get_output_data", None)
         merge_fn = getattr(_execution_mod, "merge_result_data", None)
         if not callable(original) or not callable(merge_fn):
+            _emit_trace(trace_emit, "generic_dispatch_install", outcome="skipped",
+                        reason="dispatch_boundary_missing",
+                        request_id=str(request_id or ""))
             return None
         if _ACTIVE_DISPATCH_CTX is not None:
+            _emit_trace(trace_emit, "generic_dispatch_install", outcome="skipped",
+                        reason="already_active",
+                        request_id=str(request_id or ""))
             return None
         node_roles = _invert_role_bindings(role_bindings)
         if not node_roles:
+            try:
+                _received = sorted(
+                    str(k) for k in (role_bindings.keys()
+                                     if isinstance(role_bindings, Mapping) else [])
+                )
+            except Exception:
+                _received = []
+            _emit_trace(trace_emit, "generic_dispatch_install", outcome="skipped",
+                        reason="no_eligible_roles",
+                        roles_received=",".join(_received)[:200],
+                        request_id=str(request_id or ""))
             return None
         ctx: dict[str, Any] = {
             "request_id": str(request_id or ""),
@@ -1283,6 +1303,12 @@ def install_execution_dispatch_substitution(
                 pass
             _ACTIVE_DISPATCH_CTX = None
 
+        _emit_trace(trace_emit, "generic_dispatch_install", outcome="installed",
+                    roles=len(node_roles),
+                    role_nodes=",".join(
+                        f"{nid}:{role}" for nid, role in sorted(node_roles.items())
+                    )[:300],
+                    request_id=str(request_id or ""))
         return _restore_dispatch
     except Exception:
         return None
