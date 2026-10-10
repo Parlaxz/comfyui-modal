@@ -16673,6 +16673,8 @@ class ModalRuntimeEntrypoint:
         _lane = getattr(self._preload_bridge.coordinator, "mutation_lane", None)
         _lane_acquired = [False]
         _seed_hook_restore: Callable[[], None] | None = None
+        _generic_loader_holder = None
+        _generic_loader_restore: Callable[[], None] | None = None
         started = time.time()
         try:
             # ── CacheDiT request verification ──
@@ -16712,6 +16714,29 @@ class ModalRuntimeEntrypoint:
             _seed_hook_restore = self._install_snapshot_executor_seed_hook(
                 executor, workflow, plan, trace,
             )
+            # Generic shared-loader composition (v2-only by location:
+            # canonical Golden runs never reach this function).  Wraps
+            # set_prompt AFTER the snapshot seeder so residency keeps
+            # priority; unseeded CLIPLoader nodes attempt the shared
+            # Golden cores with strict native fallback.  Install failure
+            # leaves native behavior unchanged.
+            try:
+                from comfymodal_runtime.golden_generic_loaders import (
+                    GenericLoaderHolder,
+                    install_generic_loader_hook,
+                )
+
+                _generic_loader_holder = GenericLoaderHolder()
+                _generic_loader_restore = install_generic_loader_hook(
+                    executor,
+                    workflow if isinstance(workflow, dict) else {},
+                    _generic_loader_holder,
+                    trace.emit,
+                    str(getattr(context, "request_id", "") or ""),
+                )
+            except Exception:
+                _generic_loader_holder = None
+                _generic_loader_restore = None
             # End pregraph span here â€” before prompt_executor_invoke_start, after
             # all V2-owned setup including executor.reset().
             trace.emit("pregraph_setup_end", phase="execution", metadata={
@@ -18295,6 +18320,21 @@ class ModalRuntimeEntrypoint:
         finally:
             if _seed_hook_restore is not None:
                 _seed_hook_restore()
+            # Release generic shared-loader owners AFTER result collection
+            # (tensors dead, files/history carry outputs). Never touches the
+            # shared dispatcher or canonical lifecycle.
+            if _generic_loader_restore is not None:
+                try:
+                    _generic_loader_restore()
+                except Exception:
+                    pass
+                _generic_loader_restore = None
+            if _generic_loader_holder is not None:
+                try:
+                    _generic_loader_holder.close()
+                except Exception:
+                    pass
+                _generic_loader_holder = None
             # Release sampler lane if acquired during execution.
             # Must happen before production cleanup to ensure GPU
             # commit lane is free before any post-execution work.
