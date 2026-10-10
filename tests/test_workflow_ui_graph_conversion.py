@@ -179,6 +179,20 @@ class TestUiGraphConversion:
         assert entries["positive_prompt"].node_id == "1"
         assert entries["model"].node_id == "4"
 
+    def test_candidates_ignore_stale_api_prompt_for_ui_capture(self):
+        stale = {
+            "3": {
+                "class_type": "KSampler",
+                "inputs": {"cfg": "fixed", "sampler_name": None},
+            }
+        }
+        entries, _ = derive_mapping_candidates(
+            {"graph_json": ui_graph(), "api_prompt_json": stale},
+            node_def_provider=fake_defs,
+        )
+        assert entries["cfg"].control_kind == "number"
+        assert entries["sampler"].enum_options == ["euler", "dpmpp_2m"]
+
 
 class TestDependencyMetadataCnr:
     def test_cnr_id_propagates_from_ui_graph_and_ignores_comfy_core(self):

@@ -466,7 +466,19 @@ def derive_mapping_candidates(
       Entries carry node_id/input_name; metadata (enum/min/max/step/kind)
       comes from the graph — never from hardcoded lists.
     """
-    prompt = extract_executable_prompt((capture or {}).get("api_prompt_json") or {})
+    capture = capture or {}
+    prompt = extract_executable_prompt(capture.get("api_prompt_json") or {})
+    # UI-format captures can retain an API prompt produced by an older
+    # ComfyUI/widget ordering.  The graph is the source of truth for those
+    # captures; regenerate it before deriving bindings so candidates and their
+    # metadata point at the prompt that will actually be executed.
+    graph_json = capture.get("graph_json")
+    if is_ui_workflow_format(graph_json):
+        regenerated = ui_graph_to_api_prompt(
+            graph_json, node_def_provider=node_def_provider
+        )
+        if regenerated:
+            prompt = regenerated
     entries: dict[str, MappingEntry] = {}
     output_node_id = ""
     text_count = 0

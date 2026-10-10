@@ -236,8 +236,7 @@ def resolve_workflow_run_bundle(
     for entry in mapping.get("entries") or []:
         if isinstance(entry, dict) and entry.get("semantic_role"):
             control_schema[str(entry["semantic_role"])] = entry
-
-    return {
+    bundle = {
         "status": "ok",
         "workflow": workflow,
         "version": version,
@@ -247,6 +246,60 @@ def resolve_workflow_run_bundle(
         "control_schema": control_schema,
         "defaults": default_controls_from_version(executable_prompt, control_schema),
     }
+    return _refresh_ui_workflow_bundle(bundle)
+
+
+def _refresh_ui_workflow_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild the runtime bundle from a stored UI graph when one is present.
+
+    Versions are immutable and may have been captured with an older widget
+    ordering.  Keep the stored record intact, but make the run use one prompt,
+    mapping, schema, and default set derived from the current UI graph.  API
+    prompt versions are deliberately untouched so arbitrary workflows retain
+    their existing behavior.
+    """
+    version = bundle.get("version") or {}
+    graph_json = version.get("graph_json") if isinstance(version, dict) else None
+    try:
+        from studio_domain.graph import (
+            derive_mapping_candidates,
+            is_ui_workflow_format,
+            ui_graph_to_api_prompt,
+        )
+
+        if not is_ui_workflow_format(graph_json):
+            return bundle
+        regenerated = ui_graph_to_api_prompt(graph_json)
+        if not regenerated:
+            return bundle
+
+        entries, output_node_id = derive_mapping_candidates({
+            "graph_json": graph_json,
+            "api_prompt_json": regenerated,
+        })
+        mapping = copy.deepcopy(bundle.get("mapping") or {})
+        if entries:
+            mapping["entries"] = [entry.to_dict() for entry in entries.values()]
+        if output_node_id:
+            mapping["output_node_id"] = output_node_id
+
+        control_schema = {
+            str(entry["semantic_role"]): entry
+            for entry in (mapping.get("entries") or [])
+            if isinstance(entry, dict) and entry.get("semantic_role")
+        }
+        refreshed = dict(bundle)
+        refreshed["executable_prompt"] = regenerated
+        refreshed["mapping"] = mapping
+        refreshed["control_schema"] = control_schema
+        refreshed["defaults"] = default_controls_from_version(
+            regenerated, control_schema
+        )
+        return refreshed
+    except Exception:
+        # Keep the prior stored-prompt path as a compatibility fallback for a
+        # malformed graph or an unavailable node registry.
+        return bundle
 
 
 # ── Control validation / merge ───────────────────────────────────────────
@@ -593,7 +646,11 @@ def _hydrate_missing_required_widget_defaults(
         if not isinstance(inputs, dict):
             continue
         for name, spec in (schema.get("required") or {}).items():
-            if name in inputs or not isinstance(spec, (tuple, list)) or not spec:
+            if (
+                not isinstance(spec, (tuple, list))
+                or not spec
+                or (name in inputs and inputs.get(name) is not None)
+            ):
                 continue
             options = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
             default = options.get("default")
@@ -684,19 +741,18 @@ def build_workflow_execution_plan(
         )
         from workflow_metadata import extract_model_stack, prompt_sha256
 
-        executable_prompt = bundle["executable_prompt"]
+        runtime_bundle = _refresh_ui_workflow_bundle(bundle)
+        executable_prompt = runtime_bundle["executable_prompt"]
+        graph_json = (runtime_bundle.get("version") or {}).get("graph_json")
+        is_ui_graph = False
         try:
-            from studio_domain.graph import is_ui_workflow_format, ui_graph_to_api_prompt
+            from studio_domain.graph import is_ui_workflow_format
 
-            graph_json = (bundle.get("version") or {}).get("graph_json")
-            if is_ui_workflow_format(graph_json):
-                regenerated = ui_graph_to_api_prompt(graph_json)
-                if regenerated:
-                    executable_prompt = regenerated
+            is_ui_graph = is_ui_workflow_format(graph_json)
         except Exception:
             pass
         applied = apply_workflow_values_to_prompt(
-            executable_prompt, bundle["control_schema"], values
+            executable_prompt, runtime_bundle["control_schema"], values
         )
         if "error" in applied:
             return None, applied["error"]
@@ -737,13 +793,15 @@ def build_workflow_execution_plan(
         )
         studio_meta["selected_gpu"] = _selected_gpu
 
-        output_node_id = str(bundle.get("mapping", {}).get("output_node_id", "") or "")
+        output_node_id = str(
+            runtime_bundle.get("mapping", {}).get("output_node_id", "") or ""
+        )
         if not output_node_id:
             return None, "workflow mapping has no output node id"
         output_node_ids: tuple[str, ...] = tuple([output_node_id])
         _hydrate_missing_required_widget_defaults(
             workflow,
-            node_ids={output_node_id},
+            node_ids=None if is_ui_graph else {output_node_id},
         )
 
         production_options = normalize_production_options(effective_modal_options)

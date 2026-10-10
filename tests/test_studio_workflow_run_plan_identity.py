@@ -315,6 +315,90 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
         self.assertEqual(merged["errors"], [])
         return merged["values"]
 
+    def test_ui_graph_refreshes_prompt_mapping_schema_and_defaults(self):
+        """A stale stored API prompt must not supply run controls for a UI graph."""
+        graph = {
+            "nodes": [
+                {
+                    "id": 3,
+                    "type": "KSampler",
+                    "inputs": [
+                        {"name": "model", "type": "MODEL", "link": 11},
+                        {"name": "positive", "type": "CONDITIONING", "link": 12},
+                        {"name": "negative", "type": "CONDITIONING", "link": None},
+                        {"name": "latent_image", "type": "LATENT", "link": 13},
+                    ],
+                    "widgets_values": [7, 20, 8.0, "euler", "normal", 1.0],
+                },
+                {
+                    "id": 6,
+                    "type": "SaveImage",
+                    "inputs": [{"name": "images", "type": "IMAGE", "link": 14}],
+                },
+            ],
+            "links": [
+                [11, 1, 0, 3, 0, "MODEL"],
+                [12, 2, 0, 3, 1, "CONDITIONING"],
+                [13, 4, 0, 3, 3, "LATENT"],
+                [14, 3, 0, 6, 0, "IMAGE"],
+            ],
+        }
+        bundle = {
+            "status": "ok",
+            "version": {"graph_json": graph},
+            "executable_prompt": {
+                "3": {"class_type": "KSampler", "inputs": {
+                    "cfg": "fixed", "sampler_name": None,
+                }},
+            },
+            "mapping": {
+                "output_node_id": "6",
+                "entries": [
+                    {"semantic_role": "cfg", "node_id": "3", "input_name": "cfg"},
+                    {"semantic_role": "sampler", "node_id": "3", "input_name": "sampler_name"},
+                ],
+            },
+            "control_schema": {},
+            "defaults": {},
+        }
+        graph_module = __import__("studio_domain.graph", fromlist=["_probe_node_def"])
+        with mock.patch.object(graph_module, "_probe_node_def", fake_node_def):
+            refreshed = swr._refresh_ui_workflow_bundle(bundle)
+
+        assert refreshed["executable_prompt"]["3"]["inputs"]["cfg"] == 8.0
+        assert refreshed["executable_prompt"]["3"]["inputs"]["sampler_name"] == "euler"
+        assert refreshed["control_schema"]["sampler"]["input_name"] == "sampler_name"
+        assert refreshed["defaults"]["cfg"] == 8.0
+        assert refreshed["defaults"]["sampler"] == "euler"
+
+    def test_ui_graph_hydrates_required_defaults_on_non_output_nodes(self):
+        fake_nodes = types.ModuleType("nodes")
+
+        class TextGenerate:
+            @classmethod
+            def INPUT_TYPES(cls):
+                return {"required": {
+                    "min_p": ("FLOAT", {"default": 0.05}),
+                    "top_p": ("FLOAT", {"default": 0.8}),
+                    "repetition_penalty": ("FLOAT", {"default": 1.05}),
+                    "seed": ("INT", {"default": 0}),
+                    "top_k": ("INT", {"default": 20}),
+                    "temperature": ("FLOAT", {"default": 0.7}),
+                }}
+
+        setattr(fake_nodes, "NODE_CLASS_MAPPINGS", {"TextGenerate": TextGenerate})
+        workflow = {"214": {"class_type": "TextGenerate", "inputs": {
+            "min_p": None, "top_p": None, "repetition_penalty": None,
+        }}}
+        with mock.patch.dict(sys.modules, {"nodes": fake_nodes}):
+            evidence = swr._hydrate_missing_required_widget_defaults(workflow)
+
+        assert workflow["214"]["inputs"] == {
+            "min_p": 0.05, "top_p": 0.8, "repetition_penalty": 1.05,
+            "seed": 0, "top_k": 20, "temperature": 0.7,
+        }
+        assert len(evidence["hydrated"]) == 6
+
     def _recording_build(self):
         """Patch canonical build with a recording wrapper around the real one.
 
