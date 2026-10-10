@@ -15842,6 +15842,11 @@ class ModalRuntimeEntrypoint:
         """
         if getattr(self, "_golden_execution_active", False):
             raise RuntimeError("golden_prompt_executor_forbidden")
+        # Generated-output durability is request policy, not source-publication
+        # policy. Resolve it here (same rationale as _run_plan_stream_impl):
+        # the result-persistence section below reads it, and an invalid
+        # explicit value must fail through the normal request error path.
+        _output_durability_policy = resolve_output_durability()
         # Reset the per-request unet_first_cuda_op dedup so the first forward
         # pass of this request emits the event.  Must fire before any CUDA op.
         reset_first_cuda_dedup()
