@@ -417,6 +417,7 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
             (node / "main.py").write_bytes(b"main")
 
             async def fake_publish(_root, **kwargs):
+                self.assertTrue(kwargs["allow_destructive"])
                 return await shared_publish_or_skip(
                     _root, volume=volume, **kwargs
                 )
@@ -440,6 +441,32 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
         archive_mock.assert_not_called()
         deploy_mock.assert_called_once()
         refresh_mock.assert_called_once_with("custom_nodes", workspace=workspace)
+
+    def test_studio_publisher_timeout_is_terminal_and_does_not_deploy(self):
+        module = _load_init_module()
+
+        async def hanging_sync(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        async def invoke_publisher(_root, **kwargs):
+            self.assertTrue(kwargs["allow_destructive"])
+            return await kwargs["publisher"](b"archive")
+
+        with (
+            patch.object(module, "publish_or_skip", side_effect=invoke_publisher),
+            patch.object(module, "sync_custom_nodes", side_effect=hanging_sync),
+            patch.object(module, "_ensure_modal_deploy_current") as deploy_mock,
+        ):
+            result = asyncio.run(
+                module._sync_custom_nodes_and_maybe_deploy(
+                    "custom_nodes", {}, publication_timeout_s=0.01
+                )
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["publication"]["reason"], "publication_timeout")
+        self.assertIn("outcome is unknown", result["message"])
+        deploy_mock.assert_not_called()
 
 
     def test_maybe_auto_deploy_skips_in_runtime_container(self):

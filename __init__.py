@@ -41,6 +41,13 @@ from tools.v2_control.custom_nodes import publish_or_skip
 _local_exact_prefill = env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", default=True)
 print(f"[exact_prefill.local] enabled={int(_local_exact_prefill)} source=env")
 
+# Studio publication is a user-visible background operation.  Keep its
+# timeout separate from workflow execution and Golden paths, which use the
+# normal publisher semantics without this bound.
+_STUDIO_CUSTOM_NODE_PUBLISH_TIMEOUT_S = float(
+    os.environ.get("COMFYMODAL_STUDIO_CUSTOM_NODE_PUBLISH_TIMEOUT_S", "180")
+)
+
 _log = logging.getLogger(__name__)
 
 class _LazyImport:
@@ -3297,10 +3304,68 @@ def _build_custom_nodes_archive(cn_root: str) -> bytes:
     return buf.getvalue()
 
 
-async def _sync_custom_nodes_and_maybe_deploy(cn_root: str, workspace: dict) -> dict:
-    result = await _publish_custom_nodes_or_skip(
-        cn_root, workspace, allow_destructive=True,
-    )
+class _StudioPublisherTimeout(TimeoutError):
+    """The Studio-only publisher deadline elapsed before its outcome was known."""
+
+
+async def _invoke_studio_publisher_with_timeout(
+    publisher: Any, archive_data: bytes, timeout_s: float
+) -> Any:
+    """Run the Modal publisher without letting a stuck RPC wedge the UI worker.
+
+    The Modal client uses a blocking RPC inside an asyncio executor.  Cancelling
+    that awaitable would still make ``asyncio.run`` wait for the executor while
+    it shuts down, so Studio runs this one publisher invocation in a daemon
+    thread and polls its completion from the event loop.  A timed-out RPC is
+    deliberately detached: its eventual remote outcome is unknown, and the
+    caller must report failure rather than continue to deploy or refresh.
+    """
+    result_holder: dict[str, Any] = {}
+    completed = threading.Event()
+
+    def invoke() -> None:
+        try:
+            result = publisher(archive_data)
+            if inspect.isawaitable(result):
+                result = asyncio.run(result)
+            result_holder["result"] = result
+        except BaseException as exc:
+            result_holder["error"] = exc
+        finally:
+            completed.set()
+
+    threading.Thread(
+        target=invoke,
+        name="studio-custom-node-publisher",
+        daemon=True,
+    ).start()
+
+    deadline = time.monotonic() + timeout_s
+    while not completed.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _StudioPublisherTimeout(
+                f"Custom-node publication timed out after {timeout_s:g}s; "
+                "publication outcome is unknown"
+            )
+        await asyncio.sleep(min(0.05, remaining))
+
+    error = result_holder.get("error")
+    if error is not None:
+        raise error
+    return result_holder.get("result")
+
+
+async def _sync_custom_nodes_and_maybe_deploy(
+    cn_root: str,
+    workspace: dict,
+    *,
+    publication_timeout_s: float | None = None,
+) -> dict:
+    publication_kwargs: dict[str, Any] = {"allow_destructive": True}
+    if publication_timeout_s is not None:
+        publication_kwargs["publication_timeout_s"] = publication_timeout_s
+    result = await _publish_custom_nodes_or_skip(cn_root, workspace, **publication_kwargs)
 
     if result.get("status") != "ok":
         return result
@@ -3332,6 +3397,7 @@ async def _publish_custom_nodes_or_skip(
     workspace: dict,
     *,
     allow_destructive: bool = False,
+    publication_timeout_s: float | None = None,
 ) -> dict:
     """Publish custom nodes through the receipt/full-content control plane.
 
@@ -3340,6 +3406,12 @@ async def _publish_custom_nodes_or_skip(
     matches and trusted receipt-only recovery never package or upload content.
     """
     async def publisher(archive_data: bytes) -> Any:
+        if publication_timeout_s is not None:
+            return await _invoke_studio_publisher_with_timeout(
+                lambda data: sync_custom_nodes(data, workspace=workspace),
+                archive_data,
+                publication_timeout_s,
+            )
         result = sync_custom_nodes(archive_data, workspace=workspace)
         if inspect.isawaitable(result):
             return await result
@@ -3353,6 +3425,20 @@ async def _publish_custom_nodes_or_skip(
             workspace=workspace,
             allow_destructive=allow_destructive,
         )
+    except _StudioPublisherTimeout:
+        timeout_s = publication_timeout_s
+        return {
+            "status": "error",
+            "message": (
+                f"Custom-node publication timed out after {timeout_s:g}s; "
+                "publication outcome is unknown and no deploy or refresh was started."
+            ),
+            "publication": {
+                "action": "publish",
+                "reason": "publication_timeout",
+                "verified_publication": False,
+            },
+        }
     except Exception as exc:
         return {
             "status": "error",
@@ -6975,12 +7061,18 @@ if _server:
         try:
             if operation == "publish":
                 result = asyncio.run(
-                    _sync_custom_nodes_and_maybe_deploy(_custom_nodes_root(), workspace)
+                    _sync_custom_nodes_and_maybe_deploy(
+                        _custom_nodes_root(),
+                        workspace,
+                        publication_timeout_s=_STUDIO_CUSTOM_NODE_PUBLISH_TIMEOUT_S,
+                    )
                 )
                 publication = result.get("publication", {}) if isinstance(result, dict) else {}
                 reason = publication.get("reason")
                 if reason == "destructive_custom_node_publication_blocked":
                     state, outcome = "blocked", "destructive_publication_blocked"
+                elif reason == "publication_timeout":
+                    state, outcome = "error", "publication_timeout"
                 elif isinstance(result, dict) and result.get("status") == "ok":
                     state, outcome = "completed", "published"
                 else:
