@@ -512,6 +512,149 @@ def build_generic_vae_session(
     return session
 
 
+async def compose_generic_unet_load_qd(
+    *,
+    unet_filenames: Sequence[str],
+    folder: str = "diffusion_models",
+    request_id: str,
+    path_resolver: Callable[[str, str], str | None] | None = None,
+) -> dict[str, Any]:
+    """Load UNET via the SHARED QD demand reader plus native construction.
+
+    Mirrors the live-proven QD4-CLIP recipe, transposed to diffusion
+    models: the canonical ``clip_qd_load`` reader moves bytes (it is
+    file-type agnostic; dtype membership is validated by the shared map),
+    ``*.comfy_quant`` descriptors ride CPU-only, real safetensors header
+    metadata flows into the shared upstream
+    ``comfy.sd.load_diffusion_model_state_dict`` delegation, and the
+    result carries the native ``cached_patcher_init`` shape.  No golden
+    stage is entered, so file contracts that the stage rejects
+    (scaled-FP8 / mixed dtypes) load with native semantics — identical
+    correctness to today, minus the file re-read.  Never raises.
+    """
+    started_ns = time.monotonic_ns()
+    resolve = path_resolver or _default_path_resolver
+    try:
+        names = [str(n) for n in (unet_filenames or []) if str(n or "").strip()]
+        if not names:
+            return {"ok": False, "reason": "unet_filenames_missing",
+                    "source_arm": "qd_unet_demand"}
+        if len(names) > 1:
+            return {"ok": False, "reason": "unet_multi_checkpoint_deferred",
+                    "source_arm": "qd_unet_demand"}
+        path = resolve(folder, names[0])
+        if not path:
+            return {"ok": False,
+                    "reason": f"unet_path_unresolvable:{names[0]}",
+                    "source_arm": "qd_unet_demand"}
+        t_resolved_ns = time.monotonic_ns()
+        from .clip_qd_reader import clip_qd_load, qd_config
+
+        cfg = qd_config() or {}
+        qd_value = int(cfg.get("qd", 0) or 0)
+        block_mib = int(cfg.get("block_mib", 0) or 0)
+        launch_policy = str(cfg.get("launch_policy", "") or "")
+        if not bool(cfg.get("enabled")):
+            return {"ok": False, "reason": "qd_unet_gate_disabled",
+                    "source_arm": "qd_unet_demand"}
+        if qd_value != 4:
+            return {"ok": False,
+                    "reason": f"qd_unet_gate_qd_not_4:{qd_value}",
+                    "source_arm": "qd_unet_demand"}
+        if block_mib < 1 or not launch_policy:
+            return {"ok": False, "reason": "qd_unet_gate_config_incomplete",
+                    "source_arm": "qd_unet_demand"}
+        t_gated_ns = time.monotonic_ns()
+        sd, loader, owner = clip_qd_load(
+            path,
+            qd=qd_value,
+            block_mib=block_mib,
+            trace=None,
+            launch_policy=launch_policy,
+            artifact_path=cfg.get("artifact_path") or None,
+        )
+        t_read_ns = time.monotonic_ns()
+        sd = _cpu_native_quant_markers(sd)
+        import comfy.sd
+
+        file_metadata: dict[str, Any] = {}
+        try:
+            if str(path).lower().endswith((".safetensors", ".sft")):
+                from safetensors import safe_open as _safe_open
+
+                with _safe_open(path, framework="pt", device="cpu") as _hdr:
+                    _meta = _hdr.metadata()
+                    if isinstance(_meta, dict):
+                        file_metadata = dict(_meta)
+        except Exception:
+            file_metadata = {}
+        t_prep_ns = time.monotonic_ns()
+        vram_ok, vram_detail = _ensure_stage_dynamic_vram(None, request_id)
+        if not vram_ok:
+            elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+            return {"ok": False,
+                    "reason": f"dynamic_vram_unavailable:{vram_detail}",
+                    "elapsed_ms": elapsed_ms,
+                    "source_arm": "qd_unet_demand"}
+        import torch as _torch_unet_qd
+
+        with _torch_unet_qd.inference_mode(False):
+            patcher = comfy.sd.load_diffusion_model_state_dict(
+                sd,
+                model_options={},
+                metadata=file_metadata or None,
+            )
+        if patcher is None:
+            elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+            return {"ok": False, "reason": "unet_model_config_undetected",
+                    "elapsed_ms": elapsed_ms,
+                    "source_arm": "qd_unet_demand"}
+        try:
+            patcher.cached_patcher_init = (
+                comfy.sd.load_diffusion_model,
+                (path, {}),
+            )
+        except Exception:
+            pass
+        t_construct_ns = time.monotonic_ns()
+        elapsed_ms = (t_construct_ns - started_ns) / 1_000_000.0
+        phases = {
+            "resolve_ms": round((t_resolved_ns - started_ns) / 1_000_000.0, 1),
+            "gate_ms": round((t_gated_ns - t_resolved_ns) / 1_000_000.0, 1),
+            "read_ms": round((t_read_ns - t_gated_ns) / 1_000_000.0, 1),
+            "prep_ms": round((t_prep_ns - t_read_ns) / 1_000_000.0, 1),
+            "construct_ms": round((t_construct_ns - t_prep_ns) / 1_000_000.0, 1),
+        }
+        owners = [o for o in (loader, owner) if o is not None]
+        return {
+            "ok": True,
+            "loaded": patcher,
+            "session": None,
+            "owners": owners,
+            "elapsed_ms": elapsed_ms,
+            "reason": "",
+            "source_arm": "qd_unet_demand",
+            "phases": phases,
+        }
+    except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
+        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        try:
+            import traceback as _traceback_mod
+
+            _tb_text = _traceback_mod.format_exc(limit=12)
+        except Exception:
+            _tb_text = ""
+        return {
+            "ok": False,
+            "reason": (
+                f"{type(exc).__name__}:{str(exc)[:200]}"
+                + (f" | tb:{_tb_text[-1200:]}" if _tb_text else "")
+            ),
+            "elapsed_ms": elapsed_ms,
+            "source_arm": "qd_unet_demand",
+        }
+
+
 async def compose_generic_unet_load(
     *,
     unet_filenames: Sequence[str],
@@ -1294,6 +1437,18 @@ async def _substitute_unet_vae_loader(
                 folder="diffusion_models",
                 request_id=request_id,
             )
+            if not outcome.get("ok"):
+                _stage_reason = str(outcome.get("reason") or "stage_failed")
+                outcome = await compose_generic_unet_load_qd(
+                    unet_filenames=[unet_name],
+                    folder="diffusion_models",
+                    request_id=request_id,
+                )
+                outcome.setdefault("source_arm", "qd_unet_demand")
+                if not outcome.get("ok"):
+                    outcome["reason"] = (
+                        f"{_stage_reason}|{outcome.get('reason') or 'qd_failed'}"
+                    )
         elif role == "vae":
             vae_name = str(given.get("vae_name") or "").strip()
             if not vae_name:

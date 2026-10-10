@@ -559,3 +559,69 @@ class TestUnetWeightDtypeGuard:
             assert calls == []
         finally:
             restore()
+
+
+class TestUnetQdFallback:
+    """Stage-contract rejection falls through to QD-native, then native."""
+
+    def test_stage_fail_qd_success(self, monkeypatch):
+        calls = []
+        fake, holder, sink, restore = _install(
+            monkeypatch, calls, {"unet": {"node_id": "194"}})
+        try:
+            patcher_obj = object()
+            owner = _Owner()
+
+            async def fake_stage(**kwargs):
+                return {"ok": False,
+                        "reason": "RuntimeError:non_uniform_dtype:['BF16']",
+                        "elapsed_ms": 1.0, "source_arm": "golden_unet"}
+
+            async def fake_qd(**kwargs):
+                assert kwargs["unet_filenames"] == ["u.safetensors"]
+                assert kwargs["folder"] == "diffusion_models"
+                return {"ok": True, "loaded": patcher_obj, "session": None,
+                        "owners": [owner], "elapsed_ms": 2.0, "reason": "",
+                        "source_arm": "qd_unet_demand"}
+
+            monkeypatch.setattr(ggl, "compose_generic_unet_load", fake_stage)
+            monkeypatch.setattr(ggl, "compose_generic_unet_load_qd", fake_qd)
+            out = asyncio.run(fake.get_output_data(
+                "p1", "194", UNETLoader(), {"unet_name": ["u.safetensors"]}))
+            assert out == ([[patcher_obj]], {}, False, False)
+            assert calls == []
+            assert holder._owners == [owner]
+            shared = [m for n, m in sink
+                      if n == "generic_dispatch_substitution"
+                      and m.get("actual") == "shared_core"]
+            assert len(shared) == 1
+            assert shared[0]["source_arm"] == "qd_unet_demand"
+        finally:
+            restore()
+
+    def test_stage_and_qd_fail_native_combined(self, monkeypatch):
+        calls = []
+        fake, _holder, sink, restore = _install(
+            monkeypatch, calls, {"unet": {"node_id": "194"}})
+        try:
+            async def fake_stage(**kwargs):
+                return {"ok": False, "reason": "RuntimeError:non_uniform_dtype",
+                        "source_arm": "golden_unet"}
+
+            async def fake_qd(**kwargs):
+                return {"ok": False, "reason": "RuntimeError:qd_unet_gate_disabled",
+                        "source_arm": "qd_unet_demand"}
+
+            monkeypatch.setattr(ggl, "compose_generic_unet_load", fake_stage)
+            monkeypatch.setattr(ggl, "compose_generic_unet_load_qd", fake_qd)
+            out = asyncio.run(fake.get_output_data(
+                "p1", "194", UNETLoader(), {"unet_name": ["u.safetensors"]}))
+            assert out[0] == "native-output"
+            assert len(calls) == 1
+            native = [m for n, m in sink
+                      if n == "generic_dispatch_substitution"
+                      and m.get("actual") == "native"]
+            assert native and "non_uniform_dtype" in native[0]["reason"]
+            assert "qd_unet_gate_disabled" in native[0]["reason"]
+        finally:
+            restore()
