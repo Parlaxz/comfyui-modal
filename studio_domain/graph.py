@@ -877,6 +877,29 @@ def ui_graph_to_api_prompt(
                                 inputs[input_name] = [conn[0], conn[1]]
                             else:
                                 inputs[input_name] = None
+                        elif type_name.startswith("COMFY_DYNAMICCOMBO"):
+                            selected = _next_widget()
+                            combo: dict[str, Any] = {input_name: selected}
+                            selected_option = next(
+                                (
+                                    option for option in (options.get("options") or [])
+                                    if isinstance(option, dict)
+                                    and option.get("key") == selected
+                                ),
+                                None,
+                            )
+                            option_inputs = (
+                                selected_option.get("inputs", {})
+                                if isinstance(selected_option, dict)
+                                else {}
+                            )
+                            for child_defs in (
+                                option_inputs.get("required", {}),
+                                option_inputs.get("optional", {}),
+                            ):
+                                for child_name in child_defs:
+                                    combo[child_name] = _next_widget()
+                            inputs[input_name] = combo
                         elif _is_widget_input(ui_entry, type_name, options):
                             inputs[input_name] = _next_widget()
                             if options.get("control_after_generate"):
