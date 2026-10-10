@@ -511,3 +511,51 @@ class TestQuantMarkerPlacement:
     def test_non_dict_passthrough(self):
         assert ggl._cpu_native_quant_markers(None) is None
         assert ggl._cpu_native_quant_markers([1]) == [1]
+
+
+class TestUnetWeightDtypeGuard:
+    """Explicit UNETLoader weight_dtype stays native: the shared stage
+    never receives that input, so only the default may substitute."""
+
+    def test_explicit_weight_dtype_native(self, monkeypatch):
+        calls = []
+        fake, _holder, sink, restore = _install(
+            monkeypatch, calls, {"unet": {"node_id": "194"}})
+
+        async def fail_if_called(**kwargs):
+            raise AssertionError("stage must not run with explicit weight_dtype")
+
+        monkeypatch.setattr(ggl, "compose_generic_unet_load", fail_if_called)
+        try:
+            out = asyncio.run(fake.get_output_data(
+                "p1", "194", UNETLoader(),
+                {"unet_name": ["u.safetensors"], "weight_dtype": ["fp8_e4m3fn"]}))
+            assert out[0] == "native-output"
+            assert len(calls) == 1
+            native = [m for n, m in sink
+                      if n == "generic_dispatch_substitution"
+                      and m.get("actual") == "native"]
+            assert native and "unet_explicit_weight_dtype_native" in native[0]["reason"]
+        finally:
+            restore()
+
+    def test_default_weight_dtype_proceeds(self, monkeypatch):
+        calls = []
+        fake, holder, sink, restore = _install(
+            monkeypatch, calls, {"unet": {"node_id": "194"}})
+        try:
+            patcher_obj = object()
+
+            async def fake_unet(**kwargs):
+                return {"ok": True, "loaded": patcher_obj, "session": object(),
+                        "owners": [], "elapsed_ms": 1.0, "reason": "",
+                        "source_arm": "golden_unet"}
+
+            monkeypatch.setattr(ggl, "compose_generic_unet_load", fake_unet)
+            out = asyncio.run(fake.get_output_data(
+                "p1", "194", UNETLoader(),
+                {"unet_name": ["u.safetensors"], "weight_dtype": ["default"]}))
+            assert out == ([[patcher_obj]], {}, False, False)
+            assert calls == []
+        finally:
+            restore()

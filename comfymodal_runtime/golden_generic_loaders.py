@@ -1282,6 +1282,13 @@ async def _substitute_unet_vae_loader(
             unet_name = str(given.get("unet_name") or "").strip()
             if not unet_name:
                 return {"ok": False, "reason": "unet_name_missing"}
+            # Native UNETLoader casts post-load for explicit weight_dtype;
+            # the shared stage never receives that input, so only the
+            # default passes through (anything else stays native).
+            weight_dtype = str(given.get("weight_dtype") or "default").strip().lower()
+            if weight_dtype not in ("", "default"):
+                return {"ok": False,
+                        "reason": f"unet_explicit_weight_dtype_native:{weight_dtype}"}
             outcome = await compose_generic_unet_load(
                 unet_filenames=[unet_name],
                 folder="diffusion_models",

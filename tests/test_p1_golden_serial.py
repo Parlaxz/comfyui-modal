@@ -3388,3 +3388,56 @@ def test_clip_skeleton_overlap_timeout_is_bounded_and_does_not_fall_back(
     finally:
         release.set()
         future.result(timeout=1.0)
+
+
+# ── UNET dtype-plan classification + kill-switch (stage-1 foundation) ──
+
+def _dtype_entries(pairs):
+    return [(f"layer.{i}.weight", dtype, (4, 4), i * 64, (i + 1) * 64)
+            for i, dtype in enumerate(pairs)]
+
+
+def test_classify_unet_uniform():
+    assert gs._classify_unet_dtype_source(_dtype_entries(["BF16"] * 3), {}) == "uniform"
+    assert gs._classify_unet_dtype_source(_dtype_entries(["F32"]), None) == "uniform"
+
+
+def test_classify_unet_legacy_scaled_fp8_markers_win():
+    entries = _dtype_entries(["BF16", "F32"]) + [("blk.scaled_fp8", "U8", (8,), 0, 8)]
+    assert gs._classify_unet_dtype_source(entries, {}) == "legacy_scaled_fp8"
+
+
+def test_classify_unet_mixed_without_quant():
+    entries = _dtype_entries(["BF16", "F32"])
+    assert gs._classify_unet_dtype_source(entries, {}) == "mixed"
+    assert gs._classify_unet_dtype_source(entries, {"other": 1}) == "mixed"
+
+
+def test_classify_unet_quant_fp8_krea_shape():
+    entries = (_dtype_entries(["BF16"] * 2) + _dtype_entries(["F32"] * 2)
+               + _dtype_entries(["F8_E4M3"] * 2))
+    meta = {"_quantization_metadata": {"layers": {}}}
+    assert gs._classify_unet_dtype_source(entries, meta) == "quant_fp8"
+    # F8 storage alone (no metadata) also classifies quant.
+    assert gs._classify_unet_dtype_source(
+        _dtype_entries(["BF16", "F8_E4M3"]), {}) == "quant_fp8"
+
+
+def test_classify_unet_unknown_and_empty():
+    assert gs._classify_unet_dtype_source(_dtype_entries(["NOPE"]), {}) == "unknown"
+    assert gs._classify_unet_dtype_source([], {}) == "unknown"
+    assert gs._classify_unet_dtype_source(None, None) == "unknown"
+
+
+def test_unet_dtype_plan_mode_defaults_off(monkeypatch):
+    monkeypatch.delenv("COMFYMODAL_GOLDEN_UNET_DTYPE_PLAN", raising=False)
+    assert gs._unet_dtype_plan_mode() == "off"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("mixed", "mixed"), ("MIXED", "mixed"), ("scaled_fp8", "scaled_fp8"),
+    ("off", "off"), ("", "off"), ("bogus", "off"),
+])
+def test_unet_dtype_plan_mode_values(monkeypatch, raw, expected):
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_UNET_DTYPE_PLAN", raw)
+    assert gs._unet_dtype_plan_mode() == expected

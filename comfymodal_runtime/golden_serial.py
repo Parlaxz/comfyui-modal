@@ -11938,6 +11938,74 @@ def _golden_model_transport_enabled() -> bool:
     return _golden_m2_clip_enabled() or selected in {"1", "true", "yes", "on", "m2", "persistent"}
 
 
+_UNET_DTYPE_PLAN_ENV = "COMFYMODAL_GOLDEN_UNET_DTYPE_PLAN"
+_UNET_DTYPE_PLAN_MODES = frozenset({"off", "mixed", "scaled_fp8"})
+
+
+def _unet_dtype_plan_mode() -> str:
+    """Kill-switch for UNET dtype-plan admission (default off).
+
+    Reads ``COMFYMODAL_GOLDEN_UNET_DTYPE_PLAN``; anything outside
+    off|mixed|scaled_fp8 behaves as off.  Stage 1 uses this only to
+    select explicit not-built reasons — canonical uniform sources never
+    consult it on success.  Never raises.
+    """
+    try:
+        raw = str(os.environ.get(_UNET_DTYPE_PLAN_ENV, "") or "").strip().lower()
+    except Exception:
+        return "off"
+    return raw if raw in _UNET_DTYPE_PLAN_MODES else "off"
+
+
+def _classify_unet_dtype_source(entries: Any, metadata: Any) -> str:
+    """Classify a UNET source for dtype-plan admission (pure logic).
+
+    Returns one of ``uniform`` | ``legacy_scaled_fp8`` | ``mixed`` |
+    ``quant_fp8`` | ``unknown``.  Entry items use the stage's own shape
+    ``(key, dtype_str, shape, offset, length)``; dtype membership uses
+    the same ``_TORCH_DTYPE`` map as the stage.  Classification order
+    mirrors the stage's historical checks (legacy marker first).  A
+    mixed source with FP8 storage dtypes or header
+    ``_quantization_metadata`` classifies ``quant_fp8``; other mixes are
+    ``mixed``.  Never raises.
+    """
+    try:
+        items = list(entries or [])
+    except Exception:
+        return "unknown"
+    try:
+        keys: list[str] = []
+        dtypes: list[str] = []
+        for item in items:
+            try:
+                key = str(item[0]) if len(item) > 0 else ""
+                dtype = str(item[1]) if len(item) > 1 else "?"
+            except Exception:
+                continue
+            keys.append(key)
+            dtypes.append(dtype)
+    except Exception:
+        return "unknown"
+    if not keys:
+        return "unknown"
+    if any(".scaled_fp8" in key for key in keys):
+        return "legacy_scaled_fp8"
+    try:
+        unknown = [dtype for dtype in dtypes if _TORCH_DTYPE.get(dtype) is None]
+    except Exception:
+        return "unknown"
+    if unknown:
+        return "unknown"
+    if len(set(dtypes)) <= 1:
+        return "uniform"
+    meta = metadata if isinstance(metadata, dict) else {}
+    has_quant_meta = "_quantization_metadata" in meta
+    has_f8 = any(dtype in ("F8_E4M3", "F8_E5M2") for dtype in dtypes)
+    if has_quant_meta or has_f8:
+        return "quant_fp8"
+    return "mixed"
+
+
 def _session_source_policy(session: Any) -> str:
     """Session-local source-read policy (default: canonical behavior).
 
@@ -13945,9 +14013,19 @@ async def golden_unet_load(
                 else build_header_tensor_map(header)
             )
             if any(".scaled_fp8" in name for name, *_ in entries):
+                if _unet_dtype_plan_mode() == "scaled_fp8":
+                    raise RuntimeError("unet_dtype_plan_not_built:legacy_scaled_fp8")
                 raise RuntimeError("scaled_fp8_rejected")
             dtype_names = {dtype_str for _, dtype_str, *_ in entries}
             if len(dtype_names) != 1:
+                _dtype_plan_class = _classify_unet_dtype_source(entries, metadata)
+                _dtype_plan_mode = _unet_dtype_plan_mode()
+                if (_dtype_plan_class == "mixed"
+                        and _dtype_plan_mode in ("mixed", "scaled_fp8")) or (
+                        _dtype_plan_class == "quant_fp8"
+                        and _dtype_plan_mode == "scaled_fp8"):
+                    raise RuntimeError(
+                        f"unet_dtype_plan_not_built:{_dtype_plan_class}")
                 raise RuntimeError(f"non_uniform_dtype:{sorted(dtype_names)}")
             view_dtype = _TORCH_DTYPE.get(next(iter(dtype_names)))
             if view_dtype is None:
