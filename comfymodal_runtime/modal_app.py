@@ -16714,25 +16714,36 @@ class ModalRuntimeEntrypoint:
             _seed_hook_restore = self._install_snapshot_executor_seed_hook(
                 executor, workflow, plan, trace,
             )
-            # Generic shared-loader composition (v2-only by location:
-            # canonical Golden runs never reach this function).  Wraps
-            # set_prompt AFTER the snapshot seeder so residency keeps
-            # priority; unseeded CLIPLoader nodes attempt the shared
-            # Golden cores with strict native fallback.  Install failure
-            # leaves native behavior unchanged.
+            # Generic dispatch substitution (v2-only by location:
+            # canonical Golden runs never reach this function).  Wraps the
+            # upstream node-dispatch boundary so role-bound loader nodes
+            # execute the imported golden stages instead of native reads,
+            # with strict native fallback.  Role bindings travel in the
+            # plan request metadata (see build_workflow_execution_plan);
+            # missing/empty bindings, install failure, or any stage error
+            # leaves native behavior unchanged.  The request finally-block
+            # below restores the original dispatch and releases retained
+            # owners (same holder/restore variables as before).
             try:
                 from comfymodal_runtime.golden_generic_loaders import (
                     GenericLoaderHolder,
-                    install_generic_loader_hook,
+                    install_execution_dispatch_substitution,
                 )
 
                 _generic_loader_holder = GenericLoaderHolder()
-                _generic_loader_restore = install_generic_loader_hook(
-                    executor,
-                    workflow if isinstance(workflow, dict) else {},
-                    _generic_loader_holder,
-                    trace.emit,
-                    str(getattr(context, "request_id", "") or ""),
+                _dispatch_role_bindings = {}
+                try:
+                    _plan_meta = getattr(plan, "request_metadata", None) or {}
+                    _meta_get = getattr(_plan_meta, "get", None)
+                    if callable(_meta_get):
+                        _dispatch_role_bindings = _meta_get("role_bindings") or {}
+                except Exception:
+                    _dispatch_role_bindings = {}
+                _generic_loader_restore = install_execution_dispatch_substitution(
+                    role_bindings=_dispatch_role_bindings,
+                    holder=_generic_loader_holder,
+                    trace_emit=trace.emit,
+                    request_id=str(getattr(context, "request_id", "") or ""),
                 )
             except Exception:
                 _generic_loader_holder = None

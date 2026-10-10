@@ -11938,6 +11938,20 @@ def _golden_model_transport_enabled() -> bool:
     return _golden_m2_clip_enabled() or selected in {"1", "true", "yes", "on", "m2", "persistent"}
 
 
+def _session_source_policy(session: Any) -> str:
+    """Session-local source-read policy (default: canonical behavior).
+
+    Generic substitution sets ``session.source_policy = "legacy_qd"`` to
+    take the existing isolated legacy QD read arm instead of the shared
+    M2 singleton — no environment toggle, no canonical behavior change
+    (an unset policy preserves the current selection exactly).
+    """
+    try:
+        return str(getattr(session, "source_policy", "") or "").strip().lower()
+    except Exception:
+        return ""
+
+
 def _read_golden_m2_clip(path: str, *, transport: Any = None, role: str = "clip") -> dict[str, Any]:
     """Adapt the canonical M2 loader to Golden's transport contract."""
     from .golden_model_transport import get_golden_model_transport
@@ -12113,7 +12127,7 @@ async def golden_clip_load(
             role = "clip" if len(session.clip_paths) == 1 else f"clip{index}"
             with clip_timing.span("source_open_read", boundary_kind="host_observed"):
                 with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
-                    if _golden_model_transport_enabled():
+                    if _golden_model_transport_enabled() and _session_source_policy(session) != "legacy_qd":
                         transport = _read_golden_m2_clip(
                             path, transport=getattr(session, "model_transport", None)
                         )
@@ -13872,7 +13886,7 @@ async def golden_unet_load(
         unet_path = session.model_paths["unet"]
         shared_transport = None
         shared_transport_task = None
-        if _golden_model_transport_enabled() and preloaded_transport is None:
+        if _golden_model_transport_enabled() and preloaded_transport is None and _session_source_policy(session) != "legacy_qd":
             from .golden_model_transport import get_golden_model_transport
             shared_transport = getattr(session, "model_transport", None) or get_golden_model_transport()
             session.model_transport = shared_transport
@@ -14941,7 +14955,7 @@ async def golden_vae_load(
             # Loader-process experiment: reuse the worker's CUDA-IPC-mapped
             # views + header metadata (no second read, no second H2D).
             transport = preloaded_transport
-        elif _golden_model_transport_enabled():
+        elif _golden_model_transport_enabled() and _session_source_policy(session) != "legacy_qd":
             from .golden_model_transport import get_golden_model_transport
             model_transport = getattr(session, "model_transport", None) or get_golden_model_transport()
             session.model_transport = model_transport

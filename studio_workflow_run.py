@@ -1029,6 +1029,32 @@ def build_workflow_execution_plan(
             output_mode=output_mode,
         )
         studio_meta["selected_gpu"] = _selected_gpu
+        try:
+            # Role transport for golden dispatch substitution: normalized
+            # semantic-role -> node bindings travel in request metadata so
+            # the worker can substitute golden stages at role-marked nodes.
+            # Carried verbatim ({role: {node_id, input_name}}); the worker
+            # verifies the node's actual loader class before substituting,
+            # so a stale binding can never retarget silently. Never raises;
+            # missing/empty mapping means native execution.
+            _role_bindings: dict[str, dict[str, str]] = {}
+            _mapping_entries = (runtime_bundle.get("mapping") or {}).get("entries") or []
+            if isinstance(_mapping_entries, dict):
+                _mapping_entries = list(_mapping_entries.values())
+            for _entry in _mapping_entries or []:
+                if not isinstance(_entry, dict):
+                    continue
+                _role = str(_entry.get("semantic_role") or "")
+                _nid = str(_entry.get("node_id") or "")
+                if _role and _nid and _role not in _role_bindings:
+                    _role_bindings[_role] = {
+                        "node_id": _nid,
+                        "input_name": str(_entry.get("input_name") or ""),
+                    }
+            if _role_bindings:
+                studio_meta["role_bindings"] = _role_bindings
+        except Exception:
+            pass
 
         output_node_id = str(
             runtime_bundle.get("mapping", {}).get("output_node_id", "") or ""

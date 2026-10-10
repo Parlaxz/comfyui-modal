@@ -284,6 +284,295 @@ async def compose_generic_clip_load(
         }
 
 
+async def compose_generic_clip_load_stage(
+    *,
+    clip_filenames: Sequence[str],
+    clip_type: str,
+    folder: str,
+    request_id: str,
+    path_resolver: Callable[[str, str], str | None] | None = None,
+    volume: Any = None,
+) -> dict[str, Any]:
+    """Load CLIP via the SHARED ``golden_clip_load`` stage with the isolated
+    legacy QD source policy (never the M2 singleton).
+
+    Same shared construction/adoption/proof as canonical runs; only the
+    source-read arm differs (session-local policy, no environment toggle).
+    Mixed-dtype files take the stage's observable proof-downgrade path
+    instead of failing outright.  Returns ``{"ok": True, "clip": ...,
+    "session": ..., "owners": [...], "source_arm": "golden_clip", ...}``
+    or ``{"ok": False, "reason": ...}``.  Never raises.
+    """
+    started_ns = time.monotonic_ns()
+    resolve = path_resolver or _default_path_resolver
+    try:
+        names = [str(n) for n in (clip_filenames or []) if str(n or "").strip()]
+        if not names:
+            return {"ok": False, "reason": "clip_filenames_missing",
+                    "source_arm": "golden_clip"}
+        resolved: list[str] = []
+        for name in names:
+            path = resolve(folder, name)
+            if not path:
+                return {"ok": False,
+                        "reason": f"clip_path_unresolvable:{name}",
+                        "source_arm": "golden_clip"}
+            resolved.append(path)
+        from .golden_serial import golden_clip_load
+
+        session = build_generic_clip_session(
+            clip_filenames=names,
+            clip_type=clip_type,
+            folder=folder,
+            request_id=request_id,
+            volume=volume,
+        )
+        setattr(session, "source_policy", "legacy_qd")
+        # The stage reads full paths from the session (same as canonical).
+        session.clip_paths = list(resolved)
+        clip = await golden_clip_load(session)
+        owners = list(getattr(session, "clip_owners", None) or [])
+        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        return {
+            "ok": True,
+            "clip": clip,
+            "session": session,
+            "owners": owners,
+            "elapsed_ms": elapsed_ms,
+            "reason": "",
+            "source_arm": "golden_clip",
+        }
+    except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
+        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        return {
+            "ok": False,
+            "reason": f"{type(exc).__name__}:{str(exc)[:200]}",
+            "elapsed_ms": elapsed_ms,
+            "source_arm": "golden_clip",
+        }
+
+
+def build_generic_unet_session(
+    *,
+    unet_filename: str,
+    request_id: str,
+    folder: str = "diffusion_models",
+    volume: Any = None,
+    request_extra: Mapping[str, Any] | None = None,
+) -> Any:
+    """Build a REAL GoldenSession adapted for one generic UNET load.
+
+    Mirrors the canonical request setup: contract carries the real
+    filename with ``expected_unet_tensor_count=0`` (the supported
+    derive-from-model mode for caller-selected replacement UNETs —
+    same value canonical setup uses for non-canonical models), full
+    paths go on ``session.model_paths``, and the session-local source
+    policy selects the isolated legacy QD arm (never the M2 singleton).
+    No golden_serial.py changes required.
+    """
+    from .golden_serial import (
+        GoldenRequest,
+        GoldenSession,
+        GoldenWorkflowContract,
+    )
+
+    name = str(unet_filename or "").strip()
+    if not name:
+        raise ValueError("generic_unet_filename_missing")
+    contract = GoldenWorkflowContract(
+        unet_name=name,
+        expected_unet_tensor_count=0,
+    )
+    extra = dict(request_extra or {})
+    extra.setdefault("generic_loader_composition", True)
+    extra.setdefault("golden_mode", "serial")
+    request = GoldenRequest(
+        request_id=str(request_id or "generic-unet"),
+        prompt={},
+        extra_data=extra,
+    )
+    session = GoldenSession(
+        request,
+        volume=volume,
+        contract=contract,
+    )
+    setattr(session, "source_policy", "legacy_qd")
+    session.canonical_models = False
+    return session
+
+
+def build_generic_vae_session(
+    *,
+    vae_filename: str,
+    request_id: str,
+    folder: str = "vae",
+    volume: Any = None,
+    request_extra: Mapping[str, Any] | None = None,
+) -> Any:
+    """Build a REAL GoldenSession adapted for one generic VAE load.
+
+    Same shape as :func:`build_generic_unet_session`: real filename on
+    the contract, full path on ``session.model_paths``, isolated legacy
+    QD source policy.  No golden_serial.py changes required.
+    """
+    from .golden_serial import (
+        GoldenRequest,
+        GoldenSession,
+        GoldenWorkflowContract,
+    )
+
+    name = str(vae_filename or "").strip()
+    if not name:
+        raise ValueError("generic_vae_filename_missing")
+    contract = GoldenWorkflowContract(
+        vae_name=name,
+    )
+    extra = dict(request_extra or {})
+    extra.setdefault("generic_loader_composition", True)
+    extra.setdefault("golden_mode", "serial")
+    request = GoldenRequest(
+        request_id=str(request_id or "generic-vae"),
+        prompt={},
+        extra_data=extra,
+    )
+    session = GoldenSession(
+        request,
+        volume=volume,
+        contract=contract,
+    )
+    setattr(session, "source_policy", "legacy_qd")
+    session.canonical_models = False
+    return session
+
+
+async def compose_generic_unet_load(
+    *,
+    unet_filenames: Sequence[str],
+    folder: str = "diffusion_models",
+    request_id: str,
+    path_resolver: Callable[[str, str], str | None] | None = None,
+    volume: Any = None,
+) -> dict[str, Any]:
+    """Load UNET via the SHARED ``golden_unet_load`` stage (imported).
+
+    Scaled-FP8 / non-uniform / unknown-dtype files are rejected by the
+    stage contract itself (clean fallback reason, never an exception
+    here).  Returns ``{"ok": True, "loaded": patcher, "session": ...,
+    "owners": [...], "source_arm": "golden_unet", ...}`` or ``{"ok":
+    False, "reason": ...}``.  Never raises.
+    """
+    started_ns = time.monotonic_ns()
+    resolve = path_resolver or _default_path_resolver
+    try:
+        names = [str(n) for n in (unet_filenames or []) if str(n or "").strip()]
+        if not names:
+            return {"ok": False, "reason": "unet_filenames_missing",
+                    "source_arm": "golden_unet"}
+        if len(names) > 1:
+            return {"ok": False, "reason": "unet_multi_checkpoint_deferred",
+                    "source_arm": "golden_unet"}
+        path = resolve(folder, names[0])
+        if not path:
+            return {"ok": False,
+                    "reason": f"unet_path_unresolvable:{names[0]}",
+                    "source_arm": "golden_unet"}
+        from .golden_serial import golden_unet_load
+
+        session = build_generic_unet_session(
+            unet_filename=names[0],
+            request_id=request_id,
+            folder=folder,
+            volume=volume,
+        )
+        session.model_paths = {"unet": path}
+        patcher = await golden_unet_load(session)
+        owners = [
+            o for o in [getattr(session, "unet_owner", None)]
+            if o is not None
+        ]
+        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        return {
+            "ok": True,
+            "loaded": patcher,
+            "session": session,
+            "owners": owners,
+            "elapsed_ms": elapsed_ms,
+            "reason": "",
+            "source_arm": "golden_unet",
+        }
+    except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
+        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        return {
+            "ok": False,
+            "reason": f"{type(exc).__name__}:{str(exc)[:200]}",
+            "elapsed_ms": elapsed_ms,
+            "source_arm": "golden_unet",
+        }
+
+
+async def compose_generic_vae_load(
+    *,
+    vae_filenames: Sequence[str],
+    folder: str = "vae",
+    request_id: str,
+    path_resolver: Callable[[str, str], str | None] | None = None,
+    volume: Any = None,
+) -> dict[str, Any]:
+    """Load VAE via the SHARED ``golden_vae_load`` stage (imported).
+
+    Same outcome shape as :func:`compose_generic_unet_load` with
+    ``source_arm="golden_vae"``; the native tuple is ``(vae,)``.  Never
+    raises.
+    """
+    started_ns = time.monotonic_ns()
+    resolve = path_resolver or _default_path_resolver
+    try:
+        names = [str(n) for n in (vae_filenames or []) if str(n or "").strip()]
+        if not names:
+            return {"ok": False, "reason": "vae_filenames_missing",
+                    "source_arm": "golden_vae"}
+        if len(names) > 1:
+            return {"ok": False, "reason": "vae_multi_checkpoint_deferred",
+                    "source_arm": "golden_vae"}
+        path = resolve(folder, names[0])
+        if not path:
+            return {"ok": False,
+                    "reason": f"vae_path_unresolvable:{names[0]}",
+                    "source_arm": "golden_vae"}
+        from .golden_serial import golden_vae_load
+
+        session = build_generic_vae_session(
+            vae_filename=names[0],
+            request_id=request_id,
+            folder=folder,
+            volume=volume,
+        )
+        session.model_paths = {"vae": path}
+        vae = await golden_vae_load(session)
+        owners = [
+            o for o in [getattr(session, "vae_owner", None)]
+            if o is not None
+        ]
+        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        return {
+            "ok": True,
+            "loaded": vae,
+            "session": session,
+            "owners": owners,
+            "elapsed_ms": elapsed_ms,
+            "reason": "",
+            "source_arm": "golden_vae",
+        }
+    except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
+        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        return {
+            "ok": False,
+            "reason": f"{type(exc).__name__}:{str(exc)[:200]}",
+            "elapsed_ms": elapsed_ms,
+            "source_arm": "golden_vae",
+        }
+
+
 async def compose_generic_clip_load_qd4(
     *,
     clip_filenames: Sequence[str],
@@ -570,7 +859,10 @@ async def compose_loaders_for_workflow(
                       reason=str(outcome.get("reason") or "compose_failed"),
                       source_arm=str(outcome.get("source_arm") or "unknown"))
                 continue
-            if outcome.get("session") is not None:
+            # Retain owners even when no session exists (the QD4 arm returns
+            # session=None with live QD owners); dropping them frees backing
+            # storage while the cache still references it.
+            if outcome.get("session") is not None or outcome.get("owners"):
                 holder.retain(outcome.get("session"), outcome.get("owners"))
             decision = await insert_loader_cache_entry(
                 outputs_cache, cache_key_set, node_id, outcome["clip"],
@@ -657,5 +949,340 @@ def install_generic_loader_hook(
                 pass
 
         return _restore
+    except Exception:
+        return None
+
+
+# ── Phase 1 dispatch substitution ─────────────────────────────────────
+# Role-driven node substitution at the upstream dispatch boundary
+# (``execution.get_output_data``): when the executor demands a role-bound
+# loader node, the imported golden stage runs INSTEAD of the native node
+# function and its result is returned in the exact merged output shape the
+# executor would have produced.  Anything unbound, class-mismatched,
+# list-mapped, or stage-failed executes natively.  Samplers are never
+# substituted (owner decision); forward replacement arrives in phase 2.
+#
+# Request scoping: the wrapper is installed once per generic request and
+# restored in the request finally-block.  The container runs one request
+# at a time (same single-flight assumption as the existing per-run
+# registries); a second install while active is refused, never nested.
+
+_ROLE_SUBSTITUTION_LOADER_CLASSES: dict[str, frozenset] = {
+    "clip": frozenset({"CLIPLoader"}),
+    "unet": frozenset({"UNETLoader"}),
+    "model_unet": frozenset({"UNETLoader"}),
+    "vae": frozenset({"VAELoader"}),
+}
+
+_ACTIVE_DISPATCH_CTX: dict[str, Any] | None = None
+
+
+def _emit_trace(trace_emit: Callable[..., Any] | None, name: str, **fields: Any) -> None:
+    try:
+        if callable(trace_emit):
+            trace_emit(name, phase="execution", metadata=dict(fields))
+    except Exception:
+        pass
+
+
+def _invert_role_bindings(role_bindings: Any) -> dict[str, str]:
+    """Map node_id -> substitutable role. First claim wins. Never raises."""
+    inverted: dict[str, str] = {}
+    try:
+        items = role_bindings.items() if isinstance(role_bindings, Mapping) else []
+        for role, binding in items:
+            role = str(role or "")
+            if role not in _ROLE_SUBSTITUTION_LOADER_CLASSES:
+                continue
+            nid = ""
+            if isinstance(binding, Mapping):
+                nid = str(binding.get("node_id") or "")
+            elif isinstance(binding, (str, int)):
+                nid = str(binding)
+            if nid and nid not in inverted:
+                inverted[nid] = role
+    except Exception:
+        pass
+    return inverted
+
+
+def _select_substitution(
+    ctx: Mapping[str, Any],
+    unique_id: Any,
+    obj: Any,
+    input_data_all: Any,
+) -> dict[str, Any] | None:
+    """Decide substitution for one dispatch. Returns a decision or None.
+
+    Decision requires: node claimed by a substitutable role AND the live
+    node object's class matching that role's loader class AND scalar
+    (non-list-mapped) inputs — mapping semantics stay native.  Class
+    mismatch is recorded (a stale binding must never retarget silently).
+    Never raises.
+    """
+    try:
+        node_id = str(unique_id)
+        role = (ctx.get("node_roles") or {}).get(node_id)
+        if not role:
+            return None
+        actual_class = type(obj).__name__ if obj is not None else ""
+        if actual_class not in _ROLE_SUBSTITUTION_LOADER_CLASSES.get(role, ()):
+            _emit_trace(
+                ctx.get("trace_emit"), "generic_dispatch_substitution",
+                node_id=node_id, role=role, requested="shared_core",
+                actual="native", reason=f"class_mismatch:{actual_class}",
+            )
+            return None
+        resolved: dict[str, Any] = {}
+        inputs = input_data_all if isinstance(input_data_all, dict) else {}
+        for key, value in inputs.items():
+            if isinstance(value, (list, tuple)):
+                if len(value) != 1:
+                    return None
+                resolved[str(key)] = value[0]
+            else:
+                resolved[str(key)] = value
+        return {"role": role, "node_id": node_id, "inputs": resolved}
+    except Exception:
+        return None
+
+
+async def _substitute_unet_vae_loader(
+    *, role: str, inputs: Any, request_id: str
+) -> dict[str, Any]:
+    """Shared UNET/VAE tail for dispatch substitution (imported stages).
+
+    Returns ``{"ok": True, "tuple": (...), "owners": [...], "source_arm":
+    ...}`` or ``{"ok": False, "reason": ...}``.  Stage contracts reject
+    unsupported files (scaled-FP8 UNET, non-uniform dtypes) with clean
+    reasons; the caller falls back to native.  Never raises.
+    """
+    try:
+        given = inputs if isinstance(inputs, dict) else {}
+        if role in ("unet", "model_unet"):
+            unet_name = str(given.get("unet_name") or "").strip()
+            if not unet_name:
+                return {"ok": False, "reason": "unet_name_missing"}
+            outcome = await compose_generic_unet_load(
+                unet_filenames=[unet_name],
+                folder="diffusion_models",
+                request_id=request_id,
+            )
+        elif role == "vae":
+            vae_name = str(given.get("vae_name") or "").strip()
+            if not vae_name:
+                return {"ok": False, "reason": "vae_name_missing"}
+            outcome = await compose_generic_vae_load(
+                vae_filenames=[vae_name],
+                folder="vae",
+                request_id=request_id,
+            )
+        else:
+            return {"ok": False, "reason": f"{role}_deferred"}
+        if not outcome.get("ok") or outcome.get("loaded") is None:
+            return {
+                "ok": False,
+                "reason": str(outcome.get("reason") or "compose_failed"),
+                "source_arm": str(outcome.get("source_arm") or "unknown"),
+                "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+            }
+        return {
+            "ok": True,
+            "tuple": (outcome["loaded"],),
+            "owners": list(outcome.get("owners") or []),
+            "source_arm": str(outcome.get("source_arm") or "unknown"),
+            "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+        }
+    except Exception as exc:  # noqa: BLE001 - substitution contract: never raise
+        return {"ok": False, "reason": f"{type(exc).__name__}:{str(exc)[:150]}"}
+
+
+async def _run_substituted_loader(
+    *, role: str, node_id: str, inputs: Mapping[str, Any], ctx: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Execute the golden stage for one role-bound loader node.
+
+    Arms per role, all imported shared code, strict native fallback:
+    ``clip`` (QD4 demand, then the stage with isolated legacy QD policy),
+    ``unet`` / ``model_unet`` and ``vae`` (their stages via a shared
+    helper).  Returns ``{"ok": True, ...}`` or ``{"ok": False, ...}``.
+    Never raises.
+    """
+    request_id = str(ctx.get("request_id") or "")
+    try:
+        given = inputs if isinstance(inputs, dict) else {}
+        if role != "clip":
+            return await _substitute_unet_vae_loader(
+                role=role, inputs=given, request_id=request_id)
+        classification = classify_loader_node(
+            "CLIPLoader", inputs if isinstance(inputs, dict) else {}
+        )
+        if not classification.get("supported"):
+            return {"ok": False,
+                    "reason": str(classification.get("reason") or "unsupported")}
+        outcome = await compose_generic_clip_load_qd4(
+            clip_filenames=[str(classification.get("clip_name") or "")],
+            clip_type=str(classification.get("clip_type") or "stable_diffusion"),
+            folder="text_encoders",
+            request_id=request_id,
+        )
+        if not outcome.get("ok"):
+            qd4_reason = str(outcome.get("reason") or "qd4_failed")
+            outcome = await compose_generic_clip_load_stage(
+                clip_filenames=[str(classification.get("clip_name") or "")],
+                clip_type=str(classification.get("clip_type") or "stable_diffusion"),
+                folder="text_encoders",
+                request_id=request_id,
+            )
+            outcome.setdefault("source_arm", "golden_clip")
+            if not outcome.get("ok"):
+                outcome["reason"] = (
+                    f"{qd4_reason}|{outcome.get('reason') or 'stage_failed'}"
+                )
+        if not outcome.get("ok") or outcome.get("clip") is None:
+            return {
+                "ok": False,
+                "reason": str(outcome.get("reason") or "compose_failed"),
+                "source_arm": str(outcome.get("source_arm") or "unknown"),
+                "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+            }
+        return {
+            "ok": True,
+            "tuple": (outcome["clip"],),
+            "owners": list(outcome.get("owners") or []),
+            "source_arm": str(outcome.get("source_arm") or "unknown"),
+            "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+        }
+    except Exception as exc:  # noqa: BLE001 - substitution contract: never raise
+        return {"ok": False, "reason": f"{type(exc).__name__}:{str(exc)[:150]}"}
+
+
+def install_execution_dispatch_substitution(
+    *,
+    role_bindings: Any,
+    holder: GenericLoaderHolder | None,
+    trace_emit: Callable[..., Any] | None,
+    request_id: str,
+) -> Callable[[], None] | None:
+    """Wrap upstream ``execution.get_output_data`` with role substitution.
+
+    Installs once per generic request; returns a restore callable that
+    reinstalls the original and clears the request window (call it in the
+    request finally-block).  Returns None when there is nothing eligible,
+    when already installed, or when installation fails — native behavior
+    is always the fallback.  Only loader roles substitute; every other
+    node passes through untouched.
+    """
+    global _ACTIVE_DISPATCH_CTX
+    try:
+        import execution as _execution_mod
+    except Exception:
+        return None
+    try:
+        original = getattr(_execution_mod, "get_output_data", None)
+        merge_fn = getattr(_execution_mod, "merge_result_data", None)
+        if not callable(original) or not callable(merge_fn):
+            return None
+        if _ACTIVE_DISPATCH_CTX is not None:
+            return None
+        node_roles = _invert_role_bindings(role_bindings)
+        if not node_roles:
+            return None
+        ctx: dict[str, Any] = {
+            "request_id": str(request_id or ""),
+            "node_roles": node_roles,
+            "holder": holder,
+            "trace_emit": trace_emit,
+            "original": original,
+            "merge_fn": merge_fn,
+            "module": _execution_mod,
+        }
+        _ACTIVE_DISPATCH_CTX = ctx
+
+        async def _substituting_get_output_data(
+            prompt_id: Any,
+            unique_id: Any,
+            obj: Any,
+            input_data_all: Any,
+            execution_block_cb: Any = None,
+            pre_execute_cb: Any = None,
+            v3_data: Any = None,
+        ) -> Any:
+            active = _ACTIVE_DISPATCH_CTX
+            if active is None:
+                return await original(
+                    prompt_id, unique_id, obj, input_data_all,
+                    execution_block_cb=execution_block_cb,
+                    pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+                )
+            decision = _select_substitution(active, unique_id, obj, input_data_all)
+            if decision is None:
+                return await original(
+                    prompt_id, unique_id, obj, input_data_all,
+                    execution_block_cb=execution_block_cb,
+                    pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+                )
+            sub = await _run_substituted_loader(
+                role=str(decision["role"]), node_id=str(decision["node_id"]),
+                inputs=decision["inputs"], ctx=active,
+            )
+            if not sub.get("ok"):
+                _emit_trace(
+                    active.get("trace_emit"), "generic_dispatch_substitution",
+                    node_id=str(decision["node_id"]), role=str(decision["role"]),
+                    requested="shared_core", actual="native",
+                    reason=str(sub.get("reason") or "substitute_failed"),
+                    source_arm=str(sub.get("source_arm") or "unknown"),
+                )
+                return await original(
+                    prompt_id, unique_id, obj, input_data_all,
+                    execution_block_cb=execution_block_cb,
+                    pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+                )
+            try:
+                owners = sub.get("owners") or []
+                if owners and active.get("holder") is not None:
+                    active["holder"].retain(None, owners)
+            except Exception:
+                pass
+            try:
+                output = merge_fn([sub["tuple"]], obj)
+            except Exception as merge_exc:
+                _emit_trace(
+                    active.get("trace_emit"), "generic_dispatch_substitution",
+                    node_id=str(decision["node_id"]), role=str(decision["role"]),
+                    requested="shared_core", actual="native",
+                    reason=f"merge_failed:{type(merge_exc).__name__}",
+                    source_arm=str(sub.get("source_arm") or "unknown"),
+                )
+                return await original(
+                    prompt_id, unique_id, obj, input_data_all,
+                    execution_block_cb=execution_block_cb,
+                    pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+                )
+            _emit_trace(
+                active.get("trace_emit"), "generic_dispatch_substitution",
+                node_id=str(decision["node_id"]), role=str(decision["role"]),
+                requested="shared_core", actual="shared_core",
+                reason="", source_arm=str(sub.get("source_arm") or "unknown"),
+                elapsed_ms=sub.get("elapsed_ms", 0.0),
+            )
+            return output, {}, False, False
+
+        _execution_mod.get_output_data = _substituting_get_output_data  # type: ignore[method-assign]
+
+        def _restore_dispatch() -> None:
+            global _ACTIVE_DISPATCH_CTX
+            try:
+                mod = ctx.get("module")
+                if mod is not None and getattr(
+                    mod, "get_output_data", None
+                ) is _substituting_get_output_data:
+                    mod.get_output_data = ctx.get("original")
+            except Exception:
+                pass
+            _ACTIVE_DISPATCH_CTX = None
+
+        return _restore_dispatch
     except Exception:
         return None
