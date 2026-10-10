@@ -16675,6 +16675,7 @@ class ModalRuntimeEntrypoint:
         _seed_hook_restore: Callable[[], None] | None = None
         _generic_loader_holder = None
         _generic_loader_restore: Callable[[], None] | None = None
+        _generic_text_restore: Callable[[], None] | None = None
         started = time.time()
         try:
             # ── CacheDiT request verification ──
@@ -16748,6 +16749,22 @@ class ModalRuntimeEntrypoint:
             except Exception:
                 _generic_loader_holder = None
                 _generic_loader_restore = None
+            # Generic TextGenerate substitution (optional, class-gated, own
+            # restore pair — nests safely with the loader lane in either
+            # order since node classes never overlap).  Env-gated, default
+            # off; any failure leaves native behavior unchanged.
+            _generic_text_restore = None
+            try:
+                from comfymodal_runtime.golden_generic_text import (
+                    install_text_dispatch_substitution,
+                )
+
+                _generic_text_restore = install_text_dispatch_substitution(
+                    trace_emit=trace.emit,
+                    request_id=str(getattr(context, "request_id", "") or ""),
+                )
+            except Exception:
+                _generic_text_restore = None
             # End pregraph span here â€” before prompt_executor_invoke_start, after
             # all V2-owned setup including executor.reset().
             trace.emit("pregraph_setup_end", phase="execution", metadata={
@@ -18340,6 +18357,12 @@ class ModalRuntimeEntrypoint:
                 except Exception:
                     pass
                 _generic_loader_restore = None
+            if _generic_text_restore is not None:
+                try:
+                    _generic_text_restore()
+                except Exception:
+                    pass
+                _generic_text_restore = None
             if _generic_loader_holder is not None:
                 try:
                     _generic_loader_holder.close()
