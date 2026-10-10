@@ -6948,8 +6948,45 @@ if _server:
     _dependency_resolver = _DependencyResolver(_NODE_DIR, _COMFYUI_ROOT)
     register_workflow_routes(_server, _NODE_DIR, resolver=_dependency_resolver)
     from model_library_routes import register_model_library_routes
+
+    def _start_studio_custom_node_sync(operation, expected_dependencies):
+        """Rebuild image-delivered custom nodes through the existing deploy worker."""
+        workspace = _active_workspace()
+        if workspace is None:
+            return {
+                "status": "refused",
+                "state": "refused",
+                "outcome": "no_workspace",
+                "message": "Custom-node operation refused: no active workspace configured.",
+                "_http_status": 400,
+            }
+        deploy = _start_background_deploy(
+            workspace=workspace,
+            custom_nodes_fingerprint=_build_custom_node_fingerprint(_custom_nodes_root()),
+            reason=f"studio_custom_node_{operation}",
+        )
+        if not deploy.get("started"):
+            return {
+                "status": "refused",
+                "state": "refused",
+                "outcome": deploy.get("reason", "deploy_already_running"),
+                "message": "Custom-node image rebuild refused: a deploy is already running.",
+                "_http_status": 409,
+            }
+        return {
+            "status": "started",
+            "state": "started",
+            "operation": operation,
+            "outcome": "image_rebuild_started",
+            "message": "Custom-node image rebuild started through the active workspace deploy.",
+        }
+
     register_model_library_routes(
-        _server, _NODE_DIR, _COMFYUI_ROOT, resolver=_dependency_resolver
+        _server,
+        _NODE_DIR,
+        _COMFYUI_ROOT,
+        resolver=_dependency_resolver,
+        custom_node_sync_start=_start_studio_custom_node_sync,
     )
 
     # — Studio Backends (legacy compatibility / import-only) —
