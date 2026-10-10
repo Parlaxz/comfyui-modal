@@ -17765,8 +17765,12 @@ class ModalRuntimeEntrypoint:
                 chain,
                 prompt_id=prompt_id,
                 output_node_ids=tuple(plan.output_node_ids),
-                materials_dir=(str(output_dir) if output_dir.is_dir() else "")
-                if not production_enabled else "",
+                # History file resolution must stay enabled in every mode:
+                # HistoryOutputCollector receives its directory per-collect
+                # (not via chain construction), and blanking it here is what
+                # silently produced zero-byte "successes" for custom output
+                # nodes. Canonical runs still stop at DirectOutputSink.
+                materials_dir=str(output_dir) if output_dir.is_dir() else "",
                 request_start_boundary=started,
                 stop_after_success=production_enabled,
             )
