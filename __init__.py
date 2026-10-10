@@ -3298,7 +3298,9 @@ def _build_custom_nodes_archive(cn_root: str) -> bytes:
 
 
 async def _sync_custom_nodes_and_maybe_deploy(cn_root: str, workspace: dict) -> dict:
-    result = await _publish_custom_nodes_or_skip(cn_root, workspace)
+    result = await _publish_custom_nodes_or_skip(
+        cn_root, workspace, allow_destructive=True,
+    )
 
     if result.get("status") != "ok":
         return result
@@ -3325,7 +3327,12 @@ async def _sync_custom_nodes_and_maybe_deploy(cn_root: str, workspace: dict) -> 
     return result
 
 
-async def _publish_custom_nodes_or_skip(cn_root: str, workspace: dict) -> dict:
+async def _publish_custom_nodes_or_skip(
+    cn_root: str,
+    workspace: dict,
+    *,
+    allow_destructive: bool = False,
+) -> dict:
     """Publish custom nodes through the receipt/full-content control plane.
 
     The publisher callback remains the existing Modal client operation, but
@@ -3344,6 +3351,7 @@ async def _publish_custom_nodes_or_skip(cn_root: str, workspace: dict) -> dict:
             volume_name=_CUSTOM_NODES_VOLUME_NAME,
             publisher=publisher,
             workspace=workspace,
+            allow_destructive=allow_destructive,
         )
     except Exception as exc:
         return {
