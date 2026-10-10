@@ -401,9 +401,18 @@ async def compose_generic_clip_load_stage(
         }
     except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        try:
+            import traceback as _traceback_mod
+
+            _tb_text = _traceback_mod.format_exc(limit=12)
+        except Exception:
+            _tb_text = ""
         return {
             "ok": False,
-            "reason": f"{type(exc).__name__}:{str(exc)[:200]}",
+            "reason": (
+                f"{type(exc).__name__}:{str(exc)[:200]}"
+                + (f" | tb:{_tb_text[-1200:]}" if _tb_text else "")
+            ),
             "elapsed_ms": elapsed_ms,
             "source_arm": "golden_clip",
         }
@@ -571,9 +580,18 @@ async def compose_generic_unet_load(
         }
     except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        try:
+            import traceback as _traceback_mod
+
+            _tb_text = _traceback_mod.format_exc(limit=12)
+        except Exception:
+            _tb_text = ""
         return {
             "ok": False,
-            "reason": f"{type(exc).__name__}:{str(exc)[:200]}",
+            "reason": (
+                f"{type(exc).__name__}:{str(exc)[:200]}"
+                + (f" | tb:{_tb_text[-1200:]}" if _tb_text else "")
+            ),
             "elapsed_ms": elapsed_ms,
             "source_arm": "golden_unet",
         }
@@ -646,9 +664,18 @@ async def compose_generic_vae_load(
         }
     except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        try:
+            import traceback as _traceback_mod
+
+            _tb_text = _traceback_mod.format_exc(limit=12)
+        except Exception:
+            _tb_text = ""
         return {
             "ok": False,
-            "reason": f"{type(exc).__name__}:{str(exc)[:200]}",
+            "reason": (
+                f"{type(exc).__name__}:{str(exc)[:200]}"
+                + (f" | tb:{_tb_text[-1200:]}" if _tb_text else "")
+            ),
             "elapsed_ms": elapsed_ms,
             "source_arm": "golden_vae",
         }
