@@ -17768,7 +17768,15 @@ class ModalRuntimeEntrypoint:
             selected = attempts[selected_index] if selected_index is not None else None
             if selected is None:
                 if production_enabled:
-                    raise RuntimeError("v2 production execution produced no materializable output")
+                    _chain_detail = "; ".join(
+                        f"{a.strategy}:{'ok' if a.success else 'fail'}"
+                        + (f"({a.error})" if a.error else "")
+                        for a in attempts
+                    )[:300]
+                    raise RuntimeError(
+                        "v2 production execution produced no materializable output"
+                        + (f" [chain: {_chain_detail}]" if _chain_detail else "")
+                    )
                 selected = Attempt(strategy="none", success=False, error="no output")
             _raw_output_format = legacy_options.get("output_format", "original")
             output_format = _contracts_mod.normalize_output_format(_raw_output_format)
