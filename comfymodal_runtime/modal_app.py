@@ -17780,7 +17780,11 @@ class ModalRuntimeEntrypoint:
                             if isinstance(_hist_outputs, dict) else []
                     except Exception:
                         _hist_keys = []
-                    _want_ids = [str(v) for v in list(output_node_ids or [])[:4]]
+                    try:
+                        _want_source = getattr(plan, "output_node_ids", None) or []
+                        _want_ids = [str(v) for v in list(_want_source)[:4]]
+                    except Exception:
+                        _want_ids = []
                     _diag = (
                         (f" [chain: {_chain_detail}]" if _chain_detail else "")
                         + f" [want={_want_ids} hist_nodes={_hist_keys}]"
