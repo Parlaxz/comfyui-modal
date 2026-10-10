@@ -353,11 +353,27 @@ async def compose_generic_clip_load_qd4(
         from comfy.utils import convert_old_quants
 
         # Mirror the native recipe: convert_old_quants runs whenever the
-        # (default, empty) model_options carry no custom_operations.
-        # Native passes real file metadata; none is read here (that would
-        # be a second file open), so the callee default ({}) applies.
+        # (default, empty) model_options carry no custom_operations.  The
+        # native path passes REAL safetensors header metadata, which carries
+        # _quantization_metadata for scaled-FP8 weights; passing {} skips
+        # the .comfy_quant attachment and the constructor rejects raw F8
+        # tensors (observed live).  Header-only parse: no second payload
+        # read (tensors stay lazy; only the JSON header is touched).
         model_options: dict[str, Any] = {}
-        sd, _qd_metadata = convert_old_quants(sd, model_prefix="", metadata={})
+        file_metadata: dict[str, Any] = {}
+        try:
+            if str(path).lower().endswith((".safetensors", ".sft")):
+                from safetensors import safe_open as _safe_open
+
+                with _safe_open(path, framework="pt", device="cpu") as _hdr:
+                    _meta = _hdr.metadata()
+                    if isinstance(_meta, dict):
+                        file_metadata = dict(_meta)
+        except Exception:
+            file_metadata = {}
+        sd, _qd_metadata = convert_old_quants(
+            sd, model_prefix="", metadata=file_metadata
+        )
         clip_type_obj = resolve_clip_type_shared(clip_type)
         try:
             import folder_paths
