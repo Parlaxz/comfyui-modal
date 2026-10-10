@@ -7037,7 +7037,6 @@ if _server:
         sync_id = str(uuid.uuid4())
         _set_studio_sync_status(
             sync_id,
-            sync_id=sync_id,
             operation=operation,
             state="queued",
             status="started",
