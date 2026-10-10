@@ -394,13 +394,20 @@ def _golden_history_meta(
     request_id: str,
     profile: GoldenProfile,
     controls: Mapping[str, Any] | None,
+    method: str = "",
 ) -> dict[str, Any]:
     controls_map = controls if isinstance(controls, Mapping) else {}
+    actual_method = method or profile.target["method"]
     return {
         "source": "studio_golden",
         "golden_profile": profile.name,
         "golden_request_id": request_id,
-        "golden_method": profile.target["method"],
+        # The ACTUAL executor method (generic runs use run_plan_stream,
+        # not the profile's canonical Golden method).
+        "golden_method": actual_method,
+        "golden_executor": (
+            "generic" if actual_method == "run_plan_stream" else "canonical"
+        ),
         "golden_app": profile.target["app"],
         "prompt": str(controls_map.get("prompt") or ""),
         "negative_prompt": str(controls_map.get("negative_prompt") or ""),
@@ -435,6 +442,7 @@ def _begin_golden_history(
     request_id: str,
     profile: GoldenProfile,
     controls: Mapping[str, Any] | None,
+    method: str = "",
 ) -> tuple[str, str]:
     """Open the nonterminal History record BEFORE the run is dispatched.
 
@@ -458,7 +466,7 @@ def _begin_golden_history(
             kind="playground_run",
             prompt_id=request_id,
             status="running",
-            meta=_golden_history_meta(request_id, profile, controls),
+            meta=_golden_history_meta(request_id, profile, controls, method),
         )
         if not isinstance(record, dict):
             return "", ""
@@ -612,7 +620,16 @@ async def run_golden_workflow(
         # attempt's started_at is the real run start (otherwise every Golden run
         # reported a ~1s total time), then completed below with the output and
         # timings.  Both halves are best-effort and never fail a run.
-        history_run_id, history_generation_id = _begin_golden_history(request_id, profile, merged["values"])
+        history_run_id, history_generation_id = _begin_golden_history(
+            request_id,
+            profile,
+            merged["values"],
+            method=(
+                "run_plan_stream"
+                if use_generic_executor
+                else profile.target["method"]
+            ),
+        )
         handle = (
             handle_factory(profile, workspace)
             if handle_factory is not None
@@ -673,6 +690,27 @@ async def run_golden_workflow(
                 "profile": profile.name,
             }
         materialized = _materialize_image(terminal.get("data", terminal), request_id)
+        # Generation success is not delivery success: a materialization
+        # failure with no output paths must fail the run truthfully instead
+        # of recording a completed run with no image.
+        if (
+            isinstance(materialized, dict)
+            and materialized.get("output_materialization_error")
+            and not materialized.get("output_paths")
+        ):
+            _fail_golden_history(
+                history_run_id,
+                "output materialization failed: %s (remote execution succeeded)"
+                % (materialized.get("output_materialization_error") or "unknown"),
+            )
+            return {
+                "status": "error",
+                "message": "output materialization failed: %s (remote execution succeeded)"
+                % (materialized.get("output_materialization_error") or "unknown"),
+                "request_id": request_id,
+                "runId": request_id,
+                "profile": profile.name,
+            }
         _complete_golden_history(
             history_run_id,
             materialized,

@@ -257,3 +257,126 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
     assert captured["payload"]["workflow"]["2"]["inputs"]["unet_name"] == "krea2_turbo_fp8_scaled.safetensors"
     assert captured["kwargs"]["request_id"] == "studio-test"
     assert store.read("studio-test")["terminal"] is True
+
+
+def test_golden_history_meta_records_actual_executor_method() -> None:
+    profile = profile_catalog.GoldenProfile(
+        name="golden-test",
+        owner="test",
+        target={
+            "app": "configured-app",
+            "class": "ModalRuntimeEntrypointV2",
+            "method": "run_golden_parallel_stream",
+        },
+        resources={"gpu": "H100", "cpu": 12, "memory_mb": 24576},
+        config=SimpleNamespace(),  # type: ignore[arg-type]
+        receipt=SimpleNamespace(deploy_fingerprint="deploy-test"),  # type: ignore[arg-type]
+    )
+    generic = studio_golden_run._golden_history_meta(
+        "r1", profile, {}, method="run_plan_stream"
+    )
+    assert generic["golden_method"] == "run_plan_stream"
+    assert generic["golden_executor"] == "generic"
+    canonical = studio_golden_run._golden_history_meta("r2", profile, {})
+    assert canonical["golden_method"] == "run_golden_parallel_stream"
+    assert canonical["golden_executor"] == "canonical"
+
+
+@pytest.mark.asyncio
+async def test_materialization_failure_fails_run_truthfully(monkeypatch, tmp_path) -> None:
+    target = {
+        "app": "configured-app",
+        "class": "ModalRuntimeEntrypointV2",
+        "method": "run_golden_parallel_stream",
+    }
+    profile = profile_catalog.GoldenProfile(
+        name="golden-test",
+        owner="test",
+        target=target,
+        resources={"gpu": "H100", "cpu": 12, "memory_mb": 24576},
+        config=SimpleNamespace(),  # type: ignore[arg-type]
+        receipt=SimpleNamespace(deploy_fingerprint="deploy-test"),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(studio_golden_run, "resolve_golden_profile", lambda name: profile)
+
+    class RemoteGenerator:
+        def aio(self, payload, **kwargs):
+            async def events():
+                yield {"type": "result", "sequence": 9, "data": {"image": "ok"}}
+
+            return events()
+
+    handle = SimpleNamespace(
+        run_golden_studio_stream=SimpleNamespace(remote_gen=RemoteGenerator()),
+        run_plan_stream=SimpleNamespace(remote_gen=RemoteGenerator()),
+    )
+    bundle = {
+        "status": "ok",
+        "workflow": {"workflow_id": "wf"},
+        "version": {"workflow_version_id": "wv"},
+        "preset": {"preset_id": "preset", "values": {}},
+        "defaults": {},
+        "control_schema": {},
+        "mapping": {"output_node_id": "2"},
+        "executable_prompt": {
+            "2": {"class_type": "UNETLoader", "inputs": {}},
+        },
+    }
+    import studio_workflow_run
+    monkeypatch.setattr(
+        studio_workflow_run,
+        "resolve_workflow_run_bundle",
+        lambda *args, **kwargs: bundle,
+    )
+
+    def fake_build_plan(bundle_arg, values, *args, **kwargs):
+        return (
+            SimpleNamespace(
+                to_dict=lambda: {"workflow": {}, "output_node_ids": ["2"]}
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(
+        studio_workflow_run, "build_workflow_execution_plan", fake_build_plan
+    )
+    monkeypatch.setattr(
+        studio_golden_run,
+        "_materialize_image",
+        lambda data, request_id: {"output_materialization_error": "boom"},
+    )
+    import experiment_service
+
+    calls: dict = {}
+
+    class FakeHistory:
+        def record_run(self, **kwargs):
+            calls["meta"] = kwargs.get("meta")
+            return {"run_id": "run-1", "history_generation_id": "gen-1"}
+
+        def update_run(self, run_id, **kwargs):
+            calls["update"] = (run_id, kwargs)
+
+    class FakeRegistry:
+        def history(self):
+            return FakeHistory()
+
+    monkeypatch.setattr(experiment_service, "REGISTRY", FakeRegistry())
+
+    store = GoldenStageEventStore(max_events=8, max_runs=2, ttl_seconds=60)
+    result = await studio_golden_run.run_golden_workflow(
+        workflow_id="wf",
+        version_id="wv",
+        preset_id="preset",
+        controls={},
+        request_id="studio-test",
+        node_dir=tmp_path,
+        profile_name="golden-test",
+        event_store=store,
+        handle_factory=lambda *_args: handle,
+    )
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
+    assert calls["meta"]["golden_method"] == "run_plan_stream"
+    assert calls["meta"]["golden_executor"] == "generic"
+    assert calls["update"][1]["status"] == "failed"
