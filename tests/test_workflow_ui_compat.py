@@ -103,6 +103,67 @@ def test_ui_refresh_preserves_stored_output_node_when_regenerated_graph_contains
     assert refreshed["mapping"]["output_node_id"] == "7"
 
 
+def test_ui_refresh_skips_subgraph_nested_graphs():
+    """Subgraph workflows keep the stored expanded prompt.
+
+    Regression: regenerating the prompt from the top-level UI graph drops
+    every ``"<outer>:<inner>"`` node, wiping stored bindings and surfacing
+    as ``missing required control 'clip'`` in the playground.
+    """
+    stored_prompt = {
+        "30:11": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors"}},
+        "29": {"class_type": "SaveImage", "inputs": {"images": ["30:3", 0]}},
+    }
+    stored_entries = [
+        {"semantic_role": "clip", "node_id": "30:11", "input_name": "clip_name", "control_kind": "file"},
+    ]
+    bundle = {
+        "version": {"graph_json": {
+            "nodes": [{"id": 30, "type": "sg-1"}, {"id": 29, "type": "SaveImage"}],
+            "definitions": {"subgraphs": [{"id": "sg-1", "nodes": [{"id": 11}]}]},
+        }},
+        "mapping": {"entries": stored_entries, "output_node_id": "29"},
+        "executable_prompt": stored_prompt,
+        "control_schema": {"clip": stored_entries[0]},
+        "defaults": {"clip": "clip.safetensors"},
+    }
+    with patch(
+        "studio_domain.graph.ui_graph_to_api_prompt",
+        side_effect=AssertionError("must not regenerate nested graphs"),
+    ):
+        refreshed = swr._refresh_ui_workflow_bundle(bundle)
+
+    assert refreshed["executable_prompt"] == stored_prompt
+    assert refreshed["defaults"] == {"clip": "clip.safetensors"}
+    assert swr.merge_workflow_controls(
+        refreshed["defaults"], {}, refreshed["control_schema"]
+    )["errors"] == []
+
+
+def test_ui_refresh_skips_when_regeneration_drops_stored_binding():
+    """Safety net: never replace the prompt when a stored target is lost."""
+    stored_prompt = {
+        "163": {"class_type": "KSampler", "inputs": {"cfg": 6.5}},
+    }
+    stored_entries = [
+        {"semantic_role": "cfg_scale", "node_id": "163", "input_name": "cfg", "control_kind": "number"},
+    ]
+    bundle = {
+        "version": {"graph_json": {"nodes": [{"id": 163}]}},
+        "mapping": {"entries": stored_entries, "output_node_id": ""},
+        "executable_prompt": stored_prompt,
+        "control_schema": {"cfg_scale": stored_entries[0]},
+        "defaults": {"cfg_scale": 6.5},
+    }
+    pruned = {"163": {"class_type": "KSampler", "inputs": {}}}
+    with patch("studio_domain.graph.ui_graph_to_api_prompt", return_value=pruned), \
+         patch("studio_domain.graph.derive_mapping_candidates", return_value=({}, "")):
+        refreshed = swr._refresh_ui_workflow_bundle(bundle)
+
+    assert refreshed["executable_prompt"] == stored_prompt
+    assert refreshed["defaults"] == {"cfg_scale": 6.5}
+
+
 def test_sampler_null_override_keeps_regenerated_graph_default():
     schema = {
         "sampler": {

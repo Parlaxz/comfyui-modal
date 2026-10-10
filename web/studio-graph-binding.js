@@ -63,13 +63,71 @@ function _nodesOf(graphish) {
   return [];
 }
 
-/** Sorted "id:type" fingerprint; identical graphs produce identical strings. */
+/** Sorted "id:type" fingerprint; identical graphs produce identical strings.
+ *
+ * Subgraph interiors are part of the identity: top-level-only fingerprints
+ * would treat a version's stored graph and a live graph with edited subgraph
+ * contents as equal, leaving the wizard bound against the wrong nodes.
+ */
+function _subgraphDefsOf(graphish) {
+  try {
+    if (!graphish || typeof graphish !== "object") return [];
+    const defs = graphish.definitions;
+    if (!defs || typeof defs !== "object") return [];
+    const subs = defs.subgraphs;
+    if (Array.isArray(subs)) return subs;
+    if (subs && typeof subs === "object") return Object.values(subs);
+  } catch (e) { /* fall through */ }
+  return [];
+}
+
+function _linksOf(graphish) {
+  try {
+    if (!graphish || typeof graphish !== "object") return [];
+    const links = graphish.links;
+    if (Array.isArray(links)) return links;
+  } catch (e) { /* fall through */ }
+  return [];
+}
+
 function _graphFingerprint(graphish) {
-  return _nodesOf(graphish)
+  const top = _nodesOf(graphish)
     .filter((n) => n && n.id != null)
     .map((n) => `${n.id}:${n.type || n.class_type || ""}`)
     .sort()
     .join("|");
+  let sub = "";
+  try {
+    const parts = [];
+    for (const sg of _subgraphDefsOf(graphish)) {
+      if (!sg || typeof sg !== "object") continue;
+      const sgId = sg.id != null ? String(sg.id) : "";
+      const inner = Array.isArray(sg.nodes) ? sg.nodes : [];
+      const innerFp = inner
+        .filter((n) => n && n.id != null)
+        .map((n) => `${n.id}:${n.type || n.class_type || ""}`)
+        .sort()
+        .join(",");
+      parts.push(`${sgId}[${innerFp}]`);
+    }
+    parts.sort();
+    sub = parts.join("|");
+    const links = _linksOf(graphish)
+      .map((l) => {
+        try {
+          if (Array.isArray(l)) return l.slice(0, 5).join(",");
+          if (l && typeof l === "object") {
+            return [l.id, l.origin_id, l.origin_slot, l.target_id, l.target_slot].join(",");
+          }
+        } catch (e) { /* skip */ }
+        return "";
+      })
+      .filter(Boolean)
+      .sort()
+      .join("|");
+    if (links) sub += `#links:${links}`;
+  } catch (e) { /* fingerprint stays top-level only */ }
+  return sub ? `${top}#sub:${sub}` : top;
 }
 
 /**
@@ -82,7 +140,17 @@ export function isLiveGraphEqualTo(graphJson) {
     if (!ctx.ok) return false;
     const want = _graphFingerprint(graphJson);
     if (!want) return false;
-    return _graphFingerprint(ctx.graph) === want;
+    // Compare serialized live state so subgraph definitions participate;
+    // the live LGraph object itself exposes only top-level `_nodes`.
+    let live = null;
+    try {
+      if (ctx.graph && typeof ctx.graph.serialize === "function") {
+        live = ctx.graph.serialize();
+      }
+    } catch (e) { live = null; }
+    const have = _graphFingerprint(live || ctx.graph);
+    if (!have) return false;
+    return have === want;
   } catch (e) {
     return false;
   }

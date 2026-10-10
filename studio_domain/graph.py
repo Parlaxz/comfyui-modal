@@ -114,6 +114,340 @@ def input_exists(prompt: dict[str, Any], node_id: Any, input_name: str) -> bool:
 INPUT_BINDING_KINDS = frozenset({"node_input", "widget", "node"})
 
 
+def _top_level_nodes_by_id(ui_graph: Any) -> dict[str, dict[str, Any]]:
+    """Map top-level UI node id → node dict (outer containers only).
+
+    Inner subgraph nodes reuse local ids that collide across definitions, so
+    outer-container lookup must never use the recursive ``iter_graph_nodes``
+    walk — only the top-level ``nodes`` list.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        nodes = ui_graph.get("nodes") if isinstance(ui_graph, dict) else None
+        if not isinstance(nodes, list):
+            return out
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            nid = node.get("id")
+            if nid is None:
+                continue
+            out[str(nid)] = node
+    except Exception:
+        pass
+    return out
+
+
+def _subgraph_defs_by_id(ui_graph: Any) -> dict[str, dict[str, Any]]:
+    """Map subgraph definition id → definition dict.
+
+    Handles ``definitions.subgraphs`` as a list or dict (ComfyUI frontend
+    uses a list; be tolerant). Never raises.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        if not isinstance(ui_graph, dict):
+            return out
+        definitions = ui_graph.get("definitions")
+        if not isinstance(definitions, dict):
+            return out
+        subgraphs = definitions.get("subgraphs")
+        if isinstance(subgraphs, dict):
+            items = list(subgraphs.values())
+        elif isinstance(subgraphs, (list, tuple)):
+            items = list(subgraphs)
+        else:
+            return out
+        for sg in items:
+            if not isinstance(sg, dict):
+                continue
+            sg_id = sg.get("id")
+            if sg_id is None:
+                continue
+            out[str(sg_id)] = sg
+    except Exception:
+        pass
+    return out
+
+
+def _subgraph_links(subgraph_def: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize subgraph links to dicts with origin/target ids and slots.
+
+    ComfyUI serializes subgraph links either as dicts
+    (``{id, origin_id, origin_slot, target_id, target_slot}``) or as legacy
+    lists (``[id, origin_id, origin_slot, target_id, target_slot]``). Never
+    raises.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        links = subgraph_def.get("links")
+        if not isinstance(links, (list, tuple)):
+            return out
+        for link in links:
+            try:
+                if isinstance(link, dict):
+                    out.append({
+                        "origin_id": link.get("origin_id"),
+                        "origin_slot": link.get("origin_slot"),
+                        "target_id": link.get("target_id"),
+                        "target_slot": link.get("target_slot"),
+                    })
+                elif isinstance(link, (list, tuple)) and len(link) >= 5:
+                    out.append({
+                        "origin_id": link[1],
+                        "origin_slot": link[2],
+                        "target_id": link[3],
+                        "target_slot": link[4],
+                    })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _outer_input_index(outer_node: dict[str, Any], input_name: str) -> Optional[int]:
+    """Index of ``input_name`` in an outer subgraph container's inputs list.
+
+    Matches by slot ``name``, ``widget.name``, or human ``label``
+    (case-insensitive label fallback covers wizard widget names like
+    ``seed_1`` vs inner ``seed``). Returns None when absent. Never raises.
+    """
+    try:
+        if not isinstance(outer_node, dict) or not input_name:
+            return None
+        ui_inputs = outer_node.get("inputs")
+        if not isinstance(ui_inputs, list):
+            return None
+        lowered = str(input_name).lower()
+        for idx, entry in enumerate(ui_inputs):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("name") == input_name:
+                return idx
+            widget = entry.get("widget")
+            if isinstance(widget, dict) and widget.get("name") == input_name:
+                return idx
+        for idx, entry in enumerate(ui_inputs):
+            if not isinstance(entry, dict):
+                continue
+            label = entry.get("label")
+            if isinstance(label, str) and label.lower() == lowered:
+                return idx
+    except Exception:
+        pass
+    return None
+
+
+def _inner_input_name_by_slot(
+    subgraph_def: dict[str, Any], inner_id_str: str, target_slot: Any
+) -> Optional[str]:
+    """Input name of an inner subgraph node at ``target_slot`` (list order)."""
+    try:
+        try:
+            slot_idx = int(target_slot)
+        except (TypeError, ValueError):
+            return None
+        for node in subgraph_def.get("nodes") or []:
+            if not isinstance(node, dict):
+                continue
+            if str(node.get("id")) != inner_id_str:
+                continue
+            ui_inputs = node.get("inputs")
+            if not isinstance(ui_inputs, list):
+                return None
+            if 0 <= slot_idx < len(ui_inputs):
+                entry = ui_inputs[slot_idx]
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                    return str(entry["name"])
+            return None
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_outer_widget_to_expanded(
+    prompt: dict[str, Any],
+    ui_graph: Any,
+    outer_id_str: str,
+    input_name: str,
+) -> Optional[tuple[str, str]]:
+    """Map an outer subgraph widget to its expanded executable target.
+
+    Returns ``(expanded_node_id, inner_input_name)`` like ``"30:10"`` /
+    ``"unet_name"`` when the outer container's widget feeds an inner node
+    through the subgraph ``inputNode`` (``-10``) links and that expanded node
+    exists in the prompt. Returns None when not a subgraph outer binding.
+    Never raises.
+    """
+    try:
+        if not isinstance(prompt, dict) or not outer_id_str or not input_name:
+            return None
+        if ":" in outer_id_str:
+            return None
+        top_nodes = _top_level_nodes_by_id(ui_graph)
+        outer_node = top_nodes.get(outer_id_str)
+        if not isinstance(outer_node, dict):
+            return None
+        defs = _subgraph_defs_by_id(ui_graph)
+        if not defs:
+            return None
+        outer_type = outer_node.get("type")
+        sg = defs.get(str(outer_type)) if outer_type is not None else None
+        if not isinstance(sg, dict):
+            return None
+        outer_idx = _outer_input_index(outer_node, input_name)
+        if outer_idx is None:
+            return None
+        input_node = sg.get("inputNode")
+        input_node_id = (
+            input_node.get("id") if isinstance(input_node, dict) else -10
+        )
+        for link in _subgraph_links(sg):
+            try:
+                if str(link.get("origin_id")) != str(input_node_id):
+                    continue
+                origin_slot = link.get("origin_slot")
+                if origin_slot is None:
+                    continue
+                try:
+                    if int(origin_slot) != int(outer_idx):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                target_id = link.get("target_id")
+                if target_id is None:
+                    continue
+                inner_id_str = str(target_id)
+                inner_input = _inner_input_name_by_slot(
+                    sg, inner_id_str, link.get("target_slot")
+                )
+                if not inner_input:
+                    continue
+                expanded = f"{outer_id_str}:{inner_id_str}"
+                node = prompt.get(expanded)
+                if not isinstance(node, dict):
+                    continue
+                inputs = node.get("inputs")
+                if isinstance(inputs, dict) and inner_input in inputs:
+                    return (expanded, inner_input)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _expanded_candidates_for_inner(
+    prompt: dict[str, Any], inner_id_str: str, input_name: str
+) -> list[str]:
+    """Expanded prompt keys for an inner-local subgraph node id.
+
+    Matches keys ending in ``":{inner_id}"`` whose executable inputs contain
+    ``input_name``. Never raises.
+    """
+    out: list[str] = []
+    try:
+        if not isinstance(prompt, dict) or not inner_id_str or ":" in inner_id_str:
+            return out
+        suffix = f":{inner_id_str}"
+        for key, node in prompt.items():
+            try:
+                if not isinstance(key, str) or not key.endswith(suffix):
+                    continue
+                if not isinstance(node, dict):
+                    continue
+                inputs = node.get("inputs")
+                if isinstance(inputs, dict) and input_name in inputs:
+                    out.append(key)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def subgraph_resolve_output(
+    prompt: dict[str, Any], ui_graph: Any, output_node_id: Any
+) -> Optional[str]:
+    """Resolve a wizard output node id to its executable prompt key.
+
+    Handles expanded ids directly, outer subgraph containers (via the
+    subgraph ``outputNode`` mapping), and inner-local ids (unique suffix
+    match). Returns the expanded key or None. Never raises.
+    """
+    try:
+        oid = str(output_node_id or "")
+        if not oid or not isinstance(prompt, dict):
+            return None
+        if oid in prompt:
+            return oid
+        if ":" in oid:
+            return None
+        top_nodes = _top_level_nodes_by_id(ui_graph)
+        outer_node = top_nodes.get(oid)
+        if isinstance(outer_node, dict):
+            defs = _subgraph_defs_by_id(ui_graph)
+            outer_type = outer_node.get("type")
+            sg = defs.get(str(outer_type)) if outer_type is not None else None
+            if isinstance(sg, dict):
+                output_node = sg.get("outputNode")
+                output_node_id_inner = (
+                    output_node.get("id") if isinstance(output_node, dict) else -20
+                )
+                for link in _subgraph_links(sg):
+                    try:
+                        if str(link.get("target_id")) != str(output_node_id_inner):
+                            continue
+                        inner_id_str = str(link.get("origin_id"))
+                        expanded = f"{oid}:{inner_id_str}"
+                        if expanded in prompt:
+                            return expanded
+                    except Exception:
+                        continue
+        suffix = f":{oid}"
+        matches = [
+            key for key in prompt.keys()
+            if isinstance(key, str) and key.endswith(suffix)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    except Exception:
+        pass
+    return None
+
+
+def subgraph_node_present(
+    prompt: dict[str, Any], ui_graph: Any, node_id: Any
+) -> bool:
+    """True when ``node_id`` is executable directly or via subgraph mapping."""
+    try:
+        nid = str(node_id or "")
+        if not nid or not isinstance(prompt, dict):
+            return False
+        if nid in prompt:
+            return True
+        if ":" in nid:
+            return False
+        top_nodes = _top_level_nodes_by_id(ui_graph)
+        if nid in top_nodes:
+            outer_node = top_nodes[nid]
+            defs = _subgraph_defs_by_id(ui_graph)
+            outer_type = outer_node.get("type") if isinstance(outer_node, dict) else None
+            if isinstance(outer_type, str) and outer_type in defs:
+                prefix = f"{nid}:"
+                for key in prompt.keys():
+                    if isinstance(key, str) and key.startswith(prefix):
+                        return True
+        suffix = f":{nid}"
+        for key in prompt.keys():
+            if isinstance(key, str) and key.endswith(suffix):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def resolve_binding_target(
     prompt: dict[str, Any],
     node_id: Any,
@@ -133,6 +467,15 @@ def resolve_binding_target(
     so callers can explain *why* a binding fails (e.g. a pure-widget or
     hidden-state value that never reaches the executable prompt).
 
+    Subgraph workflows expand inner nodes to ``"<outer>:<inner>"`` prompt
+    keys (ComfyUI ``graphToPrompt``). Wizard bindings captured from the live
+    canvas use UI ids — an outer container id (``"30"``) or an inner-local id
+    (``"10"``) — neither of which appears verbatim in the prompt. When the
+    direct lookup fails and a UI graph is available, resolution additionally
+    tries the outer-widget → expanded mapping (via subgraph ``inputNode``
+    links) and the unique inner-local → expanded suffix match, reporting the
+    normalized ``expanded_node_id`` / ``expanded_input_name`` on success.
+
     Returns a dict with:
 
     * ``resolvable`` — True only when the name is an executable-input key.
@@ -142,6 +485,8 @@ def resolve_binding_target(
       writing the control replaces that link.
     * ``node_present`` — False when the node id is absent from the prompt.
     * ``node_def_available`` — whether a node definition could be probed.
+    * ``expanded_node_id`` / ``expanded_input_name`` / ``via_subgraph`` —
+      normalized executable target when resolution went through a subgraph.
 
     Never raises.
     """
@@ -156,31 +501,106 @@ def resolve_binding_target(
     }
     try:
         node = prompt.get(node_id_str) if isinstance(prompt, dict) else None
-        if not isinstance(node, dict):
-            return result
-        result["node_present"] = True
-        inputs = node.get("inputs")
-        if isinstance(inputs, dict) and input_name in inputs:
-            result["resolvable"] = True
-            result["location"] = "inputs"
-            value = inputs.get(input_name)
-            if _is_connection_spec(value):
-                result["linked"] = True
-                result["upstream_node_id"] = str(value[0])
-            return result
+        if isinstance(node, dict):
+            result["node_present"] = True
+            inputs = node.get("inputs")
+            if isinstance(inputs, dict) and input_name in inputs:
+                result["resolvable"] = True
+                result["location"] = "inputs"
+                value = inputs.get(input_name)
+                if _is_connection_spec(value):
+                    result["linked"] = True
+                    try:
+                        result["upstream_node_id"] = str(value[0])  # type: ignore[index]
+                    except Exception:
+                        pass
+                return result
 
-        provider = node_def_provider or _probe_node_def
-        try:
-            probed = provider(str(node.get("class_type", "")))
-            if isinstance(probed, tuple) and len(probed) == 2:
-                result["node_def_available"] = True
-                for defs_dict in probed:
-                    if isinstance(defs_dict, dict) and input_name in defs_dict:
-                        result["location"] = "node_def"
-                        return result
-        except Exception:
-            pass
+            provider = node_def_provider or _probe_node_def
+            try:
+                probed = provider(str(node.get("class_type", "")))
+                if isinstance(probed, tuple) and len(probed) == 2:
+                    result["node_def_available"] = True
+                    for defs_dict in probed:
+                        if isinstance(defs_dict, dict) and input_name in defs_dict:
+                            result["location"] = "node_def"
+                            return result
+            except Exception:
+                pass
 
+            if _ui_node_has_widget(ui_graph, node_id_str, input_name):
+                result["location"] = "ui_widget"
+            return result
+        # Direct node absent: try subgraph-aware resolution before failing.
+        if isinstance(prompt, dict) and ui_graph is not None and ":" not in node_id_str:
+            expanded = _resolve_outer_widget_to_expanded(
+                prompt, ui_graph, node_id_str, input_name
+            )
+            if expanded is not None:
+                expanded_id, expanded_input = expanded
+                target_node = prompt.get(expanded_id)
+                if isinstance(target_node, dict):
+                    result["node_present"] = True
+                    result["resolvable"] = True
+                    result["location"] = "inputs"
+                    result["expanded_node_id"] = expanded_id
+                    result["expanded_input_name"] = expanded_input
+                    result["via_subgraph"] = "outer"
+                    target_inputs = target_node.get("inputs")
+                    value = target_inputs.get(expanded_input) if isinstance(target_inputs, dict) else None
+                    if _is_connection_spec(value):
+                        result["linked"] = True
+                        try:
+                            result["upstream_node_id"] = str(value[0])  # type: ignore[index]
+                        except Exception:
+                            pass
+                    return result
+            candidates = _expanded_candidates_for_inner(
+                prompt, node_id_str, input_name
+            )
+            if len(candidates) == 1:
+                expanded_id = candidates[0]
+                target_node = prompt.get(expanded_id)
+                result["node_present"] = True
+                result["resolvable"] = True
+                result["location"] = "inputs"
+                result["expanded_node_id"] = expanded_id
+                result["expanded_input_name"] = input_name
+                result["via_subgraph"] = "inner"
+                value = None
+                if isinstance(target_node, dict):
+                    target_inputs = target_node.get("inputs")
+                    if isinstance(target_inputs, dict):
+                        value = target_inputs.get(input_name)
+                if _is_connection_spec(value):
+                    result["linked"] = True
+                    try:
+                        result["upstream_node_id"] = str(value[0])  # type: ignore[index]
+                    except Exception:
+                        pass
+                return result
+            if len(candidates) > 1:
+                result["subgraph_candidates"] = candidates
+            elif subgraph_node_present(prompt, ui_graph, node_id_str):
+                result["node_present"] = True
+
+            provider = node_def_provider or _probe_node_def
+            try:
+                probed_outer = None
+                top_nodes = _top_level_nodes_by_id(ui_graph)
+                outer_node = top_nodes.get(node_id_str)
+                if isinstance(outer_node, dict):
+                    probed_outer = provider(str(outer_node.get("type", "")))
+                if isinstance(probed_outer, tuple) and len(probed_outer) == 2:
+                    result["node_def_available"] = True
+            except Exception:
+                pass
+            if _ui_node_has_widget(ui_graph, node_id_str, input_name):
+                result["location"] = "ui_widget"
+            return result
+        # No subgraph context (or already-expanded id): generic UI-widget
+        # reporting for the absent node. ``node`` is not a dict here (the
+        # dict case returned above); this is the terminal fall-through.
         if _ui_node_has_widget(ui_graph, node_id_str, input_name):
             result["location"] = "ui_widget"
         return result
@@ -248,14 +668,18 @@ def find_binding_candidates(
             inputs = node.get("inputs")
             if isinstance(inputs, dict) and input_name in inputs:
                 value = inputs.get(input_name)
+                upstream: Any = None
+                if _is_connection_spec(value):
+                    try:
+                        upstream = str(value[0])  # type: ignore[index]
+                    except Exception:
+                        upstream = None
                 candidates.append({
                     "node_id": str(nid),
                     "input_name": input_name,
                     "via": "inputs",
                     "linked": bool(_is_connection_spec(value)),
-                    "upstream_node_id": (
-                        str(value[0]) if _is_connection_spec(value) else None
-                    ),
+                    "upstream_node_id": upstream,
                 })
         if len(candidates) >= limit:
             return candidates
@@ -553,6 +977,114 @@ def derive_mapping_candidates(
     return entries, output_node_id
 
 
+def _probe_return_types(class_type: str) -> Optional[list]:
+    """Lazily probe the ComfyUI node registry for RETURN_TYPES.
+
+    Returns the RETURN_TYPES list, or ``None`` when the registry is
+    unavailable or the class is unknown. Never raises. Mirrors the
+    guarded lazy-probe pattern of :func:`_probe_node_def`.
+    """
+    try:
+        import nodes  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        cls = nodes.NODE_CLASS_MAPPINGS.get(str(class_type or ""))
+        if cls is None:
+            return None
+        returns = getattr(cls, "RETURN_TYPES", None)
+        if not isinstance(returns, (list, tuple)):
+            return None
+        return list(returns)
+    except Exception:
+        return None
+
+
+def node_has_image_output(class_type: str, *, return_types_provider=None) -> bool:
+    """True when ``class_type`` can emit images.
+
+    Fixed allowlist (``OUTPUT_NODE_CLASSES``) plus runtime capability:
+    a node whose ``RETURN_TYPES`` contains ``IMAGE`` is output-capable
+    regardless of whether its class is known to the allowlist (custom
+    compare/preview nodes such as RGThree or Pixaroma variants). The
+    registry is probed lazily so registry-less contexts keep working.
+    Never raises.
+    """
+    name = str(class_type or "")
+    if not name:
+        return False
+    if name in OUTPUT_NODE_CLASSES:
+        return True
+    try:
+        returns = None
+        if callable(return_types_provider):
+            returns = return_types_provider(name)
+        elif return_types_provider is None:
+            returns = _probe_return_types(name)
+        if not isinstance(returns, (list, tuple)):
+            return False
+        return any(str(r).upper() == "IMAGE" for r in returns)
+    except Exception:
+        return False
+
+
+def derive_output_node_ids_from_prompt(
+    prompt: Any, *, explicit_output_id: str = "", return_types_provider=None
+) -> list:
+    """All image-capable node ids in graph order; explicit mapping output first.
+
+    Unlike :func:`derive_mapping_candidates` (single first-allowlist-match
+    ``output_node_id``), this collects EVERY node able to emit images so
+    result collection is not limited to three hardcoded classes. Order is
+    graph order with the explicit mapping output hoisted first when present.
+    Deduped. Never raises.
+    """
+    ids: list = []
+    try:
+        items = prompt.items() if isinstance(prompt, dict) else []
+        for node_id, node in items:
+            if not isinstance(node, dict):
+                continue
+            if node_has_image_output(
+                str(node.get("class_type", "") or ""),
+                return_types_provider=return_types_provider,
+            ):
+                nid = str(node_id)
+                if nid and nid not in ids:
+                    ids.append(nid)
+    except Exception:
+        pass
+    explicit = str(explicit_output_id or "")
+    if explicit and explicit in ids:
+        ids = [explicit] + [i for i in ids if i != explicit]
+    return ids
+
+
+def derive_output_node_ids(
+    capture: Any, *, explicit_output_id: str = "", return_types_provider=None
+) -> list:
+    """Capture-shaped wrapper around :func:`derive_output_node_ids_from_prompt`.
+
+    Applies the same UI-graph regeneration as :func:`derive_mapping_candidates`
+    so candidates point at the prompt that will actually execute. Never raises.
+    """
+    try:
+        capture = capture or {}
+        prompt = extract_executable_prompt(capture.get("api_prompt_json") or {})
+        graph_json = capture.get("graph_json")
+        if is_ui_workflow_format(graph_json):
+            regenerated = ui_graph_to_api_prompt(graph_json)
+            if regenerated:
+                prompt = regenerated
+        return derive_output_node_ids_from_prompt(
+            prompt,
+            explicit_output_id=explicit_output_id,
+            return_types_provider=return_types_provider,
+        )
+    except Exception:
+        return []
+
+
 _CORE_CNR_IDS = ("comfy-core", "comfyui-core")
 
 
@@ -742,6 +1274,38 @@ def is_ui_workflow_format(graph_json: Any) -> bool:
         isinstance(graph_json, dict)
         and isinstance(graph_json.get("nodes"), list)
     )
+
+
+def ui_graph_has_nested_containers(graph_json: Any) -> bool:
+    """True when a UI graph nests executable nodes below containers.
+
+    Covers current subgraph definitions (``definitions.subgraphs``) and
+    legacy group nodes (``extra.groupNodes``). ``ui_graph_to_api_prompt``
+    only converts the top-level ``nodes`` list, so regenerating the prompt
+    from such a graph would silently drop the nested nodes — callers that
+    rebuild runtime state from the UI graph must keep the stored expanded
+    prompt instead. Never raises.
+    """
+    try:
+        if not isinstance(graph_json, dict):
+            return False
+        definitions = graph_json.get("definitions")
+        if isinstance(definitions, dict):
+            subgraphs = definitions.get("subgraphs")
+            if isinstance(subgraphs, dict) and subgraphs:
+                return True
+            if isinstance(subgraphs, (list, tuple)) and len(subgraphs) > 0:
+                return True
+        extra = graph_json.get("extra")
+        if isinstance(extra, dict):
+            group_nodes = extra.get("groupNodes")
+            if isinstance(group_nodes, dict) and group_nodes:
+                return True
+            if isinstance(group_nodes, (list, tuple)) and len(group_nodes) > 0:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 _WIDGET_TYPE_NAMES = frozenset({

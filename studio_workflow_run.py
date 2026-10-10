@@ -273,6 +273,13 @@ def _refresh_ui_workflow_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     mapping, schema, and default set derived from the current UI graph.  API
     prompt versions are deliberately untouched so arbitrary workflows retain
     their existing behavior.
+
+    Subgraph/group-nested graphs are never regenerated: the stored executable
+    prompt (expanded ``"<outer>:<inner>"`` keys from live ``graphToPrompt``)
+    is authoritative, while ``ui_graph_to_api_prompt`` only converts the
+    top-level ``nodes`` list and would silently drop every nested node —
+    wiping stored bindings and their defaults (e.g. ``missing required
+    control 'clip'`` on subgraph workflows).
     """
     version = bundle.get("version") or {}
     graph_json = version.get("graph_json") if isinstance(version, dict) else None
@@ -280,14 +287,41 @@ def _refresh_ui_workflow_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
         from studio_domain.graph import (
             derive_mapping_candidates,
             is_ui_workflow_format,
+            ui_graph_has_nested_containers,
             ui_graph_to_api_prompt,
         )
 
         if not is_ui_workflow_format(graph_json):
             return bundle
+        if ui_graph_has_nested_containers(graph_json):
+            return bundle
         regenerated = ui_graph_to_api_prompt(graph_json)
         if not regenerated:
             return bundle
+        # Safety net: never replace the stored prompt when regeneration
+        # would drop a stored binding target (stale defs, unknown classes,
+        # or any other conversion gap). Dropping the prompt also drops its
+        # defaults, surfacing as ``missing required control`` at run time.
+        try:
+            stored_mapping = bundle.get("mapping") or {}
+            stored_entries = stored_mapping.get("entries") or []
+            if isinstance(stored_entries, dict):
+                stored_entries = list(stored_entries.values())
+            for stored in stored_entries:
+                if not isinstance(stored, dict):
+                    continue
+                nid = str(stored.get("node_id") or "")
+                iname = str(stored.get("input_name") or "")
+                if not nid or not iname:
+                    continue
+                node = regenerated.get(nid)
+                if not isinstance(node, dict):
+                    return bundle
+                inputs = node.get("inputs")
+                if not isinstance(inputs, dict) or iname not in inputs:
+                    return bundle
+        except Exception:
+            pass
 
         entries, output_node_id = derive_mapping_candidates({
             "graph_json": graph_json,
@@ -656,10 +690,70 @@ def _build_plan_replay_meta(
     }
 
 
+def _resolve_execution_target(
+    workflow: dict[str, Any],
+    executable_prompt: dict[str, Any],
+    ui_graph: Any,
+    node_id: str,
+    input_name: str,
+) -> tuple[str, str] | None:
+    """Resolve a stored mapping target to its executable prompt key.
+
+    Direct hits pass through. Subgraph UI ids resolve without guessing:
+    outer containers via the subgraph ``inputNode`` mapping (needs
+    ``ui_graph``) and inner-local ids via a unique ``":<id>"`` suffix match
+    against the executable prompt. Returns ``(node_id, input_name)`` or None.
+    Never raises.
+    """
+    try:
+        if not node_id or not input_name:
+            return None
+        node = workflow.get(node_id)
+        if isinstance(node, dict):
+            inputs = node.get("inputs")
+            if isinstance(inputs, dict) and input_name in inputs:
+                return (node_id, input_name)
+        if ":" in node_id:
+            return None
+        if ui_graph is not None:
+            try:
+                from studio_domain.graph import _resolve_outer_widget_to_expanded
+            except Exception:
+                _resolve_outer_widget_to_expanded = None  # type: ignore[assignment]
+            if _resolve_outer_widget_to_expanded is not None:
+                try:
+                    expanded = _resolve_outer_widget_to_expanded(
+                        executable_prompt, ui_graph, node_id, input_name
+                    )
+                except Exception:
+                    expanded = None
+                if expanded is not None:
+                    return expanded
+        suffix = f":{node_id}"
+        matches: list[str] = []
+        try:
+            for key, candidate in workflow.items():
+                if not isinstance(key, str) or not key.endswith(suffix):
+                    continue
+                if not isinstance(candidate, dict):
+                    continue
+                inputs = candidate.get("inputs")
+                if isinstance(inputs, dict) and input_name in inputs:
+                    matches.append(key)
+        except Exception:
+            matches = []
+        if len(matches) == 1:
+            return (matches[0], input_name)
+    except Exception:
+        pass
+    return None
+
+
 def apply_workflow_values_to_prompt(
     executable_prompt: dict[str, Any],
     control_schema: dict[str, Any],
     values: dict[str, Any],
+    ui_graph: Any = None,
 ) -> dict[str, Any]:
     """Apply control values VERBATIM into a deep copy of the executable prompt.
 
@@ -667,6 +761,11 @@ def apply_workflow_values_to_prompt(
     ``input_name``.  ``kind=="widget"`` entries store the widget value under
     ``node["inputs"][input_name]`` (ComfyUI API prompts keep widget values in
     ``inputs``).  Unresolvable mappings block with an error (never guessed).
+
+    Subgraph mappings stored as UI ids (outer ``"30"`` or inner-local
+    ``"10"``) resolve to their expanded ``"30:10"`` executable key via
+    ``_resolve_execution_target``; stored expanded ids pass through
+    unchanged.
 
     After all writes every written value is read back and asserted identical
     (``==`` with equal types); a mismatch is a hard error.
@@ -677,6 +776,7 @@ def apply_workflow_values_to_prompt(
         return {"error": "executable prompt is not a dict"}
     workflow = copy.deepcopy(executable_prompt)
 
+    resolved_targets: dict[str, tuple[str, str]] = {}
     for role, value in (values or {}).items():
         entry = control_schema.get(role)
         if entry is None:
@@ -685,44 +785,66 @@ def apply_workflow_values_to_prompt(
         input_name = str(entry.get("input_name", "") or "")
         if not node_id or not input_name:
             return {"error": f"mapped control {role!r} has no node/input binding"}
-        node = workflow.get(node_id)
-        if not isinstance(node, dict):
-            return {
-                "error": (
-                    f"mapped control {role!r} cannot be resolved: "
-                    f"node {node_id} not present"
-                ),
-            }
-        inputs = node.get("inputs")
-        if not isinstance(inputs, dict) or input_name not in inputs:
+        target = _resolve_execution_target(
+            workflow, executable_prompt, ui_graph, node_id, input_name
+        )
+        if target is None:
+            node = workflow.get(node_id)
+            if not isinstance(node, dict):
+                return {
+                    "error": (
+                        f"mapped control {role!r} cannot be resolved: "
+                        f"node {node_id} not present"
+                    ),
+                }
             return {
                 "error": (
                     f"mapped control {role!r} cannot be resolved: node {node_id} "
                     f"input {input_name!r} not present"
                 ),
             }
-        inputs[input_name] = value
+        resolved_targets[role] = target
+        node = workflow.get(target[0])
+        if not isinstance(node, dict):
+            return {
+                "error": (
+                    f"mapped control {role!r} cannot be resolved: "
+                    f"node {target[0]} not present"
+                ),
+            }
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict) or target[1] not in inputs:
+            return {
+                "error": (
+                    f"mapped control {role!r} cannot be resolved: node {target[0]} "
+                    f"input {target[1]!r} not present"
+                ),
+            }
+        inputs[target[1]] = value
 
     # Read back and assert verbatim identity.
     for role, value in (values or {}).items():
-        entry = control_schema.get(role)
-        if entry is None:
-            return {
-                "error": f"control {role!r} has no mapping entry; cannot resolve"
-            }
-        node_id = str(entry.get("node_id", "") or "")
-        input_name = str(entry.get("input_name", "") or "")
-        node = workflow.get(node_id)
+        target = resolved_targets.get(role)
+        if target is None:
+            entry = control_schema.get(role)
+            if entry is None:
+                return {
+                    "error": f"control {role!r} has no mapping entry; cannot resolve"
+                }
+            node_id = str(entry.get("node_id", "") or "")
+            input_name = str(entry.get("input_name", "") or "")
+            target = (node_id, input_name)
+        node = workflow.get(target[0])
         written = None
         if isinstance(node, dict):
             inputs = node.get("inputs")
             if isinstance(inputs, dict):
-                written = inputs.get(input_name)
+                written = inputs.get(target[1])
         if not _values_identical(written, value):
             return {
                 "error": (
                     f"mapped control {role!r} read-back mismatch: wrote "
-                    f"{value!r} but node {node_id} input {input_name!r} holds "
+                    f"{value!r} but node {target[0]} input {target[1]!r} holds "
                     f"{written!r}"
                 ),
             }
@@ -866,7 +988,8 @@ def build_workflow_execution_plan(
         except Exception:
             pass
         applied = apply_workflow_values_to_prompt(
-            executable_prompt, runtime_bundle["control_schema"], values
+            executable_prompt, runtime_bundle["control_schema"], values,
+            ui_graph=graph_json,
         )
         if "error" in applied:
             return None, applied["error"]
@@ -913,6 +1036,20 @@ def build_workflow_execution_plan(
         if not output_node_id:
             return None, "workflow mapping has no output node id"
         output_node_ids: tuple[str, ...] = tuple([output_node_id])
+        try:
+            # Universal capture: collect EVERY image-capable node (custom
+            # compare/preview outputs included), not just the single mapping
+            # output. Explicit mapping output stays first; the collection
+            # chain already accepts a tuple. Never breaks single-output plans.
+            from studio_domain.graph import derive_output_node_ids_from_prompt
+
+            _extra_outputs = derive_output_node_ids_from_prompt(
+                workflow, explicit_output_id=output_node_id
+            )
+            if _extra_outputs:
+                output_node_ids = tuple(_extra_outputs)
+        except Exception:
+            pass
         _hydrate_missing_required_widget_defaults(
             workflow,
             node_ids=None if is_ui_graph else {output_node_id},
@@ -1413,6 +1550,7 @@ async def _record_workflow_run_failure(
                     bundle.get("executable_prompt") or {},
                     bundle.get("control_schema") or {},
                     values,
+                    ui_graph=(bundle.get("version") or {}).get("graph_json"),
                 )
                 if "workflow" in applied:
                     workflow_json = applied["workflow"]

@@ -46,6 +46,9 @@ from .graph import (
     infer_control_kind,
     is_ui_workflow_format,
     resolve_binding_target,
+    subgraph_node_present,
+    subgraph_resolve_output,
+    ui_graph_has_nested_containers,
     ui_graph_to_api_prompt,
 )
 from .services import WorkflowDomainService
@@ -84,5 +87,8 @@ __all__ = [
     "infer_control_kind",
     "is_ui_workflow_format",
     "resolve_binding_target",
+    "subgraph_node_present",
+    "subgraph_resolve_output",
+    "ui_graph_has_nested_containers",
     "ui_graph_to_api_prompt",
 ]

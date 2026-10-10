@@ -680,7 +680,7 @@ export function renderWorkflows(state, context) {
   // Already-mapped versions keep the legacy "Edit mapping" revision path
   // untouched. A missing version context falls back to the detail page.
 
-  function openVersionSetupWizard(wfId, versionId, notice, initialStep) {
+  function openVersionSetupWizard(wfId, versionId, notice, initialStep, initialMapping) {
     import("./studio-workflow-setup-wizard.js").then(({ openWorkflowSetupWizard }) => {
       if (stale()) return;
       if (!wfId || !versionId) {
@@ -693,6 +693,7 @@ export function renderWorkflows(state, context) {
         workflowId: wfId,
         workflowVersionId: versionId,
         initialStep: initialStep || "features",
+        initialMapping: initialMapping || null,
       });
     }).catch(() => {
       openWorkflowDetail(wfId, versionId, notice);
@@ -3098,7 +3099,7 @@ export function renderWorkflows(state, context) {
         el("button", {
           class: "comfymodal-secondary-btn",
           text: "Edit mapping",
-           onclick: () => openVersionSetupWizard(_view.selectedWorkflowId, _view.selectedVersionId, null, "bindings"),
+           onclick: () => openVersionSetupWizard(_view.selectedWorkflowId, _view.selectedVersionId, null, "bindings", _view.data.mapping),
         }),
       ]));
     } else {

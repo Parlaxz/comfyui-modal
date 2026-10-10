@@ -31,6 +31,11 @@ from studio_domain import (
     resolve_binding_target,
 )
 from studio_domain.services import WorkflowDomainService as _Service  # noqa: F401
+from studio_domain.graph import (
+    derive_output_node_ids,
+    derive_output_node_ids_from_prompt,
+    node_has_image_output,
+)
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────
@@ -688,6 +693,229 @@ class BindingResolutionTests(WorkflowDomainTestCase):
         self.assertIn(
             "mapped entry 'seed' input 'seed' not present on node 204", state.reasons
         )
+
+
+def _subgraph_fixture() -> tuple[dict, dict]:
+    """Minimal outer-container + expanded-prompt subgraph fixture.
+
+    Outer node ``30`` (subgraph ``sg-1``) exposes widgets that feed inner
+    nodes through ``inputNode`` links; ComfyUI expands them to ``"30:<inner>"``
+    prompt keys. Mirrors the real Krea subgraph shape at a fraction of the
+    size.
+    """
+    sg_id = "sg-1"
+    graph_json = {
+        "nodes": [
+            {
+                "id": 30,
+                "type": sg_id,
+                "inputs": [
+                    {"name": "value", "type": "STRING", "widget": {"name": "value"}, "link": None},
+                    {"name": "seed_1", "type": "INT", "widget": {"name": "seed_1"}, "link": None},
+                    {"name": "unet_name", "type": "COMBO", "widget": {"name": "unet_name"}, "link": None},
+                ],
+                "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [44]}],
+                "widgets_values": ["hello", 7, "model.safetensors"],
+            },
+            {
+                "id": 29,
+                "type": "SaveImage",
+                "inputs": [{"name": "images", "type": "IMAGE", "link": 44}],
+                "outputs": [],
+            },
+        ],
+        "links": [[44, 30, 0, 29, 0, "IMAGE"]],
+        "definitions": {
+            "subgraphs": [
+                {
+                    "id": sg_id,
+                    "inputNode": {"id": -10},
+                    "outputNode": {"id": -20},
+                    "nodes": [
+                        {
+                            "id": 19,
+                            "type": "PrimitiveStringMultiline",
+                            "inputs": [{"name": "value", "type": "STRING", "widget": {"name": "value"}, "link": 45}],
+                            "widgets_values": ["hello"],
+                        },
+                        {
+                            "id": 3,
+                            "type": "KSampler",
+                            "inputs": [
+                                {"name": "model", "type": "MODEL", "link": 30},
+                                {"name": "seed", "type": "INT", "widget": {"name": "seed"}, "link": 77},
+                            ],
+                            "widgets_values": [7],
+                        },
+                        {
+                            "id": 10,
+                            "type": "UNETLoader",
+                            "inputs": [{"name": "unet_name", "type": "COMBO", "widget": {"name": "unet_name"}, "link": 82}],
+                            "widgets_values": ["model.safetensors"],
+                        },
+                    ],
+                    "links": [
+                        {"id": 45, "origin_id": -10, "origin_slot": 0, "target_id": 19, "target_slot": 0, "type": "STRING"},
+                        {"id": 77, "origin_id": -10, "origin_slot": 1, "target_id": 3, "target_slot": 1, "type": "INT"},
+                        {"id": 82, "origin_id": -10, "origin_slot": 2, "target_id": 10, "target_slot": 0, "type": "COMBO"},
+                    ],
+                }
+            ]
+        },
+    }
+    prompt = {
+        "30:19": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "hello"}},
+        "30:3": {"class_type": "KSampler", "inputs": {"model": ["30:10", 0], "seed": 7}},
+        "30:10": {"class_type": "UNETLoader", "inputs": {"unet_name": "model.safetensors"}},
+        "29": {"class_type": "SaveImage", "inputs": {"images": ["30:3", 0]}},
+    }
+    return graph_json, prompt
+
+
+@pytest.mark.fast_unit
+class SubgraphBindingTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.service = WorkflowDomainService(str(Path(self._tmp.name)))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_outer_widget_resolves_to_expanded(self):
+        graph_json, prompt = _subgraph_fixture()
+        target = resolve_binding_target(
+            prompt, "30", "value", ui_graph=graph_json
+        )
+        self.assertTrue(target.get("resolvable"))
+        self.assertEqual(target.get("expanded_node_id"), "30:19")
+        self.assertEqual(target.get("expanded_input_name"), "value")
+
+    def test_inner_local_resolves_to_expanded(self):
+        graph_json, prompt = _subgraph_fixture()
+        target = resolve_binding_target(
+            prompt, "10", "unet_name", ui_graph=graph_json
+        )
+        self.assertTrue(target.get("resolvable"))
+        self.assertEqual(target.get("expanded_node_id"), "30:10")
+
+    def test_save_normalizes_subgraph_bindings_to_expanded(self):
+        graph_json, prompt = _subgraph_fixture()
+        wf = self.service.create_workflow("Subgraph")
+        version = self.service.create_version_from_capture(
+            wf["workflow_id"],
+            {"graph_json": graph_json, "api_prompt_json": {"workflow": {}, "output": prompt}},
+        )
+        version_id = version["workflow_version_id"]
+        mapping = self.service.set_mapping(
+            version_id,
+            entries={
+                "prompt": {"semantic_role": "prompt", "node_id": "30", "input_name": "value", "kind": "widget", "control_kind": "multiline", "display_name": "Prompt"},
+                "seed": {"semantic_role": "seed", "node_id": "30", "input_name": "seed_1", "kind": "widget", "control_kind": "integer", "display_name": "Seed"},
+                "model_unet": {"semantic_role": "model_unet", "node_id": "10", "input_name": "unet_name", "kind": "widget", "control_kind": "file", "display_name": "UNET"},
+            },
+            output_node_id="29",
+        )
+        stored = {e["semantic_role"]: e for e in mapping["entries"]}
+        self.assertEqual(stored["prompt"]["node_id"], "30:19")
+        self.assertEqual(stored["prompt"]["input_name"], "value")
+        self.assertEqual(stored["seed"]["node_id"], "30:3")
+        self.assertEqual(stored["seed"]["input_name"], "seed")
+        self.assertEqual(stored["model_unet"]["node_id"], "30:10")
+        state = self.service.derive_version_state(version_id)
+        self.assertTrue(state.runnable, state.reasons)
+
+    def test_ambiguous_inner_reports_subgraph_hint(self):
+        graph_json, prompt = _subgraph_fixture()
+        prompt = dict(prompt)
+        prompt["31:10"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "other.safetensors"}}
+        target = resolve_binding_target(
+            prompt, "10", "unet_name", ui_graph=graph_json
+        )
+        self.assertFalse(target.get("resolvable"))
+        self.assertIn("31:10", target.get("subgraph_candidates") or [])
+
+
+@pytest.mark.fast_unit
+class UniversalOutputDiscoveryTests(unittest.TestCase):
+    """Universal final-image capture: every image-bearing node is found.
+
+    Covers the fixed allowlist (no registry needed), custom compare/preview
+    classes via RETURN_TYPES (RGThree-style, Pixaroma-style), graph-order
+    collection, explicit-output hoisting, and the capture wrapper.
+    """
+
+    def _returns_provider(self, mapping):
+        def provider(class_type):
+            return mapping.get(str(class_type))
+        return provider
+
+    def _prompt(self):
+        return {
+            "1": {"class_type": "KSampler", "inputs": {"model": ["4", 0]}},
+            "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+            "3": {"class_type": "RGThreeImageCompare",
+                   "inputs": {"image_a": ["1", 0], "image_b": ["1", 0]}},
+            "4": {"class_type": "PixaromaPreview", "inputs": {"images": ["1", 0]}},
+            "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "x"}},
+        }
+
+    def _mapping(self):
+        return {
+            "SaveImage": ["IMAGE"],
+            "RGThreeImageCompare": ["IMAGE", "IMAGE"],
+            "PixaromaPreview": ["IMAGE"],
+            "KSampler": ["LATENT"],
+            "CLIPTextEncode": ["CONDITIONING"],
+        }
+
+    def test_allowlist_class_needs_no_registry(self):
+        self.assertTrue(node_has_image_output("SaveImage"))
+        self.assertTrue(node_has_image_output("PreviewImage"))
+        self.assertTrue(node_has_image_output("SaveImageWithMetaData"))
+
+    def test_custom_image_class_discovered_via_provider(self):
+        provider = self._returns_provider(self._mapping())
+        self.assertTrue(node_has_image_output(
+            "RGThreeImageCompare", return_types_provider=provider))
+        self.assertTrue(node_has_image_output(
+            "PixaromaPreview", return_types_provider=provider))
+
+    def test_non_image_class_rejected(self):
+        provider = self._returns_provider(self._mapping())
+        self.assertFalse(node_has_image_output(
+            "KSampler", return_types_provider=provider))
+        self.assertFalse(node_has_image_output(
+            "NoSuchClass", return_types_provider=provider))
+        self.assertFalse(node_has_image_output(""))
+        self.assertFalse(node_has_image_output("NoSuchClass"))
+
+    def test_collects_all_in_graph_order(self):
+        ids = derive_output_node_ids_from_prompt(
+            self._prompt(),
+            return_types_provider=self._returns_provider(self._mapping()),
+        )
+        self.assertEqual(ids, ["2", "3", "4"])
+
+    def test_explicit_output_hoisted_first(self):
+        ids = derive_output_node_ids_from_prompt(
+            self._prompt(),
+            explicit_output_id="4",
+            return_types_provider=self._returns_provider(self._mapping()),
+        )
+        self.assertEqual(ids, ["4", "2", "3"])
+
+    def test_capture_wrapper_matches(self):
+        capture = {"graph_json": {"id": "g1", "nodes": []},
+                   "api_prompt_json": {"workflow": {}, "output": self._prompt()}}
+        ids = derive_output_node_ids(
+            capture,
+            return_types_provider=self._returns_provider(self._mapping()),
+        )
+        self.assertEqual(ids, ["2", "3", "4"])
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

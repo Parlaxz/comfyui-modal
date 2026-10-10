@@ -562,6 +562,7 @@ async def run_golden_workflow(
         }
     applied = apply_workflow_values_to_prompt(
         bundle["executable_prompt"], bundle["control_schema"], merged["values"],
+        ui_graph=(bundle.get("version") or {}).get("graph_json"),
     )
     if "error" in applied:
         return {

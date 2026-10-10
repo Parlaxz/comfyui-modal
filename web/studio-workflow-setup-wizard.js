@@ -32,6 +32,7 @@ import {
 } from "./studio-model-library.js";
 import {
   getWorkflowVersion,
+  getMapping,
   createMapping,
   createMappingRevision,
   getVersionDependencies,
@@ -250,6 +251,81 @@ export function isValidConcreteBinding(val) {
   return !!(val.widgetName || val.inputName || val.outputIndex != null);
 }
 
+function _mappingToBindings(mapping) {
+  const bindings = {};
+  const source = mapping && mapping.mapping && typeof mapping.mapping === "object"
+    ? mapping.mapping
+    : mapping;
+  if (!source || typeof source !== "object") return bindings;
+
+  const catalogKeys = new Set([...Object.keys(BINDABLE_INPUTS), OUTPUT_BINDING.key]);
+  const entries = Array.isArray(source.entries)
+    ? source.entries.map((entry) => [entry && entry.semantic_role, entry])
+    : Object.entries(source.entries || {});
+
+  entries.forEach(([role, entry]) => {
+    if (!catalogKeys.has(role) || !entry || typeof entry !== "object") return;
+    const nodeId = entry.node_id != null ? entry.node_id : entry.nodeId;
+    if (nodeId == null || String(nodeId).trim() === "") return;
+    const inputName = entry.input_name != null ? entry.input_name : entry.inputName;
+    const kind = entry.kind;
+    let bindingKind;
+    let widgetName = null;
+    let inputBindingName = null;
+    let outputIndex = null;
+    if (kind === "widget") {
+      bindingKind = "widget";
+      widgetName = inputName || null;
+    } else if (kind === "node_input") {
+      bindingKind = "input";
+      inputBindingName = inputName || null;
+    } else if (kind === "node_output") {
+      bindingKind = "output";
+      const rawIndex = entry.output_index != null ? entry.output_index
+        : entry.outputIndex != null ? entry.outputIndex
+          : entry.index != null ? entry.index : entry.output_name;
+      const match = typeof rawIndex === "number" ? rawIndex
+        : String(rawIndex == null ? "" : rawIndex).match(/\d+/);
+      outputIndex = Number.isFinite(Number(match)) && Number(match) >= 0 ? Number(match) : 0;
+    } else if (inputName) {
+      bindingKind = "widget";
+      widgetName = inputName;
+    } else {
+      return;
+    }
+    if (!widgetName && !inputBindingName && outputIndex == null) return;
+    bindings[role] = {
+      kind: bindingKind,
+      nodeId,
+      nodeType: entry.node_type || entry.nodeType || "",
+      nodeTitle: entry.node_title || entry.nodeTitle || "",
+      widgetName,
+      inputName: inputBindingName,
+      outputIndex,
+      label: entry.display_name || "",
+      candidates: [],
+      widgetSchema: null,
+    };
+  });
+
+  const outputNodeId = source.output_node_id;
+  if (outputNodeId != null && String(outputNodeId).trim() !== "") {
+    bindings[OUTPUT_BINDING.key] = {
+      kind: "output",
+      nodeId: outputNodeId,
+      nodeType: "",
+      nodeTitle: "",
+      widgetName: null,
+      inputName: null,
+      outputIndex: 0,
+      label: "",
+      candidates: [],
+      widgetSchema: null,
+    };
+  }
+  return bindings;
+}
+
 // ── Wizard state ────────────────────────────────────────────────────────
 
 let _wizardState = null;
@@ -325,6 +401,9 @@ function makeInitialState(options) {
     if (versionOpt.initialStep === "bindings") {
       state.selectedFeatures = ["txt2img"];
       state.step = "bindings";
+    }
+    if (versionOpt.initialMapping && versionOpt.initialStep === "bindings") {
+      Object.assign(state.bindings, _mappingToBindings(versionOpt.initialMapping));
     }
   }
 
@@ -2381,6 +2460,7 @@ function _restoreCanvasGraph() {
 }
 
 async function prefetchVersionSetupGraph(state) {
+  if (!state || _wizardState !== state) return;
   const apiBase = state._apiBase;
   const versionId = state.workflowVersionId;
   let version = null;
@@ -2392,7 +2472,7 @@ async function prefetchVersionSetupGraph(state) {
   } catch (e) {
     version = null;
   }
-  if (!state || _wizardState !== state) return; // closed or replaced meanwhile
+  if (_wizardState !== state) return; // closed or replaced meanwhile
   const graph = version && (version.graph_json || version.graphJson);
   if (!graph) return;
   state.graphJson = graph;
@@ -2400,6 +2480,7 @@ async function prefetchVersionSetupGraph(state) {
   // The canvas must show THIS version's graph: "Use Selected Node" and the
   // canvas-capture path bind against the live canvas, so binding against a
   // different workflow's graph would store nodes the version does not have.
+  if (_wizardState !== state) return;
   await _showVersionGraphOnCanvas(state, graph);
   if (_wizardState !== state) return;
   try {
@@ -2409,6 +2490,22 @@ async function prefetchVersionSetupGraph(state) {
       state.suggestStatus = `Found likely targets for ${found} binding${found === 1 ? "" : "s"} in this version's stored graph. Confirm each one below.`;
     }
   } catch (e) { /* suggestions are best-effort */ }
+  const requiredKeys = collectRequiredBindings(state.selectedFeatures).map((binding) => binding.key);
+  const missingRequired = requiredKeys.some((key) => !isValidConcreteBinding(state.bindings && state.bindings[key]));
+  if (state.step === "bindings" && (!state.bindings || !Object.keys(state.bindings).length || missingRequired)) {
+    if (_wizardState !== state) return;
+    let mappingResponse = null;
+    try {
+      mappingResponse = await getMapping(apiBase, versionId);
+    } catch (e) {
+      mappingResponse = null;
+    }
+    if (_wizardState !== state) return;
+    const mappingBindings = _mappingToBindings(mappingResponse);
+    Object.keys(mappingBindings).forEach((key) => {
+      if (state.bindings[key] == null) state.bindings[key] = mappingBindings[key];
+    });
+  }
   const panel = _wizardRoot && _wizardRoot.querySelector(".comfymodal-studio-wizard-panel");
   if (panel) renderWizard(panel, state);
 }

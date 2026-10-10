@@ -28,6 +28,8 @@ from .graph import (
     is_ui_workflow_format,
     node_exists,
     resolve_binding_target,
+    subgraph_node_present,
+    subgraph_resolve_output,
     ui_graph_to_api_prompt,
 )
 from .models import (
@@ -221,6 +223,29 @@ class WorkflowDomainService:
             entry_objects[role] = entry
         return entry_objects
 
+    @staticmethod
+    def normalize_output_node_id(
+        output_node_id: Any,
+        executable: dict[str, Any],
+        ui_graph: Any,
+    ) -> str:
+        """Normalize a wizard output node id to its executable prompt key.
+
+        Expanded subgraph ids (``"30:8"``) pass through; outer containers
+        (``"30"``) and inner-local ids (``"10"``) resolve to their expanded
+        key when unambiguous. Returns "" when unresolvable. Never raises.
+        """
+        try:
+            oid = str(output_node_id or "")
+            if not oid:
+                return ""
+            if isinstance(executable, dict) and oid in executable:
+                return oid
+            resolved = subgraph_resolve_output(executable, ui_graph, oid)
+            return str(resolved or "")
+        except Exception:
+            return ""
+
     def _validate_entries_against_graph(
         self,
         entries: dict[str, MappingEntry],
@@ -236,6 +261,12 @@ class WorkflowDomainService:
         hidden-state value that never reaches the executable prompt) is
         rejected with resolvable alternatives, so an un-runnable mapping
         like ``seed`` → a seed-producer node can never be stored.
+
+        Subgraph workflows expand inner nodes to ``"<outer>:<inner>"`` prompt
+        keys while the wizard captures UI ids (outer ``"30"`` or inner-local
+        ``"10"``). Resolvable subgraph bindings are normalized in place to
+        their expanded executable target so the stored mapping runs
+        unchanged downstream.
         """
         executable = version.get("executable_prompt") or {}
         ui_graph = version.get("graph_json")
@@ -258,11 +289,25 @@ class WorkflowDomainService:
                 node_def_provider=self._node_def_provider,
             )
             if target.get("resolvable"):
+                expanded_id = target.get("expanded_node_id")
+                expanded_input = target.get("expanded_input_name")
+                if expanded_id and expanded_input:
+                    entry.node_id = str(expanded_id)
+                    entry.input_name = str(expanded_input)
                 continue
             if not target.get("node_present"):
-                problems.append(
-                    f"mapped entry {role!r} node {node_id} not present in graph"
-                )
+                candidates = target.get("subgraph_candidates")
+                if isinstance(candidates, list) and candidates:
+                    problems.append(
+                        f"mapped entry {role!r} node {node_id} is ambiguous "
+                        f"across subgraphs (matches {', '.join(candidates)}); "
+                        f"bind the outer subgraph widget or re-capture the "
+                        f"expanded node id"
+                    )
+                else:
+                    problems.append(
+                        f"mapped entry {role!r} node {node_id} not present in graph"
+                    )
                 continue
             message = (
                 f"mapped entry {role!r} input {input_name!r} "
@@ -756,6 +801,11 @@ class WorkflowDomainService:
         now = now_iso()
         normalized = self._normalize_entries(entries)
         self._validate_entries_against_graph(normalized, source)
+        output_node_id = self.normalize_output_node_id(
+            output_node_id,
+            source.get("executable_prompt") or {},
+            source.get("graph_json"),
+        ) or str(output_node_id or "")
         versions = self.store.list_versions_for_workflow(
             str(source.get("workflow_id", ""))
         )
@@ -841,17 +891,13 @@ class WorkflowDomainService:
             reasons.append("missing mapping")
         else:
             entries_raw = mapping.get("entries") or []
+            ui_graph = version.get("graph_json")
             for raw_entry in entries_raw:
                 if not isinstance(raw_entry, dict):
                     continue
                 role = raw_entry.get("semantic_role", "")
                 node_id = str(raw_entry.get("node_id", ""))
                 kind = raw_entry.get("kind", "node_input")
-                if node_id and not node_exists(executable, node_id):
-                    reasons.append(
-                        f"mapped entry {role!r} node {node_id} not present in graph"
-                    )
-                    continue
                 if kind in INPUT_BINDING_KINDS:
                     input_name = str(raw_entry.get("input_name", ""))
                     if node_id and input_name:
@@ -859,16 +905,41 @@ class WorkflowDomainService:
                             executable,
                             node_id,
                             input_name,
-                            ui_graph=version.get("graph_json"),
+                            ui_graph=ui_graph,
                             node_def_provider=self._node_def_provider,
                         )
-                        if not target.get("resolvable"):
+                        if target.get("resolvable"):
+                            continue
+                        if not target.get("node_present") and not subgraph_node_present(
+                            executable, ui_graph, node_id
+                        ):
                             reasons.append(
-                                f"mapped entry {role!r} input {input_name!r} "
-                                f"not present on node {node_id}"
+                                f"mapped entry {role!r} node {node_id} not present in graph"
                             )
+                            continue
+                        reasons.append(
+                            f"mapped entry {role!r} input {input_name!r} "
+                            f"not present on node {node_id}"
+                        )
+                        continue
+                if node_id and not node_exists(executable, node_id):
+                    if subgraph_node_present(executable, ui_graph, node_id):
+                        continue
+                    reasons.append(
+                        f"mapped entry {role!r} node {node_id} not present in graph"
+                    )
+                    continue
             output_node_id = str(mapping.get("output_node_id", ""))
-            if not output_node_id or not node_exists(executable, output_node_id):
+            output_ok = bool(
+                output_node_id
+                and (
+                    node_exists(executable, output_node_id)
+                    or subgraph_resolve_output(
+                        executable, version.get("graph_json"), output_node_id
+                    )
+                )
+            )
+            if not output_ok:
                 reasons.append("no output node")
         if self._dependency_provider is not None:
             try:
@@ -926,6 +997,11 @@ class WorkflowDomainService:
         now = now_iso()
         normalized = self._normalize_entries(entries)
         self._validate_entries_against_graph(normalized, version)
+        output_node_id = self.normalize_output_node_id(
+            output_node_id,
+            version.get("executable_prompt") or {},
+            version.get("graph_json"),
+        ) or str(output_node_id or "")
         mapping = Mapping(
             mapping_id=make_mapping_id(),
             workflow_version_id=workflow_version_id,
