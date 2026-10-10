@@ -53,3 +53,9 @@ method = "run_golden_parallel_stream"
 [environment]
 # Unpinned (not testing): provider default region for faster scheduling.
 COMFYMODAL_V2_REGION = ""
+# Phase B generic composition: enable the shared QD4 CLIP demand reader so
+# generic CLIPLoader nodes use the canonical clip_qd_load arm (self-contained
+# per call, immune to the poisoned M2 pool). Canonical note: the speculative
+# lane also switches its source read to this arm when enabled, by design
+# fail-closed to _fastsafe_load with explicit telemetry on any E30 error.
+COMFYMODAL_V2_CLIP_QD_READER = "1"
