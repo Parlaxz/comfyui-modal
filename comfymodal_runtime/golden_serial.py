@@ -12096,6 +12096,163 @@ def derive_mixed_plan_bindings(
     return plan
 
 
+_QUANT_FP8_FORMATS = frozenset({"float8_e4m3fn", "float8_e5m2"})
+_QUANT_DESCRIPTOR_OPTIONAL_KEYS = frozenset({"full_precision_matrix_mult"})
+
+
+def parse_unet_quant_metadata(metadata: Any) -> dict[str, dict[str, Any]]:
+    """Parse and validate UNET quantization metadata (pure logic).
+
+    Expects the ``_quantization_metadata`` JSON string mapping to
+    ``{"layers": {layer: descriptor}}``.  Only ``float8_e4m3fn`` /
+    ``float8_e5m2`` formats are admitted; optional descriptor fields
+    beyond ``full_precision_matrix_mult`` (boolean) are rejected rather
+    than silently discarded.  Returns ``{layer: {"format": ...,
+    "full_precision_matrix_mult": bool}}``.  Raises RuntimeError with an
+    explicit reason on any defect (stage fail-closed style).
+    """
+    if not isinstance(metadata, dict):
+        raise RuntimeError("unet_quant_metadata_missing")
+    raw = metadata.get("_quantization_metadata")
+    if not isinstance(raw, str) or not raw.strip():
+        raise RuntimeError("unet_quant_metadata_missing")
+    try:
+        import json as _json
+
+        parsed = _json.loads(raw)
+    except Exception:
+        raise RuntimeError("unet_quant_metadata_invalid:unparseable")
+    if not isinstance(parsed, dict):
+        raise RuntimeError("unet_quant_metadata_invalid:not_object")
+    layers = parsed.get("layers")
+    if not isinstance(layers, dict) or not layers:
+        raise RuntimeError("unet_quant_metadata_invalid:no_layers")
+    normalized: dict[str, dict[str, Any]] = {}
+    for layer, descriptor in layers.items():
+        if not isinstance(layer, str) or not layer:
+            raise RuntimeError("unet_quant_metadata_invalid:layer_name")
+        if not isinstance(descriptor, dict):
+            raise RuntimeError(f"unet_quant_metadata_invalid:{layer}")
+        fmt = descriptor.get("format")
+        if fmt not in _QUANT_FP8_FORMATS:
+            raise RuntimeError(f"unet_quant_format_unsupported:{layer}:{fmt}")
+        for key in descriptor:
+            if key == "format":
+                continue
+            if key not in _QUANT_DESCRIPTOR_OPTIONAL_KEYS:
+                raise RuntimeError(f"unet_quant_descriptor_unsupported:{layer}:{key}")
+        full_mm = descriptor.get("full_precision_matrix_mult", False)
+        if not isinstance(full_mm, bool):
+            raise RuntimeError(f"unet_quant_descriptor_unsupported:{layer}:full_precision_matrix_mult")
+        normalized[layer] = {"format": fmt, "full_precision_matrix_mult": full_mm}
+    return normalized
+
+
+def build_quant_fp8_plan(entries: Any, metadata: Any) -> dict[str, Any]:
+    """Build a metadata-defined scaled-FP8 source plan (pure logic).
+
+    Every FP8 weight must be described by validated metadata with its
+    F32 tensorwise scale present; every scale-like key must belong to a
+    declared layer; raw source ``.comfy_quant`` descriptors are rejected
+    (this slice materializes markers only via upstream conversion).
+    Source specs carry a ``role`` (``quant_weight`` | ``weight_scale``
+    | ``input_scale`` | ``plain``) for storage-proof routing.  Raises
+    RuntimeError with an explicit reason on any defect.
+    """
+    layers = parse_unet_quant_metadata(metadata)
+    try:
+        items = list(entries or [])
+    except Exception:
+        raise RuntimeError("unet_source_plan_entries_invalid")
+    by_key: dict[str, dict[str, Any]] = {}
+    for item in items:
+        try:
+            key = str(item[0])
+            dtype_name = str(item[1])
+            shape = tuple(int(v) for v in item[2])
+            offset = int(item[3])
+            length = int(item[4])
+        except Exception:
+            raise RuntimeError("unet_source_plan_entry_malformed")
+        if not key or key in by_key:
+            raise RuntimeError(f"unet_source_plan_key:{key or 'empty'}")
+        if key.endswith(".comfy_quant"):
+            raise RuntimeError(f"unet_quant_source_markers_unsupported:{key}")
+        by_key[key] = {
+            "dtype_name": dtype_name,
+            "shape": shape,
+            "offset": offset,
+            "length": length,
+        }
+    if not by_key:
+        raise RuntimeError("unet_source_plan_empty")
+    source_specs: dict[str, dict[str, Any]] = {}
+    quant_layers: dict[str, dict[str, Any]] = {}
+    marker_keys: list[str] = []
+    covered_fp8: set[str] = set()
+    for layer, descriptor in layers.items():
+        weight_key = f"{layer}.weight"
+        scale_key = f"{layer}.scale_weight"
+        input_scale_key = f"{layer}.scale_input"
+        weight = by_key.get(weight_key)
+        if weight is None:
+            raise RuntimeError(f"unet_quant_weight_missing:{weight_key}")
+        if weight["dtype_name"] not in ("F8_E4M3", "F8_E5M2"):
+            raise RuntimeError(
+                f"unet_quant_weight_dtype:{weight_key}:{weight['dtype_name']}")
+        scale = by_key.get(scale_key)
+        if scale is None:
+            raise RuntimeError(f"unet_quant_scale_missing:{scale_key}")
+        if scale["dtype_name"] != "F32":
+            raise RuntimeError(
+                f"unet_quant_scale_invalid:{scale_key}:{scale['dtype_name']}")
+        scale_numel = 1
+        for dim in scale["shape"]:
+            scale_numel *= int(dim)
+        if scale_numel != 1:
+            raise RuntimeError(f"unet_quant_scale_shape:{scale_key}")
+        input_scale = by_key.get(input_scale_key)
+        marker_key = f"{layer}.comfy_quant"
+        if marker_key in by_key:
+            raise RuntimeError(f"unet_quant_source_markers_unsupported:{marker_key}")
+        covered_fp8.add(weight_key)
+        quant_layers[layer] = {
+            "format": descriptor["format"],
+            "full_precision_matrix_mult": descriptor["full_precision_matrix_mult"],
+            "weight_source_key": weight_key,
+            "scale_source_key": scale_key,
+            "input_scale_source_key": input_scale_key if input_scale is not None else None,
+            "marker_key": marker_key,
+            "descriptor": dict(descriptor),
+        }
+        marker_keys.append(marker_key)
+        source_specs[weight_key] = dict(weight, role="quant_weight")
+        source_specs[scale_key] = dict(scale, role="weight_scale")
+        if input_scale is not None:
+            source_specs[input_scale_key] = dict(input_scale, role="input_scale")
+    accounted_scales: set[str] = set()
+    for layer in quant_layers:
+        accounted_scales.add(quant_layers[layer]["scale_source_key"])
+        if quant_layers[layer].get("input_scale_source_key") is not None:
+            accounted_scales.add(quant_layers[layer]["input_scale_source_key"])
+    for key, info in by_key.items():
+        if (
+            key.endswith(".scale_weight") or key.endswith(".scale_input")
+        ) and key not in accounted_scales:
+            raise RuntimeError(f"unet_quant_unexpected_scale:{key}")
+        if info["dtype_name"] in ("F8_E4M3", "F8_E5M2") and key not in covered_fp8:
+            raise RuntimeError(f"unet_quant_weight_uncovered:{key}")
+        if key not in source_specs:
+            source_specs[key] = dict(info, role="plain")
+    return {
+        "kind": "scaled_fp8",
+        "source_specs": source_specs,
+        "bindings": {},
+        "quant_layers": quant_layers,
+        "marker_keys": tuple(marker_keys),
+    }
+
+
 def _session_source_policy(session: Any) -> str:
     """Session-local source-read policy (default: canonical behavior).
 

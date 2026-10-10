@@ -3513,3 +3513,88 @@ def test_derive_mixed_plan_bindings_rejections():
             {"source_specs": {"p.x": {}, "x": {}}}, "p.")
     with pytest.raises(RuntimeError, match="unet_plan_invalid"):
         gs.derive_mixed_plan_bindings(None, "")
+
+
+# ── UNET scaled-FP8 quant plan (Unit 2) ──
+
+def _quant_entries():
+    return [
+        ("blk.a.weight", "F8_E4M3", (8, 8), 0, 64),
+        ("blk.a.scale_weight", "F32", (1,), 64, 68),
+        ("blk.b.weight", "BF16", (4, 4), 68, 132),
+    ]
+
+
+def _quant_meta(layers=None):
+    if layers is None:
+        layers = {"blk.a": {"format": "float8_e4m3fn"}}
+    return {"_quantization_metadata": json.dumps({"layers": layers})}
+
+
+def test_parse_unet_quant_metadata_ok():
+    out = gs.parse_unet_quant_metadata(_quant_meta())
+    assert out == {"blk.a": {"format": "float8_e4m3fn",
+                             "full_precision_matrix_mult": False}}
+
+
+def test_parse_unet_quant_metadata_rejections():
+    with pytest.raises(RuntimeError, match="unet_quant_metadata_missing"):
+        gs.parse_unet_quant_metadata({})
+    with pytest.raises(RuntimeError, match="unet_quant_metadata_missing"):
+        gs.parse_unet_quant_metadata(None)
+    with pytest.raises(RuntimeError, match="unet_quant_metadata_invalid"):
+        gs.parse_unet_quant_metadata({"_quantization_metadata": "not-json"})
+    with pytest.raises(RuntimeError, match="unet_quant_format_unsupported"):
+        gs.parse_unet_quant_metadata(_quant_meta({"blk.a": {"format": "int4"}}))
+    with pytest.raises(RuntimeError, match="unet_quant_descriptor_unsupported"):
+        gs.parse_unet_quant_metadata(
+            _quant_meta({"blk.a": {"format": "float8_e4m3fn", "weird": 1}}))
+
+
+def test_build_quant_fp8_plan_ok():
+    plan = gs.build_quant_fp8_plan(_quant_entries(), _quant_meta())
+    assert plan["kind"] == "scaled_fp8"
+    assert set(plan["source_specs"]) == {
+        "blk.a.weight", "blk.a.scale_weight", "blk.b.weight"}
+    assert plan["source_specs"]["blk.a.weight"]["role"] == "quant_weight"
+    assert plan["source_specs"]["blk.a.scale_weight"]["role"] == "weight_scale"
+    assert plan["source_specs"]["blk.b.weight"]["role"] == "plain"
+    assert plan["quant_layers"]["blk.a"]["marker_key"] == "blk.a.comfy_quant"
+    assert plan["marker_keys"] == ("blk.a.comfy_quant",)
+
+
+def test_build_quant_fp8_plan_input_scale():
+    entries = _quant_entries() + [("blk.a.scale_input", "F32", (1,), 132, 136)]
+    plan = gs.build_quant_fp8_plan(entries, _quant_meta())
+    assert plan["source_specs"]["blk.a.scale_input"]["role"] == "input_scale"
+    assert (plan["quant_layers"]["blk.a"]["input_scale_source_key"]
+            == "blk.a.scale_input")
+
+
+def test_build_quant_fp8_plan_rejections():
+    with pytest.raises(RuntimeError, match="unet_quant_scale_missing"):
+        gs.build_quant_fp8_plan(
+            [("blk.a.weight", "F8_E4M3", (8, 8), 0, 64)], _quant_meta())
+    with pytest.raises(RuntimeError, match="unet_quant_scale_invalid"):
+        gs.build_quant_fp8_plan(
+            [("blk.a.weight", "F8_E4M3", (8, 8), 0, 64),
+             ("blk.a.scale_weight", "BF16", (1,), 64, 68)], _quant_meta())
+    with pytest.raises(RuntimeError, match="unet_quant_scale_shape"):
+        gs.build_quant_fp8_plan(
+            [("blk.a.weight", "F8_E4M3", (8, 8), 0, 64),
+             ("blk.a.scale_weight", "F32", (4,), 64, 80)], _quant_meta())
+    with pytest.raises(RuntimeError, match="unet_quant_weight_uncovered"):
+        gs.build_quant_fp8_plan(
+            [("blk.a.weight", "F8_E4M3", (8, 8), 0, 64),
+             ("blk.a.scale_weight", "F32", (1,), 64, 68),
+             ("blk.z.weight", "F8_E4M3", (8, 8), 68, 132)], _quant_meta())
+    with pytest.raises(RuntimeError, match="unet_quant_unexpected_scale"):
+        gs.build_quant_fp8_plan(
+            [("blk.a.weight", "F8_E4M3", (8, 8), 0, 64),
+             ("blk.a.scale_weight", "F32", (1,), 64, 68),
+             ("blk.orphan.scale_weight", "F32", (1,), 68, 72)], _quant_meta())
+    with pytest.raises(RuntimeError, match="unet_quant_source_markers_unsupported"):
+        gs.build_quant_fp8_plan(
+            [("blk.a.weight", "F8_E4M3", (8, 8), 0, 64),
+             ("blk.a.scale_weight", "F32", (1,), 64, 68),
+             ("blk.a.comfy_quant", "U8", (8,), 68, 76)], _quant_meta())
