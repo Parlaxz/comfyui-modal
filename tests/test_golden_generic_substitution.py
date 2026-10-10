@@ -462,3 +462,52 @@ class TestDynamicVramGating:
         assert outcome["ok"] is False
         assert "dynamic_vram_unavailable" in outcome["reason"]
         assert outcome["source_arm"] == "golden_unet"
+
+
+class TestQuantMarkerPlacement:
+    """*.comfy_quant descriptors must be CPU (loaders call .numpy()).
+
+    Weights stay untouched (zero-copy preserved); only CUDA-like marker
+    tensors move. Duck-typed: no torch needed."""
+
+    def test_cuda_like_markers_moved_to_cpu(self):
+        moved = []
+
+        class FakeCudaTensor:
+            is_cuda = True
+
+            def __init__(self, name):
+                self.name = name
+
+            def to(self, device):
+                moved.append((self.name, device))
+                return "cpu-%s" % self.name
+
+        weight = object()
+        sd = {"layer.weight": weight,
+              "layer.comfy_quant": FakeCudaTensor("q"),
+              "other.comfy_quant": FakeCudaTensor("q2")}
+        out = ggl._cpu_native_quant_markers(sd)
+        assert out is sd
+        assert sd["layer.comfy_quant"] == "cpu-q"
+        assert ("q", "cpu") in moved and ("q2", "cpu") in moved
+        assert sd["layer.weight"] is weight
+
+    def test_cpu_and_non_markers_untouched(self):
+        class FakeCpuTensor:
+            is_cuda = False
+
+            def to(self, device):
+                raise AssertionError("must not move")
+
+        marker = FakeCpuTensor()
+        sd = {"w": FakeCpuTensor(), "m.comfy_quant": marker,
+              "plain": 123, "x.comfy_quant": object()}
+        out = ggl._cpu_native_quant_markers(sd)
+        assert out is sd
+        assert sd["m.comfy_quant"] is marker
+        assert sd["plain"] == 123
+
+    def test_non_dict_passthrough(self):
+        assert ggl._cpu_native_quant_markers(None) is None
+        assert ggl._cpu_native_quant_markers([1]) == [1]

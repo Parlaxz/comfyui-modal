@@ -152,6 +152,12 @@ _TORCH_DTYPE = {
     "U32": torch.uint32,
     "U64": torch.uint64,
     "BOOL": torch.bool,
+    # Scaled-FP8 weights (1 byte/elem, same size math as U8): the reader
+    # moves bytes, never interprets values, so F8 views are byte-exact.
+    # Consumers must keep `.comfy_quant` descriptor tensors on CPU (their
+    # loader calls `.numpy()` on them).
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
 }
 
 # ── Gate / config helpers ─────────────────────────────────────────────────

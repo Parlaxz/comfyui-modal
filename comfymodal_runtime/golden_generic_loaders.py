@@ -681,6 +681,37 @@ async def compose_generic_vae_load(
         }
 
 
+def _cpu_native_quant_markers(state_dict: Any) -> Any:
+    """Move ``*.comfy_quant`` descriptor tensors to CPU (metadata, not weights).
+
+    Quantized releases ship per-layer JSON descriptors under
+    ``<layer>.comfy_quant`` keys; loaders read them via ``.numpy()``,
+    which forbids CUDA tensors (the exact live failure).  The
+    descriptors are byte-sized metadata consumed (popped) at
+    construction and never adopted as parameters, so CPU placement
+    preserves zero-copy weight adoption exactly.  Duck-typed (no torch
+    import needed); returns the input untouched on anything unexpected.
+    Never raises.
+    """
+    try:
+        if not isinstance(state_dict, dict):
+            return state_dict
+        for key in list(state_dict.keys()):
+            if not str(key).endswith(".comfy_quant"):
+                continue
+            tensor = state_dict[key]
+            to = getattr(tensor, "to", None)
+            is_cuda = getattr(tensor, "is_cuda", False)
+            if callable(to) and bool(is_cuda):
+                try:
+                    state_dict[key] = to("cpu")
+                except Exception:
+                    continue
+        return state_dict
+    except Exception:
+        return state_dict
+
+
 async def compose_generic_clip_load_qd4(
     *,
     clip_filenames: Sequence[str],
@@ -746,6 +777,9 @@ async def compose_generic_clip_load_qd4(
             launch_policy=launch_policy,
             artifact_path=cfg.get("artifact_path") or None,
         )
+        # Quant descriptors must be CPU (loaders call .numpy() on them);
+        # weights stay GPU views (zero-copy preserved).
+        sd = _cpu_native_quant_markers(sd)
         import comfy.sd
         from comfy.utils import convert_old_quants
 
