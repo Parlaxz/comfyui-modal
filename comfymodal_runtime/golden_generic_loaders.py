@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import os
 import time
+import json
 from typing import Any, Callable, Mapping, Sequence
 
 from .golden_aimdo_activation import activate_golden_dynamic_vram
@@ -542,6 +543,21 @@ async def compose_generic_unet_load(
             return {"ok": False,
                     "reason": f"unet_path_unresolvable:{names[0]}",
                     "source_arm": "golden_unet"}
+        # Header survey for contract diagnosis (proves the file's real
+        # composition in the trace when the stage rejects it).
+        header_info = _describe_safetensors_header(path)
+        try:
+            _hd = header_info if isinstance(header_info, dict) else {}
+            _dtypes = ",".join(
+                f"{k}:{v}" for k, v in sorted((_hd.get("dtypes") or {}).items()))
+            header_bit = (
+                f" | header:{_hd.get('tensors')}t[{_dtypes}]"
+                f"sfp8x{_hd.get('scaled_fp8_key_count', 0)}"
+                f"qmeta={int(bool(_hd.get('has_quantization_metadata')))}"
+            ) if _hd.get("ok") else ""
+        except Exception:
+            header_bit = ""
+            header_info = {"ok": False}
         from .golden_serial import golden_unet_load
 
         session = build_generic_unet_session(
@@ -572,6 +588,7 @@ async def compose_generic_unet_load(
         return {
             "ok": True,
             "loaded": patcher,
+            "header": header_info,
             "session": session,
             "owners": owners,
             "elapsed_ms": elapsed_ms,
@@ -591,6 +608,7 @@ async def compose_generic_unet_load(
             "reason": (
                 f"{type(exc).__name__}:{str(exc)[:200]}"
                 + (f" | tb:{_tb_text[-1200:]}" if _tb_text else "")
+                + header_bit
             ),
             "elapsed_ms": elapsed_ms,
             "source_arm": "golden_unet",
@@ -712,6 +730,52 @@ def _cpu_native_quant_markers(state_dict: Any) -> Any:
         return state_dict
 
 
+def _describe_safetensors_header(path: Any) -> dict[str, Any]:
+    """Header-only safetensors survey (no payload read).
+
+    Returns dtype histogram, ``scaled_fp8`` key inventory, and
+    quantization-metadata presence for stage-contract diagnosis (e.g.
+    designing mixed/FP8 UNET adoption from the file's real composition).
+    Header JSON is kilobytes; the multi-GB payload is never touched.
+    Never raises.
+    """
+    try:
+        with open(str(path), "rb") as handle:
+            prefix = handle.read(8)
+            if len(prefix) < 8:
+                return {"ok": False, "reason": "truncated_header"}
+            size = int.from_bytes(prefix, "little")
+            if size <= 0 or size > 64 * 1024 * 1024:
+                return {"ok": False, "reason": "bad_header_len"}
+            header = json.loads(handle.read(size).decode("utf-8"))
+        if not isinstance(header, dict):
+            return {"ok": False, "reason": "header_not_object"}
+        histogram: dict[str, int] = {}
+        scaled_keys: list[str] = []
+        total = 0
+        for key, info in header.items():
+            if key == "__metadata__":
+                continue
+            total += 1
+            dtype = str((info if isinstance(info, dict) else {}).get("dtype", "?"))
+            histogram[dtype] = histogram.get(dtype, 0) + 1
+            if "scaled_fp8" in str(key):
+                scaled_keys.append(str(key))
+        metadata = header.get("__metadata__") or {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        return {
+            "ok": True,
+            "tensors": total,
+            "dtypes": histogram,
+            "scaled_fp8_keys": scaled_keys[:25],
+            "scaled_fp8_key_count": len(scaled_keys),
+            "has_quantization_metadata": "_quantization_metadata" in metadata,
+            "metadata_keys": sorted(str(k) for k in metadata.keys())[:25],
+        }
+    except Exception as exc:  # noqa: BLE001 - survey is best-effort
+        return {"ok": False, "reason": f"{type(exc).__name__}"}
+
+
 async def compose_generic_clip_load_qd4(
     *,
     clip_filenames: Sequence[str],
@@ -753,6 +817,7 @@ async def compose_generic_clip_load_qd4(
             return {"ok": False,
                     "reason": f"clip_path_unresolvable:{names[0]}",
                     "source_arm": "qd4_demand"}
+        t_resolved_ns = time.monotonic_ns()
         from .clip_qd_reader import clip_qd_load, qd_config
 
         cfg = qd_config() or {}
@@ -769,6 +834,7 @@ async def compose_generic_clip_load_qd4(
         if block_mib < 1 or not launch_policy:
             return {"ok": False, "reason": "qd4_gate_config_incomplete",
                     "source_arm": "qd4_demand"}
+        t_gated_ns = time.monotonic_ns()
         sd, loader, owner = clip_qd_load(
             path,
             qd=qd_value,
@@ -777,6 +843,7 @@ async def compose_generic_clip_load_qd4(
             launch_policy=launch_policy,
             artifact_path=cfg.get("artifact_path") or None,
         )
+        t_read_ns = time.monotonic_ns()
         # Quant descriptors must be CPU (loaders call .numpy() on them);
         # weights stay GPU views (zero-copy preserved).
         sd = _cpu_native_quant_markers(sd)
@@ -812,6 +879,7 @@ async def compose_generic_clip_load_qd4(
             embedding_directory = folder_paths.get_folder_paths("embeddings")
         except Exception:
             embedding_directory = None
+        t_prep_ns = time.monotonic_ns()
         clip = comfy.sd.load_text_encoder_state_dicts(
             [sd],
             embedding_directory=embedding_directory,
@@ -825,7 +893,15 @@ async def compose_generic_clip_load_qd4(
             )
         except Exception:
             pass
-        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        t_construct_ns = time.monotonic_ns()
+        elapsed_ms = (t_construct_ns - started_ns) / 1_000_000.0
+        phases = {
+            "resolve_ms": round((t_resolved_ns - started_ns) / 1_000_000.0, 1),
+            "gate_ms": round((t_gated_ns - t_resolved_ns) / 1_000_000.0, 1),
+            "read_ms": round((t_read_ns - t_gated_ns) / 1_000_000.0, 1),
+            "prep_ms": round((t_prep_ns - t_read_ns) / 1_000_000.0, 1),
+            "construct_ms": round((t_construct_ns - t_prep_ns) / 1_000_000.0, 1),
+        }
         owners = [o for o in (loader, owner) if o is not None]
         return {
             "ok": True,
@@ -835,6 +911,7 @@ async def compose_generic_clip_load_qd4(
             "elapsed_ms": elapsed_ms,
             "reason": "",
             "source_arm": "qd4_demand",
+            "phases": phases,
         }
     except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
@@ -1294,6 +1371,7 @@ async def _run_substituted_loader(
             "owners": list(outcome.get("owners") or []),
             "source_arm": str(outcome.get("source_arm") or "unknown"),
             "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+            "phases": dict(outcome.get("phases") or {}),
         }
     except Exception as exc:  # noqa: BLE001 - substitution contract: never raise
         return {"ok": False, "reason": f"{type(exc).__name__}:{str(exc)[:150]}"}
@@ -1428,6 +1506,7 @@ def install_execution_dispatch_substitution(
                 requested="shared_core", actual="shared_core",
                 reason="", source_arm=str(sub.get("source_arm") or "unknown"),
                 elapsed_ms=sub.get("elapsed_ms", 0.0),
+                phases=sub.get("phases", {}),
             )
             return output, {}, False, False
 
