@@ -10,8 +10,9 @@ the SAME hard-stop boundary as the legacy Studio preset surface:
   ``EXECUTION_MODE_RETIRED`` before acceptance; the former v1/shadow
   submission-time path was retired in H12.
 
-All controls are validated verbatim (never coerced) against the version
-mapping's control schema and applied verbatim into the executable prompt.
+All controls are validated against the version mapping's control schema and
+applied into the executable prompt without type coercion.  The one path-only
+compatibility normalization is flattening model-loader subfolder names.
 The version's derived runnable state is authoritative: an unrunnable version
 fails closed before any plan is built.
 
@@ -60,6 +61,18 @@ _MODEL_LOADER_INPUTS = {
 }
 
 
+_MODEL_LOADER_FIELDS = frozenset(
+    field for fields in _MODEL_LOADER_INPUTS.values() for field in fields
+)
+
+
+def _normalize_model_name(value: Any) -> Any:
+    """Flatten a model-library path to the name exposed by the model volume."""
+    if not isinstance(value, str):
+        return value
+    return value.strip().replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def _normalize_model_loader_names(workflow: dict[str, Any]) -> None:
     """Match model-library installs, which flatten loader subfolder names."""
     for node in workflow.values():
@@ -71,8 +84,11 @@ def _normalize_model_loader_names(workflow: dict[str, Any]) -> None:
             continue
         for field in fields:
             value = inputs.get(field)
-            if isinstance(value, str) and ("/" in value or "\\" in value):
-                inputs[field] = value.replace("\\", "/").rsplit("/", 1)[-1]
+            if isinstance(value, str):
+                # UI controls can send the model-library subfolder prefix
+                # (notably ``krea2\\...``), while the deployed model volume
+                # exposes the installed basename to ComfyUI.
+                inputs[field] = _normalize_model_name(value)
 
 
 # ── Domain service construction (mirrors studio_workflow_routes.py) ──────
@@ -279,9 +295,64 @@ def _refresh_ui_workflow_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
         })
         mapping = copy.deepcopy(bundle.get("mapping") or {})
         if entries:
-            mapping["entries"] = [entry.to_dict() for entry in entries.values()]
+            stored_entries = mapping.get("entries") or []
+            if isinstance(stored_entries, dict):
+                stored_entries = list(stored_entries.values())
+            stored_entries = [
+                copy.deepcopy(entry)
+                for entry in stored_entries
+                if isinstance(entry, dict) and entry.get("semantic_role")
+            ]
+
+            # Stored semantic roles are part of the public Studio contract.
+            # The graph re-derivation only refreshes their binding metadata;
+            # it must not rename aliases such as ``cfg_scale`` → ``cfg``.
+            fresh_by_binding = {
+                (
+                    str(entry.node_id),
+                    str(entry.input_name),
+                ): entry.to_dict()
+                for entry in entries.values()
+                if entry.node_id and entry.input_name
+            }
+            refreshed_entries: list[dict[str, Any]] = []
+            stored_bindings: set[tuple[str, str]] = set()
+            for stored in stored_entries:
+                binding = (
+                    str(stored.get("node_id") or ""),
+                    str(stored.get("input_name") or ""),
+                )
+                fresh = fresh_by_binding.get(binding)
+                if fresh is not None:
+                    alias = str(stored["semantic_role"])
+                    refreshed_entry = copy.deepcopy(fresh)
+                    refreshed_entry["semantic_role"] = alias
+                    refreshed_entries.append(refreshed_entry)
+                    stored_bindings.add(binding)
+                else:
+                    refreshed_entries.append(stored)
+
+            # New graph controls are useful only when their node/input has no
+            # stored mapping.  This is also what keeps one fresh canonical
+            # role from displacing several historical aliases on a binding.
+            for binding, fresh in fresh_by_binding.items():
+                if binding not in stored_bindings and not any(
+                    (
+                        str(entry.get("node_id") or ""),
+                        str(entry.get("input_name") or ""),
+                    ) == binding
+                    for entry in stored_entries
+                ):
+                    refreshed_entries.append(copy.deepcopy(fresh))
+            mapping["entries"] = refreshed_entries
         if output_node_id:
             mapping["output_node_id"] = output_node_id
+
+        # A required input may be omitted by the UI→API conversion.  Let the
+        # live node schema supply an explicit default before defaults are read;
+        # inputs with no schema default remain absent and fail required
+        # validation later.  In particular, never manufacture image data.
+        _hydrate_missing_required_widget_defaults(regenerated)
 
         control_schema = {
             str(entry["semantic_role"]): entry
@@ -416,6 +487,8 @@ def default_controls_from_version(
         value = node_inputs.get(input_name)
         if isinstance(value, (dict, list)):
             continue
+        if input_name in _MODEL_LOADER_FIELDS:
+            value = _normalize_model_name(value)
         defaults[role] = value
     return defaults
 
@@ -443,6 +516,27 @@ def merge_workflow_controls(
 
     merged: dict[str, Any] = dict(defaults)
     for key, value in overrides.items():
+        # The Studio UI serializes an untouched sampler selector as null.
+        # Keep the value regenerated from the current graph in that case;
+        # when no graph default exists, retaining None below still exercises
+        # the normal required/enum validation path.
+        entry = control_schema.get(key)
+        if (
+            value is None
+            and key in defaults
+            and isinstance(entry, dict)
+            and str(entry.get("input_name") or "") == "sampler_name"
+        ):
+            continue
+        if (
+            isinstance(entry, dict)
+            and str(entry.get("input_name") or "") in _MODEL_LOADER_FIELDS
+        ):
+            # Normalize before strict enum validation as well as again at the
+            # executable-prompt seam.  Otherwise ``krea2\\name`` is rejected
+            # against the live allowed basename ``name`` before the workflow
+            # can reach the loader normalizer.
+            value = _normalize_model_name(value)
         merged[key] = value
 
     errors: list[dict[str, str]] = validate_workflow_controls(merged, control_schema)
@@ -653,11 +747,12 @@ def _hydrate_missing_required_widget_defaults(
             ):
                 continue
             options = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
-            default = options.get("default")
-            if default is None and isinstance(spec[0], (tuple, list)) and spec[0]:
-                default = spec[0][0]
-            if default is None:
+            # Only an explicit node-schema default is authoritative.  The
+            # first enum option is not a default, and an IMAGE input must
+            # never be filled with invented data.
+            if "default" not in options or options.get("default") is None:
                 continue
+            default = options["default"]
             inputs[name] = copy.deepcopy(default)
             hydrated.append({"node_id": str(node_id), "input": str(name)})
     return {"hydrated": hydrated, "unavailable": False}
