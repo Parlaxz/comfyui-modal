@@ -156,6 +156,8 @@ def resolve_workflow_run_bundle(
     workflow_id: str,
     version_id: str,
     node_dir: str | os.PathLike,
+    *,
+    remote_model_readiness: bool = False,
 ) -> dict[str, Any]:
     """Resolve and gate a workflow run: workflow + version + mapping.
 
@@ -197,6 +199,20 @@ def resolve_workflow_run_bundle(
         }
 
     state = service.derive_version_state(version_id).to_dict()
+    if remote_model_readiness and not state.get("runnable"):
+        # Golden resolves models in the deployed Modal volume. Host-local model
+        # absence must not block a remote workflow before dispatch; all other
+        # workflow/dependency/mapping reasons remain fail-closed.
+        reasons = [
+            reason for reason in (state.get("reasons") or [])
+            if not str(reason).startswith("missing model ")
+        ]
+        state = {
+            **state,
+            "reasons": reasons,
+            "runnable": not reasons,
+            "status": "ready" if not reasons else "incomplete",
+        }
     if not state.get("runnable"):
         return {
             "status": "error",
@@ -548,7 +564,11 @@ def apply_workflow_values_to_prompt(
     return {"workflow": workflow}
 
 
-def _hydrate_missing_required_widget_defaults(workflow: dict[str, Any]) -> dict[str, Any]:
+def _hydrate_missing_required_widget_defaults(
+    workflow: dict[str, Any],
+    *,
+    node_ids: set[str] | None = None,
+) -> dict[str, Any]:
     """Fill omitted API-prompt widgets from the live node schema defaults."""
     hydrated: list[dict[str, str]] = []
     try:
@@ -557,6 +577,8 @@ def _hydrate_missing_required_widget_defaults(workflow: dict[str, Any]) -> dict[
         return {"hydrated": hydrated, "unavailable": True}
     mappings = getattr(nodes, "NODE_CLASS_MAPPINGS", {}) or {}
     for node_id, node in workflow.items():
+        if node_ids is not None and str(node_id) not in node_ids:
+            continue
         if not isinstance(node, dict):
             continue
         class_def = mappings.get(node.get("class_type"))
@@ -674,7 +696,6 @@ def build_workflow_execution_plan(
         _repair_missing_clip_inputs(workflow)
         _repair_missing_vae_inputs(workflow)
         _normalize_model_loader_names(workflow)
-        _hydrate_missing_required_widget_defaults(workflow)
 
         # ── Prompt bundle (custom, mirrors _default_build_execution_plan) ──
         # The modern role for the positive prompt is ``positive_prompt``; map
@@ -709,6 +730,10 @@ def build_workflow_execution_plan(
         if not output_node_id:
             return None, "workflow mapping has no output node id"
         output_node_ids: tuple[str, ...] = tuple([output_node_id])
+        _hydrate_missing_required_widget_defaults(
+            workflow,
+            node_ids={output_node_id},
+        )
 
         production_options = normalize_production_options(effective_modal_options)
         if production_options.get("enabled"):

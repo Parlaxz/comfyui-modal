@@ -533,7 +533,10 @@ async def run_golden_workflow(
     # allow_remote_execution from this seam; control defaults now come from
     # the version's own executable_prompt via bundle["defaults"].
     bundle = resolve_workflow_run_bundle(
-        workflow_id, version_id, node_dir,
+        workflow_id,
+        version_id,
+        node_dir,
+        remote_model_readiness=True,
     )
     if bundle.get("status") != "ok":
         return bundle
