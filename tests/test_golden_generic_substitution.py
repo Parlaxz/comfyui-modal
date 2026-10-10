@@ -407,3 +407,58 @@ class TestDispatchSubstitution:
             assert len(calls) == 1
         finally:
             restore()
+
+
+class TestDynamicVramGating:
+    """Golden stages require DynamicVRAM; the gate must fail closed
+    BEFORE any stage import or transport work. Uses the real compose
+    ordering with a mocked activator (stages stay unexercised here)."""
+
+    def test_helper_gate_not_set(self, monkeypatch):
+        sink = []
+        monkeypatch.setattr(
+            ggl, "activate_golden_dynamic_vram",
+            lambda: {"activated": False, "already_activated": False,
+                     "reason": "gate_not_set"})
+        ok, detail = ggl._ensure_stage_dynamic_vram(
+            (lambda n, **kw: sink.append((n, kw.get("metadata", {})))), "r1")
+        assert ok is False
+        assert detail == "gate_not_set"
+        assert sink and sink[0][0] == "generic_dynamic_vram"
+        assert sink[0][1]["outcome"] == "skipped"
+
+    def test_helper_activated(self, monkeypatch):
+        monkeypatch.setattr(
+            ggl, "activate_golden_dynamic_vram",
+            lambda: {"activated": True, "already_activated": False})
+        ok, detail = ggl._ensure_stage_dynamic_vram(None, "r1")
+        assert (ok, detail) == (True, "activated")
+
+    def test_helper_already_activated(self, monkeypatch):
+        monkeypatch.setattr(
+            ggl, "activate_golden_dynamic_vram",
+            lambda: {"activated": True, "already_activated": True})
+        ok, detail = ggl._ensure_stage_dynamic_vram(None, "r1")
+        assert (ok, detail) == (True, "already")
+
+    def test_helper_activator_raises(self, monkeypatch):
+        def boom():
+            raise RuntimeError("golden_aimdo_activation_failed:x")
+
+        monkeypatch.setattr(ggl, "activate_golden_dynamic_vram", boom)
+        ok, detail = ggl._ensure_stage_dynamic_vram(None, "r1")
+        assert ok is False
+        assert "RuntimeError" in detail
+
+    def test_unet_compose_gated_before_stage(self, monkeypatch):
+        monkeypatch.setattr(
+            ggl, "activate_golden_dynamic_vram",
+            lambda: {"activated": False, "already_activated": False,
+                     "reason": "gate_not_set"})
+        outcome = asyncio.run(ggl.compose_generic_unet_load(
+            unet_filenames=["u.safetensors"], folder="diffusion_models",
+            request_id="r1",
+            path_resolver=lambda folder, name: "/tmp/" + name))
+        assert outcome["ok"] is False
+        assert "dynamic_vram_unavailable" in outcome["reason"]
+        assert outcome["source_arm"] == "golden_unet"

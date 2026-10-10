@@ -45,6 +45,8 @@ import os
 import time
 from typing import Any, Callable, Mapping, Sequence
 
+from .golden_aimdo_activation import activate_golden_dynamic_vram
+
 
 # Loader classes this composition knows how to classify.  Only CLIPLoader
 # has a composed fast path today; the rest report explicit reasons.
@@ -284,6 +286,46 @@ async def compose_generic_clip_load(
         }
 
 
+def _ensure_stage_dynamic_vram(
+    trace_emit: Callable[..., Any] | None, request_id: str
+) -> tuple[bool, str]:
+    """Ensure DynamicVRAM activation before golden stage loads.
+
+    Calls the sanctioned ``activate_golden_dynamic_vram`` (the
+    main.py-equivalent rebind the CLI sequence never performs on workers;
+    idempotent per process, verified, fail-closed).  Golden CLIP/VAE
+    stages reject requests without it (``*_dynamic_core_model_patcher_
+    required``).  Returns ``(True, detail)`` when active, ``(False,
+    reason)`` otherwise — both mean native fallback, never raise.  The
+    only shared-state effect is the sanctioned activation itself, which
+    canonical requests perform on these workers as a matter of course.
+    """
+    try:
+        evidence = activate_golden_dynamic_vram()
+        if isinstance(evidence, dict) and (
+            evidence.get("activated") or evidence.get("already_activated")
+        ):
+            return True, (
+                "already" if evidence.get("already_activated") else "activated"
+            )
+        reason = ""
+        if isinstance(evidence, dict):
+            reason = str(evidence.get("reason") or "gate_not_set")
+        _emit_trace(
+            trace_emit, "generic_dynamic_vram", outcome="skipped",
+            reason=reason or "dynamic_vram_gate_not_set",
+            request_id=str(request_id or ""),
+        )
+        return False, reason or "dynamic_vram_gate_not_set"
+    except Exception as exc:  # noqa: BLE001 - activation is best-effort here
+        detail = f"{type(exc).__name__}:{str(exc)[:150]}"
+        _emit_trace(
+            trace_emit, "generic_dynamic_vram", outcome="failed",
+            reason=detail, request_id=str(request_id or ""),
+        )
+        return False, detail
+
+
 async def compose_generic_clip_load_stage(
     *,
     clip_filenames: Sequence[str],
@@ -328,6 +370,13 @@ async def compose_generic_clip_load_stage(
             volume=volume,
         )
         setattr(session, "source_policy", "legacy_qd")
+        vram_ok, vram_detail = _ensure_stage_dynamic_vram(None, request_id)
+        if not vram_ok:
+            elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+            return {"ok": False,
+                    "reason": f"dynamic_vram_unavailable:{vram_detail}",
+                    "elapsed_ms": elapsed_ms,
+                    "source_arm": "golden_clip"}
         # The stage reads full paths from the session (same as canonical).
         session.clip_paths = list(resolved)
         # QD publication must produce ordinary mutable tensors: the executor
@@ -493,6 +542,13 @@ async def compose_generic_unet_load(
             volume=volume,
         )
         session.model_paths = {"unet": path}
+        vram_ok, vram_detail = _ensure_stage_dynamic_vram(None, request_id)
+        if not vram_ok:
+            elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+            return {"ok": False,
+                    "reason": f"dynamic_vram_unavailable:{vram_detail}",
+                    "elapsed_ms": elapsed_ms,
+                    "source_arm": "golden_unet"}
         # Same inference-mode guard as the CLIP stage path: ordinary mutable
         # tensors for transport publication and assign=True adoption.
         import torch as _torch_unet
@@ -561,6 +617,13 @@ async def compose_generic_vae_load(
             volume=volume,
         )
         session.model_paths = {"vae": path}
+        vram_ok, vram_detail = _ensure_stage_dynamic_vram(None, request_id)
+        if not vram_ok:
+            elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+            return {"ok": False,
+                    "reason": f"dynamic_vram_unavailable:{vram_detail}",
+                    "elapsed_ms": elapsed_ms,
+                    "source_arm": "golden_vae"}
         # Same inference-mode guard as the CLIP stage path: ordinary mutable
         # tensors for transport publication and assign=True adoption.
         import torch as _torch_vae
