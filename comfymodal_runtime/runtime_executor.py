@@ -2887,6 +2887,44 @@ def install_pre_sampler_hooks() -> None:
     except (ImportError, AttributeError):
         pass
 
+    # ── 4b. LLM text-generate execution dtype (measurement-only) ──────
+    # TextGenerate runs BaseGenerate.generate (comfy/text_encoders/llama.py):
+    # one autoregressive forward per token, execution dtype chosen inside
+    # as bf16 iff should_use_bf16(device) else fp32. Log the actual inputs
+    # once per process so slow tok/s can be attributed to dtype vs kernels.
+    try:
+        from comfy.text_encoders.llama import BaseGenerate as _BaseGenerate
+    except ImportError:
+        _BaseGenerate = None
+    _orig_llm_generate = getattr(_BaseGenerate, "generate", None) if _BaseGenerate is not None else None
+    if _orig_llm_generate is not None and "BaseGenerate.generate" not in _ORIGINAL_FUNCTIONS:
+        _ORIGINAL_FUNCTIONS["BaseGenerate.generate"] = _orig_llm_generate
+
+        def _patched_llm_generate(self, embeds=None, *args: Any, **kwargs: Any):
+            if not getattr(_patched_llm_generate, "_dtype_logged", False):
+                try:
+                    import torch as _torch
+                    _dev = embeds.device if embeds is not None else "unknown"
+                    _bf16_ok = _mm.should_use_bf16(_dev) if embeds is not None else "n/a"
+                    _exp = "bfloat16" if _bf16_ok is True else ("float32" if _bf16_ok is False else "n/a")
+                    try:
+                        import comfy_kitchen as _ck
+                        _decode_avail = bool(_ck.flash_attention_decode_is_available(_dev)) if embeds is not None else False
+                    except Exception:
+                        _decode_avail = False
+                    print(
+                        f"[v2.llm_generate_dtype] device={_dev} embeds_dtype={embeds.dtype if embeds is not None else 'n/a'} "
+                        f"should_use_bf16={_bf16_ok} execution_dtype={_exp} "
+                        f"kitchen_flash_decode_available={_decode_avail}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                _patched_llm_generate._dtype_logged = True
+            return _orig_llm_generate(self, embeds=embeds, *args, **kwargs)
+
+        _BaseGenerate.generate = _patched_llm_generate
+
     # ── 5. PromptExecutor.execute_async ────────────────────────────────
     _prompt_executor_cls = getattr(_execution, "PromptExecutor", None)
     _orig_exec_async = getattr(_prompt_executor_cls, "execute_async", None) if _prompt_executor_cls is not None else None
