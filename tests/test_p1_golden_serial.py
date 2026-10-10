@@ -3598,3 +3598,75 @@ def test_build_quant_fp8_plan_rejections():
             [("blk.a.weight", "F8_E4M3", (8, 8), 0, 64),
              ("blk.a.scale_weight", "F32", (1,), 64, 68),
              ("blk.a.comfy_quant", "U8", (8,), 68, 76)], _quant_meta())
+
+
+# ── UNET quant metadata normalization + detection ordering (Unit 2) ──
+
+def test_unet_quant_normalize_strips_prefix():
+    layers = {"diffusion_model.blk.a": {"format": "float8_e4m3fn"},
+              "diffusion_model.blk.b": {"format": "float8_e5m2"}}
+    out = gs.normalize_quant_metadata_layers(layers, "diffusion_model.")
+    assert out == {"blk.a": {"format": "float8_e4m3fn"},
+                   "blk.b": {"format": "float8_e5m2"}}
+
+
+def test_unet_quant_normalize_rejections():
+    with pytest.raises(RuntimeError, match="unet_quant_metadata_normalize_invalid"):
+        gs.normalize_quant_metadata_layers({}, "")
+    with pytest.raises(RuntimeError, match="unet_quant_metadata_normalize_collision"):
+        gs.normalize_quant_metadata_layers({"a.x": {}, "x": {}}, "a.")
+
+
+def _unet_quant_det_fakes():
+    calls = []
+
+    def fake_quant(sd, prefix="", metadata=None):
+        calls.append((sorted(sd.keys()), metadata))
+        return dict(sd), dict(metadata or {}) if isinstance(metadata, dict) else {}
+
+    def fake_prefix(sd):
+        return "diffusion_model."
+
+    def fake_strip(sd, mapping, filter_keys=True):
+        out = {}
+        for k, v in sd.items():
+            nk = k
+            for pre, rep in (mapping or {}).items():
+                if pre and k.startswith(pre):
+                    nk = rep + k[len(pre):]
+            out[nk] = v
+        return out
+
+    return calls, fake_quant, fake_prefix, fake_strip
+
+
+def test_unet_quant_detection_input_ordering():
+    calls, fake_quant, fake_prefix, fake_strip = _unet_quant_det_fakes()
+    plan = {"kind": "scaled_fp8",
+            "quant_layers": {"l.a": {"format": "float8_e4m3fn",
+                                     "descriptor": {"format": "float8_e4m3fn"}}}}
+    sd, out_meta, prefix = gs._quant_detection_input(
+        {"a": 1, "diffusion_model.b": 2, "s.scale_input": 3},
+        {"m": 1}, fake_prefix, fake_strip, fake_quant,
+        source_plan=plan)
+    assert prefix == "diffusion_model."
+    assert sd["s.scale_input"] == 3
+    assert sd["a"] == 1 and sd["b"] == 2
+    assert len(calls) == 2
+    assert calls[0][1] == {"m": 1}
+    assert json.loads(calls[1][1]["_quantization_metadata"]) == {
+        "layers": {"l.a": {"format": "float8_e4m3fn"}}}
+
+
+def test_unet_native_detection_input_dispatch():
+    calls, fake_quant, fake_prefix, fake_strip = _unet_quant_det_fakes()
+    plan = {"kind": "scaled_fp8", "quant_layers": {}}
+    out = gs._native_detection_input(
+        {"a": 1}, {"m": 0}, fake_prefix, fake_strip, fake_quant,
+        source_plan=plan)
+    assert out[2] == "diffusion_model."
+    calls.clear()
+    out2 = gs._native_detection_input(
+        {"a": 1}, {"m": 0}, fake_prefix, fake_strip, fake_quant)
+    assert out2[2] == "diffusion_model."
+    assert len(calls) == 2

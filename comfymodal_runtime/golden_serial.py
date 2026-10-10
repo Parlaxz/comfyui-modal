@@ -12148,6 +12148,37 @@ def parse_unet_quant_metadata(metadata: Any) -> dict[str, dict[str, Any]]:
     return normalized
 
 
+def normalize_quant_metadata_layers(plan_layers: Any, prefix: Any) -> dict[str, dict[str, Any]]:
+    """Normalize validated quant layer names into the stripped namespace.
+
+    Pure logic: strips the detected model prefix from validated layer
+    names (same rule as transport dictionary processing) so the second
+    upstream conversion attaches markers where the ops loaders read
+    them.  Requires a bijection (collision/empty results reject loudly).
+    Returns a NEW dict; the input is untouched.  Raises RuntimeError.
+    """
+    if not isinstance(plan_layers, dict) or not plan_layers:
+        raise RuntimeError("unet_quant_metadata_normalize_invalid")
+    prefix_str = str(prefix or "")
+    normalized: dict[str, dict[str, Any]] = {}
+    for layer, descriptor in plan_layers.items():
+        if not isinstance(layer, str) or not layer:
+            raise RuntimeError("unet_quant_metadata_normalize_invalid:layer_name")
+        if not isinstance(descriptor, dict):
+            raise RuntimeError(f"unet_quant_metadata_normalize_invalid:{layer}")
+        stripped = (
+            layer[len(prefix_str):]
+            if prefix_str and layer.startswith(prefix_str)
+            else layer
+        )
+        if not stripped:
+            raise RuntimeError(f"unet_quant_metadata_normalize_empty:{layer}")
+        if stripped in normalized:
+            raise RuntimeError(f"unet_quant_metadata_normalize_collision:{stripped}")
+        normalized[stripped] = dict(descriptor)
+    return normalized
+
+
 def build_quant_fp8_plan(entries: Any, metadata: Any) -> dict[str, Any]:
     """Build a metadata-defined scaled-FP8 source plan (pure logic).
 
@@ -13772,10 +13803,27 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
 # ── UNET construction helpers (R42-derived, fail-closed) ──────────────────
 
 
-def _native_detection_input(base_sd: dict, base_meta: Any, prefix_fn, strip_fn, quant_fn=None):
+def _native_detection_input(base_sd: dict, base_meta: Any, prefix_fn, strip_fn, quant_fn=None, *, source_plan: Any = None):
     """EXACT input parity with comfy.sd.load_diffusion_model_state_dict:
     convert_old_quants -> unet_prefix_from_state_dict ->
-    state_dict_prefix_replace(filter_keys=True) applied ONLY when non-empty."""
+    state_dict_prefix_replace(filter_keys=True) applied ONLY when non-empty.
+
+    Quant-plan branch (``source_plan`` with ``kind == "scaled_fp8"``):
+    same order, but the second conversion uses prefix-normalized
+    metadata (so markers attach where the ops loaders read them), and
+    ``.scale_input`` entries are set aside around both conversions:
+    upstream ``convert_old_quants`` calls ``.item()`` on scale values,
+    which has no meaning for meta tensors (detection input).  The
+    asides are reinserted verbatim afterwards; the real (non-meta)
+    adoption path keeps exact native semantics.  When ``source_plan``
+    is absent (or not a scaled_fp8 plan) the body below is byte-for-byte
+    the historical behavior.
+    """
+    if isinstance(source_plan, dict) and source_plan.get("kind") == "scaled_fp8":
+        return _quant_detection_input(
+            base_sd, base_meta, prefix_fn, strip_fn, quant_fn,
+            source_plan=source_plan,
+        )
     detect_sd = dict(base_sd)
     detect_meta = base_meta
     if callable(quant_fn):
@@ -13789,6 +13837,75 @@ def _native_detection_input(base_sd: dict, base_meta: Any, prefix_fn, strip_fn, 
         if callable(quant_fn):
             detect_sd, detect_meta = quant_fn(detect_sd, "", metadata=detect_meta)
     return detect_sd, detect_meta, prefix
+
+
+def _quant_detection_input(base_sd: dict, base_meta: Any, prefix_fn, strip_fn, quant_fn, *, source_plan: dict) -> tuple[dict, Any, str]:
+    """Quant-plan detection input: normalized-metadata double conversion.
+
+    Operates on a shallow meta-state copy; never mutates the caller dict.
+    ``.scale_input`` entries are set aside around both upstream
+    conversions (their ``.item()`` value check is meaningless on meta
+    tensors) and reinserted verbatim.  Normalized metadata (stripped
+    layer namespace) drives the second conversion; collisions reject
+    loudly.  Raises RuntimeError with an explicit reason on any defect.
+    """
+    try:
+        working = dict(base_sd)
+    except Exception:
+        raise RuntimeError("unet_quant_detection_input_invalid")
+    asides: dict[str, Any] = {}
+    for key in list(working.keys()):
+        if isinstance(key, str) and key.endswith(".scale_input"):
+            asides[key] = working.pop(key)
+    detect_meta = base_meta
+    if callable(quant_fn):
+        try:
+            working, detect_meta = quant_fn(dict(working), "", metadata=detect_meta)
+        except Exception as exc:
+            raise RuntimeError(f"unet_quant_detection_convert_first:{type(exc).__name__}")
+    try:
+        prefix = prefix_fn(working)
+    except Exception as exc:
+        raise RuntimeError(f"unet_quant_detection_prefix:{type(exc).__name__}")
+    try:
+        temp = strip_fn(dict(working), {prefix: ""}, filter_keys=True)
+    except Exception as exc:
+        raise RuntimeError(f"unet_quant_detection_strip:{type(exc).__name__}")
+    if len(temp) > 0:
+        working = temp
+        try:
+            quant_layers = source_plan.get("quant_layers", {})
+            layer_descriptors = {
+                layer: info.get("descriptor", {})
+                for layer, info in quant_layers.items()
+                if isinstance(info, dict)
+            }
+            normalized_layers = normalize_quant_metadata_layers(
+                layer_descriptors if layer_descriptors else source_plan.get("quant_layers", {}),
+                prefix,
+            )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"unet_quant_detection_normalize:{type(exc).__name__}")
+        try:
+            import json as _json
+
+            normalized_meta = dict(detect_meta) if isinstance(detect_meta, dict) else {}
+            normalized_meta["_quantization_metadata"] = _json.dumps({"layers": normalized_layers})
+        except Exception:
+            raise RuntimeError("unet_quant_detection_metadata_encode")
+        if callable(quant_fn):
+            try:
+                working, detect_meta = quant_fn(dict(working), "", metadata=normalized_meta)
+            except Exception as exc:
+                raise RuntimeError(f"unet_quant_detection_convert_second:{type(exc).__name__}")
+            detect_meta = normalized_meta
+    for key, value in asides.items():
+        if key in working:
+            raise RuntimeError(f"unet_quant_detection_aside_collision:{key}")
+        working[key] = value
+    return working, detect_meta, prefix
 
 
 def validate_unet_binding(
