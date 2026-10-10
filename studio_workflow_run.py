@@ -544,6 +544,18 @@ def merge_workflow_controls(
             # against the live allowed basename ``name`` before the workflow
             # can reach the loader normalizer.
             value = _normalize_model_name(value)
+        if (
+            isinstance(value, str)
+            and not _is_numeric(value)
+            and isinstance(entry, dict)
+            and str(entry.get("control_kind") or "") in ("number", "integer")
+        ):
+            # A non-numeric string can never be a legitimate value from our
+            # own numeric controls — it is stale UI state (e.g. a
+            # control_after_generate token surfacing as a numeric control).
+            # ComfyUI would choke on it deep inside sampling, so drop the
+            # override and let the graph-derived default win instead.
+            continue
         merged[key] = value
 
     errors: list[dict[str, str]] = validate_workflow_controls(merged, control_schema)

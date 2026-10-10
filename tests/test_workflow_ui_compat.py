@@ -169,3 +169,33 @@ def test_required_image_is_only_hydrated_from_explicit_schema_default(monkeypatc
         {}, {}, {"source_image": {"required": True}},
     )["errors"]
     assert {item["input"] for item in evidence["hydrated"]} == {"filename_prefix"}
+
+
+def test_stale_string_override_for_number_control_falls_back_to_default():
+    schema = {
+        "cfg_scale": {
+            "node_id": "163",
+            "input_name": "cfg",
+            "control_kind": "number",
+        },
+    }
+    merged = swr.merge_workflow_controls(
+        {"cfg_scale": 8.0}, {"cfg_scale": "fixed"}, schema,
+    )
+    assert merged["errors"] == []
+    assert merged["values"]["cfg_scale"] == 8.0
+
+
+def test_numeric_string_override_for_number_control_preserved_verbatim():
+    schema = {
+        "cfg_scale": {
+            "node_id": "163",
+            "input_name": "cfg",
+            "control_kind": "number",
+        },
+    }
+    merged = swr.merge_workflow_controls(
+        {"cfg_scale": 8.0}, {"cfg_scale": "7.5"}, schema,
+    )
+    assert merged["errors"] == []
+    assert merged["values"]["cfg_scale"] == "7.5"
