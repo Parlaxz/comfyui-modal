@@ -16750,11 +16750,24 @@ class ModalRuntimeEntrypoint:
                 "reason": _quiesce_outcome.get("reason", ""),
             })
             execute_async = getattr(executor, "execute_async", None)
+            # Materialization contract: the plan's declared output nodes must
+            # execute, otherwise collection is guaranteed to fail. Upstream
+            # only enqueues execute_outputs (+ ancestors); validation-derived
+            # outputs can omit custom output nodes (e.g. third-party preview
+            # nodes), so union the plan's authoritative output ids. No-op when
+            # they are already included (canonical runs).
+            try:
+                _plan_output_ids = [str(v) for v in (plan.output_node_ids or [])]
+            except Exception:
+                _plan_output_ids = []
+            _execute_outputs = list(dict.fromkeys(
+                [str(v) for v in (outputs_to_execute or [])] + _plan_output_ids
+            ))
             execute_kwargs = {
                 "prompt": workflow,
                 "prompt_id": prompt_id,
                 "extra_data": {"client_id": prompt_id},
-                "execute_outputs": outputs_to_execute,
+                "execute_outputs": _execute_outputs,
             }
             # â”€â”€ Build node-ID â†’ class_type map â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _node_class_map: dict[str, str] = {}
