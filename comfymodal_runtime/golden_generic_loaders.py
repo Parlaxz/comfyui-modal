@@ -330,7 +330,15 @@ async def compose_generic_clip_load_stage(
         setattr(session, "source_policy", "legacy_qd")
         # The stage reads full paths from the session (same as canonical).
         session.clip_paths = list(resolved)
-        clip = await golden_clip_load(session)
+        # QD publication must produce ordinary mutable tensors: the executor
+        # runs under inference mode, and the legacy transport plus the
+        # assign=True adoption perform in-place updates that inference
+        # tensors forbid.  Mirrors the clip_qd_reader publication boundary
+        # (same requirement, same guard).  Stage-local only.
+        import torch as _torch
+
+        with _torch.inference_mode(False):
+            clip = await golden_clip_load(session)
         owners = list(getattr(session, "clip_owners", None) or [])
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
         return {
@@ -485,7 +493,12 @@ async def compose_generic_unet_load(
             volume=volume,
         )
         session.model_paths = {"unet": path}
-        patcher = await golden_unet_load(session)
+        # Same inference-mode guard as the CLIP stage path: ordinary mutable
+        # tensors for transport publication and assign=True adoption.
+        import torch as _torch_unet
+
+        with _torch_unet.inference_mode(False):
+            patcher = await golden_unet_load(session)
         owners = [
             o for o in [getattr(session, "unet_owner", None)]
             if o is not None
@@ -548,7 +561,12 @@ async def compose_generic_vae_load(
             volume=volume,
         )
         session.model_paths = {"vae": path}
-        vae = await golden_vae_load(session)
+        # Same inference-mode guard as the CLIP stage path: ordinary mutable
+        # tensors for transport publication and assign=True adoption.
+        import torch as _torch_vae
+
+        with _torch_vae.inference_mode(False):
+            vae = await golden_vae_load(session)
         owners = [
             o for o in [getattr(session, "vae_owner", None)]
             if o is not None
