@@ -17773,9 +17773,20 @@ class ModalRuntimeEntrypoint:
                         + (f"({a.error})" if a.error else "")
                         for a in attempts
                     )[:300]
+                    try:
+                        _hist_entry = (history.get(prompt_id, {}) or {})
+                        _hist_outputs = _hist_entry.get("outputs", {}) or {}
+                        _hist_keys = sorted(str(k) for k in _hist_outputs.keys())[:8] \
+                            if isinstance(_hist_outputs, dict) else []
+                    except Exception:
+                        _hist_keys = []
+                    _want_ids = [str(v) for v in list(output_node_ids or [])[:4]]
+                    _diag = (
+                        (f" [chain: {_chain_detail}]" if _chain_detail else "")
+                        + f" [want={_want_ids} hist_nodes={_hist_keys}]"
+                    )
                     raise RuntimeError(
-                        "v2 production execution produced no materializable output"
-                        + (f" [chain: {_chain_detail}]" if _chain_detail else "")
+                        "v2 production execution produced no materializable output" + _diag
                     )
                 selected = Attempt(strategy="none", success=False, error="no output")
             _raw_output_format = legacy_options.get("output_format", "original")
