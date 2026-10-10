@@ -356,6 +356,14 @@ def _parse_type_spec(spec: Any) -> tuple[str, dict[str, Any]]:
     if isinstance(spec, (list, tuple)):
         if not spec:
             return "", {}
+        if (
+            len(spec) == 2
+            and isinstance(spec[0], (list, tuple))
+            and isinstance(spec[1], dict)
+        ):
+            options = dict(spec[1])
+            options.setdefault("enum", list(spec[0]))
+            return "ENUM", options
         if isinstance(spec[0], str) and len(spec) == 2 and isinstance(spec[1], dict):
             return spec[0], dict(spec[1])
         if len(spec) == 1 and isinstance(spec[0], str):
@@ -833,6 +841,14 @@ def ui_graph_to_api_prompt(
                         ui_entry = ui_by_name.get(input_name)
                         link = ui_entry.get("link") if isinstance(ui_entry, dict) else None
                         if link is not None and isinstance(ui_entry, dict):
+                            # ComfyUI retains a widget value even after that
+                            # input is linked (e.g. KSampler seed). Consume it
+                            # to preserve positional widget alignment, but keep
+                            # the graph link authoritative in the API prompt.
+                            if "widget" in ui_entry:
+                                _next_widget()
+                            if options.get("control_after_generate"):
+                                _next_widget()
                             # Linked slot: resolve origin via slot index.
                             slot = next(
                                 (s for s, e in ui_by_slot.items() if e is ui_entry),
@@ -845,6 +861,8 @@ def ui_graph_to_api_prompt(
                                 inputs[input_name] = None
                         elif _is_widget_input(ui_entry, type_name, options):
                             inputs[input_name] = _next_widget()
+                            if options.get("control_after_generate"):
+                                _next_widget()
                         else:
                             inputs[input_name] = None
 

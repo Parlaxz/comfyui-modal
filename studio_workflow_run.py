@@ -684,8 +684,19 @@ def build_workflow_execution_plan(
         )
         from workflow_metadata import extract_model_stack, prompt_sha256
 
+        executable_prompt = bundle["executable_prompt"]
+        try:
+            from studio_domain.graph import is_ui_workflow_format, ui_graph_to_api_prompt
+
+            graph_json = (bundle.get("version") or {}).get("graph_json")
+            if is_ui_workflow_format(graph_json):
+                regenerated = ui_graph_to_api_prompt(graph_json)
+                if regenerated:
+                    executable_prompt = regenerated
+        except Exception:
+            pass
         applied = apply_workflow_values_to_prompt(
-            bundle["executable_prompt"], bundle["control_schema"], values
+            executable_prompt, bundle["control_schema"], values
         )
         if "error" in applied:
             return None, applied["error"]
