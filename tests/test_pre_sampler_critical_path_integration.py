@@ -2669,3 +2669,152 @@ class TestStructuredReportTotals:
         assert report.get("non_overlapping_measured_total") == 1000.0, (
             f"expected non_overlapping_measured_total=1000.0, got {report.get('non_overlapping_measured_total')}"
         )
+
+
+class _FakeBaseGenerate:
+    """Signature-compatible stand-in for comfy.text_encoders.llama.BaseGenerate."""
+
+    def __init__(self):
+        self.calls = []
+
+    def generate(self, embeds=None, do_sample=True, max_length=256,
+                 temperature=1.0, top_k=50, top_p=1.0, min_p=0.0,
+                 repetition_penalty=1.0, seed=0, **kwargs):
+        self.calls.append({
+            "embeds": embeds, "do_sample": do_sample, "max_length": max_length,
+            "temperature": temperature, "top_k": top_k, "top_p": top_p,
+            "min_p": min_p, "repetition_penalty": repetition_penalty,
+            "seed": seed, "kwargs": dict(kwargs),
+        })
+        return ("fake-generated", embeds)
+
+
+_fake_orig_generate = _FakeBaseGenerate.generate
+
+
+@pytest.fixture()
+def _llama_generate_hook():
+    """Stub comfy.text_encoders.llama, install hooks, and fully clean up.
+
+    Restores the fake method explicitly (the uninstaller does not cover
+    this hook), pops the install record so reinstalls work, and removes
+    the stub modules. Never leaks wrapper state into other tests.
+    """
+    import sys as _sys
+    import types as _types
+
+    from comfymodal_runtime import runtime_executor as _re
+
+    _ensure_comfyui_stubs()
+    saved_pkg = _sys.modules.get("comfy.text_encoders")
+    saved_mod = _sys.modules.get("comfy.text_encoders.llama")
+    _comfy_mod = _sys.modules.get("comfy")
+    had_parent_attr = hasattr(_comfy_mod, "text_encoders")
+    saved_parent_attr = getattr(_comfy_mod, "text_encoders", None)
+    had_entry = "BaseGenerate.generate" in _re._ORIGINAL_FUNCTIONS
+    saved_entry = _re._ORIGINAL_FUNCTIONS.get("BaseGenerate.generate")
+    pkg = _types.ModuleType("comfy.text_encoders")
+    pkg.__path__ = []
+    mod = _types.ModuleType("comfy.text_encoders.llama")
+    mod.BaseGenerate = _FakeBaseGenerate
+    pkg.llama = mod
+    _sys.modules["comfy.text_encoders"] = pkg
+    _sys.modules["comfy.text_encoders.llama"] = mod
+    setattr(_comfy_mod, "text_encoders", pkg)
+    try:
+        yield _FakeBaseGenerate
+    finally:
+        _FakeBaseGenerate.generate = _fake_orig_generate
+        if had_entry:
+            _re._ORIGINAL_FUNCTIONS["BaseGenerate.generate"] = saved_entry
+        else:
+            _re._ORIGINAL_FUNCTIONS.pop("BaseGenerate.generate", None)
+        if saved_pkg is None:
+            _sys.modules.pop("comfy.text_encoders", None)
+        else:
+            _sys.modules["comfy.text_encoders"] = saved_pkg
+        if saved_mod is None:
+            _sys.modules.pop("comfy.text_encoders.llama", None)
+        else:
+            _sys.modules["comfy.text_encoders.llama"] = saved_mod
+        if had_parent_attr:
+            setattr(_sys.modules["comfy"], "text_encoders", saved_parent_attr)
+        else:
+            try:
+                delattr(_sys.modules["comfy"], "text_encoders")
+            except Exception:
+                pass
+
+
+@pytest.mark.fast_unit
+class TestLlmGenerateForwarding:
+    """BaseGenerate.generate wrapper must preserve positional arguments.
+
+    Regression contract for the duplicate-``embeds`` failure: the runtime
+    instrumentation wrapper consumed the positional embedding argument and
+    re-forwarded it by keyword, shifting every other positional left and
+    raising ``got multiple values for argument 'embeds'`` on the exact
+    upstream Qwen3VL positional call shape.
+    """
+
+    def test_positional_qwen3vl_shape(self, _llama_generate_hook):
+        fake_cls = _llama_generate_hook
+        embeds = object()
+        state: dict[str, Any] = {}
+        with pre_sampler_instrumentation_scope(state):
+            install_pre_sampler_hooks()
+            inst = fake_cls()
+            result = inst.generate(
+                embeds, False, 512, 0.7, 64, 0.95, 0.05, 1.05, 5,
+                presence_penalty=0.0, position_ids=None,
+                visual_pos_masks=None, deepstack_embeds=None,
+            )
+        assert result[0] == "fake-generated"
+        assert result[1] is embeds
+        assert len(inst.calls) == 1
+        call = inst.calls[0]
+        assert call["embeds"] is embeds
+        assert call["do_sample"] is False
+        assert call["max_length"] == 512
+        assert call["temperature"] == 0.7
+        assert call["top_k"] == 64
+        assert call["top_p"] == 0.95
+        assert call["min_p"] == 0.05
+        assert call["repetition_penalty"] == 1.05
+        assert call["seed"] == 5
+        assert call["kwargs"]["presence_penalty"] == 0.0
+        assert call["kwargs"]["position_ids"] is None
+        assert call["kwargs"]["visual_pos_masks"] is None
+        assert call["kwargs"]["deepstack_embeds"] is None
+
+    def test_keyword_embeds(self, _llama_generate_hook):
+        fake_cls = _llama_generate_hook
+        embeds = object()
+        state: dict[str, Any] = {}
+        with pre_sampler_instrumentation_scope(state):
+            install_pre_sampler_hooks()
+            inst = fake_cls()
+            result = inst.generate(embeds=embeds, do_sample=False, max_length=128)
+        assert result[1] is embeds
+        assert len(inst.calls) == 1
+        call = inst.calls[0]
+        assert call["embeds"] is embeds
+        assert call["do_sample"] is False
+        assert call["max_length"] == 128
+
+    def test_defaults_and_extra_kwargs(self, _llama_generate_hook):
+        fake_cls = _llama_generate_hook
+        embeds = object()
+        state: dict[str, Any] = {}
+        with pre_sampler_instrumentation_scope(state):
+            install_pre_sampler_hooks()
+            inst = fake_cls()
+            result = inst.generate()
+            assert result == ("fake-generated", None)
+            call = inst.calls[0]
+            assert call["embeds"] is None
+            assert call["do_sample"] is True
+            assert call["max_length"] == 256
+            result2 = inst.generate(embeds, position_ids="p1")
+        assert result2[1] is embeds
+        assert inst.calls[1]["kwargs"] == {"position_ids": "p1"}

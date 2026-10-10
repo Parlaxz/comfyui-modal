@@ -2921,7 +2921,7 @@ def install_pre_sampler_hooks() -> None:
                 except Exception:
                     pass
                 _patched_llm_generate._dtype_logged = True
-            return _orig_llm_generate(self, embeds=embeds, *args, **kwargs)
+            return _orig_llm_generate(self, embeds, *args, **kwargs)
 
         _BaseGenerate.generate = _patched_llm_generate
 
