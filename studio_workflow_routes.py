@@ -593,6 +593,29 @@ def register_workflow_routes(
                 for entry in mapping.get("entries") or []:
                     if isinstance(entry, dict) and entry.get("semantic_role"):
                         control_schema[str(entry["semantic_role"])] = entry
+            # Serve the graph-regenerated executable prompt (when the version
+            # carries a UI graph) so frontend control defaults come from the
+            # same current values the run path executes. The stored version
+            # record is never mutated; this only affects the response copy.
+            # Runnable UI-graph versions whose stored prompt has stale widget
+            # values would otherwise poison UI defaults (e.g. a stale
+            # control_after_generate value surfacing as a numeric control).
+            if version_id and isinstance(version, dict):
+                try:
+                    from studio_workflow_run import (
+                        resolve_workflow_run_bundle as _resolve_run_bundle,
+                    )
+                    _bundle = _resolve_run_bundle(
+                        wf_id, version_id, node_dir,
+                        remote_model_readiness=True,
+                    )
+                except Exception:
+                    _bundle = None
+                if isinstance(_bundle, dict) and _bundle.get("status") == "ok":
+                    version = copy.deepcopy(version)
+                    version["executable_prompt"] = (
+                        _bundle.get("executable_prompt") or {}
+                    )
             return web.json_response({
                 "status": "ok",
                 "workflow": workflow,
