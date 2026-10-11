@@ -390,6 +390,12 @@ async def compose_generic_clip_load_stage(
         with _torch.inference_mode(False):
             clip = await golden_clip_load(session)
         owners = list(getattr(session, "clip_owners", None) or [])
+        # Post-construction de-quant walk (same as the QD4 arm): drops _v
+        # offload-view markers that crash the low-VRAM gather path on
+        # quantized-storage / wider-compute layers, and normalizes
+        # hostile-shape quantized linears.  Operates on OUR object only.
+        _stage_layer_report = force_plain_hostile_linears(
+            clip, tag="stage-clip")
         _log_clip_placement("stage", clip)
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
         return {
@@ -400,6 +406,7 @@ async def compose_generic_clip_load_stage(
             "elapsed_ms": elapsed_ms,
             "reason": "",
             "source_arm": "golden_clip",
+            "fp8_layer_dequant": _stage_layer_report,
         }
     except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
