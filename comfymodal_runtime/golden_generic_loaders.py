@@ -589,6 +589,13 @@ async def compose_generic_unet_load_qd(
         except Exception:
             file_metadata = {}
         t_prep_ns = time.monotonic_ns()
+        # Selective FP8->BF16 upcast (generic shape rule): hostile-shape FP8
+        # weights become plain BF16 BEFORE the loader's internal
+        # convert_old_quants, and the metadata copy is scrubbed of them so
+        # no descriptor is re-attached.  Aligned FP8 stays native.
+        _install_fp8_fallback_log_guard()
+        sd, file_metadata, fp8_upcast_report = selective_fp8_bf16_upcast(
+            sd, file_metadata)
         vram_ok, vram_detail = _ensure_stage_dynamic_vram(None, request_id)
         if not vram_ok:
             elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
@@ -635,6 +642,7 @@ async def compose_generic_unet_load_qd(
             "reason": "",
             "source_arm": "qd_unet_demand",
             "phases": phases,
+            "fp8_selective_upcast": fp8_upcast_report,
         }
     except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
@@ -873,6 +881,237 @@ def _cpu_native_quant_markers(state_dict: Any) -> Any:
         return state_dict
 
 
+# cuBLAS FP8 GEMM requires 16-element alignment on the logical M/N/K dims.
+# Model files pin static weight shapes, so any FP8 weight whose static
+# (out, in) dims break alignment fails EVERY cuBLAS FP8 attempt at runtime
+# (observed live: n in {3396, 283, 4379} -> CUBLAS_STATUS_NOT_SUPPORTED ->
+# per-op dequant fallback, hundreds of times per sample).  The batch dim M
+# is dynamic per run and cannot be covered at load; N/K are static and can.
+_FP8_GEMM_ALIGN = 16
+_FP8_SELECTIVE_UPCAST_ENV = "COMFYMODAL_V2_FP8_SELECTIVE_UPCAST"
+_FP8_DTYPES = ("float8_e4m3fn", "float8_e5m2")
+_FP8_QUANT_SUFFIXES = (".comfy_quant", ".weight_scale", ".input_scale",
+                       ".scale_weight", ".scale_input")
+
+_fp8_log_guard_installed = False
+_fp8_log_guard_drops = 0
+
+
+def _fp8_native_shape_ok(shape: Any) -> bool:
+    """True when static GEMM dims satisfy cuBLAS FP8 alignment (pure logic).
+
+    Generic shape rule only: Linear/Conv weight layout ``(out, in, ...)``
+    needs ``out % 16 == 0 and in % 16 == 0``.  Anything unknown or
+    non-matrix (biases, norms) returns True so the caller leaves it
+    untouched (fail-safe direction).  Never raises.
+    """
+    try:
+        dims = tuple(int(d) for d in (shape or ()))
+    except Exception:
+        return True
+    if len(dims) < 2:
+        return True
+    try:
+        n, k = dims[0], dims[1]
+    except Exception:
+        return True
+    if n <= 0 or k <= 0:
+        return True
+    return (n % _FP8_GEMM_ALIGN == 0) and (k % _FP8_GEMM_ALIGN == 0)
+
+
+def _is_fp8_weight_tensor(key: Any, tensor: Any) -> bool:
+    """True for upcast-candidate weights: ``*.weight``, ndim>=2, FP8 dtype."""
+    try:
+        if not str(key or "").endswith(".weight"):
+            return False
+        if "float8" not in str(getattr(tensor, "dtype", "")).lower():
+            return False
+        shape = getattr(tensor, "shape", None)
+        return shape is not None and len(tuple(shape)) >= 2
+    except Exception:
+        return False
+
+
+def selective_fp8_bf16_upcast(
+    state_dict: Any,
+    metadata: Any = None,
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Upcast cuBLAS-hostile FP8 weights to BF16 at load (generic, shape-ruled).
+
+    For every FP8 ``*.weight`` whose static shape fails
+    :func:`_fp8_native_shape_ok`, folds its scale in
+    (``weight.to(bf16) * scale``) and drops ALL of its quant artifacts
+    (descriptors + scales, both modern and legacy key schemes) so downstream
+    loaders bind a plain BF16 linear.  Aligned FP8 weights pass through
+    untouched and keep native FP8 execution.  The file's
+    ``_quantization_metadata`` copy is scrubbed of upcast layers so loaders
+    that attach descriptors internally (diffusion path) cannot re-quantize
+    them.  A layer is committed ONLY when fully neutralized (no quant keys
+    remain in-sd AND no metadata entry remains); otherwise it is reverted to
+    its original FP8 tensors.  File-agnostic: no filenames, no model lists.
+
+    Returns ``(sd, metadata, report)``.  Never raises.
+    """
+    report: dict[str, Any] = {
+        "enabled": False, "upcast_count": 0, "upcast_bytes": 0,
+        "reverted": [], "skipped": [], "elapsed_ms": 0.0,
+    }
+    started_ns = time.monotonic_ns()
+    try:
+        if str(os.environ.get(_FP8_SELECTIVE_UPCAST_ENV, "1")).strip() != "1":
+            report["elapsed_ms"] = (
+                (time.monotonic_ns() - started_ns) / 1_000_000.0)
+            return state_dict, metadata, report
+        if not isinstance(state_dict, dict):
+            report["skipped"].append("state_dict_not_dict")
+            report["elapsed_ms"] = (
+                (time.monotonic_ns() - started_ns) / 1_000_000.0)
+            return state_dict, metadata, report
+        import torch as _torch_upcast
+
+        layers_meta: Any = None
+        meta_copy = dict(metadata) if isinstance(metadata, dict) else {}
+        try:
+            raw = meta_copy.get("_quantization_metadata")
+            if isinstance(raw, str) and raw:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and isinstance(
+                        parsed.get("layers"), dict):
+                    layers_meta = dict(parsed["layers"])
+        except Exception:
+            layers_meta = None
+        upcast_prefixes: list[str] = []
+        committed: list[tuple[str, dict[str, Any]]] = []
+        for key in list(state_dict.keys()):
+            tensor = state_dict.get(key)
+            if not _is_fp8_weight_tensor(key, tensor):
+                continue
+            try:
+                shape = tuple(int(d) for d in tuple(tensor.shape))
+            except Exception:
+                report["skipped"].append(f"{key}:shape unreadable")
+                continue
+            if _fp8_native_shape_ok(shape):
+                continue
+            prefix = str(key)[: -len(".weight")]
+            scale = None
+            for suffix in (".weight_scale", ".scale_weight"):
+                candidate = state_dict.get(prefix + suffix)
+                if candidate is not None:
+                    scale = candidate
+                    break
+            saved: dict[str, Any] = {key: tensor}
+            for suffix in _FP8_QUANT_SUFFIXES:
+                qkey = prefix + suffix
+                if qkey in state_dict:
+                    saved[qkey] = state_dict[qkey]
+            try:
+                w = tensor.to(_torch_upcast.bfloat16)
+                if scale is not None:
+                    s = scale.to(device=w.device,
+                                 dtype=_torch_upcast.bfloat16)
+                    w = w * s
+                state_dict[key] = w
+                for suffix in _FP8_QUANT_SUFFIXES:
+                    state_dict.pop(prefix + suffix, None)
+            except Exception as exc:
+                for qkey, original in saved.items():
+                    try:
+                        state_dict[qkey] = original
+                    except Exception:
+                        pass
+                report["skipped"].append(f"{key}:{type(exc).__name__}")
+                continue
+            residual = [qkey for qkey in state_dict
+                        if str(qkey).startswith(prefix)
+                        and any(str(qkey).endswith(s)
+                                for s in _FP8_QUANT_SUFFIXES)]
+            if residual:
+                for qkey, original in saved.items():
+                    try:
+                        state_dict[qkey] = original
+                    except Exception:
+                        pass
+                report["reverted"].append(
+                    f"{key}:residual={len(residual)}")
+                continue
+            try:
+                committed.append((prefix, saved))
+                upcast_prefixes.append(prefix)
+                report["upcast_count"] += 1
+                report["upcast_bytes"] += int(tensor.nelement())
+            except Exception:
+                pass
+        if isinstance(layers_meta, dict) and upcast_prefixes:
+            try:
+                scrubbed = {k: v for k, v in layers_meta.items()
+                            if k not in upcast_prefixes}
+                reparsed = {"layers": scrubbed}
+                meta_copy["_quantization_metadata"] = json.dumps(reparsed)
+            except Exception:
+                # Scrub failed: the loader would re-attach descriptors, so
+                # restore every committed layer instead of misbuilding.
+                for prefix, saved in committed:
+                    for qkey, original in saved.items():
+                        try:
+                            state_dict[qkey] = original
+                        except Exception:
+                            pass
+                    try:
+                        report["reverted"].append(f"{prefix}:scrub_failed")
+                    except Exception:
+                        pass
+                report["upcast_count"] = 0
+                report["upcast_bytes"] = 0
+        report["enabled"] = True
+        report["elapsed_ms"] = round(
+            (time.monotonic_ns() - started_ns) / 1_000_000.0, 1)
+        return state_dict, meta_copy, report
+    except Exception:
+        try:
+            report["elapsed_ms"] = round(
+                (time.monotonic_ns() - started_ns) / 1_000_000.0, 1)
+        except Exception:
+            pass
+        return state_dict, metadata, report
+
+
+def _install_fp8_fallback_log_guard() -> bool:
+    """Cap comfy_kitchen FP8-fallback WARNING spam (process logging only).
+
+    Attaches a counting filter to the ``comfy_kitchen.tensor.fp8`` logger:
+    the first few fallback warnings pass (residual fallbacks stay visible),
+    the rest are dropped.  No library code is touched; process-local
+    logging configuration only.  Idempotent.  Never raises.
+    """
+    global _fp8_log_guard_installed
+    if _fp8_log_guard_installed:
+        return True
+    try:
+        import logging as _logging
+
+        logger = _logging.getLogger("comfy_kitchen.tensor.fp8")
+
+        class _CapFallbackSpam(_logging.Filter):
+            def filter(self, record: Any) -> bool:
+                global _fp8_log_guard_drops
+                try:
+                    if "falling back to dequantization" in str(
+                            record.getMessage()):
+                        _fp8_log_guard_drops += 1
+                        return _fp8_log_guard_drops <= 5
+                except Exception:
+                    pass
+                return True
+
+        logger.addFilter(_CapFallbackSpam())
+        _fp8_log_guard_installed = True
+        return True
+    except Exception:
+        return False
+
+
 def _describe_safetensors_header(path: Any) -> dict[str, Any]:
     """Header-only safetensors survey (no payload read).
 
@@ -1015,6 +1254,13 @@ async def compose_generic_clip_load_qd4(
         sd, _qd_metadata = convert_old_quants(
             sd, model_prefix="", metadata=file_metadata
         )
+        # Selective FP8->BF16 upcast (generic shape rule): hostile-shape FP8
+        # weights become plain BF16 so no cuBLAS FP8 attempt can fail on
+        # them at runtime.  Descriptors were attached above, so the helper
+        # pops them with the scales.  Aligned FP8 stays native.
+        _install_fp8_fallback_log_guard()
+        sd, _upcast_metadata, fp8_upcast_report = selective_fp8_bf16_upcast(
+            sd, file_metadata)
         clip_type_obj = resolve_clip_type_shared(clip_type)
         try:
             import folder_paths
@@ -1055,6 +1301,7 @@ async def compose_generic_clip_load_qd4(
             "reason": "",
             "source_arm": "qd4_demand",
             "phases": phases,
+            "fp8_selective_upcast": fp8_upcast_report,
         }
     except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
