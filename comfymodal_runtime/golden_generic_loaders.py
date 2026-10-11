@@ -336,8 +336,10 @@ async def compose_generic_clip_load_stage(
     path_resolver: Callable[[str, str], str | None] | None = None,
     volume: Any = None,
 ) -> dict[str, Any]:
-    """Load CLIP via the SHARED ``golden_clip_load`` stage with the isolated
-    legacy QD source policy (never the M2 singleton).
+    """Load CLIP via the SHARED ``golden_clip_load`` stage with the shared
+    model transport (same selection as canonical runs: the session carries
+    no source-policy override, so an enabled shared transport serves the
+    read; every container is fresh, so no cross-run pool state exists).
 
     Same shared construction/adoption/proof as canonical runs; only the
     source-read arm differs (session-local policy, no environment toggle).
@@ -370,7 +372,10 @@ async def compose_generic_clip_load_stage(
             request_id=request_id,
             volume=volume,
         )
-        setattr(session, "source_policy", "legacy_qd")
+        # No source-policy override: the session takes the canonical
+        # transport selection (shared transport when enabled), exactly
+        # like canonical runs.  Every container is fresh, so no
+        # cross-run pool state exists to isolate from.
         vram_ok, vram_detail = _ensure_stage_dynamic_vram(None, request_id)
         if not vram_ok:
             elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
@@ -441,8 +446,8 @@ def build_generic_unet_session(
     filename with ``expected_unet_tensor_count=0`` (the supported
     derive-from-model mode for caller-selected replacement UNETs —
     same value canonical setup uses for non-canonical models), full
-    paths go on ``session.model_paths``, and the session-local source
-    policy selects the isolated legacy QD arm (never the M2 singleton).
+    paths go on ``session.model_paths``, and transport selection is
+    canonical (no source-policy override).
     No golden_serial.py changes required.
     """
     from .golden_serial import (
@@ -471,7 +476,8 @@ def build_generic_unet_session(
         volume=volume,
         contract=contract,
     )
-    setattr(session, "source_policy", "legacy_qd")
+    # No source-policy override: canonical transport selection applies,
+    # exactly like canonical runs (see the CLIP composer above).
     session.canonical_models = False
     return session
 
@@ -487,8 +493,8 @@ def build_generic_vae_session(
     """Build a REAL GoldenSession adapted for one generic VAE load.
 
     Same shape as :func:`build_generic_unet_session`: real filename on
-    the contract, full path on ``session.model_paths``, isolated legacy
-    QD source policy.  No golden_serial.py changes required.
+    the contract, full path on ``session.model_paths``, canonical
+    transport selection.  No golden_serial.py changes required.
     """
     from .golden_serial import (
         GoldenRequest,
@@ -515,7 +521,8 @@ def build_generic_vae_session(
         volume=volume,
         contract=contract,
     )
-    setattr(session, "source_policy", "legacy_qd")
+    # No source-policy override: canonical transport selection applies,
+    # exactly like canonical runs (see the CLIP composer above).
     session.canonical_models = False
     return session
 
@@ -1473,15 +1480,27 @@ def _describe_safetensors_header(path: Any) -> dict[str, Any]:
             return {"ok": False, "reason": "header_not_object"}
         histogram: dict[str, int] = {}
         scaled_keys: list[str] = []
+        quantized_keys = 0
         total = 0
         for key, info in header.items():
             if key == "__metadata__":
                 continue
             total += 1
-            dtype = str((info if isinstance(info, dict) else {}).get("dtype", "?"))
+            key_text = str(key)
+            entry = info if isinstance(info, dict) else {}
+            dtype = str(entry.get("dtype", "?"))
             histogram[dtype] = histogram.get(dtype, 0) + 1
-            if "scaled_fp8" in str(key):
-                scaled_keys.append(str(key))
+            if "scaled_fp8" in key_text:
+                scaled_keys.append(key_text)
+            if (
+                key_text.endswith(".comfy_quant")
+                or key_text.endswith(".weight_scale")
+                or key_text.endswith(".input_scale")
+                or key_text.endswith(".scale_weight")
+                or key_text.endswith(".scale_input")
+                or "scaled_fp8" in key_text
+            ):
+                quantized_keys += 1
         metadata = header.get("__metadata__") or {}
         metadata = metadata if isinstance(metadata, dict) else {}
         return {
@@ -1490,11 +1509,254 @@ def _describe_safetensors_header(path: Any) -> dict[str, Any]:
             "dtypes": histogram,
             "scaled_fp8_keys": scaled_keys[:25],
             "scaled_fp8_key_count": len(scaled_keys),
+            "quantized_key_count": quantized_keys,
             "has_quantization_metadata": "_quantization_metadata" in metadata,
             "metadata_keys": sorted(str(k) for k in metadata.keys())[:25],
         }
     except Exception as exc:  # noqa: BLE001 - survey is best-effort
         return {"ok": False, "reason": f"{type(exc).__name__}"}
+
+
+def _plain_source_native_decline(
+    *, folder: str, filename: str, source_arm: str,
+) -> dict[str, Any] | None:
+    """Decline substitution only for a proven plain model header.
+
+    Gated on the overlap switch: declining only wins when the overlap
+    machinery is active to cover the read ahead of demand; standalone it
+    merely converts an upfront stage load into deferred native
+    first-touch cost inside the sampler.  Missing or unreadable headers
+    deliberately return ``None`` so the current stage path remains the
+    safe fallback for unknown source formats.  The survey reads only the
+    safetensors length prefix and JSON header, never the payload.  Never
+    raises.
+    """
+    if not _overlap_switch_enabled():
+        return None
+    started_ns = time.monotonic_ns()
+    try:
+        path = _default_path_resolver(folder, filename)
+        if not path:
+            return None
+        details = _describe_safetensors_header(path)
+        if not isinstance(details, dict) or not details.get("ok"):
+            return None
+        dtypes = {
+            str(dtype).upper()
+            for dtype in (details.get("dtypes") or {})
+        }
+        plain_dtypes = {"BF16", "F16", "F32"}
+        if (
+            dtypes
+            and dtypes <= plain_dtypes
+            and not int(details.get("quantized_key_count") or 0)
+            and not int(details.get("scaled_fp8_key_count") or 0)
+            and not bool(details.get("has_quantization_metadata"))
+        ):
+            return {
+                "ok": False,
+                "reason": "plain_source_native_optimal",
+                "source_arm": source_arm,
+                "elapsed_ms": (time.monotonic_ns() - started_ns) / 1_000_000.0,
+            }
+    except Exception:
+        # Header failures must continue toward the existing stage behavior.
+        return None
+    return None
+
+
+def _native_torch_file_reader(path: str) -> tuple[Any, Any]:
+    """Read one model file exactly like the native loaders (lazy import)."""
+    from comfy.utils import load_torch_file as _read
+
+    return _read(path, return_metadata=True)
+
+
+def _native_unet_binder() -> tuple[Any, Any]:
+    """Native UNET constructor pair (lazy import, never modified)."""
+    from comfy.sd import load_diffusion_model as _reload
+    from comfy.sd import load_diffusion_model_state_dict as _construct
+
+    return _construct, _reload
+
+
+def _advise_sequential_source(path: str, size_bytes: int) -> dict[str, Any]:
+    """Best-effort whole-file readahead hint (advisory only, never raises).
+
+    With mmap-backed readers the payload stays on disk until first touch;
+    a WILLNEED hint lets the kernel page it in ahead of binding without
+    duplicating tensors or changing any torch semantics.  Unavailable
+    (e.g. non-POSIX platforms) or failed hints simply skip: the prepared
+    source stays valid, only the warming is lost.
+    """
+    outcome: dict[str, Any] = {
+        "status": "skipped_platform",
+        "advised_bytes": 0,
+    }
+    try:
+        advise = getattr(os, "posix_fadvise", None)
+        willneed = getattr(os, "POSIX_FADV_WILLNEED", None)
+        if advise is None or willneed is None or not callable(advise):
+            return outcome
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            advise(fd, 0, 0, willneed)
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+    except Exception as exc:  # noqa: BLE001 - advisory only
+        outcome["status"] = f"advise_failed:{type(exc).__name__}"
+        return outcome
+    outcome["status"] = "advised"
+    try:
+        outcome["advised_bytes"] = int(size_bytes or 0)
+    except Exception:
+        pass
+    return outcome
+
+
+def _prepare_generic_unet_source(
+    *,
+    folder: str,
+    filename: str,
+    path_resolver: Callable[[str, str], str | None] | None = None,
+    reader: Callable[[str], tuple[Any, Any]] | None = None,
+) -> dict[str, Any]:
+    """Prepare a UNET source for later executor-thread binding (pure IO).
+
+    Mirrors the native read half of ``UNETLoader``: resolve, stat for a
+    bind-time identity check, read via ``load_torch_file`` semantics,
+    then issue a best-effort readahead hint so a later bind faults from
+    page cache.  No tensor is constructed, no cache is touched, no
+    model-management global changes.  Never raises.
+    """
+    started_ns = time.monotonic_ns()
+
+    def _fail(reason: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "reason": str(reason),
+            "sd": None,
+            "metadata": None,
+            "path": None,
+            "size_bytes": 0,
+            "mtime_ns": 0,
+            "advise_status": "not_attempted",
+            "advised_bytes": 0,
+            "elapsed_ms": (time.monotonic_ns() - started_ns) / 1_000_000.0,
+        }
+
+    try:
+        name = str(filename or "").strip()
+        if not name:
+            return _fail("unet_filename_missing")
+        resolve = path_resolver or _default_path_resolver
+        path = resolve(str(folder or ""), name)
+        if not path:
+            return _fail(f"source_path_unresolvable:{name}")
+        try:
+            st = os.stat(path)
+            size_bytes = int(st.st_size)
+            mtime_ns = int(st.st_mtime_ns)
+        except Exception:
+            return _fail("source_stat_failed")
+        read = reader or _native_torch_file_reader
+        try:
+            sd, metadata = read(path)
+        except Exception as exc:  # noqa: BLE001 - source failure is data
+            return _fail(f"{type(exc).__name__}:{str(exc)[:120]}")
+        if not isinstance(sd, dict):
+            return _fail("source_not_mapping")
+        advise = _advise_sequential_source(path, size_bytes)
+        return {
+            "ok": True,
+            "reason": "",
+            "sd": sd,
+            "metadata": metadata,
+            "path": path,
+            "size_bytes": size_bytes,
+            "mtime_ns": mtime_ns,
+            "advise_status": str(advise.get("status") or ""),
+            "advised_bytes": int(advise.get("advised_bytes") or 0),
+            "elapsed_ms": (time.monotonic_ns() - started_ns) / 1_000_000.0,
+        }
+    except Exception as exc:  # noqa: BLE001 - prepare contract: never raise
+        return _fail(type(exc).__name__)
+
+
+def _bind_generic_unet_source(
+    *,
+    prepared: Any,
+    model_options: Mapping[str, Any] | None = None,
+    constructor: Callable[..., Any] | None = None,
+    reloader: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Bind a prepared UNET source to a real MODEL (executor thread only).
+
+    Consumes the exact ``sd`` object preparation read (no second payload
+    read by construction) through the native construction tail, then
+    stamps the identical ``cached_patcher_init`` the native loader sets
+    so downstream reload semantics match.  The source file is re-statted:
+    any size/mtime change since preparation declines instead of binding
+    stale bytes.  Never raises; failure means the caller takes the
+    established native route (which raises identically, as before).
+    """
+    started_ns = time.monotonic_ns()
+
+    def _fail(reason: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "reason": str(reason),
+            "model": None,
+            "elapsed_ms": (time.monotonic_ns() - started_ns) / 1_000_000.0,
+        }
+
+    try:
+        if not isinstance(prepared, Mapping):
+            return _fail("prepared_not_mapping")
+        sd = prepared.get("sd")
+        if not isinstance(sd, dict):
+            return _fail("prepared_sd_missing")
+        path = str(prepared.get("path") or "")
+        if not path:
+            return _fail("prepared_path_missing")
+        try:
+            st = os.stat(path)
+            if (int(st.st_size) != int(prepared.get("size_bytes") or -1)
+                    or int(st.st_mtime_ns) != int(
+                        prepared.get("mtime_ns") or -1)):
+                return _fail("source_changed")
+        except Exception:
+            return _fail("source_restat_failed")
+        options = dict(model_options or {})
+        construct, reload = (
+            (constructor, reloader)
+            if constructor is not None and reloader is not None
+            else _native_unet_binder()
+        )
+        try:
+            model = construct(
+                sd, model_options=dict(options),
+                metadata=prepared.get("metadata"))
+        except Exception as exc:  # noqa: BLE001 - construction is data
+            return _fail(f"{type(exc).__name__}:{str(exc)[:120]}")
+        if model is None:
+            return _fail("model_type_undetected")
+        try:
+            model.cached_patcher_init = (reload, (path, dict(options)))
+        except Exception:
+            return _fail("patcher_init_failed")
+        return {
+            "ok": True,
+            "reason": "",
+            "model": model,
+            "path": path,
+            "elapsed_ms": (time.monotonic_ns() - started_ns) / 1_000_000.0,
+        }
+    except Exception as exc:  # noqa: BLE001 - bind contract: never raise
+        return _fail(type(exc).__name__)
 
 
 async def compose_generic_clip_load_qd4(
@@ -1959,6 +2221,177 @@ def _invert_role_bindings(role_bindings: Any) -> dict[str, str]:
     return inverted
 
 
+_GENERIC_OVERLAP_ENV = "COMFYMODAL_V2_GENERIC_OVERLAP"
+
+_OVERLAP_FORWARD_CLASSES = frozenset({"CLIPTextEncode"})
+
+_OVERLAP_UNET_ROLES = ("unet", "model_unet")
+
+
+def _overlap_switch_enabled() -> bool:
+    """Deploy-owned switch for generic load overlap (default off)."""
+    try:
+        return str(os.environ.get(_GENERIC_OVERLAP_ENV, "0")).strip() == "1"
+    except Exception:
+        return False
+
+
+def _overlap_ineligible(reason: str) -> dict[str, Any]:
+    return {
+        "eligible": False,
+        "clip_node_id": None,
+        "unet_node_id": None,
+        "forward_node_id": None,
+        "deferral_allowed": False,
+        "identification": "",
+        "reason": str(reason or "unknown"),
+    }
+
+
+def _overlap_upstream_ids(
+    workflow: Mapping[str, Any], start_id: str,
+) -> set[str]:
+    """All static upstream node ids of one executable-prompt node.
+
+    Follows ``[node_id, slot]`` link values only; SetNode/GetNode named
+    pipes are intentionally invisible (callers must treat absence as
+    unknown, never as proof of independence).  Never raises.
+    """
+    seen: set[str] = set()
+    try:
+        stack = [str(start_id)]
+        guard = 0
+        while stack and guard < 100000:
+            guard += 1
+            node = workflow.get(stack.pop())
+            if not isinstance(node, Mapping):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, Mapping):
+                continue
+            for value in inputs.values():
+                if (
+                    isinstance(value, (list, tuple))
+                    and len(value) >= 1
+                    and isinstance(value[0], (str, int))
+                    and str(value[0]) in workflow
+                    and str(value[0]) not in seen
+                ):
+                    seen.add(str(value[0]))
+                    stack.append(str(value[0]))
+    except Exception:
+        pass
+    return seen
+
+
+def _derive_generic_overlap_plan(
+    *, workflow: Any, role_bindings: Any,
+) -> dict[str, Any]:
+    """Derive the load-overlap triple for one request (pure logic).
+
+    Returns ``eligible`` with ``clip_node_id`` (always set when
+    eligible), optional ``unet_node_id`` / ``forward_node_id``, and
+    ``deferral_allowed`` (UNET-loader deferral is safe: UNET is not a
+    static ancestor of the forward node).  The forward id is timing
+    information only — nothing executes early, so misidentification
+    costs overlap, never correctness.  Ambiguity degrades to
+    clip-first ordering (forward None) rather than failing.  Never
+    raises.
+    """
+    try:
+        node_roles = _invert_role_bindings(role_bindings)
+        if not node_roles:
+            return _overlap_ineligible("no_eligible_roles")
+        if not isinstance(workflow, Mapping):
+            return _overlap_ineligible("workflow_not_mapping")
+        wf = {str(k): v for k, v in workflow.items()}
+        clip_nid = next(
+            (nid for nid, role in node_roles.items() if role == "clip"),
+            "",
+        )
+        if not clip_nid:
+            return _overlap_ineligible("clip_binding_missing")
+        clip_node = wf.get(clip_nid)
+        if (
+            not isinstance(clip_node, Mapping)
+            or str(clip_node.get("class_type") or "")
+            not in _ROLE_SUBSTITUTION_LOADER_CLASSES.get("clip", frozenset())
+        ):
+            return _overlap_ineligible("clip_binding_unresolvable")
+        unet_nid = next(
+            (nid for nid, role in node_roles.items()
+             if role in _OVERLAP_UNET_ROLES),
+            "",
+        )
+        unet_node = wf.get(unet_nid) if unet_nid else None
+        if (
+            not unet_nid
+            or not isinstance(unet_node, Mapping)
+            or str(unet_node.get("class_type") or "")
+            not in _ROLE_SUBSTITUTION_LOADER_CLASSES.get(
+                node_roles.get(unet_nid, "unet"), frozenset())
+        ):
+            return {
+                "eligible": True,
+                "clip_node_id": clip_nid,
+                "unet_node_id": None,
+                "forward_node_id": None,
+                "deferral_allowed": False,
+                "identification": "derived",
+                "reason": "unet_binding_unresolvable",
+            }
+        candidates = []
+        for raw_nid in sorted(wf.keys(), key=str):
+            node = wf.get(raw_nid)
+            if not isinstance(node, Mapping):
+                continue
+            if str(node.get("class_type") or "") not in _OVERLAP_FORWARD_CLASSES:
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, Mapping):
+                continue
+            ref = inputs.get("clip")
+            if (
+                isinstance(ref, (list, tuple))
+                and len(ref) >= 1
+                and str(ref[0]) == clip_nid
+            ):
+                candidates.append(str(raw_nid))
+        if len(candidates) != 1:
+            return {
+                "eligible": True,
+                "clip_node_id": clip_nid,
+                "unet_node_id": unet_nid,
+                "forward_node_id": None,
+                "deferral_allowed": False,
+                "identification": "derived",
+                "reason": ("forward_not_found"
+                           if not candidates else "ambiguous_forward"),
+            }
+        fwd = candidates[0]
+        if unet_nid in _overlap_upstream_ids(wf, fwd):
+            return {
+                "eligible": True,
+                "clip_node_id": clip_nid,
+                "unet_node_id": unet_nid,
+                "forward_node_id": fwd,
+                "deferral_allowed": False,
+                "identification": "derived",
+                "reason": "unet_ancestor_of_forward",
+            }
+        return {
+            "eligible": True,
+            "clip_node_id": clip_nid,
+            "unet_node_id": unet_nid,
+            "forward_node_id": fwd,
+            "deferral_allowed": True,
+            "identification": "derived",
+            "reason": "",
+        }
+    except Exception as exc:  # noqa: BLE001 - planner contract: never raise
+        return _overlap_ineligible(type(exc).__name__)
+
+
 def _select_substitution(
     ctx: Mapping[str, Any],
     unique_id: Any,
@@ -2023,6 +2456,11 @@ async def _substitute_unet_vae_loader(
             if weight_dtype not in ("", "default"):
                 return {"ok": False,
                         "reason": f"unet_explicit_weight_dtype_native:{weight_dtype}"}
+            # NOTE (overlap retired): plain sources used to decline here so
+            # a warming prefetch could cover the native read.  Generic loads
+            # now take the canonical shared transport directly, so every
+            # source stays on the stage path; native remains the failure
+            # fallback below, never a routing decision.
             outcome = await compose_generic_unet_load(
                 unet_filenames=[unet_name],
                 folder="diffusion_models",
@@ -2144,17 +2582,115 @@ async def _run_native_with_kitchen_option(
     node_id = str(unique_id)
     try:
         if not _is_sampler_node(obj, input_data_all):
+            # Generic node wall for the single gantt: every non-sampler,
+            # non-substituted node execution gets one span so nothing on
+            # the critical path is invisible. Classes already covered by
+            # dedicated spans (paired-event VAE/output spans, loader and
+            # sampler substitution spans, inner LLM span) are skipped to
+            # avoid double bars. Measurement only; never alters dispatch.
+            try:
+                _cls_name = type(obj).__name__
+            except Exception:
+                _cls_name = ""
+            _skip_prefixes = (
+                "VAEDecode",
+                "ComfyModalProductionOutput",
+                "ComfyModalProductionImageComparerOutput",
+                "TextGenerate",
+                "CLIPLoader",
+                "UNETLoader",
+                "VAELoader",
+                "DualCLIPLoader",
+                "CheckpointLoader",
+            )
+            if _cls_name and not _cls_name.startswith(_skip_prefixes):
+                try:
+                    import time as _node_time
+                    _node_start_ns = int(_node_time.monotonic_ns())
+                except Exception:
+                    _node_time = None  # type: ignore[assignment]
+                    _node_start_ns = 0
+                try:
+                    return await original(
+                        prompt_id, unique_id, obj, input_data_all,
+                        execution_block_cb=execution_block_cb,
+                        pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+                    )
+                finally:
+                    try:
+                        if _node_time is not None and _node_start_ns:
+                            _node_end_ns = int(_node_time.monotonic_ns())
+                            if _node_end_ns >= _node_start_ns:
+                                from .gantt_telemetry import (
+                                    register_gantt_span as _node_register_span,
+                                )
+                                _upper = _cls_name.upper()
+                                if "ENCODE" in _upper or "CLIP" in _upper:
+                                    _node_lane = "CPU"
+                                elif "SAMPL" in _upper:
+                                    _node_lane = "GPU"
+                                else:
+                                    _node_lane = "MAIN"
+                                _node_register_span(
+                                    f"{_cls_name} (node {node_id})",
+                                    start_mono_ns=_node_start_ns,
+                                    end_mono_ns=_node_end_ns,
+                                    lane=_node_lane,
+                                    metadata={
+                                        "node_id": node_id,
+                                        "node_class": _cls_name,
+                                    },
+                                )
+                    except Exception:
+                        pass
             return await original(
                 prompt_id, unique_id, obj, input_data_all,
                 execution_block_cb=execution_block_cb,
                 pre_execute_cb=pre_execute_cb, v3_data=v3_data,
             )
+    except Exception:
+        return await original(
+            prompt_id, unique_id, obj, input_data_all,
+            execution_block_cb=execution_block_cb,
+            pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+        )
+    # Sampler execution: timed wall for the single gantt. Measurement
+    # only: never alters dispatch, fallback, or error semantics.
+    try:
+        import time as _samp_time
+        _samp_start_ns = int(_samp_time.monotonic_ns())
+    except Exception:
+        _samp_time = None  # type: ignore[assignment]
+        _samp_start_ns = 0
+
+    def _record_sampling_span() -> None:
+        try:
+            if _samp_time is None or not _samp_start_ns:
+                return
+            _samp_end_ns = int(_samp_time.monotonic_ns())
+            if _samp_end_ns < _samp_start_ns:
+                return
+            from .gantt_telemetry import register_gantt_span as _samp_register_span
+            _samp_register_span(
+                "sampling",
+                start_mono_ns=_samp_start_ns,
+                end_mono_ns=_samp_end_ns,
+                lane="GPU",
+                metadata={"node_id": node_id},
+            )
+        except Exception:
+            pass
+
+    try:
         if _kitchen_policy_backend() != "comfy_kitchen":
-            return await original(
-                prompt_id, unique_id, obj, input_data_all,
-                execution_block_cb=execution_block_cb,
-                pre_execute_cb=pre_execute_cb, v3_data=v3_data,
-            )
+            try:
+                return await original(
+                    prompt_id, unique_id, obj, input_data_all,
+                    execution_block_cb=execution_block_cb,
+                    pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+                )
+            finally:
+                _record_sampling_span()
         model = input_data_all.get("model")
         patcher = model[0] if isinstance(model, (list, tuple)) else model
         try:
@@ -2166,17 +2702,23 @@ async def _run_native_with_kitchen_option(
                 outcome="skipped",
                 reason=f"scope_setup:{type(setup_exc).__name__}",
             )
-            return await original(
-                prompt_id, unique_id, obj, input_data_all,
-                execution_block_cb=execution_block_cb,
-                pre_execute_cb=pre_execute_cb, v3_data=v3_data,
-            )
+            try:
+                return await original(
+                    prompt_id, unique_id, obj, input_data_all,
+                    execution_block_cb=execution_block_cb,
+                    pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+                )
+            finally:
+                _record_sampling_span()
         with scope as scope_state:
-            result = await original(
-                prompt_id, unique_id, obj, input_data_all,
-                execution_block_cb=execution_block_cb,
-                pre_execute_cb=pre_execute_cb, v3_data=v3_data,
-            )
+            try:
+                result = await original(
+                    prompt_id, unique_id, obj, input_data_all,
+                    execution_block_cb=execution_block_cb,
+                    pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+                )
+            finally:
+                _record_sampling_span()
         try:
             selected = str((scope_state or {}).get("selected_callable", ""))
             calls = int((scope_state or {}).get("calls", 0) or 0)
@@ -2189,6 +2731,7 @@ async def _run_native_with_kitchen_option(
         )
         return result
     except Exception:
+        _record_sampling_span()
         return await original(
             prompt_id, unique_id, obj, input_data_all,
             execution_block_cb=execution_block_cb,
@@ -2312,12 +2855,168 @@ async def _run_substituted_loader(
         return {"ok": False, "reason": f"{type(exc).__name__}:{str(exc)[:150]}"}
 
 
+def _overlap_select_pick(
+    *, available: Any, clip_node_id: Any, unet_node_id: Any,
+    forward_node_id: Any, deferral_allowed: bool, dispatched: Any,
+) -> dict[str, Any]:
+    """Pure pick-policy decision (no executor access).
+
+    Returns ``{"action": "pick", "node_id": ...}`` to force one ready
+    node, ``{"action": "exclude", "node_id": ...}`` to pick via the
+    original policy from the ready set minus that node, or
+    ``{"action": "original"}`` to leave ordering untouched.  Deferral
+    only ever postpones the UNET loader while other ready nodes exist
+    (finite drain: it still dispatches), and only when UNET is proven
+    not to gate the forward node — misidentification costs overlap,
+    never correctness.  Never raises.
+    """
+    try:
+        avail = [str(n) for n in (available or [])]
+        done = set(str(n) for n in (dispatched or ()))
+        clip = str(clip_node_id or "")
+        unet = str(unet_node_id or "")
+        fwd = str(forward_node_id or "")
+        if clip and clip in avail and clip not in done:
+            return {"action": "pick", "node_id": clip}
+        if (bool(deferral_allowed) and unet and fwd
+                and unet in avail and fwd not in done):
+            if fwd in avail:
+                return {"action": "pick", "node_id": fwd}
+            if [n for n in avail if n != unet]:
+                return {"action": "exclude", "node_id": unet}
+        return {"action": "original", "node_id": None}
+    except Exception:
+        return {"action": "original", "node_id": None}
+
+
+def _overlap_advise_model(*, folder: Any, filename: Any) -> dict[str, Any]:
+    """Resolve + stat + advise one model file (pure IO hint, never raises).
+
+    Content-agnostic page-cache warming for a later load of the same
+    path: safe regardless of snapshot/cache validity (the kernel drops
+    unused or invalidated pages freely) and skipped cleanly where the
+    platform lacks the hint.  Never reads tensor payloads.
+    """
+    started_ns = time.monotonic_ns()
+
+    def _fail(reason: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "reason": str(reason),
+            "path": None,
+            "size_bytes": 0,
+            "advise_status": "not_attempted",
+            "advised_bytes": 0,
+            "elapsed_ms": (time.monotonic_ns() - started_ns) / 1_000_000.0,
+        }
+
+    try:
+        name = str(filename or "").strip()
+        if not name:
+            return _fail("filename_missing")
+        path = _default_path_resolver(str(folder or ""), name)
+        if not path:
+            return _fail(f"source_path_unresolvable:{name}")
+        try:
+            size_bytes = int(os.stat(path).st_size)
+        except Exception:
+            return _fail("source_stat_failed")
+        advise = _advise_sequential_source(path, size_bytes)
+        return {
+            "ok": True,
+            "reason": "",
+            "path": path,
+            "size_bytes": size_bytes,
+            "advise_status": str(advise.get("status") or ""),
+            "advised_bytes": int(advise.get("advised_bytes") or 0),
+            "elapsed_ms": (time.monotonic_ns() - started_ns) / 1_000_000.0,
+        }
+    except Exception as exc:  # noqa: BLE001 - hint contract: never raise
+        return _fail(type(exc).__name__)
+
+
+def _install_overlap_pick_policy(
+    *, trace_emit: Callable[..., Any] | None, request_id: str,
+    get_ctx: Callable[[], Any],
+) -> Callable[[], None] | None:
+    """Wrap ExecutionList.ux_friendly_pick_node per request (save/restore).
+
+    Mirrors the repo's established ExecutionList patch discipline: the
+    original is restored only if the wrapper is still installed, and any
+    failure (including a missing graph module) means no policy with the
+    stock ordering untouched.  The wrapper consults the live request
+    context on every pick, so teardown (context cleared) degrades to
+    passthrough even before restore runs.  Never raises.
+    """
+    try:
+        try:
+            from comfy_execution.graph import ExecutionList as _ExecList
+        except Exception:
+            return None
+        orig = getattr(_ExecList, "ux_friendly_pick_node", None)
+        if not callable(orig):
+            return None
+        if getattr(orig, "__overlap_wrapped__", False):
+            return None
+
+        def _wrapped_pick(self: Any, node_list: Any) -> Any:
+            try:
+                ctx = get_ctx()
+                plan = (ctx or {}).get("overlap_plan") or {}
+                if not plan.get("eligible"):
+                    return orig(self, node_list)
+                avail = [str(n) for n in (node_list or [])]
+                done = set((ctx or {}).get("dispatched_nodes") or set())
+                decision = _overlap_select_pick(
+                    available=avail,
+                    clip_node_id=plan.get("clip_node_id"),
+                    unet_node_id=plan.get("unet_node_id"),
+                    forward_node_id=plan.get("forward_node_id"),
+                    deferral_allowed=bool(plan.get("deferral_allowed")),
+                    dispatched=done)
+                action = str(decision.get("action") or "original")
+                if action == "pick":
+                    _emit_trace(trace_emit, "generic_overlap_pick",
+                                request_id=str(request_id or ""),
+                                action="pick",
+                                node_id=str(decision.get("node_id") or ""))
+                    return decision.get("node_id")
+                if action == "exclude":
+                    rest = [n for n in avail
+                            if n != str(decision.get("node_id") or "")]
+                    if rest:
+                        _emit_trace(trace_emit, "generic_overlap_pick",
+                                    request_id=str(request_id or ""),
+                                    action="exclude",
+                                    node_id=str(decision.get("node_id") or ""))
+                        return orig(self, rest)
+                return orig(self, node_list)
+            except Exception:
+                return orig(self, node_list)
+
+        _wrapped_pick.__overlap_wrapped__ = True  # type: ignore[attr-defined]
+        _ExecList.ux_friendly_pick_node = _wrapped_pick  # type: ignore[method-assign]
+
+        def _restore_pick() -> None:
+            try:
+                if (getattr(_ExecList, "ux_friendly_pick_node", None)
+                        is _wrapped_pick):
+                    _ExecList.ux_friendly_pick_node = orig  # type: ignore[method-assign]
+            except Exception:
+                pass
+
+        return _restore_pick
+    except Exception:
+        return None
+
+
 def install_execution_dispatch_substitution(
     *,
     role_bindings: Any,
     holder: GenericLoaderHolder | None,
     trace_emit: Callable[..., Any] | None,
     request_id: str,
+    workflow: Any = None,
 ) -> Callable[[], None] | None:
     """Wrap upstream ``execution.get_output_data`` with role substitution.
 
@@ -2372,6 +3071,71 @@ def install_execution_dispatch_substitution(
             "merge_fn": merge_fn,
             "module": _execution_mod,
         }
+        # Overlap plan (Phase 1: derive + observe only, no scheduling).
+        # Default-off switch: disabled means the planner never runs and the
+        # context carries a documenting ineligible plan.  No worker, read,
+        # allocation, or cache change happens in either case.
+        overlap_plan: dict[str, Any] = _overlap_ineligible("overlap_disabled")
+        if _overlap_switch_enabled():
+            overlap_plan = _derive_generic_overlap_plan(
+                workflow=workflow, role_bindings=role_bindings)
+            _emit_trace(trace_emit, "generic_overlap_plan",
+                        request_id=str(request_id or ""),
+                        eligible=bool(overlap_plan.get("eligible")),
+                        clip_node_id=overlap_plan.get("clip_node_id"),
+                        unet_node_id=overlap_plan.get("unet_node_id"),
+                        forward_node_id=overlap_plan.get("forward_node_id"),
+                        deferral_allowed=bool(
+                            overlap_plan.get("deferral_allowed")),
+                        reason=str(overlap_plan.get("reason") or ""))
+        ctx["overlap_plan"] = overlap_plan
+        ctx["overlap_pick_restore"] = None
+        if overlap_plan.get("eligible"):
+            # Warm both model files while setup runs: content-agnostic
+            # page-cache hints, harmless when unused or invalidated.
+            try:
+                wf_nodes = workflow if isinstance(workflow, Mapping) else {}
+                _adv_targets: list[tuple[str, str, Any]] = []
+                _clip_node = wf_nodes.get(
+                    str(overlap_plan.get("clip_node_id") or ""))
+                if isinstance(_clip_node, Mapping):
+                    _clip_inputs = _clip_node.get("inputs")
+                    if isinstance(_clip_inputs, Mapping):
+                        _adv_targets.append((
+                            "clip", "text_encoders",
+                            _clip_inputs.get("clip_name")))
+                _unet_id = str(overlap_plan.get("unet_node_id") or "")
+                if _unet_id:
+                    _unet_node = wf_nodes.get(_unet_id)
+                    if isinstance(_unet_node, Mapping):
+                        _unet_inputs = _unet_node.get("inputs")
+                        if isinstance(_unet_inputs, Mapping):
+                            _adv_targets.append((
+                                "model_unet", "diffusion_models",
+                                _unet_inputs.get("unet_name")))
+                for _role, _folder, _filename in _adv_targets:
+                    if not isinstance(_filename, str) or not _filename.strip():
+                        continue
+                    _adv = _overlap_advise_model(
+                        folder=_folder, filename=_filename)
+                    _emit_trace(trace_emit, "generic_overlap_advise",
+                                request_id=str(request_id or ""),
+                                role=_role,
+                                ok=bool(_adv.get("ok")),
+                                advise_status=str(
+                                    _adv.get("advise_status") or ""),
+                                size_bytes=int(_adv.get("size_bytes") or 0),
+                                elapsed_ms=float(_adv.get("elapsed_ms") or 0.0),
+                                reason=str(_adv.get("reason") or ""))
+            except Exception:
+                pass
+            try:
+                ctx["overlap_pick_restore"] = _install_overlap_pick_policy(
+                    trace_emit=trace_emit,
+                    request_id=str(request_id or ""),
+                    get_ctx=lambda: _ACTIVE_DISPATCH_CTX)
+            except Exception:
+                ctx["overlap_pick_restore"] = None
         _ACTIVE_DISPATCH_CTX = ctx
 
         async def _substituting_get_output_data(
@@ -2390,6 +3154,16 @@ def install_execution_dispatch_substitution(
                     execution_block_cb=execution_block_cb,
                     pre_execute_cb=pre_execute_cb, v3_data=v3_data,
                 )
+            try:
+                _ov_plan = active.get("overlap_plan") or {}
+                if _ov_plan.get("eligible"):
+                    _disp = active.get("dispatched_nodes")
+                    if _disp is None:
+                        _disp = set()
+                        active["dispatched_nodes"] = _disp
+                    _disp.add(str(unique_id))
+            except Exception:
+                pass
             decision = _select_substitution(active, unique_id, obj, input_data_all)
             if decision is None:
                 return await _run_native_with_kitchen_option(
@@ -2398,10 +3172,44 @@ def install_execution_dispatch_substitution(
                     execution_block_cb=execution_block_cb,
                     pre_execute_cb=pre_execute_cb, v3_data=v3_data,
                 )
+            try:
+                import time as _time
+                _sub_start_ns = int(_time.monotonic_ns())
+            except Exception:
+                _time = None  # type: ignore[assignment]
+                _sub_start_ns = 0
             sub = await _run_substituted_loader(
                 role=str(decision["role"]), node_id=str(decision["node_id"]),
                 inputs=decision["inputs"], ctx=active,
             )
+            try:
+                if _time is not None and _sub_start_ns:
+                    _sub_end_ns = int(_time.monotonic_ns())
+                    _role_norm = str(decision["role"]).strip().lower()
+                    if _role_norm in ("clip",):
+                        _span_name, _span_lane = "CLIP load", "STORAGE"
+                    elif _role_norm in ("unet", "model_unet"):
+                        _span_name, _span_lane = "UNET load", "STORAGE"
+                    elif _role_norm in ("vae",):
+                        _span_name, _span_lane = "VAE load", "MODEL-MGMT"
+                    else:
+                        _span_name, _span_lane = "", ""
+                    if _span_name and _sub_end_ns >= _sub_start_ns:
+                        from .gantt_telemetry import register_gantt_span as _register_span
+                        _register_span(
+                            _span_name,
+                            start_mono_ns=_sub_start_ns,
+                            end_mono_ns=_sub_end_ns,
+                            lane=_span_lane,
+                            metadata={
+                                "node_id": str(decision["node_id"]),
+                                "role": str(decision["role"]),
+                                "source_arm": str(sub.get("source_arm") or "unknown"),
+                                "ok": bool(sub.get("ok")),
+                            },
+                        )
+            except Exception:
+                pass
             if not sub.get("ok"):
                 _emit_trace(
                     active.get("trace_emit"), "generic_dispatch_substitution",
@@ -2450,6 +3258,12 @@ def install_execution_dispatch_substitution(
 
         def _restore_dispatch() -> None:
             global _ACTIVE_DISPATCH_CTX
+            try:
+                _pick_restore = ctx.get("overlap_pick_restore")
+                if callable(_pick_restore):
+                    _pick_restore()
+            except Exception:
+                pass
             try:
                 mod = ctx.get("module")
                 if mod is not None and getattr(

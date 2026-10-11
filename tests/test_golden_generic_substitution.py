@@ -799,3 +799,500 @@ class TestKitchenAttention:
             restore()
             monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
                                raising=False)
+
+
+class TestGenericOverlapPlan:
+    """Pure overlap planner: triple derivation, no scheduling."""
+
+    @staticmethod
+    def _zit_bindings():
+        return {
+            "clip": {"node_id": "62", "input_name": "clip_name"},
+            "model_unet": {"node_id": "66", "input_name": "unet_name"},
+            "vae": {"node_id": "1277", "input_name": "vae_name"},
+        }
+
+    @staticmethod
+    def _zit_workflow(extra=None):
+        wf = {
+            "62": {"class_type": "CLIPLoader",
+                   "inputs": {"clip_name": "qwen.safetensors"}},
+            "66": {"class_type": "UNETLoader",
+                   "inputs": {"unet_name": "z.safetensors"}},
+            "67": {"class_type": "CLIPTextEncode",
+                   "inputs": {"clip": ["62", 0], "text": ["82", 0]}},
+            "82": {"class_type": "GetNode",
+                   "inputs": {}},
+        }
+        if extra:
+            wf.update(extra)
+        return wf
+
+    def test_zit_triple_eligible(self):
+        plan = ggl._derive_generic_overlap_plan(
+            workflow=self._zit_workflow(),
+            role_bindings=self._zit_bindings())
+        assert plan["eligible"] is True
+        assert plan["clip_node_id"] == "62"
+        assert plan["unet_node_id"] == "66"
+        assert plan["forward_node_id"] == "67"
+        assert plan["deferral_allowed"] is True
+        assert plan["identification"] == "derived"
+        assert plan["reason"] == ""
+
+    def test_ambiguous_forward_degrades(self):
+        wf = self._zit_workflow(extra={
+            "68": {"class_type": "CLIPTextEncode",
+                   "inputs": {"clip": ["62", 0], "text": "x"}}})
+        plan = ggl._derive_generic_overlap_plan(
+            workflow=wf, role_bindings=self._zit_bindings())
+        assert plan["eligible"] is True
+        assert plan["forward_node_id"] is None
+        assert plan["deferral_allowed"] is False
+        assert plan["reason"] == "ambiguous_forward"
+
+    def test_no_encode_clip_first_only(self):
+        wf = {k: v for k, v in self._zit_workflow().items() if k != "67"}
+        plan = ggl._derive_generic_overlap_plan(
+            workflow=wf, role_bindings=self._zit_bindings())
+        assert plan["eligible"] is True
+        assert plan["forward_node_id"] is None
+        assert plan["reason"] == "forward_not_found"
+
+    def test_stale_clip_binding_ineligible(self):
+        plan = ggl._derive_generic_overlap_plan(
+            workflow=self._zit_workflow(),
+            role_bindings={"clip": {"node_id": "999"}})
+        assert plan["eligible"] is False
+
+    def test_unet_class_mismatch_clip_first_only(self):
+        wf = self._zit_workflow()
+        wf["66"] = {"class_type": "VAELoader", "inputs": {}}
+        plan = ggl._derive_generic_overlap_plan(
+            workflow=wf, role_bindings=self._zit_bindings())
+        assert plan["eligible"] is True
+        assert plan["unet_node_id"] is None
+        assert plan["deferral_allowed"] is False
+
+    def test_unet_ancestor_of_forward_no_deferral(self):
+        wf = self._zit_workflow()
+        wf["67"] = {"class_type": "CLIPTextEncode",
+                    "inputs": {"clip": ["62", 0], "model": ["66", 0]}}
+        plan = ggl._derive_generic_overlap_plan(
+            workflow=wf, role_bindings=self._zit_bindings())
+        assert plan["eligible"] is True
+        assert plan["forward_node_id"] == "67"
+        assert plan["deferral_allowed"] is False
+        assert plan["reason"] == "unet_ancestor_of_forward"
+
+    def test_empty_bindings_ineligible(self):
+        plan = ggl._derive_generic_overlap_plan(
+            workflow=self._zit_workflow(), role_bindings={})
+        assert plan["eligible"] is False
+        assert plan["reason"] == "no_eligible_roles"
+
+    def test_non_mapping_workflow_ineligible(self):
+        plan = ggl._derive_generic_overlap_plan(
+            workflow=None, role_bindings=self._zit_bindings())
+        assert plan["eligible"] is False
+
+    def test_never_raises_on_garbage(self):
+        for wf, bindings in ((None, None), ([], []),
+                             ("x", "y"), ({"62": []}, {"clip": "62"})):
+            plan = ggl._derive_generic_overlap_plan(
+                workflow=wf, role_bindings=bindings)
+            assert isinstance(plan, dict)
+            assert plan["eligible"] is False
+
+    def test_installer_emits_plan_when_enabled(self, monkeypatch):
+        calls = []
+        _install_fake_execution(monkeypatch, calls)
+        monkeypatch.setenv("COMFYMODAL_V2_GENERIC_OVERLAP", "1")
+        sink = []
+        restore = None
+        try:
+            restore = ggl.install_execution_dispatch_substitution(
+                role_bindings=self._zit_bindings(),
+                holder=ggl.GenericLoaderHolder(),
+                trace_emit=(lambda name, **kw: sink.append(
+                    (name, kw.get("metadata", {})))),
+                request_id="r1",
+                workflow=self._zit_workflow(),
+            )
+            assert restore is not None
+            events = [m for n, m in sink if n == "generic_overlap_plan"]
+            assert len(events) == 1
+            assert events[0]["eligible"] is True
+            assert events[0]["forward_node_id"] == "67"
+            assert ggl._ACTIVE_DISPATCH_CTX is not None
+            stored = ggl._ACTIVE_DISPATCH_CTX["overlap_plan"]
+            assert stored["eligible"] is True
+            assert stored["deferral_allowed"] is True
+        finally:
+            if restore is not None:
+                restore()
+            monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP",
+                               raising=False)
+
+    def test_installer_silent_when_disabled(self, monkeypatch):
+        calls = []
+        _install_fake_execution(monkeypatch, calls)
+        monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP", raising=False)
+        sink = []
+        restore = ggl.install_execution_dispatch_substitution(
+            role_bindings=self._zit_bindings(),
+            holder=ggl.GenericLoaderHolder(),
+            trace_emit=(lambda name, **kw: sink.append(
+                (name, kw.get("metadata", {})))),
+            request_id="r1",
+            workflow=self._zit_workflow(),
+        )
+        assert restore is not None
+        try:
+            assert not [n for n, _m in sink if n == "generic_overlap_plan"]
+            assert ggl._ACTIVE_DISPATCH_CTX is not None
+            stored = ggl._ACTIVE_DISPATCH_CTX["overlap_plan"]
+            assert stored["eligible"] is False
+            assert stored["reason"] == "overlap_disabled"
+        finally:
+            restore()
+
+
+class TestGenericUnetPrepareBind:
+    """UNET prepare/bind split: single read, identity-checked bind."""
+
+    @staticmethod
+    def _reloader(*args, **kwargs):
+        raise AssertionError("reloader must stay inert during bind")
+
+    @staticmethod
+    def _reader(calls, sd=None, metadata=None, explode=None):
+        def _read(path):
+            calls.append(path)
+            if explode is not None:
+                raise explode
+            return ({"w": object()} if sd is None else sd,
+                    {} if metadata is None else metadata)
+        return _read
+
+    @staticmethod
+    def _file(tmp_path, name="u.safetensors", data=b"0123456789"):
+        target = tmp_path / name
+        target.write_bytes(data)
+        return str(target)
+
+    def test_prepare_single_read_with_identity(self, tmp_path):
+        calls = []
+        out = ggl._prepare_generic_unet_source(
+            folder="diffusion_models", filename="u.safetensors",
+            path_resolver=lambda _f, _n: self._file(tmp_path),
+            reader=self._reader(calls))
+        assert out["ok"] is True
+        assert calls and len(calls) == 1
+        assert out["size_bytes"] == 10
+        assert out["mtime_ns"] > 0
+        assert isinstance(out["sd"], dict)
+        assert out["advise_status"] != ""
+        assert out["elapsed_ms"] >= 0.0
+
+    def test_prepare_failures_never_raise(self, tmp_path):
+        assert ggl._prepare_generic_unet_source(
+            folder="d", filename="",
+            path_resolver=lambda _f, _n: None)["ok"] is False
+        assert ggl._prepare_generic_unet_source(
+            folder="d", filename="x",
+            path_resolver=lambda _f, _n: None)["ok"] is False
+        out = ggl._prepare_generic_unet_source(
+            folder="d", filename="x",
+            path_resolver=lambda _f, _n: self._file(tmp_path),
+            reader=self._reader([], explode=RuntimeError("disk")))
+        assert out["ok"] is False
+        assert "RuntimeError" in out["reason"]
+        out = ggl._prepare_generic_unet_source(
+            folder="d", filename="x",
+            path_resolver=lambda _f, _n: self._file(tmp_path),
+            reader=lambda _p: (["not", "a", "dict"], {}))
+        assert out["ok"] is False
+        assert out["reason"] == "source_not_mapping"
+
+    def test_bind_consumes_without_reread(self, tmp_path):
+        calls = []
+        seen = {}
+
+        class _Model:
+            pass
+
+        def _ctor(sd, model_options=None, metadata=None):
+            seen["sd"] = sd
+            seen["options"] = dict(model_options or {})
+            seen["metadata"] = metadata
+            return seen.setdefault("model", _Model())
+
+        prepared = ggl._prepare_generic_unet_source(
+            folder="d", filename="u.safetensors",
+            path_resolver=lambda _f, _n: self._file(tmp_path),
+            reader=self._reader(calls))
+        assert prepared["ok"] is True
+        out = ggl._bind_generic_unet_source(
+            prepared=prepared,
+            constructor=_ctor, reloader=self._reloader)
+        assert out["ok"] is True
+        assert len(calls) == 1
+        assert seen["sd"] is prepared["sd"]
+        assert seen["options"] == {}
+        assert out["model"] is seen["model"]
+
+    def test_bind_options_and_patcher_init(self, tmp_path):
+        seen = {}
+
+        class _Model:
+            pass
+
+        def _ctor(sd, model_options=None, metadata=None):
+            seen["options"] = dict(model_options or {})
+            return _Model()
+
+        reloader = self._reloader
+        prepared = ggl._prepare_generic_unet_source(
+            folder="d", filename="u.safetensors",
+            path_resolver=lambda _f, _n: self._file(tmp_path),
+            reader=self._reader([]))
+        out = ggl._bind_generic_unet_source(
+            prepared=prepared, model_options={"dtype": "x"},
+            constructor=_ctor, reloader=reloader)
+        assert out["ok"] is True
+        assert seen["options"] == {"dtype": "x"}
+        assert out["model"].cached_patcher_init == (
+            reloader, (prepared["path"], {"dtype": "x"}))
+
+    def test_bind_rejects_changed_source(self, tmp_path):
+        path = self._file(tmp_path)
+        prepared = ggl._prepare_generic_unet_source(
+            folder="d", filename="u.safetensors",
+            path_resolver=lambda _f, _n: path,
+            reader=self._reader([]))
+        assert prepared["ok"] is True
+        with open(path, "ab") as handle:
+            handle.write(b"more")
+        out = ggl._bind_generic_unet_source(
+            prepared=prepared,
+            constructor=lambda **_k: object(), reloader=self._reloader)
+        assert out["ok"] is False
+        assert out["reason"] == "source_changed"
+
+    def test_bind_rejects_undetected_or_raising(self, tmp_path):
+        prepared = ggl._prepare_generic_unet_source(
+            folder="d", filename="u.safetensors",
+            path_resolver=lambda _f, _n: self._file(tmp_path),
+            reader=self._reader([]))
+        out = ggl._bind_generic_unet_source(
+            prepared=prepared,
+            constructor=lambda sd, **_k: None, reloader=self._reloader)
+        assert out["ok"] is False
+        assert out["reason"] == "model_type_undetected"
+        out = ggl._bind_generic_unet_source(
+            prepared=prepared,
+            constructor=lambda sd, **_k: (_ for _ in ()).throw(
+                ValueError("bad")),
+            reloader=self._reloader)
+        assert out["ok"] is False
+        assert "ValueError" in out["reason"]
+
+    def test_bind_never_raises_on_garbage(self):
+        for prepared in (None, [], "x", {}, {"sd": []}, {"sd": {}}):
+            out = ggl._bind_generic_unet_source(
+                prepared=prepared,
+                constructor=lambda **_k: object(), reloader=self._reloader)
+            assert isinstance(out, dict)
+            assert out["ok"] is False
+
+
+class TestPlainDeclineSwitchGate:
+    """Plain-source decline fires only with overlap active."""
+
+    @staticmethod
+    def _plain_header(monkeypatch, tmp_path):
+        target = tmp_path / "u.safetensors"
+        target.write_bytes(b"0" * 64)
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver",
+            lambda _f, _n: str(target))
+        monkeypatch.setattr(
+            ggl, "_describe_safetensors_header",
+            lambda _p: {"ok": True, "dtypes": {"BF16"},
+                        "quantized_key_count": 0,
+                        "scaled_fp8_key_count": 0,
+                        "has_quantization_metadata": False})
+
+    def test_decline_off_by_default(self, monkeypatch, tmp_path):
+        self._plain_header(monkeypatch, tmp_path)
+        monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP", raising=False)
+        assert ggl._plain_source_native_decline(
+            folder="d", filename="u.safetensors",
+            source_arm="golden_unet") is None
+
+    def test_decline_fires_when_enabled(self, monkeypatch, tmp_path):
+        self._plain_header(monkeypatch, tmp_path)
+        monkeypatch.setenv("COMFYMODAL_V2_GENERIC_OVERLAP", "1")
+        try:
+            out = ggl._plain_source_native_decline(
+                folder="d", filename="u.safetensors",
+                source_arm="golden_unet")
+            assert out is not None
+            assert out["ok"] is False
+            assert out["reason"] == "plain_source_native_optimal"
+        finally:
+            monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP",
+                               raising=False)
+
+
+class TestGenericOverlapPick:
+    """Pick policy + advise hints: ordering only, never execution."""
+
+    @staticmethod
+    def _pick(**kw):
+        base: dict[str, object] = dict(
+            available=[], clip_node_id="62", unet_node_id="66",
+            forward_node_id="67", deferral_allowed=True,
+            dispatched=set())
+        base.update(kw)
+        return ggl._overlap_select_pick(
+            available=base["available"],
+            clip_node_id=base["clip_node_id"],
+            unet_node_id=base["unet_node_id"],
+            forward_node_id=base["forward_node_id"],
+            deferral_allowed=bool(base["deferral_allowed"]),
+            dispatched=base["dispatched"])
+
+    def test_clip_first(self):
+        out = self._pick(available=["66", "62", "1277"])
+        assert out == {"action": "pick", "node_id": "62"}
+
+    def test_clip_done_no_force(self):
+        # A dispatched node never reappears in the live ready set; the
+        # policy must not re-pick it.
+        out = self._pick(available=["62"], dispatched={"62"})
+        assert out["action"] == "original"
+
+    def test_forward_preferred_over_unet(self):
+        out = self._pick(available=["66", "67", "1277"])
+        assert out == {"action": "pick", "node_id": "67"}
+
+    def test_unet_excluded_while_forward_pending(self):
+        out = self._pick(available=["66", "1277"])
+        assert out == {"action": "exclude", "node_id": "66"}
+
+    def test_unet_only_available_runs(self):
+        out = self._pick(available=["66"])
+        assert out["action"] == "original"
+
+    def test_forward_dispatched_lifts_deferral(self):
+        out = self._pick(available=["66", "1277"], dispatched={"67"})
+        assert out["action"] == "original"
+
+    def test_deferral_off_leaves_order(self):
+        out = self._pick(available=["66", "67"], deferral_allowed=False)
+        assert out["action"] == "original"
+
+    def test_no_forward_no_deferral(self):
+        out = self._pick(available=["66", "1277"], forward_node_id=None)
+        assert out["action"] == "original"
+
+    def test_never_raises(self):
+        out = ggl._overlap_select_pick(
+            available=None, clip_node_id=None, unet_node_id=None,
+            forward_node_id=None, deferral_allowed=True, dispatched=None)
+        assert out["action"] == "original"
+
+    def test_advise_model_tmp_file(self, tmp_path):
+        target = tmp_path / "m.safetensors"
+        target.write_bytes(b"0123456789")
+        out = ggl._overlap_advise_model(
+            folder="any", filename="m.safetensors")
+        assert isinstance(out, dict)
+        # Resolver is folder_paths-backed; unresolvable locally is fine.
+        assert out["ok"] in (True, False)
+        assert out["advise_status"] != ""
+
+    def test_advise_model_failures_never_raise(self):
+        assert ggl._overlap_advise_model(
+            folder="d", filename="")["ok"] is False
+        assert ggl._overlap_advise_model(
+            folder="d", filename="missing.safetensors")["ok"] is False
+
+    def test_pick_wrapper_reorders_and_restores(self, monkeypatch):
+        import sys as _sys
+        import types as _types
+
+        calls = []
+
+        class _ExecList:
+            def ux_friendly_pick_node(self, node_list):
+                calls.append(list(node_list))
+                return node_list[0]
+
+        pkg = _types.ModuleType("comfy_execution")
+        sub = _types.ModuleType("comfy_execution.graph")
+        setattr(sub, "ExecutionList", _ExecList)
+        monkeypatch.setitem(_sys.modules, "comfy_execution", pkg)
+        monkeypatch.setitem(_sys.modules, "comfy_execution.graph", sub)
+        ctx = {"overlap_plan": {
+            "eligible": True, "clip_node_id": "62",
+            "unet_node_id": "66", "forward_node_id": "67",
+            "deferral_allowed": True},
+            "dispatched_nodes": set()}
+        sink = []
+        restore = ggl._install_overlap_pick_policy(
+            trace_emit=(lambda name, **kw: sink.append(
+                (name, kw.get("metadata", {})))),
+            request_id="r1", get_ctx=lambda: ctx)
+        assert restore is not None
+        try:
+            inst = _ExecList()
+            assert inst.ux_friendly_pick_node(["66", "67"]) == "67"
+            assert inst.ux_friendly_pick_node(["62", "66"]) == "62"
+            ctx["dispatched_nodes"].add("67")
+            assert inst.ux_friendly_pick_node(["66", "1277"]) == "66"
+            assert [n for n, _m in sink
+                    if n == "generic_overlap_pick"]
+        finally:
+            restore()
+        assert (_ExecList.ux_friendly_pick_node.__name__ ==
+                "ux_friendly_pick_node")
+
+    def test_pick_wrapper_missing_graph_is_none(self, monkeypatch):
+        import sys as _sys
+
+        monkeypatch.delitem(_sys.modules, "comfy_execution", raising=False)
+        monkeypatch.delitem(_sys.modules, "comfy_execution.graph",
+                            raising=False)
+        out = ggl._install_overlap_pick_policy(
+            trace_emit=None, request_id="r1", get_ctx=dict)
+        assert out is None
+
+    def test_dispatched_tracking_recorded(self, monkeypatch):
+        calls = []
+        _install_fake_execution(monkeypatch, calls)
+        monkeypatch.setenv("COMFYMODAL_V2_GENERIC_OVERLAP", "1")
+        wf = TestGenericOverlapPlan._zit_workflow()
+        sink = []
+        restore = None
+        try:
+            restore = ggl.install_execution_dispatch_substitution(
+                role_bindings=TestGenericOverlapPlan._zit_bindings(),
+                holder=ggl.GenericLoaderHolder(),
+                trace_emit=(lambda name, **kw: sink.append(
+                    (name, kw.get("metadata", {})))),
+                request_id="r1",
+                workflow=wf,
+            )
+            assert restore is not None
+            stored = ggl._ACTIVE_DISPATCH_CTX
+            assert stored is not None
+            assert stored["overlap_plan"]["eligible"] is True
+            assert "overlap_pick_restore" in stored
+        finally:
+            if restore is not None:
+                restore()
+            monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP",
+                               raising=False)

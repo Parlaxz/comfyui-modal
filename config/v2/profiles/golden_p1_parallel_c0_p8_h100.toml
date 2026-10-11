@@ -51,8 +51,9 @@ class = "ModalRuntimeEntrypointV2"
 method = "run_golden_parallel_stream"
 
 [environment]
-# Unpinned (not testing): provider default region for faster scheduling.
-COMFYMODAL_V2_REGION = ""
+# Pin Golden containers to the US region ("us", not "us-central"); redeploy
+# is required because the previous unpinned deployment receipt is invalidated.
+COMFYMODAL_V2_REGION = "us-central"
 # Phase B generic composition: enable the shared QD4 CLIP demand reader so
 # generic CLIPLoader nodes use the canonical clip_qd_load arm (self-contained
 # per call, immune to the poisoned M2 pool). Canonical note: the speculative
@@ -68,3 +69,13 @@ COMFYMODAL_V2_TEXT_SUBSTITUTION = "1"
 # scaled-FP8/mixed-quant files via a normalize-to-plain source plan
 # (FP8 folded to BF16 at adoption; uniform sources never consult it).
 COMFYMODAL_GOLDEN_UNET_DTYPE_PLAN = "scaled_fp8"
+# Shared model transport for generic loads: the golden stages use the same
+# C0/shared-arena transport as canonical runs (never the isolated legacy QD
+# arm). Every container is fresh, so no cross-run pool state exists to avoid.
+COMFYMODAL_GOLDEN_CLIP_LOADER = "m2"
+# Generic load overlap: role-bound CLIP loads first, UNET defers past the
+# text-encode window, and both model files get page-cache warming hints at
+# install. Plain sources decline to native only while this is on (standalone
+# decline defers cost into the sampler). Observability via
+# generic_overlap_plan / generic_overlap_pick / generic_overlap_advise.
+COMFYMODAL_V2_GENERIC_OVERLAP = "1"

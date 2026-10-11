@@ -2563,3 +2563,13 @@ change_requires = "deploy"
 runtime_exposed = true
 owner = "generic-unet"
 description = "UNET dtype-plan admission: off (default, fail-closed as today) or scaled_fp8 (admit quant_fp8 files via normalize-to-plain plan; uniform sources never consult it)."
+
+[[flag]]
+name = "COMFYMODAL_V2_GENERIC_OVERLAP"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "deploy"
+runtime_exposed = true
+owner = "generic-overlap"
+description = "Generic load overlap: role-bound CLIP loads first, UNET defers past the text-encode window, both model files get page-cache warming hints. Plain sources decline to native only while on."

@@ -12441,10 +12441,12 @@ def build_quant_fp8_plan(entries: Any, metadata: Any) -> dict[str, Any]:
 def _session_source_policy(session: Any) -> str:
     """Session-local source-read policy (default: canonical behavior).
 
-    Generic substitution sets ``session.source_policy = "legacy_qd"`` to
-    take the existing isolated legacy QD read arm instead of the shared
-    M2 singleton — no environment toggle, no canonical behavior change
-    (an unset policy preserves the current selection exactly).
+    A session may set ``session.source_policy = "legacy_qd"`` to take the
+    isolated legacy QD read arm instead of the shared transport.  Generic
+    composition no longer sets it: generic sessions take the canonical
+    transport selection exactly like canonical runs (every container is
+    fresh, so no cross-run pool state exists to isolate from).  An unset
+    policy preserves the current selection exactly.
     """
     try:
         return str(getattr(session, "source_policy", "") or "").strip().lower()

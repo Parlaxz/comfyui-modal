@@ -16745,6 +16745,7 @@ class ModalRuntimeEntrypoint:
                     holder=_generic_loader_holder,
                     trace_emit=trace.emit,
                     request_id=str(getattr(context, "request_id", "") or ""),
+                    workflow=workflow,
                 )
             except Exception:
                 _generic_loader_holder = None
@@ -18210,6 +18211,15 @@ class ModalRuntimeEntrypoint:
             # Schema v2 certs include preflight_ok=True to attest that
             # deterministic preflight completed successfully for this identity.
             # Only write when preflight actually ran (not on cert skip).
+            try:
+                print(
+                    f"[v2.post_result] stage=cert_enter "
+                    f"mono_ns={time.monotonic_ns()} "
+                    f"wall_unix_ns={time.time_ns()}",
+                    flush=True,
+                )
+            except Exception:
+                pass
             if should_write_validation_cert(_v2_schedule_cert_write, _v2_preflight_ran):
                 _cert_write_ok = await _write_v2_validation_certificate(
                     _v2_cert_identity,
@@ -18251,6 +18261,16 @@ class ModalRuntimeEntrypoint:
                         )
 
 
+            # ── Post-result span mark: cert-write exit (diagnostic only) ──
+            try:
+                print(
+                    f"[v2.post_result] stage=cert_exit "
+                    f"mono_ns={time.monotonic_ns()} "
+                    f"wall_unix_ns={time.time_ns()}",
+                    flush=True,
+                )
+            except Exception:
+                pass
             # Stop sampling at result completion before assembling request diagnostics.
             _cpu_sampler_for_result = getattr(self, "_process_cpu_sampler", None)
             if _cpu_sampler_for_result is not None:
@@ -22718,6 +22738,15 @@ class ModalRuntimeEntrypoint:
                         _run_label = "remote normal run"
                     _waterfall_started_ms = (time.monotonic_ns() - _method_first_line_ns) / 1_000_000
                     _waterfall_now_ns = time.time_ns()
+                    try:
+                        print(
+                            f"[v2.post_result] stage=report_render_enter "
+                            f"mono_ns={time.monotonic_ns()} "
+                            f"wall_unix_ns={time.time_ns()}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
                     _waterfall = build_waterfall(
                         result=data,
                         timing=data.get("timing", {}) if isinstance(data.get("timing"), Mapping) else {},
@@ -22759,22 +22788,15 @@ class ModalRuntimeEntrypoint:
                         data.get("trace") if isinstance(data, dict) else None
                     )
                     if _gantt_trace is not None:
+                        # Single-gantt contract: exactly one V2 REMOTE GANTT
+                        # full overview per request. The separate
+                        # canonical-ledger Gantt is intentionally retired
+                        # so there is only one gantt alongside the one
+                        # waterfall.
                         emit_gantt_records(
                             _gantt_trace,
                             request_id=_t4_request_id or request_id,
                         )
-                        # ── E29: canonical-ledger Gantt (request-scoped) ──
-                        # Renders ONLY from the canonical ledger store, which
-                        # begin_request() reset at method entry — a reused
-                        # container can never append previous-request spans.
-                        try:
-                            from . import critical_path_ledger as _cpl
-                            emit_canonical_gantt(
-                                _cpl,
-                                request_id=_t4_request_id or request_id,
-                            )
-                        except Exception:
-                            pass
                         _gantt_report = collect_gantt_report(_gantt_trace)
                         if isinstance(data, dict) and _gantt_report.get("spans"):
                             data["gantt_telemetry"] = _gantt_report
@@ -22982,6 +23004,15 @@ class ModalRuntimeEntrypoint:
                         data["output_stage13_breakdown"] = build_stage13_breakdown(_s13_boundaries)
                 except Exception:
                     pass
+                try:
+                    print(
+                        f"[v2.post_result] stage=result_yield "
+                        f"mono_ns={time.monotonic_ns()} "
+                        f"wall_unix_ns={time.time_ns()}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
             yield event
 
         # Variant A: the asset commit completes after the result event was
@@ -22989,6 +23020,15 @@ class ModalRuntimeEntrypoint:
         # local drain can record the final state.  The Modal container
         # entrypoint drives this generator to exhaustion even when the client
         # closed the stream, so this tail WILL run.
+        try:
+            print(
+                f"[v2.post_result] stage=deferred_tail_enter "
+                f"mono_ns={time.monotonic_ns()} "
+                f"wall_unix_ns={time.time_ns()}",
+                flush=True,
+            )
+        except Exception:
+            pass
         _deferred_commit_event = await self._finalize_deferred_commit(request_id=request_id)
         if _deferred_commit_event is not None:
             # The deferred commit runs AFTER the result event was already
