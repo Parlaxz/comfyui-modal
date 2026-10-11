@@ -751,7 +751,7 @@ async def compose_generic_unet_load(
             "reason": (
                 f"{type(exc).__name__}:{str(exc)[:200]}"
                 + (f" | tb:{_tb_text[-1200:]}" if _tb_text else "")
-                + header_bit
+                + (header_bit if "header_bit" in locals() else "")
             ),
             "elapsed_ms": elapsed_ms,
             "source_arm": "golden_unet",
@@ -1478,6 +1478,119 @@ async def _substitute_unet_vae_loader(
         return {"ok": False, "reason": f"{type(exc).__name__}:{str(exc)[:150]}"}
 
 
+def _kitchen_policy_backend() -> str:
+    """Deploy-owned attention selection for generic runs (never raises).
+
+    Mirrors the profile intent: when the deployment selects
+    ``comfy_kitchen``, generic native sampling runs under the same
+    shared attention scope canonical sampling uses.  Anything else
+    means native attention untouched.
+    """
+    try:
+        return str(os.environ.get(
+            "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND", "") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _kitchen_scope_for(patcher: Any, backend: str) -> Any:
+    """Return the shared attention scope (imported, never copied)."""
+    from .golden_serial import attention_backend_scope
+
+    return attention_backend_scope(patcher, backend)
+
+
+def _is_sampler_node(obj: Any, input_data_all: Any) -> bool:
+    """True for sampler-like nodes carrying a model input. Never raises."""
+    try:
+        if "sampler" not in type(obj).__name__.lower():
+            return False
+        if not isinstance(input_data_all, dict):
+            return False
+        model = input_data_all.get("model")
+        if isinstance(model, (list, tuple)):
+            return len(model) > 0 and model[0] is not None
+        return model is not None
+    except Exception:
+        return False
+
+
+async def _run_native_with_kitchen_option(
+    active: Mapping[str, Any],
+    prompt_id: Any,
+    unique_id: Any,
+    obj: Any,
+    input_data_all: Any,
+    original: Any,
+    *,
+    execution_block_cb: Any = None,
+    pre_execute_cb: Any = None,
+    v3_data: Any = None,
+) -> Any:
+    """Native execution with kitchen attention forced for sampler nodes.
+
+    Samplers are NEVER replaced (owner decision): the original native
+    call runs, wrapped in the shared attention scope when the deployment
+    selects ``comfy_kitchen``.  Scope-setup failure falls back to the
+    bare native call with a skipped event; node errors propagate
+    unchanged (the scope restores via its own finally).  Never raises
+    itself.
+    """
+    node_id = str(unique_id)
+    try:
+        if not _is_sampler_node(obj, input_data_all):
+            return await original(
+                prompt_id, unique_id, obj, input_data_all,
+                execution_block_cb=execution_block_cb,
+                pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+            )
+        if _kitchen_policy_backend() != "comfy_kitchen":
+            return await original(
+                prompt_id, unique_id, obj, input_data_all,
+                execution_block_cb=execution_block_cb,
+                pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+            )
+        model = input_data_all.get("model")
+        patcher = model[0] if isinstance(model, (list, tuple)) else model
+        try:
+            scope = _kitchen_scope_for(patcher, "comfy_kitchen")
+        except Exception as setup_exc:
+            _emit_trace(
+                active.get("trace_emit"), "generic_kitchen_attention",
+                node_id=node_id, requested="comfy_kitchen",
+                outcome="skipped",
+                reason=f"scope_setup:{type(setup_exc).__name__}",
+            )
+            return await original(
+                prompt_id, unique_id, obj, input_data_all,
+                execution_block_cb=execution_block_cb,
+                pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+            )
+        with scope as scope_state:
+            result = await original(
+                prompt_id, unique_id, obj, input_data_all,
+                execution_block_cb=execution_block_cb,
+                pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+            )
+        try:
+            selected = str((scope_state or {}).get("selected_callable", ""))
+            calls = int((scope_state or {}).get("calls", 0) or 0)
+        except Exception:
+            selected, calls = "", 0
+        _emit_trace(
+            active.get("trace_emit"), "generic_kitchen_attention",
+            node_id=node_id, requested="comfy_kitchen",
+            outcome="engaged", selected=selected, calls=calls,
+        )
+        return result
+    except Exception:
+        return await original(
+            prompt_id, unique_id, obj, input_data_all,
+            execution_block_cb=execution_block_cb,
+            pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+        )
+
+
 async def _run_substituted_loader(
     *, role: str, node_id: str, inputs: Mapping[str, Any], ctx: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1660,8 +1773,9 @@ def install_execution_dispatch_substitution(
                 )
             decision = _select_substitution(active, unique_id, obj, input_data_all)
             if decision is None:
-                return await original(
-                    prompt_id, unique_id, obj, input_data_all,
+                return await _run_native_with_kitchen_option(
+                    active, prompt_id, unique_id, obj, input_data_all,
+                    original,
                     execution_block_cb=execution_block_cb,
                     pre_execute_cb=pre_execute_cb, v3_data=v3_data,
                 )

@@ -625,3 +625,177 @@ class TestUnetQdFallback:
             assert "qd_unet_gate_disabled" in native[0]["reason"]
         finally:
             restore()
+
+
+class _FakeKitchenScope:
+    def __init__(self, log, state):
+        self._log = log
+        self._state = dict(state)
+
+    def __enter__(self):
+        self._log.append("enter")
+        return self._state
+
+    def __exit__(self, *exc):
+        self._log.append("exit")
+        return False
+
+
+class TestKitchenAttention:
+    """Native sampling runs untouched; kitchen attention wraps it when the
+    deployment selects comfy_kitchen. Setup failure degrades to bare
+    native; node errors propagate with the scope restored."""
+
+    def _sampler_inputs(self, patcher):
+        return {"model": [patcher], "seed": [1], "steps": [8]}
+
+    def test_engaged(self, monkeypatch):
+        calls = []
+        log = []
+        seen = {}
+        fake, _holder, sink, restore = _install(
+            monkeypatch, calls, {"clip": {"node_id": "195"}})
+        monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                           "comfy_kitchen")
+
+        def factory(patcher, backend):
+            seen["patcher"] = patcher
+            seen["backend"] = backend
+            return _FakeKitchenScope(
+                log, {"selected_callable": "fake_kitchen_int8", "calls": 7})
+
+        monkeypatch.setattr(ggl, "_kitchen_scope_for", factory)
+        try:
+            patcher = type("P", (), {"model_options": {}})()
+            out = asyncio.run(fake.get_output_data(
+                "p1", "163", KSampler(), self._sampler_inputs(patcher)))
+            assert out[0] == "native-output"
+            assert len(calls) == 1
+            assert seen["patcher"] is patcher
+            assert seen["backend"] == "comfy_kitchen"
+            assert log == ["enter", "exit"]
+            engaged = [m for n, m in sink
+                       if n == "generic_kitchen_attention"
+                       and m.get("outcome") == "engaged"]
+            assert len(engaged) == 1
+            assert engaged[0]["selected"] == "fake_kitchen_int8"
+            assert engaged[0]["calls"] == 7
+            assert engaged[0]["node_id"] == "163"
+        finally:
+            restore()
+            monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                               raising=False)
+
+    def test_policy_off_bare(self, monkeypatch):
+        calls = []
+        fake, _holder, sink, restore = _install(
+            monkeypatch, calls, {"clip": {"node_id": "195"}})
+        monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                           raising=False)
+
+        def factory(patcher, backend):
+            raise AssertionError("scope must not build when policy off")
+
+        monkeypatch.setattr(ggl, "_kitchen_scope_for", factory)
+        try:
+            patcher = type("P", (), {"model_options": {}})()
+            out = asyncio.run(fake.get_output_data(
+                "p1", "163", KSampler(), self._sampler_inputs(patcher)))
+            assert out[0] == "native-output"
+            assert len(calls) == 1
+            assert not [n for n, _m in sink if n == "generic_kitchen_attention"]
+        finally:
+            restore()
+
+    def test_setup_failure_falls_back_bare(self, monkeypatch):
+        calls = []
+        fake, _holder, sink, restore = _install(
+            monkeypatch, calls, {"clip": {"node_id": "195"}})
+        monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                           "comfy_kitchen")
+
+        def factory(patcher, backend):
+            raise RuntimeError("comfy_kitchen_attention_unavailable")
+
+        monkeypatch.setattr(ggl, "_kitchen_scope_for", factory)
+        try:
+            patcher = type("P", (), {"model_options": {}})()
+            out = asyncio.run(fake.get_output_data(
+                "p1", "163", KSampler(), self._sampler_inputs(patcher)))
+            assert out[0] == "native-output"
+            assert len(calls) == 1
+            skipped = [m for n, m in sink
+                       if n == "generic_kitchen_attention"
+                       and m.get("outcome") == "skipped"]
+            assert len(skipped) == 1
+            assert "scope_setup" in skipped[0]["reason"]
+        finally:
+            restore()
+            monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                               raising=False)
+
+    def test_non_sampler_untouched(self, monkeypatch):
+        calls = []
+        log = []
+        fake, _holder, sink, restore = _install(
+            monkeypatch, calls, {"clip": {"node_id": "195"}})
+        monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                           "comfy_kitchen")
+
+        def factory(patcher, backend):
+            log.append("built")
+            return _FakeKitchenScope(log, {})
+
+        monkeypatch.setattr(ggl, "_kitchen_scope_for", factory)
+        try:
+            out = asyncio.run(fake.get_output_data(
+                "p1", "199", CLIPLoader(), {"images": ["1", 0]}))
+            assert out[0] == "native-output"
+            assert log == []
+            assert not [n for n, _m in sink if n == "generic_kitchen_attention"]
+        finally:
+            restore()
+            monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                               raising=False)
+
+    def test_node_error_propagates_scope_restored(self, monkeypatch):
+        import sys as _sys
+        import types as _types
+
+        log = []
+
+        async def raising_native(prompt_id, unique_id, obj, input_data_all,
+                                 execution_block_cb=None, pre_execute_cb=None,
+                                 v3_data=None):
+            raise RuntimeError("sampler_boom")
+
+        def fake_merge(results, obj):
+            return results
+
+        fake = _types.ModuleType("execution")
+        setattr(fake, "get_output_data", raising_native)
+        setattr(fake, "merge_result_data", fake_merge)
+        monkeypatch.setitem(_sys.modules, "execution", fake)
+        monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                           "comfy_kitchen")
+
+        def factory(patcher, backend):
+            return _FakeKitchenScope(
+                log, {"selected_callable": "x", "calls": 0})
+
+        monkeypatch.setattr(ggl, "_kitchen_scope_for", factory)
+        holder = ggl.GenericLoaderHolder()
+        restore = ggl.install_execution_dispatch_substitution(
+            role_bindings={"clip": {"node_id": "195"}}, holder=holder,
+            trace_emit=lambda *a, **k: None, request_id="r1")
+        assert restore is not None
+        try:
+            patcher = type("P", (), {"model_options": {}})()
+            with pytest.raises(RuntimeError, match="sampler_boom"):
+                asyncio.run(fake.get_output_data(
+                    "p1", "163", KSampler(), self._sampler_inputs(patcher)))
+            assert log == ["enter", "exit"]
+        finally:
+            restore()
+            monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                               raising=False)
