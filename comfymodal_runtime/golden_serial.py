@@ -12687,6 +12687,13 @@ async def golden_clip_load(
         if preloaded_transports is None:
             overlap_construct = _start_clip_skeleton_overlap(session, spec=spec, rec=rec)
         overlap_source_start_ns = time.monotonic_ns() if overlap_construct is not None else None
+        try:
+            print(
+                "[v2.clip_stage_phase] event=transport_start mono_ms={}".format(
+                    time.monotonic_ns() // 1_000_000),
+                flush=True)
+        except Exception:
+            pass
         for index, path in enumerate(
             session.clip_paths if preloaded_transports is None else ()
         ):
@@ -12886,9 +12893,21 @@ async def golden_clip_load(
         if not source_dtypes:
             raise RuntimeError("clip_source_state_dict_empty")
         try:
+            _tstat: dict[str, Any] = {}
+            try:
+                for _tr in (transports or []):
+                    _st = (_tr or {}).get("stats") or {}
+                    if _st:
+                        _tstat = dict(_st)
+                        break
+            except Exception:
+                _tstat = {}
             print(
-                "[v2.clip_stage_phase] event=transport_done mono_ms={}".format(
-                    time.monotonic_ns() // 1_000_000),
+                "[v2.clip_stage_phase] event=transport_done mono_ms={} "
+                "source_wall_ms={} gpu_ready_wall_ms={}".format(
+                    time.monotonic_ns() // 1_000_000,
+                    _tstat.get("source_wall_ms"),
+                    _tstat.get("gpu_ready_wall_ms")),
                 flush=True)
         except Exception:
             pass
