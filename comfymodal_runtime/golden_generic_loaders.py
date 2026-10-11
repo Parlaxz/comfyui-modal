@@ -2168,6 +2168,13 @@ async def _run_substituted_loader(
             "reason": str(outcome.get("reason") or ""),
         })
         outcome["attempt_walls"] = attempt_walls
+        try:
+            print(
+                "[v2.generic_attempt_walls] role=clip walls={}".format(
+                    json.dumps(attempt_walls)[:600]),
+                flush=True)
+        except Exception:
+            pass
         if not outcome.get("ok"):
             stage_reason = str(stage_outcome.get("reason") or "stage_failed")
             outcome["reason"] = (
