@@ -12798,6 +12798,24 @@ async def golden_clip_load(
                     source_wall_ms=stats.get("source_wall_ms"),
                     h2d_completed_bytes=stats.get("h2d_completed_bytes"),
                 )
+                try:
+                    print(
+                        "[v2.transport_arm] role=clip "
+                        f"execution_arm={transport_record.get('execution_arm')} "
+                        f"source_engine={transport_record.get('source_engine')} "
+                        f"h2d_engine={transport_record.get('h2d_engine')} "
+                        f"c0_arena_created={transport_record.get('c0_arena_created')} "
+                        f"c0_arena_reused={transport_record.get('c0_arena_reused')} "
+                        f"layout_cache_hit={transport_record.get('layout_cache_hit')} "
+                        f"fd_cache_hit={transport_record.get('fd_cache_hit')} "
+                        f"source_wall_ms={transport_record.get('source_wall_ms')} "
+                        f"source_gbps={transport_record.get('source_gbps')} "
+                        f"gpu_ready_wall_ms={transport_record.get('gpu_ready_wall_ms')} "
+                        f"total_load_ms={transport_record.get('total_load_ms')}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
             source_layout = stats.get("source_open_header_layout") or {}
             staging = stats.get("staging") or {}
             if diagnostics_enabled:
@@ -14977,6 +14995,24 @@ async def golden_unet_load(
             }
             session.model_transport_records.append(transport_record)
             rec.event("golden_model_transport_load", **transport_record)
+            try:
+                print(
+                    "[v2.transport_arm] role=unet "
+                    f"execution_arm={transport_record.get('execution_arm')} "
+                    f"source_engine={transport_record.get('source_engine')} "
+                    f"h2d_engine={transport_record.get('h2d_engine')} "
+                    f"c0_arena_created={transport_record.get('c0_arena_created')} "
+                    f"c0_arena_reused={transport_record.get('c0_arena_reused')} "
+                    f"layout_cache_hit={transport_record.get('layout_cache_hit')} "
+                    f"fd_cache_hit={transport_record.get('fd_cache_hit')} "
+                    f"source_wall_ms={transport_record.get('source_wall_ms')} "
+                    f"source_gbps={transport_record.get('source_gbps')} "
+                    f"gpu_ready_wall_ms={transport_record.get('gpu_ready_wall_ms')} "
+                    f"total_load_ms={transport_record.get('total_load_ms')}",
+                    flush=True,
+                )
+            except Exception:
+                pass
             preresolve_record = getattr(session, "unet_layout_preresolve_record", None)
             if isinstance(preresolve_record, dict):
                 preresolve_record["layout_cache_hit"] = loaded.stats.get("layout_cache_hit")
