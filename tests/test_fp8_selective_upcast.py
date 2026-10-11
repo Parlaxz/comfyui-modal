@@ -149,6 +149,69 @@ class TestSelectiveUpcast:
         assert report["enabled"] in (True, False)
 
 
+class _FakeQT:
+    """Duck-typed quantized weight (dequantize + shape, no Comfy import)."""
+
+    def __init__(self, tensor):
+        self._t = tensor
+
+    @property
+    def shape(self):
+        return self._t.shape
+
+    @property
+    def dtype(self):
+        return self._t.dtype
+
+    @property
+    def device(self):
+        return self._t.device
+
+    def dequantize(self):
+        return self._t.to(torch.bfloat16)
+
+    def nelement(self):
+        return self._t.nelement()
+
+
+class _FakeQuantLinear(torch.nn.Module):
+    def __init__(self, in_f, out_f):
+        super().__init__()
+        self.weight = _FakeQT(torch.zeros(
+            out_f, in_f, dtype=torch.float8_e4m3fn))
+        self.layout_type = "TensorCoreFP8Layout"
+        self.quant_format = "float8_e4m3fn"
+        self._full_precision_mm = False
+        self.out_features = out_f
+        self.in_features = in_f
+
+
+class TestForcePlainHostileLinears:
+    def test_normalizes_hostile_leaves_aligned(self):
+        root = torch.nn.Module()
+        root.bad = _FakeQuantLinear(2560, 3396)
+        root.good = _FakeQuantLinear(2560, 2560)
+        root.plain = torch.nn.Linear(100, 283)
+        rep = ggl.force_plain_hostile_linears(root, tag="t")
+        assert rep["normalized"] == 1
+        assert any("bad" in n for n in rep["names"])
+        assert root.bad.layout_type is None
+        assert root.bad.quant_format is None
+        assert root.bad._full_precision_mm is True
+        assert isinstance(root.bad.weight, torch.nn.Parameter)
+        assert root.bad.weight.dtype == torch.bfloat16
+        assert torch.equal(root.bad.weight,
+                           torch.zeros(3396, 2560, dtype=torch.bfloat16))
+        # Aligned quantized layer keeps native FP8.
+        assert hasattr(root.good.weight, "dequantize")
+        assert root.good.layout_type == "TensorCoreFP8Layout"
+
+    def test_no_modules_no_raise(self):
+        assert ggl.force_plain_hostile_linears(
+            object(), tag="t")["normalized"] == 0
+        assert ggl.force_plain_hostile_linears(None)["normalized"] == 0
+
+
 class TestLogGuard:
     def test_install_idempotent_and_caps(self):
         assert ggl._install_fp8_fallback_log_guard() is True

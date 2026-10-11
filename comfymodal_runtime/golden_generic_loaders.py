@@ -623,6 +623,9 @@ async def compose_generic_unet_load_qd(
             )
         except Exception:
             pass
+        # Post-construction de-quant walk: loader fusion can build hostile
+        # GEMM dims no file scan can see.  Generic shape rule on OUR object.
+        fp8_layer_report = force_plain_hostile_linears(patcher, tag="unet")
         t_construct_ns = time.monotonic_ns()
         elapsed_ms = (t_construct_ns - started_ns) / 1_000_000.0
         phases = {
@@ -643,6 +646,7 @@ async def compose_generic_unet_load_qd(
             "source_arm": "qd_unet_demand",
             "phases": phases,
             "fp8_selective_upcast": fp8_upcast_report,
+            "fp8_layer_dequant": fp8_layer_report,
         }
     except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
@@ -1143,6 +1147,168 @@ def selective_fp8_bf16_upcast(
         return state_dict, metadata, report
 
 
+def _is_quantized_weight(tensor: Any) -> bool:
+    """True only for actually-quantized weights (not plain dense tensors).
+
+    ``torch.Tensor.dequantize`` exists on EVERY tensor (quantized-ops
+    method), so mere attribute presence is not a signal.  Quantized means
+    torch-quantized storage, an FP8 dtype, or a kitchen-style wrapper
+    exposing dequantize without torch quantized storage.
+    """
+    try:
+        if tensor is None:
+            return False
+        if bool(getattr(tensor, "is_quantized", False)):
+            return True
+        dtype_name = str(getattr(tensor, "dtype", "")).lower()
+        if "float8" in dtype_name:
+            return True
+        if "quantiz" in type(tensor).__name__.lower():
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _resolve_module_root(obj: Any) -> Any | None:
+    """Best-effort nn.Module root for a constructed model holder."""
+    try:
+        for candidate in (obj, getattr(obj, "model", None),
+                          getattr(getattr(obj, "patcher", None),
+                                  "model", None)):
+            if candidate is not None and hasattr(candidate, "named_modules"):
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _weight_static_shape(weight: Any) -> tuple[int, ...] | None:
+    try:
+        shape = getattr(weight, "shape", None)
+        if shape is None:
+            return None
+        dims = tuple(int(d) for d in tuple(shape))
+        return dims if len(dims) >= 2 else None
+    except Exception:
+        return None
+
+
+def force_plain_hostile_linears(root: Any, tag: str = "") -> dict[str, Any]:
+    """De-quantize hostile-shape linears on a CONSTRUCTED model (generic).
+
+    Loader fusion/reshape can build quantized linears whose runtime GEMM
+    dims break cuBLAS FP8 alignment even though every FILE weight is clean
+    (observed live: out_features in {3396, 283, 4379}).  Those layers fail
+    EVERY cuBLAS FP8 attempt and fall back per-op, hundreds of times per
+    sample.  This walk finds them post-construction by SHAPE (any model,
+    any file): any module whose weight's static ``(out, in)`` fails
+    :func:`_fp8_native_shape_ok` and which is quantized (layout set or
+    de-quantizable weight) gets its weight replaced by its de-quantized
+    plain tensor with the layout nulled — numerically identical to today's
+    per-op fallback, minus all of its overhead.  Aligned quantized layers
+    keep native FP8.  Operates on OUR constructed object only; no library
+    code is touched.  Never raises.
+    """
+    report: dict[str, Any] = {
+        "tag": str(tag or ""), "walked": 0, "normalized": 0,
+        "names": [], "elapsed_ms": 0.0,
+    }
+    started_ns = time.monotonic_ns()
+    try:
+        import torch as _torch_walk
+
+        target = _resolve_module_root(root)
+        if target is None:
+            return report
+        with _torch_walk.inference_mode(False):
+            try:
+                modules = list(target.named_modules())
+            except Exception:
+                return report
+            for name, mod in modules:
+                try:
+                    report["walked"] += 1
+                    weight = getattr(mod, "weight", None)
+                    data = getattr(weight, "data", None)
+                    quant_weight = None
+                    for candidate in (weight, data):
+                        if _is_quantized_weight(candidate):
+                            quant_weight = candidate
+                            break
+                    layout_set = (
+                        getattr(mod, "layout_type", None) is not None)
+                    if quant_weight is None and not layout_set:
+                        continue
+                    shape = _weight_static_shape(
+                        quant_weight if quant_weight is not None
+                        else weight)
+                    if shape is None:
+                        out_f = getattr(mod, "out_features", None)
+                        in_f = getattr(mod, "in_features", None)
+                        try:
+                            shape = (int(out_f), int(in_f))
+                        except Exception:
+                            continue
+                    if _fp8_native_shape_ok(shape):
+                        continue
+                    if (quant_weight is not None and callable(
+                            getattr(quant_weight, "dequantize", None))):
+                        try:
+                            plain = quant_weight.dequantize()
+                        except Exception:
+                            continue
+                        try:
+                            module_weight = _torch_walk.nn.Parameter(
+                                plain, requires_grad=False)
+                        except Exception:
+                            continue
+                        try:
+                            mod.weight = module_weight
+                        except Exception:
+                            continue
+                    try:
+                        mod.layout_type = None
+                    except Exception:
+                        pass
+                    try:
+                        mod.quant_format = None
+                    except Exception:
+                        pass
+                    try:
+                        mod._full_precision_mm = True
+                    except Exception:
+                        pass
+                    report["normalized"] += 1
+                    if len(report["names"]) < 10:
+                        try:
+                            report["names"].append(str(name or "?"))
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        report["elapsed_ms"] = round(
+            (time.monotonic_ns() - started_ns) / 1_000_000.0, 1)
+        try:
+            print(
+                "[v2.fp8_layer_dequant] tag={} walked={} normalized={} "
+                "names={} ms={}".format(
+                    report["tag"], report["walked"],
+                    report["normalized"], report["names"],
+                    report["elapsed_ms"]),
+                flush=True)
+        except Exception:
+            pass
+        return report
+    except Exception:
+        try:
+            report["elapsed_ms"] = round(
+                (time.monotonic_ns() - started_ns) / 1_000_000.0, 1)
+        except Exception:
+            pass
+        return report
+
+
 def _install_fp8_fallback_log_guard() -> bool:
     """Cap comfy_kitchen FP8-fallback WARNING spam (process logging only).
 
@@ -1366,6 +1532,9 @@ async def compose_generic_clip_load_qd4(
             )
         except Exception:
             pass
+        # Post-construction de-quant walk: loader fusion can build hostile
+        # GEMM dims no file scan can see.  Generic shape rule on OUR object.
+        fp8_layer_report = force_plain_hostile_linears(clip, tag="clip")
         t_construct_ns = time.monotonic_ns()
         elapsed_ms = (t_construct_ns - started_ns) / 1_000_000.0
         phases = {
@@ -1386,6 +1555,7 @@ async def compose_generic_clip_load_qd4(
             "source_arm": "qd4_demand",
             "phases": phases,
             "fp8_selective_upcast": fp8_upcast_report,
+            "fp8_layer_dequant": fp8_layer_report,
         }
     except Exception as exc:  # noqa: BLE001 - fallback contract: never raise
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
