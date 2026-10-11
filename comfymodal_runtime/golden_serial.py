@@ -12333,6 +12333,42 @@ def _read_golden_m2_clip(path: str, *, transport: Any = None, role: str = "clip"
     }
 
 
+def _cpu_quant_markers_in_place(state_dicts: Any) -> int:
+    """Move ``*.comfy_quant`` descriptors to CPU across transported dicts.
+
+    Loaders parse descriptors via ``.numpy()``, which forbids CUDA tensors
+    (observed live: QD-transported scaled-FP8 sources crash the bind with
+    "can't convert cuda device type tensor to numpy").  Weights stay GPU
+    views (zero-copy preserved); descriptors are byte-sized metadata
+    consumed at construction.  No-op when no descriptors exist (every
+    canonical BF16 source) or they already ride CPU, so canonical paths
+    are untouched.  Returns the moved count.  Never raises.
+    """
+    moved = 0
+    try:
+        dicts = list(state_dicts or ())
+    except Exception:
+        return 0
+    for sd in dicts:
+        try:
+            if not isinstance(sd, dict):
+                continue
+            for key in list(sd.keys()):
+                if not str(key).endswith(".comfy_quant"):
+                    continue
+                tensor = sd[key]
+                try:
+                    if not bool(getattr(tensor, "is_cuda", False)):
+                        continue
+                    sd[key] = tensor.to("cpu")
+                    moved += 1
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return moved
+
+
 async def golden_clip_load(
     session: GoldenSession, *, preloaded_transports: Optional[list[dict]] = None
 ) -> Any:
@@ -12838,6 +12874,11 @@ async def golden_clip_load(
         def golden_initial_device(load_device, offload_device, model_size=0):
             return torch.device("meta")
 
+        # Quant descriptors must be CPU before any bind path (overlap join
+        # and direct construction both consume these same dicts): loaders
+        # parse them via .numpy().  No-op for descriptor-free sources.
+        _markers_moved = _cpu_quant_markers_in_place(transformed_state_dicts)
+        rec.event("clip_quant_markers_cpu", moved=int(_markers_moved))
         # Constructor/load_state_dict(assign=True) is the actual ownership
         # bind seam.  Enter bind before it, including the dynamic-patcher
         # postflight immediately following the constructor, so failures there
