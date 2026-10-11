@@ -12899,14 +12899,15 @@ async def golden_clip_load(
                 for _tr in (transports or []):
                     _st = (_tr or {}).get("stats") or {}
                     if isinstance(_st, dict) and _st:
-                        _tkeys = sorted(str(k) for k in _st.keys())[:20]
+                        _tkeys = sorted(str(k) for k in _st.keys())
                         for _cand in ("source_wall_ms",
                                        "qd_source_io_wall_ms",
                                        "total_load_ms",
-                                       "gpu_ready_wall_ms"):
-                            if _st.get(_cand) is not None:
+                                       "gpu_ready_wall_ms",
+                                       "source_fill_wall_ms",
+                                       "gpu_ready_tail_ms"):
+                            if _st.get(_cand) is not None and _tsrc is None:
                                 _tsrc = _st.get(_cand)
-                                break
                         break
             except Exception:
                 _tkeys = []
@@ -12915,7 +12916,7 @@ async def golden_clip_load(
                 "[v2.clip_stage_phase] event=transport_done mono_ms={} "
                 "read_wall_ms={} stat_keys={}".format(
                     time.monotonic_ns() // 1_000_000,
-                    _tsrc, _tkeys),
+                    _tsrc, _tkeys[:30]),
                 flush=True)
         except Exception:
             pass
