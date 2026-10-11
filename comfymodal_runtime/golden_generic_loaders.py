@@ -920,17 +920,23 @@ def _fp8_native_shape_ok(shape: Any) -> bool:
     return (n % _FP8_GEMM_ALIGN == 0) and (k % _FP8_GEMM_ALIGN == 0)
 
 
-def _is_fp8_weight_tensor(key: Any, tensor: Any) -> bool:
-    """True for upcast-candidate weights: ``*.weight``, ndim>=2, FP8 dtype."""
+def _is_weight_matrix(key: Any, tensor: Any) -> bool:
+    """True for candidate weights: ``*.weight``, ndim>=2 (any dtype)."""
     try:
         if not str(key or "").endswith(".weight"):
-            return False
-        if "float8" not in str(getattr(tensor, "dtype", "")).lower():
             return False
         shape = getattr(tensor, "shape", None)
         return shape is not None and len(tuple(shape)) >= 2
     except Exception:
         return False
+
+
+# File dtypes whose hostile-shape layers are de-quantized to plain compute
+# (their quant config is stripped so loaders take the plain branch).
+_PLAINABLE_DTYPES = frozenset({
+    "torch.bfloat16", "torch.float16", "torch.float32",
+    "bfloat16", "float16", "float32",
+})
 
 
 def _log_upcast_report(report: Any) -> None:
@@ -944,9 +950,10 @@ def _log_upcast_report(report: Any) -> None:
         rep = report if isinstance(report, dict) else {}
         print(
             "[v2.fp8_selective_upcast] enabled={} candidates={} upcast={} "
-            "bytes={} reverted={} skipped={} ms={}".format(
+            "stripped={} bytes={} reverted={} skipped={} ms={}".format(
                 rep.get("enabled"), rep.get("candidates"),
-                rep.get("upcast_count"), rep.get("upcast_bytes"),
+                rep.get("upcast_count"), rep.get("stripped_count"),
+                rep.get("upcast_bytes"),
                 len(rep.get("reverted") or []),
                 len(rep.get("skipped") or []),
                 rep.get("elapsed_ms")),
@@ -959,25 +966,30 @@ def selective_fp8_bf16_upcast(
     state_dict: Any,
     metadata: Any = None,
 ) -> tuple[Any, Any, dict[str, Any]]:
-    """Upcast cuBLAS-hostile FP8 weights to BF16 at load (generic, shape-ruled).
+    """De-quantize cuBLAS-hostile layers at load (generic, shape-ruled).
 
-    For every FP8 ``*.weight`` whose static shape fails
-    :func:`_fp8_native_shape_ok`, folds its scale in
-    (``weight.to(bf16) * scale``) and drops ALL of its quant artifacts
-    (descriptors + scales, both modern and legacy key schemes) so downstream
-    loaders bind a plain BF16 linear.  Aligned FP8 weights pass through
-    untouched and keep native FP8 execution.  The file's
-    ``_quantization_metadata`` copy is scrubbed of upcast layers so loaders
-    that attach descriptors internally (diffusion path) cannot re-quantize
-    them.  A layer is committed ONLY when fully neutralized (no quant keys
-    remain in-sd AND no metadata entry remains); otherwise it is reverted to
-    its original FP8 tensors.  File-agnostic: no filenames, no model lists.
+    For every ``*.weight`` matrix whose static shape fails
+    :func:`_fp8_native_shape_ok`, removes the layer from the FP8 runtime
+    path so no cuBLAS FP8 attempt can fail on it:
+
+    * FP8 weights are folded to BF16 (``weight.to(bf16) * scale``);
+    * BF16/FP16/FP32 weights are left byte-identical — only their quant
+      config is stripped (in-sd descriptors/scales plus the
+      ``_quantization_metadata`` entry), because loaders wrap ANY
+      descriptor-carrying layer into runtime-quantized FP8 linears
+      regardless of file dtype (verified in ``comfy/ops.py``: descriptor
+      present -> quantized layout, absent -> plain parameter).
+
+    Aligned layers pass through untouched and keep native FP8 execution.
+    A layer is committed ONLY when fully neutralized; otherwise it is
+    reverted.  File-agnostic: no filenames, no model lists.
 
     Returns ``(sd, metadata, report)``.  Never raises.
     """
     report: dict[str, Any] = {
         "enabled": False, "candidates": 0, "upcast_count": 0,
-        "upcast_bytes": 0, "reverted": [], "skipped": [],
+        "upcast_bytes": 0, "stripped_count": 0,
+        "reverted": [], "skipped": [],
         "elapsed_ms": 0.0,
     }
     started_ns = time.monotonic_ns()
@@ -1010,7 +1022,7 @@ def selective_fp8_bf16_upcast(
         committed: list[tuple[str, dict[str, Any]]] = []
         for key in list(state_dict.keys()):
             tensor = state_dict.get(key)
-            if not _is_fp8_weight_tensor(key, tensor):
+            if not _is_weight_matrix(key, tensor):
                 continue
             try:
                 report["candidates"] += 1
@@ -1024,6 +1036,14 @@ def selective_fp8_bf16_upcast(
             if _fp8_native_shape_ok(shape):
                 continue
             prefix = str(key)[: -len(".weight")]
+            try:
+                dtype_name = str(getattr(tensor, "dtype", "")).lower()
+            except Exception:
+                dtype_name = ""
+            is_fp8 = "float8" in dtype_name
+            if not is_fp8 and dtype_name not in _PLAINABLE_DTYPES:
+                report["skipped"].append(f"{key}:dtype {dtype_name or '?'}")
+                continue
             scale = None
             for suffix in (".weight_scale", ".scale_weight"):
                 candidate = state_dict.get(prefix + suffix)
@@ -1035,13 +1055,22 @@ def selective_fp8_bf16_upcast(
                 qkey = prefix + suffix
                 if qkey in state_dict:
                     saved[qkey] = state_dict[qkey]
+            has_insd_config = any(
+                (prefix + s) in state_dict for s in _FP8_QUANT_SUFFIXES)
+            has_meta_config = (isinstance(layers_meta, dict)
+                               and prefix in layers_meta)
+            if not is_fp8 and not has_insd_config and not has_meta_config:
+                # Plain already: no descriptor can quantize this layer.
+                report["skipped"].append(f"{key}:already_plain")
+                continue
             try:
-                w = tensor.to(_torch_upcast.bfloat16)
-                if scale is not None:
-                    s = scale.to(device=w.device,
-                                 dtype=_torch_upcast.bfloat16)
-                    w = w * s
-                state_dict[key] = w
+                if is_fp8:
+                    w = tensor.to(_torch_upcast.bfloat16)
+                    if scale is not None:
+                        s = scale.to(device=w.device,
+                                     dtype=_torch_upcast.bfloat16)
+                        w = w * s
+                    state_dict[key] = w
                 for suffix in _FP8_QUANT_SUFFIXES:
                     state_dict.pop(prefix + suffix, None)
             except Exception as exc:
@@ -1068,8 +1097,11 @@ def selective_fp8_bf16_upcast(
             try:
                 committed.append((prefix, saved))
                 upcast_prefixes.append(prefix)
-                report["upcast_count"] += 1
-                report["upcast_bytes"] += int(tensor.nelement())
+                if is_fp8:
+                    report["upcast_count"] += 1
+                    report["upcast_bytes"] += int(tensor.nelement())
+                else:
+                    report["stripped_count"] += 1
             except Exception:
                 pass
         if isinstance(layers_meta, dict) and upcast_prefixes:
@@ -1093,6 +1125,7 @@ def selective_fp8_bf16_upcast(
                         pass
                 report["upcast_count"] = 0
                 report["upcast_bytes"] = 0
+                report["stripped_count"] = 0
         report["enabled"] = True
         report["elapsed_ms"] = round(
             (time.monotonic_ns() - started_ns) / 1_000_000.0, 1)

@@ -45,6 +45,15 @@ def _make_sd():
         "blk.good.weight": _f8(64, 256),
         "blk.good.weight_scale": torch.tensor(3.0),
         "blk.good.comfy_quant": _quant_descriptor(),
+        # Hostile-shape BF16 WITH quant config: weight untouched, config
+        # stripped (loader takes the plain branch).
+        "blk.bf16bad.weight": torch.zeros(48, 283,
+                                          dtype=torch.bfloat16),
+        "blk.bf16bad.weight_scale": torch.tensor(1.5),
+        "blk.bf16bad.comfy_quant": _quant_descriptor(),
+        # Hostile-shape BF16 WITHOUT quant config: already plain, skip.
+        "blk.bf16plain.weight": torch.zeros(32, 100,
+                                           dtype=torch.bfloat16),
         # Non-FP8: untouched.
         "blk.plain.weight": torch.zeros(64, 256, dtype=torch.bfloat16),
         "blk.bias": torch.zeros(64),
@@ -56,6 +65,7 @@ def _make_metadata():
         "blk.bad": {"format": "float8_e4m3fn"},
         "blk.old": {"format": "float8_e4m3fn"},
         "blk.good": {"format": "float8_e4m3fn"},
+        "blk.bf16bad": {"format": "float8_e4m3fn"},
     }})}
 
 
@@ -80,8 +90,9 @@ class TestSelectiveUpcast:
         sd = _make_sd()
         out, meta, report = ggl.selective_fp8_bf16_upcast(sd, _make_metadata())
         assert report["enabled"] is True
-        assert report["candidates"] == 3
+        assert report["candidates"] == 6
         assert report["upcast_count"] == 2
+        assert report["stripped_count"] == 1
         assert report["reverted"] == []
         # Hostile layers: BF16, artifacts gone.
         for prefix in ("blk.bad", "blk.old"):
@@ -91,12 +102,22 @@ class TestSelectiveUpcast:
         # Aligned FP8: untouched, descriptor retained.
         assert out["blk.good.weight"].dtype == torch.float8_e4m3fn
         assert "blk.good.comfy_quant" in out
+        # Stripped BF16: weight byte-identical, config gone.
+        assert out["blk.bf16bad.weight"].dtype == torch.bfloat16
+        assert torch.equal(out["blk.bf16bad.weight"],
+                           torch.zeros(48, 283, dtype=torch.bfloat16))
+        for suffix in ggl._FP8_QUANT_SUFFIXES:
+            assert "blk.bf16bad" + suffix not in out
+        # Already-plain BF16: untouched, recorded as skipped.
+        assert out["blk.bf16plain.weight"].dtype == torch.bfloat16
+        assert any("already_plain" in s for s in report["skipped"])
         # Plain tensors: untouched.
         assert out["blk.plain.weight"].dtype == torch.bfloat16
         # Metadata scrubbed of upcast layers only.
         layers = json.loads(meta["_quantization_metadata"])["layers"]
         assert "blk.bad" not in layers
         assert "blk.old" not in layers
+        assert "blk.bf16bad" not in layers
         assert "blk.good" in layers
 
     def test_scale_folding_math(self):
