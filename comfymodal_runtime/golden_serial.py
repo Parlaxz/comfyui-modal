@@ -12893,21 +12893,29 @@ async def golden_clip_load(
         if not source_dtypes:
             raise RuntimeError("clip_source_state_dict_empty")
         try:
-            _tstat: dict[str, Any] = {}
+            _tkeys: list[str] = []
+            _tsrc: Any = None
             try:
                 for _tr in (transports or []):
                     _st = (_tr or {}).get("stats") or {}
-                    if _st:
-                        _tstat = dict(_st)
+                    if isinstance(_st, dict) and _st:
+                        _tkeys = sorted(str(k) for k in _st.keys())[:20]
+                        for _cand in ("source_wall_ms",
+                                       "qd_source_io_wall_ms",
+                                       "total_load_ms",
+                                       "gpu_ready_wall_ms"):
+                            if _st.get(_cand) is not None:
+                                _tsrc = _st.get(_cand)
+                                break
                         break
             except Exception:
-                _tstat = {}
+                _tkeys = []
+                _tsrc = None
             print(
                 "[v2.clip_stage_phase] event=transport_done mono_ms={} "
-                "source_wall_ms={} gpu_ready_wall_ms={}".format(
+                "read_wall_ms={} stat_keys={}".format(
                     time.monotonic_ns() // 1_000_000,
-                    _tstat.get("source_wall_ms"),
-                    _tstat.get("gpu_ready_wall_ms")),
+                    _tsrc, _tkeys),
                 flush=True)
         except Exception:
             pass

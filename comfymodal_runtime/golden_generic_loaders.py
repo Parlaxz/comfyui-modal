@@ -2202,11 +2202,11 @@ async def _run_substituted_loader(
     """Execute the golden stage for one role-bound loader node.
 
     Arms per role, all imported shared code, strict native fallback:
-    ``clip`` (DIAGNOSTIC stage-first for one run to capture stage-built
-    patcher/offload state; expected to fail at first generate — restore
-    QD4-first after diagnosis), ``unet`` / ``model_unet`` and ``vae``
-    (their stages via a shared helper).  Returns ``{"ok": True, ...}``
-    or ``{"ok": False, ...}``.  Never raises.
+    ``clip`` (shared stage first: proven working end to end on FP8
+    sources since the quant-marker and real-device fixes; QD4 second),
+    ``unet`` / ``model_unet`` and ``vae`` (their stages via a shared
+    helper).  Returns ``{"ok": True, ...}`` or ``{"ok": False, ...}``.
+    Never raises.
     """
     request_id = str(ctx.get("request_id") or "")
     try:
@@ -2220,10 +2220,10 @@ async def _run_substituted_loader(
         if not classification.get("supported"):
             return {"ok": False,
                     "reason": str(classification.get("reason") or "unsupported")}
-        # DIAGNOSTIC stage-first routing (one run): captures stage-built
-        # patcher/offload state via [v2.clip_placement] before the known
-        # downstream gather-sizing crash.  Expected to fail at first
-        # generate; restore QD4-first after diagnosis.  Keep both walls.
+        # Shared-stage-first routing: the stage owns FP8 sources end to
+        # end since the quant-marker and real-device fixes (proven live).
+        # QD4 second.  Keep both attempt walls so a slow invocation cannot
+        # hide a failed first arm.
         attempt_walls: list[dict[str, Any]] = []
         try:
             stage_outcome = await compose_generic_clip_load_stage(
