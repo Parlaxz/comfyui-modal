@@ -2935,6 +2935,18 @@ def install_pre_sampler_hooks() -> None:
                 except Exception:
                     pass
                 _patched_llm_generate._dtype_logged = True
+            try:
+                # Re-marking guard: loads between construction and generate
+                # can re-apply _v offload-view markers (which crash the
+                # low-VRAM gather path on quantized-storage layers).  The
+                # walk is a ~ms no-op when nothing is marked; it never
+                # touches weights, layouts, or execution semantics.
+                from comfymodal_runtime.golden_generic_loaders import (
+                    force_plain_hostile_linears as _force_plain,
+                )
+                _force_plain(self, tag="llm-generate")
+            except Exception:
+                pass
             return _orig_llm_generate(self, embeds, *args, **kwargs)
 
         _BaseGenerate.generate = _patched_llm_generate
