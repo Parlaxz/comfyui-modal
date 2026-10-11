@@ -933,6 +933,28 @@ def _is_fp8_weight_tensor(key: Any, tensor: Any) -> bool:
         return False
 
 
+def _log_upcast_report(report: Any) -> None:
+    """One worker-log line per upcast pass (visible in remote logs).
+
+    The outcome dict does not propagate to the result payload, so this
+    print is the observable proof of what the shape rule did.  Never
+    raises.
+    """
+    try:
+        rep = report if isinstance(report, dict) else {}
+        print(
+            "[v2.fp8_selective_upcast] enabled={} candidates={} upcast={} "
+            "bytes={} reverted={} skipped={} ms={}".format(
+                rep.get("enabled"), rep.get("candidates"),
+                rep.get("upcast_count"), rep.get("upcast_bytes"),
+                len(rep.get("reverted") or []),
+                len(rep.get("skipped") or []),
+                rep.get("elapsed_ms")),
+            flush=True)
+    except Exception:
+        pass
+
+
 def selective_fp8_bf16_upcast(
     state_dict: Any,
     metadata: Any = None,
@@ -954,19 +976,22 @@ def selective_fp8_bf16_upcast(
     Returns ``(sd, metadata, report)``.  Never raises.
     """
     report: dict[str, Any] = {
-        "enabled": False, "upcast_count": 0, "upcast_bytes": 0,
-        "reverted": [], "skipped": [], "elapsed_ms": 0.0,
+        "enabled": False, "candidates": 0, "upcast_count": 0,
+        "upcast_bytes": 0, "reverted": [], "skipped": [],
+        "elapsed_ms": 0.0,
     }
     started_ns = time.monotonic_ns()
     try:
         if str(os.environ.get(_FP8_SELECTIVE_UPCAST_ENV, "1")).strip() != "1":
             report["elapsed_ms"] = (
                 (time.monotonic_ns() - started_ns) / 1_000_000.0)
+            _log_upcast_report(report)
             return state_dict, metadata, report
         if not isinstance(state_dict, dict):
             report["skipped"].append("state_dict_not_dict")
             report["elapsed_ms"] = (
                 (time.monotonic_ns() - started_ns) / 1_000_000.0)
+            _log_upcast_report(report)
             return state_dict, metadata, report
         import torch as _torch_upcast
 
@@ -987,6 +1012,10 @@ def selective_fp8_bf16_upcast(
             tensor = state_dict.get(key)
             if not _is_fp8_weight_tensor(key, tensor):
                 continue
+            try:
+                report["candidates"] += 1
+            except Exception:
+                pass
             try:
                 shape = tuple(int(d) for d in tuple(tensor.shape))
             except Exception:
@@ -1067,6 +1096,7 @@ def selective_fp8_bf16_upcast(
         report["enabled"] = True
         report["elapsed_ms"] = round(
             (time.monotonic_ns() - started_ns) / 1_000_000.0, 1)
+        _log_upcast_report(report)
         return state_dict, meta_copy, report
     except Exception:
         try:
@@ -1074,6 +1104,7 @@ def selective_fp8_bf16_upcast(
                 (time.monotonic_ns() - started_ns) / 1_000_000.0, 1)
         except Exception:
             pass
+        _log_upcast_report(report)
         return state_dict, metadata, report
 
 

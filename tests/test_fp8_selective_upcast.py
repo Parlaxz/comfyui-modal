@@ -80,6 +80,7 @@ class TestSelectiveUpcast:
         sd = _make_sd()
         out, meta, report = ggl.selective_fp8_bf16_upcast(sd, _make_metadata())
         assert report["enabled"] is True
+        assert report["candidates"] == 3
         assert report["upcast_count"] == 2
         assert report["reverted"] == []
         # Hostile layers: BF16, artifacts gone.
