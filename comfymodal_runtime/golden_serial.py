@@ -12369,6 +12369,36 @@ def _cpu_quant_markers_in_place(state_dicts: Any) -> int:
     return moved
 
 
+def _clip_source_has_quantized_layers(state_dicts: Any) -> bool:
+    """True when transported CLIP dicts carry quantized layers (pure logic).
+
+    Detects ``*.comfy_quant`` descriptors or FP8-dtype tensors.  The
+    constructor seam uses this to pick real-device construction (which
+    materializes QT data at bind) over the meta seam (which leaves QT
+    qdata/scales meta with no later materialization).  Never raises.
+    """
+    try:
+        dicts = list(state_dicts or ())
+    except Exception:
+        return False
+    for sd in dicts:
+        try:
+            if not isinstance(sd, dict):
+                continue
+            for key, tensor in sd.items():
+                if str(key).endswith(".comfy_quant"):
+                    return True
+                try:
+                    if "float8" in str(
+                            getattr(tensor, "dtype", "")).lower():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
 async def golden_clip_load(
     session: GoldenSession, *, preloaded_transports: Optional[list[dict]] = None
 ) -> Any:
@@ -12871,7 +12901,25 @@ async def golden_clip_load(
 
         native_initial_device = model_management.text_encoder_initial_device
 
+        # Quantized sources cannot construct on meta: the quant loader
+        # casts transported views to the factory device at bind, so a meta
+        # factory leaves QT qdata/scales meta with no later materialization
+        # (observed live: first forward dies copying out of meta tensors).
+        # Constructing quantized sources directly on the load device keeps
+        # zero-copy adoption (assign takes the transported views as-is)
+        # while materializing real data.  Uniform BF16 sources keep the
+        # meta seam exactly (canonical paths byte-identical).
+        _clip_quantized_source = _clip_source_has_quantized_layers(
+            transformed_state_dicts)
+        rec.event(
+            "clip_initial_device",
+            mode="load_device" if _clip_quantized_source else "meta",
+            quantized_source=bool(_clip_quantized_source),
+        )
+
         def golden_initial_device(load_device, offload_device, model_size=0):
+            if _clip_quantized_source:
+                return load_device
             return torch.device("meta")
 
         # Quant descriptors must be CPU before any bind path (overlap join

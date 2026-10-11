@@ -58,3 +58,29 @@ class TestCpuQuantMarkersInPlace:
         assert gs._cpu_quant_markers_in_place(None) == 0
         assert gs._cpu_quant_markers_in_place("nope") == 0
         assert gs._cpu_quant_markers_in_place([None, 42, "x"]) == 0
+
+
+class _FakeDtypeTensor:
+    def __init__(self, dtype_name):
+        self.dtype = dtype_name
+
+
+class TestClipQuantizedSourceDetection:
+    def test_descriptor_detected(self):
+        sd = {"layer.weight": torch.zeros(2, 2),
+              "layer.comfy_quant": torch.tensor([1], dtype=torch.uint8)}
+        assert gs._clip_source_has_quantized_layers([sd]) is True
+
+    def test_fp8_dtype_detected(self):
+        sd = {"layer.weight": _FakeDtypeTensor("torch.float8_e4m3fn")}
+        assert gs._clip_source_has_quantized_layers([sd]) is True
+
+    def test_uniform_bf16_not_detected(self):
+        sd = {"a.weight": torch.zeros(2, 2, dtype=torch.bfloat16),
+              "b.weight": torch.zeros(2, 2, dtype=torch.bfloat16)}
+        assert gs._clip_source_has_quantized_layers([sd]) is False
+
+    def test_garbage_is_not_detected(self):
+        assert gs._clip_source_has_quantized_layers(None) is False
+        assert gs._clip_source_has_quantized_layers("nope") is False
+        assert gs._clip_source_has_quantized_layers([None]) is False
