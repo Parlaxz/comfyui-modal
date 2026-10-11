@@ -90,6 +90,8 @@ GOLDEN_PARALLEL_MODE = "golden_p1_parallel"
 GOLDEN_ATTENTION_BACKEND_FLAG = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
 GOLDEN_CPU_QD2_PREFETCH_FLAG = "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
 GOLDEN_CPU_QD2_DEPLOY_FLAG = "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH"
+GOLDEN_SOURCE_EXPERIMENT_PROFILE_MARKER = "source_experiment_controls"
+GOLDEN_SOURCE_EXPERIMENT_ENV = "COMFYMODAL_GOLDEN_SOURCE_EXPERIMENT"
 FULL_RUN_METHOD = "run_plan_stream"
 PROTECTED_GOLDEN_APP = "stable-modal-comfy-v2-golden-p1"
 _MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -134,6 +136,37 @@ def _golden_cpu_qd2_prefetch_requested(config: config_mod.ResolvedConfig) -> boo
             f"{GOLDEN_CPU_QD2_PREFETCH_FLAG} must resolve to 0 or 1; got {raw!r}"
         )
     return raw == "1"
+
+
+def _golden_source_experiment_env(config: config_mod.ResolvedConfig) -> dict[str, str]:
+    """Project explicit experiment selectors, never baseline defaults.
+
+    Fires when the experiment profile is selected OR when any selector flag
+    was explicitly set for this run. Baseline runs (base profile, no --set)
+    still resolve to {} so ordinary requests stay byte-identical.
+    """
+    names = (
+        "COMFYMODAL_GOLDEN_SOURCE_POLICY",
+        "COMFYMODAL_GOLDEN_SOURCE_LAUNCH_GAP_NS",
+        "COMFYMODAL_GOLDEN_MICROSCOPE",
+        "COMFYMODAL_GOLDEN_QD_MODE",
+    )
+    if GOLDEN_SOURCE_EXPERIMENT_PROFILE_MARKER not in str(config.profile_name):
+        explicit = False
+        for name in names:
+            flag = config.flag(name)
+            if flag is not None and str(getattr(flag, "source", "")) in {"cli", "inherit", "set"}:
+                explicit = True
+                break
+        if not explicit:
+            return {}
+    values: dict[str, str] = {}
+    values[GOLDEN_SOURCE_EXPERIMENT_ENV] = "1"
+    for name in names:
+        flag = config.flag(name)
+        if flag is not None:
+            values[name] = str(getattr(flag, "value", ""))
+    return values
 
 
 def _require_golden_cpu_qd2_deploy_gate(
@@ -732,7 +765,10 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
         # ordinary run_plan_stream path.  Project the effective Golden mode
         # explicitly so the request reaches the serial-Golden branch.  The
         # local Golden guard rejects explicit generic modes before this point.
-        return args, {"V2_BENCHMARK_MODE": _benchmark_mode(config)}
+        return args, {
+            "V2_BENCHMARK_MODE": _benchmark_mode(config),
+            **_golden_source_experiment_env(config),
+        }
 
     selector = _backend_selector(config)
     args = ([selector] if selector else []) + ["--run-count", "1"]

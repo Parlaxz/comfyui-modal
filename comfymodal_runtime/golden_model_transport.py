@@ -1168,19 +1168,29 @@ class GoldenModelTransport:
         # Measured on trace a4a4eaaf52fe456cbcd3583527068891: this path drives
         # 184 source reads (clip_load's 120) and produced zero frames. Imported
         # lazily so this module stays importable without the trace runtime.
+        #
+        # Request-scoped experiment controls ride the same handoff explicitly:
+        # ContextVars do not cross asyncio.to_thread, so capture the active
+        # controls here (async request context) and thread them through the
+        # sync loaders.  None (no experimental request) preserves today's path.
+        try:
+            from .golden_experiment_controls import active_controls as _active_controls
+        except BaseException:
+            _active_controls = None
+        _request_controls = _active_controls() if _active_controls is not None else None
         try:
             from .full_execution_trace import thread_traced
-            target = thread_traced(functools.partial(self._load_sync, role=role))
+            target = thread_traced(functools.partial(self._load_sync, role=role, experiment_controls=_request_controls))
         except BaseException:
-            return await asyncio.to_thread(self._load_sync, path, role=role)
+            return await asyncio.to_thread(self._load_sync, path, role=role, experiment_controls=_request_controls)
         return await asyncio.to_thread(target, path)
 
     def load_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
         return self._load_sync(path, role=role)
 
-    def _load_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
+    def _load_sync(self, path: str, *, role: str = "model", experiment_controls: Any = None) -> LoadedSafetensors:
         if self._c0_enabled:
-            return self._load_c0_sync(path, role=role)
+            return self._load_c0_sync(path, role=role, experiment_controls=experiment_controls)
         started_ns = time.perf_counter_ns()
         with self._lock:
             if self._poisoned:
@@ -1339,13 +1349,19 @@ class GoldenModelTransport:
             self._load_count += 1
             return LoadedSafetensors(layout.path, views, owner, layout, stats)
 
-    def _load_c0_source_threads_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
+    def _load_c0_source_threads_sync(self, path: str, *, role: str = "model", experiment_controls: Any = None) -> LoadedSafetensors:
         """Load through the restore-created source process and shared arena."""
         started_ns = time.perf_counter_ns()
         started_mono_ns = time.monotonic_ns()
         self._c0_setup_marks = marks = {"load_enter": int(started_mono_ns)}
         from . import golden_io_process_v2 as c0
         from . import golden_qd_transport as qd_transport
+        from .golden_experiment_controls import active_controls
+        # The sync loader runs on an executor thread where the request
+        # ContextVar is invisible, so prefer explicitly threaded controls and
+        # fall back to the context read (direct sync callers).
+        if experiment_controls is None:
+            experiment_controls = active_controls()
 
         with self._lock:
             if self._poisoned:
@@ -1401,6 +1417,9 @@ class GoldenModelTransport:
                     identity=layout.identity,
                     destination_size=layout.data_bytes,
                     role=role,
+                    source_policy=(experiment_controls.source_policy if experiment_controls else "CURRENT"),
+                    source_launch_gap_ns=(experiment_controls.launch_gap_ns if experiment_controls else golden_source_threads.PACER_GAP_NS),
+                    microscope_mode=(experiment_controls.microscope_mode if experiment_controls else "OFF"),
                 )
                 marks["plan_install_end"] = time.monotonic_ns()
                 # The source pipeline span covers every range published through
@@ -1646,6 +1665,24 @@ class GoldenModelTransport:
                         arena_bytes=getattr(runtime, "size_bytes", None),
                         source_child_pid=source_child_pid,
                     ),
+                    # Runtime-observed experiment controls.  This sub-dict is
+                    # the projection that reaches run artifacts, so the
+                    # effective controls live here (not only at stats top
+                    # level): requested-vs-observed comparison needs them next
+                    # to the source measurements.  None when no experimental
+                    # request selected them.
+                    "golden_source_experiment": (
+                        dict(experiment_controls.effective_description)
+                        if experiment_controls is not None else None
+                    ),
+                    "microscope_scope_note": (
+                        dict(source_telemetry.get("microscope_scope_note"))
+                        if isinstance(source_telemetry.get("microscope_scope_note"), dict)
+                        else None
+                    ),
+                    "microscope_records": list(
+                        source_telemetry.get("microscope_records") or []
+                    ),
                 },
                 "quiescence": {
                     "workers_joined": False,
@@ -1678,10 +1715,18 @@ class GoldenModelTransport:
                 },
                 "transport_lifecycle": self.lifecycle_telemetry(reused=self._load_count > 0),
             }
+            if experiment_controls is not None:
+                effective_controls = dict(experiment_controls.effective_description)
+                stats["golden_source_experiment"] = effective_controls
+                stats["source_scheduler"] = effective_controls
+            if isinstance(source_telemetry.get("microscope_scope_note"), dict):
+                stats["microscope_scope_note"] = dict(
+                    source_telemetry["microscope_scope_note"]
+                )
             self._load_count += 1
             return LoadedSafetensors(layout.path, views, owner, layout, stats)
 
-    def _load_c0_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
+    def _load_c0_sync(self, path: str, *, role: str = "model", experiment_controls: Any = None) -> LoadedSafetensors:
         """Load one checkpoint through the persistent C0 shared arena.
 
         C0 body, M2 engines: the C0 arena stays the backing resource,
@@ -1692,7 +1737,7 @@ class GoldenModelTransport:
         are forked here, and no standalone M2 loader wrapper is entered.
         """
         if self._c0_source_threads_enabled:
-            return self._load_c0_source_threads_sync(path, role=role)
+            return self._load_c0_source_threads_sync(path, role=role, experiment_controls=experiment_controls)
         started_ns = time.perf_counter_ns()
         started_mono_ns = time.monotonic_ns()
         # Passive per-load setup waterfall (observation-only monotonic_ns).

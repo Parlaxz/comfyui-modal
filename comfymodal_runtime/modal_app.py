@@ -49,6 +49,13 @@ from .contracts import (
     stable_hash,
 )
 from . import contracts as _contracts_mod
+from .golden_experiment_controls import (
+    PHASE_EXACT,
+    GoldenExperimentControlError,
+    controls_context,
+    controls_from_request,
+    validate_compatibility,
+)
 
 
 _STUDIO_MODEL_LOADER_INPUTS = {
@@ -4917,6 +4924,8 @@ _REGION_PIN_ALLOWLIST = frozenset({
     "ap-northeast-1", "ap-southeast-1", "ap-southeast-2", "ca-central-1",
     "sa-east-1", "us-east4", "us-west1", "us-west4",
     "europe-west1", "europe-west4", "asia-east1", "asia-southeast1",
+    "us-central",
+    "us-west",
 })
 
 
@@ -23400,6 +23409,32 @@ class ModalRuntimeEntrypoint:
             # process environment per request; a mismatch fails closed above.
             if not source_threads_deployed:
                 os.environ["COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE"] = c0_mmap_lifecycle
+            try:
+                source_controls = controls_from_request(request)
+                if source_controls.experimental:
+                    validate_compatibility(
+                        source_controls,
+                        mmap_lifecycle=c0_mmap_lifecycle,
+                        whole_mmap=c0_mmap_lifecycle == "whole",
+                    )
+                    if not source_threads_deployed:
+                        raise GoldenExperimentControlError(
+                            "golden_source_experiment_requires_c0_source_threads"
+                        )
+                    if source_controls.source_policy == PHASE_EXACT and not source_threads_deployed:
+                        raise GoldenExperimentControlError(
+                            "phase_exact_requires_c0_source_threads"
+                        )
+                    if (
+                        source_controls.source_policy == PHASE_EXACT
+                        and str(os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND", "thread")).strip().lower()
+                        != "thread"
+                    ):
+                        raise GoldenExperimentControlError(
+                            "phase_exact_requires_thread_readers"
+                        )
+            except GoldenExperimentControlError as exc:
+                raise ValueError(str(exc)) from exc
             # The resolved value is placed on GoldenRequest below.  This is a
             # real request selector, not an evidence-only environment marker.
             attention_backend = normalize_attention_backend(
@@ -23434,6 +23469,10 @@ class ModalRuntimeEntrypoint:
             identity_telemetry["golden_mode"] = requested_mode
             identity_telemetry["c0_mmap_lifecycle"] = c0_mmap_lifecycle
             identity_telemetry["c0_source_threads"] = source_threads_deployed
+            if source_controls.experimental:
+                identity_telemetry["golden_source_experiment"] = dict(
+                    source_controls.effective_description
+                )
             identity_telemetry["deep_trace_level_requested"] = _deep_trace_level
             identity_telemetry["deep_trace_level_effective"] = "off"
             identity_telemetry["output_durability_mode"] = output_policy.mode
@@ -23832,7 +23871,11 @@ class ModalRuntimeEntrypoint:
                     if requested_mode == "parallel"
                     else golden_serial_execute
                 )
-                with _golden_trace_scope:
+                _source_controls_scope = (
+                    controls_context(source_controls)
+                    if source_controls.experimental else nullcontext()
+                )
+                with _source_controls_scope, _golden_trace_scope:
                     if stage_stream_factory is None:
                         # Ordinary v2ctl path: direct, unconditional, and free
                         # of any Studio machinery.  No request-payload switch can
