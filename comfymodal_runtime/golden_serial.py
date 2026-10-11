@@ -12900,7 +12900,9 @@ async def golden_clip_load(
                     _st = (_tr or {}).get("stats") or {}
                     if isinstance(_st, dict) and _st:
                         _tkeys = sorted(str(k) for k in _st.keys())
-                        for _cand in ("source_wall_ms",
+                        for _cand in ("SOURCE_TOTAL_WALL_MS",
+                                       "SOURCE_TO_GPU_READY_MS",
+                                       "source_wall_ms",
                                        "qd_source_io_wall_ms",
                                        "total_load_ms",
                                        "gpu_ready_wall_ms",
