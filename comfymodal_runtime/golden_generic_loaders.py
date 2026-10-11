@@ -2098,7 +2098,9 @@ async def _run_substituted_loader(
     """Execute the golden stage for one role-bound loader node.
 
     Arms per role, all imported shared code, strict native fallback:
-    ``clip`` (shared stage first for overlap, then QD4 demand),
+    ``clip`` (QD4 demand first — proven working; shared stage second while
+    its downstream offload state is diagnosed: stage-bound FP8 models
+    currently trip the low-VRAM gather sizing at first generate),
     ``unet`` / ``model_unet`` and ``vae`` (their stages via a shared
     helper).  Returns ``{"ok": True, ...}`` or ``{"ok": False, ...}``.
     Never raises.
@@ -2115,40 +2117,12 @@ async def _run_substituted_loader(
         if not classification.get("supported"):
             return {"ok": False,
                     "reason": str(classification.get("reason") or "unsupported")}
-        # Shared-stage-first routing (oracle clip-slowdown fix): the stage
-        # preserves skeleton-overlap scheduling inside golden_clip_load,
-        # while QD4-demand does read-then-construct sequentially. Try the
-        # shared composition first, QD4 second. Keep both attempt walls so
-        # a slow invocation cannot hide a failed first arm.
+        # QD4-first routing (proven working): the shared stage binds FP8
+        # sources since the quant-marker fix, but stage-bound models trip
+        # the low-VRAM gather sizing at first generate (2x buffer
+        # mismatch).  Try QD4 first, stage second, until the stage-built
+        # model's offload state is diagnosed.  Keep both attempt walls.
         attempt_walls: list[dict[str, Any]] = []
-        try:
-            stage_outcome = await compose_generic_clip_load_stage(
-                clip_filenames=[str(classification.get("clip_name") or "")],
-                clip_type=str(classification.get("clip_type") or "stable_diffusion"),
-                folder="text_encoders",
-                request_id=request_id,
-            )
-        except Exception as exc:  # noqa: BLE001 - fallback contract
-            stage_outcome = {"ok": False,
-                             "reason": f"{type(exc).__name__}:{str(exc)[:150]}",
-                             "source_arm": "golden_clip",
-                             "elapsed_ms": 0.0}
-        attempt_walls.append({
-            "arm": str(stage_outcome.get("source_arm") or "golden_clip"),
-            "ok": bool(stage_outcome.get("ok")),
-            "elapsed_ms": float(stage_outcome.get("elapsed_ms") or 0.0),
-            "reason": str(stage_outcome.get("reason") or ""),
-        })
-        if stage_outcome.get("ok") and stage_outcome.get("clip") is not None:
-            stage_outcome["attempt_walls"] = attempt_walls
-            return {
-                "ok": True,
-                "tuple": (stage_outcome["clip"],),
-                "owners": list(stage_outcome.get("owners") or []),
-                "source_arm": str(stage_outcome.get("source_arm") or "unknown"),
-                "elapsed_ms": stage_outcome.get("elapsed_ms", 0.0),
-                "attempt_walls": attempt_walls,
-            }
         try:
             outcome = await compose_generic_clip_load_qd4(
                 clip_filenames=[str(classification.get("clip_name") or "")],
@@ -2167,7 +2141,43 @@ async def _run_substituted_loader(
             "elapsed_ms": float(outcome.get("elapsed_ms") or 0.0),
             "reason": str(outcome.get("reason") or ""),
         })
-        outcome["attempt_walls"] = attempt_walls
+        if outcome.get("ok") and outcome.get("clip") is not None:
+            outcome["attempt_walls"] = attempt_walls
+            try:
+                print(
+                    "[v2.generic_attempt_walls] role=clip walls={}".format(
+                        json.dumps(attempt_walls)[:600]),
+                    flush=True)
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "tuple": (outcome["clip"],),
+                "owners": list(outcome.get("owners") or []),
+                "source_arm": str(outcome.get("source_arm") or "unknown"),
+                "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+                "phases": dict(outcome.get("phases") or {}),
+                "attempt_walls": attempt_walls,
+            }
+        try:
+            stage_outcome = await compose_generic_clip_load_stage(
+                clip_filenames=[str(classification.get("clip_name") or "")],
+                clip_type=str(classification.get("clip_type") or "stable_diffusion"),
+                folder="text_encoders",
+                request_id=request_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - fallback contract
+            stage_outcome = {"ok": False,
+                             "reason": f"{type(exc).__name__}:{str(exc)[:150]}",
+                             "source_arm": "golden_clip",
+                             "elapsed_ms": 0.0}
+        attempt_walls.append({
+            "arm": str(stage_outcome.get("source_arm") or "golden_clip"),
+            "ok": bool(stage_outcome.get("ok")),
+            "elapsed_ms": float(stage_outcome.get("elapsed_ms") or 0.0),
+            "reason": str(stage_outcome.get("reason") or ""),
+        })
+        stage_outcome["attempt_walls"] = attempt_walls
         try:
             print(
                 "[v2.generic_attempt_walls] role=clip walls={}".format(
@@ -2175,26 +2185,25 @@ async def _run_substituted_loader(
                 flush=True)
         except Exception:
             pass
-        if not outcome.get("ok"):
-            stage_reason = str(stage_outcome.get("reason") or "stage_failed")
-            outcome["reason"] = (
-                f"{stage_reason}|{outcome.get('reason') or 'qd4_failed'}"
+        if not stage_outcome.get("ok"):
+            qd4_reason = str(outcome.get("reason") or "qd4_failed")
+            stage_outcome["reason"] = (
+                f"{qd4_reason}|{stage_outcome.get('reason') or 'stage_failed'}"
             )
-        if not outcome.get("ok") or outcome.get("clip") is None:
+        if not stage_outcome.get("ok") or stage_outcome.get("clip") is None:
             return {
                 "ok": False,
-                "reason": str(outcome.get("reason") or "compose_failed"),
-                "source_arm": str(outcome.get("source_arm") or "unknown"),
-                "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+                "reason": str(stage_outcome.get("reason") or "compose_failed"),
+                "source_arm": str(stage_outcome.get("source_arm") or "unknown"),
+                "elapsed_ms": stage_outcome.get("elapsed_ms", 0.0),
                 "attempt_walls": attempt_walls,
             }
         return {
             "ok": True,
-            "tuple": (outcome["clip"],),
-            "owners": list(outcome.get("owners") or []),
-            "source_arm": str(outcome.get("source_arm") or "unknown"),
-            "elapsed_ms": outcome.get("elapsed_ms", 0.0),
-            "phases": dict(outcome.get("phases") or {}),
+            "tuple": (stage_outcome["clip"],),
+            "owners": list(stage_outcome.get("owners") or []),
+            "source_arm": str(stage_outcome.get("source_arm") or "unknown"),
+            "elapsed_ms": stage_outcome.get("elapsed_ms", 0.0),
             "attempt_walls": attempt_walls,
         }
     except Exception as exc:  # noqa: BLE001 - substitution contract: never raise
