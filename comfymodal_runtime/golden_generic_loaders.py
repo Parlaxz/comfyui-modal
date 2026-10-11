@@ -390,6 +390,7 @@ async def compose_generic_clip_load_stage(
         with _torch.inference_mode(False):
             clip = await golden_clip_load(session)
         owners = list(getattr(session, "clip_owners", None) or [])
+        _log_clip_placement("stage", clip)
         elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
         return {
             "ok": True,
@@ -943,6 +944,40 @@ _PLAINABLE_DTYPES = frozenset({
     "torch.bfloat16", "torch.float16", "torch.float32",
     "bfloat16", "float16", "float32",
 })
+
+
+def _log_clip_placement(tag: Any, clip: Any) -> None:
+    """One worker-log line with CLIP patcher/offload state (diagnostic).
+
+    Compares stage-built vs QD-built objects: load/offload devices,
+    dynamic patcher flag, and a sample weight's device/dtype.  Never
+    raises.
+    """
+    try:
+        patcher = getattr(clip, "patcher", clip)
+        model = getattr(patcher, "model", patcher)
+        sample = None
+        try:
+            for param in model.parameters():
+                sample = param
+                break
+        except Exception:
+            sample = None
+        try:
+            dynamic = patcher.is_dynamic()
+        except Exception:
+            dynamic = "?"
+        print(
+            "[v2.clip_placement] tag={} model={} load_device={} "
+            "offload_device={} dynamic={} w_device={} w_dtype={}".format(
+                tag, type(model).__name__,
+                getattr(patcher, "load_device", "?"),
+                getattr(patcher, "offload_device", "?"), dynamic,
+                getattr(sample, "device", "?"),
+                getattr(sample, "dtype", "?")),
+            flush=True)
+    except Exception:
+        pass
 
 
 def _log_upcast_report(report: Any) -> None:
@@ -1535,6 +1570,7 @@ async def compose_generic_clip_load_qd4(
         # Post-construction de-quant walk: loader fusion can build hostile
         # GEMM dims no file scan can see.  Generic shape rule on OUR object.
         fp8_layer_report = force_plain_hostile_linears(clip, tag="clip")
+        _log_clip_placement("qd4", clip)
         t_construct_ns = time.monotonic_ns()
         elapsed_ms = (t_construct_ns - started_ns) / 1_000_000.0
         phases = {
@@ -2098,12 +2134,11 @@ async def _run_substituted_loader(
     """Execute the golden stage for one role-bound loader node.
 
     Arms per role, all imported shared code, strict native fallback:
-    ``clip`` (QD4 demand first — proven working; shared stage second while
-    its downstream offload state is diagnosed: stage-bound FP8 models
-    currently trip the low-VRAM gather sizing at first generate),
-    ``unet`` / ``model_unet`` and ``vae`` (their stages via a shared
-    helper).  Returns ``{"ok": True, ...}`` or ``{"ok": False, ...}``.
-    Never raises.
+    ``clip`` (DIAGNOSTIC stage-first for one run to capture stage-built
+    patcher/offload state; expected to fail at first generate — restore
+    QD4-first after diagnosis), ``unet`` / ``model_unet`` and ``vae``
+    (their stages via a shared helper).  Returns ``{"ok": True, ...}``
+    or ``{"ok": False, ...}``.  Never raises.
     """
     request_id = str(ctx.get("request_id") or "")
     try:
@@ -2117,48 +2152,11 @@ async def _run_substituted_loader(
         if not classification.get("supported"):
             return {"ok": False,
                     "reason": str(classification.get("reason") or "unsupported")}
-        # QD4-first routing (proven working): the shared stage binds FP8
-        # sources since the quant-marker fix, but stage-bound models trip
-        # the low-VRAM gather sizing at first generate (2x buffer
-        # mismatch).  Try QD4 first, stage second, until the stage-built
-        # model's offload state is diagnosed.  Keep both attempt walls.
+        # DIAGNOSTIC stage-first routing (one run): captures stage-built
+        # patcher/offload state via [v2.clip_placement] before the known
+        # downstream gather-sizing crash.  Expected to fail at first
+        # generate; restore QD4-first after diagnosis.  Keep both walls.
         attempt_walls: list[dict[str, Any]] = []
-        try:
-            outcome = await compose_generic_clip_load_qd4(
-                clip_filenames=[str(classification.get("clip_name") or "")],
-                clip_type=str(classification.get("clip_type") or "stable_diffusion"),
-                folder="text_encoders",
-                request_id=request_id,
-            )
-        except Exception as exc:  # noqa: BLE001 - fallback contract
-            outcome = {"ok": False,
-                       "reason": f"{type(exc).__name__}:{str(exc)[:150]}",
-                       "source_arm": "qd4_demand",
-                       "elapsed_ms": 0.0}
-        attempt_walls.append({
-            "arm": str(outcome.get("source_arm") or "qd4_demand"),
-            "ok": bool(outcome.get("ok")),
-            "elapsed_ms": float(outcome.get("elapsed_ms") or 0.0),
-            "reason": str(outcome.get("reason") or ""),
-        })
-        if outcome.get("ok") and outcome.get("clip") is not None:
-            outcome["attempt_walls"] = attempt_walls
-            try:
-                print(
-                    "[v2.generic_attempt_walls] role=clip walls={}".format(
-                        json.dumps(attempt_walls)[:600]),
-                    flush=True)
-            except Exception:
-                pass
-            return {
-                "ok": True,
-                "tuple": (outcome["clip"],),
-                "owners": list(outcome.get("owners") or []),
-                "source_arm": str(outcome.get("source_arm") or "unknown"),
-                "elapsed_ms": outcome.get("elapsed_ms", 0.0),
-                "phases": dict(outcome.get("phases") or {}),
-                "attempt_walls": attempt_walls,
-            }
         try:
             stage_outcome = await compose_generic_clip_load_stage(
                 clip_filenames=[str(classification.get("clip_name") or "")],
@@ -2177,7 +2175,42 @@ async def _run_substituted_loader(
             "elapsed_ms": float(stage_outcome.get("elapsed_ms") or 0.0),
             "reason": str(stage_outcome.get("reason") or ""),
         })
-        stage_outcome["attempt_walls"] = attempt_walls
+        if stage_outcome.get("ok") and stage_outcome.get("clip") is not None:
+            stage_outcome["attempt_walls"] = attempt_walls
+            try:
+                print(
+                    "[v2.generic_attempt_walls] role=clip walls={}".format(
+                        json.dumps(attempt_walls)[:600]),
+                    flush=True)
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "tuple": (stage_outcome["clip"],),
+                "owners": list(stage_outcome.get("owners") or []),
+                "source_arm": str(stage_outcome.get("source_arm") or "unknown"),
+                "elapsed_ms": stage_outcome.get("elapsed_ms", 0.0),
+                "attempt_walls": attempt_walls,
+            }
+        try:
+            outcome = await compose_generic_clip_load_qd4(
+                clip_filenames=[str(classification.get("clip_name") or "")],
+                clip_type=str(classification.get("clip_type") or "stable_diffusion"),
+                folder="text_encoders",
+                request_id=request_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - fallback contract
+            outcome = {"ok": False,
+                       "reason": f"{type(exc).__name__}:{str(exc)[:150]}",
+                       "source_arm": "qd4_demand",
+                       "elapsed_ms": 0.0}
+        attempt_walls.append({
+            "arm": str(outcome.get("source_arm") or "qd4_demand"),
+            "ok": bool(outcome.get("ok")),
+            "elapsed_ms": float(outcome.get("elapsed_ms") or 0.0),
+            "reason": str(outcome.get("reason") or ""),
+        })
+        outcome["attempt_walls"] = attempt_walls
         try:
             print(
                 "[v2.generic_attempt_walls] role=clip walls={}".format(
@@ -2185,25 +2218,26 @@ async def _run_substituted_loader(
                 flush=True)
         except Exception:
             pass
-        if not stage_outcome.get("ok"):
-            qd4_reason = str(outcome.get("reason") or "qd4_failed")
-            stage_outcome["reason"] = (
-                f"{qd4_reason}|{stage_outcome.get('reason') or 'stage_failed'}"
+        if not outcome.get("ok"):
+            stage_reason = str(stage_outcome.get("reason") or "stage_failed")
+            outcome["reason"] = (
+                f"{stage_reason}|{outcome.get('reason') or 'qd4_failed'}"
             )
-        if not stage_outcome.get("ok") or stage_outcome.get("clip") is None:
+        if not outcome.get("ok") or outcome.get("clip") is None:
             return {
                 "ok": False,
-                "reason": str(stage_outcome.get("reason") or "compose_failed"),
-                "source_arm": str(stage_outcome.get("source_arm") or "unknown"),
-                "elapsed_ms": stage_outcome.get("elapsed_ms", 0.0),
+                "reason": str(outcome.get("reason") or "compose_failed"),
+                "source_arm": str(outcome.get("source_arm") or "unknown"),
+                "elapsed_ms": outcome.get("elapsed_ms", 0.0),
                 "attempt_walls": attempt_walls,
             }
         return {
             "ok": True,
-            "tuple": (stage_outcome["clip"],),
-            "owners": list(stage_outcome.get("owners") or []),
-            "source_arm": str(stage_outcome.get("source_arm") or "unknown"),
-            "elapsed_ms": stage_outcome.get("elapsed_ms", 0.0),
+            "tuple": (outcome["clip"],),
+            "owners": list(outcome.get("owners") or []),
+            "source_arm": str(outcome.get("source_arm") or "unknown"),
+            "elapsed_ms": outcome.get("elapsed_ms", 0.0),
+            "phases": dict(outcome.get("phases") or {}),
             "attempt_walls": attempt_walls,
         }
     except Exception as exc:  # noqa: BLE001 - substitution contract: never raise
