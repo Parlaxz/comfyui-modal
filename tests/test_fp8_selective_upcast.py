@@ -162,8 +162,27 @@ class TestLogGuard:
                                     msg, None, None)
             return all(f.filter(rec) for f in logger.filters)
 
-        spam = ("FP8 _scaled_mm failed: falling back to dequantization",)
         ggl._fp8_log_guard_drops = 0
-        assert [_passes(spam) for _ in range(5)] == [True] * 5
-        assert _passes(spam) is False
+        ggl._fp8_log_guard_seen = set()
+        spam = ("FP8 _scaled_mm failed: falling back to dequantization",)
+        assert _passes(spam) is True
+        assert [_passes(spam) for _ in range(5)] == [False] * 5
+        assert ggl._fp8_log_guard_drops == 5
         assert _passes("something else") is True
+
+    def test_unique_shapes_pass_up_to_cap(self):
+        ggl._install_fp8_fallback_log_guard()
+        logger = logging.getLogger("comfy_kitchen.tensor.fp8")
+        ggl._fp8_log_guard_drops = 0
+        ggl._fp8_log_guard_seen = set()
+
+        def _passes(msg):
+            rec = logging.LogRecord("comfy_kitchen.tensor.fp8",
+                                    logging.WARNING, __file__, 1,
+                                    msg, None, None)
+            return all(f.filter(rec) for f in logger.filters)
+
+        base = "FP8 _scaled_mm failed: {} falling back to dequantization"
+        results = [_passes(base.format(i)) for i in range(30)]
+        assert results[:25] == [True] * 25
+        assert results[25:] == [False] * 5

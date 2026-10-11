@@ -895,6 +895,8 @@ _FP8_QUANT_SUFFIXES = (".comfy_quant", ".weight_scale", ".input_scale",
 
 _fp8_log_guard_installed = False
 _fp8_log_guard_drops = 0
+_fp8_log_guard_unique_cap = 25
+_fp8_log_guard_seen: set[str] = set()
 
 
 def _fp8_native_shape_ok(shape: Any) -> bool:
@@ -1145,8 +1147,9 @@ def _install_fp8_fallback_log_guard() -> bool:
     """Cap comfy_kitchen FP8-fallback WARNING spam (process logging only).
 
     Attaches a counting filter to the ``comfy_kitchen.tensor.fp8`` logger:
-    the first few fallback warnings pass (residual fallbacks stay visible),
-    the rest are dropped.  No library code is touched; process-local
+    the first 25 UNIQUE fallback shapes pass (each distinct (m, n, k)
+    config is diagnostic gold), repeats are dropped, and every 100th drop
+    prints a magnitude line.  No library code is touched; process-local
     logging configuration only.  Idempotent.  Never raises.
     """
     global _fp8_log_guard_installed
@@ -1161,10 +1164,27 @@ def _install_fp8_fallback_log_guard() -> bool:
             def filter(self, record: Any) -> bool:
                 global _fp8_log_guard_drops
                 try:
-                    if "falling back to dequantization" in str(
-                            record.getMessage()):
+                    msg = str(record.getMessage())
+                    if "falling back to dequantization" not in msg:
+                        return True
+                    if msg in _fp8_log_guard_seen:
                         _fp8_log_guard_drops += 1
-                        return _fp8_log_guard_drops <= 5
+                        if _fp8_log_guard_drops % 100 == 0:
+                            try:
+                                print(
+                                    "[v2.fp8_fallback] suppressed={} "
+                                    "unique_shapes={}".format(
+                                        _fp8_log_guard_drops,
+                                        len(_fp8_log_guard_seen)),
+                                    flush=True)
+                            except Exception:
+                                pass
+                        return False
+                    if len(_fp8_log_guard_seen) < _fp8_log_guard_unique_cap:
+                        _fp8_log_guard_seen.add(msg)
+                        return True
+                    _fp8_log_guard_drops += 1
+                    return False
                 except Exception:
                     pass
                 return True
