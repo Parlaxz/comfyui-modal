@@ -64,3 +64,7 @@ COMFYMODAL_V2_CLIP_QD_READER = "1"
 # tokens) instead of the native per-token-sync loop. Never raises — any
 # failure falls back to native with explicit telemetry.
 COMFYMODAL_V2_TEXT_SUBSTITUTION = "1"
+# Generic UNET quant_fp8 admission: the golden UNET stage admits
+# scaled-FP8/mixed-quant files via a normalize-to-plain source plan
+# (FP8 folded to BF16 at adoption; uniform sources never consult it).
+COMFYMODAL_GOLDEN_UNET_DTYPE_PLAN = "scaled_fp8"

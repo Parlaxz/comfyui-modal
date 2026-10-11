@@ -148,6 +148,27 @@ class TestSelectiveUpcast:
         _, _, report = ggl.selective_fp8_bf16_upcast("nope", 42)
         assert report["enabled"] in (True, False)
 
+    def test_force_all_upcasts_aligned_and_bare(self):
+        sd = {
+            "blk.good.weight": _f8(64, 256),
+            "blk.good.weight_scale": torch.tensor(3.0),
+            "blk.bias_f8": _f8(64),
+        }
+        out, _, report = ggl.selective_fp8_bf16_upcast(
+            sd, {}, force_all_fp8=True, ignore_env=True)
+        assert report["upcast_count"] == 2
+        assert out["blk.good.weight"].dtype == torch.bfloat16
+        assert out["blk.bias_f8"].dtype == torch.bfloat16
+
+    def test_ignore_env_bypasses_kill_switch(self, monkeypatch):
+        monkeypatch.setenv(ggl._FP8_SELECTIVE_UPCAST_ENV, "0")
+        sd = {"blk.bad.weight": _f8(64, 3396)}
+        out, _, report = ggl.selective_fp8_bf16_upcast(
+            sd, {}, ignore_env=True)
+        assert report["enabled"] is True
+        assert report["upcast_count"] == 1
+        assert out["blk.bad.weight"].dtype == torch.bfloat16
+
 
 class _FakeQT:
     """Duck-typed quantized weight (dequantize + shape, no Comfy import)."""

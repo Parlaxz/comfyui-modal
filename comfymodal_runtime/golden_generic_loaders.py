@@ -1010,9 +1010,22 @@ def _log_upcast_report(report: Any) -> None:
         pass
 
 
+def _is_fp8_tensor(tensor: Any) -> bool:
+    """True for FP8-dtype tensors of any shape/name (force-mode scope)."""
+    try:
+        if tensor is None:
+            return False
+        return "float8" in str(getattr(tensor, "dtype", "")).lower()
+    except Exception:
+        return False
+
+
 def selective_fp8_bf16_upcast(
     state_dict: Any,
     metadata: Any = None,
+    *,
+    force_all_fp8: bool = False,
+    ignore_env: bool = False,
 ) -> tuple[Any, Any, dict[str, Any]]:
     """De-quantize cuBLAS-hostile layers at load (generic, shape-ruled).
 
@@ -1032,6 +1045,11 @@ def selective_fp8_bf16_upcast(
     A layer is committed ONLY when fully neutralized; otherwise it is
     reverted.  File-agnostic: no filenames, no model lists.
 
+    ``force_all_fp8`` normalizes EVERY FP8 tensor (not just hostile-shape
+    weights) for stage-level source plans, where any QT module would trap
+    on the meta-device bind.  ``ignore_env`` bypasses the kill-switch
+    (the caller stage's own mode gate is the authority instead).
+
     Returns ``(sd, metadata, report)``.  Never raises.
     """
     report: dict[str, Any] = {
@@ -1042,7 +1060,8 @@ def selective_fp8_bf16_upcast(
     }
     started_ns = time.monotonic_ns()
     try:
-        if str(os.environ.get(_FP8_SELECTIVE_UPCAST_ENV, "1")).strip() != "1":
+        if not ignore_env and str(os.environ.get(
+                _FP8_SELECTIVE_UPCAST_ENV, "1")).strip() != "1":
             report["elapsed_ms"] = (
                 (time.monotonic_ns() - started_ns) / 1_000_000.0)
             _log_upcast_report(report)
@@ -1070,7 +1089,8 @@ def selective_fp8_bf16_upcast(
         committed: list[tuple[str, dict[str, Any]]] = []
         for key in list(state_dict.keys()):
             tensor = state_dict.get(key)
-            if not _is_weight_matrix(key, tensor):
+            bare_fp8 = bool(force_all_fp8) and _is_fp8_tensor(tensor)
+            if not bare_fp8 and not _is_weight_matrix(key, tensor):
                 continue
             try:
                 report["candidates"] += 1
@@ -1081,9 +1101,12 @@ def selective_fp8_bf16_upcast(
             except Exception:
                 report["skipped"].append(f"{key}:shape unreadable")
                 continue
-            if _fp8_native_shape_ok(shape):
+            if not force_all_fp8 and _fp8_native_shape_ok(shape):
                 continue
-            prefix = str(key)[: -len(".weight")]
+            if str(key).endswith(".weight"):
+                prefix = str(key)[: -len(".weight")]
+            else:
+                prefix = str(key)
             try:
                 dtype_name = str(getattr(tensor, "dtype", "")).lower()
             except Exception:

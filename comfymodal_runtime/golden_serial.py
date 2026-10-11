@@ -12058,6 +12058,160 @@ def build_mixed_source_plan(entries: Any) -> dict[str, Any]:
     }
 
 
+_QUANT_FP8_DTYPE_NAMES = frozenset({"F8_E4M3", "F8_E5M2"})
+_QUANT_ARTIFACT_SUFFIXES = (
+    ".comfy_quant",
+    ".weight_scale",
+    ".input_scale",
+    ".scale_weight",
+    ".scale_input",
+)
+
+
+def build_quant_fp8_source_plan(entries: Any, metadata: Any = None) -> dict[str, Any]:
+    """Build a metadata-only source plan for scaled-FP8 UNET sources.
+
+    Covers files the classifier names ``quant_fp8``: per-tensor header
+    dtypes mixing FP8 with full-precision storage, with quantization
+    described either by safetensors ``_quantization_metadata`` or by
+    legacy in-file scale keys.  The plan normalizes (never natively
+    executes): every FP8 entry folds to BF16 at adoption, so downstream
+    construction, detection, inference-dtype selection, and proof all run
+    the proven plain-tensor machinery.
+
+    Pure logic over the same preflight-validated ``(key, dtype_str, shape,
+    offset, length)`` entries as the mixed builder.  ``source_specs``
+    holds every adoptable entry (weights AND buffers, any storage dtype)
+    EXCEPT quant artifacts (descriptors/scales), which are recorded under
+    ``quant_layers``/``dropped_quant_keys`` for the normalize step instead
+    of the binding proof.  ``expected_growth_bytes`` is the exact extra
+    allocation the FP8->BF16 fold adds (1B->2B per FP8 byte), consumed by
+    the allocation guards' plan-aware allowance.  Rejects duplicate keys,
+    malformed/empty/zero-length entries, unsupported dtypes, raw
+    ``.comfy_quant`` payload entries, and files with no FP8 content (those
+    belong to the mixed plan) with explicit reasons.  Never touches the
+    payload.  Raises RuntimeError on any defect.
+    """
+    try:
+        items = list(entries or [])
+    except Exception:
+        raise RuntimeError("unet_source_plan_entries_invalid")
+    source_specs: dict[str, dict[str, Any]] = {}
+    for item in items:
+        try:
+            key = str(item[0])
+            dtype_name = str(item[1])
+            shape = tuple(int(v) for v in item[2])
+            offset = int(item[3])
+            length = int(item[4])
+        except Exception:
+            raise RuntimeError("unet_source_plan_entry_malformed")
+        if not key or key in source_specs:
+            raise RuntimeError(f"unet_source_plan_key:{key or 'empty'}")
+        if key.endswith(".comfy_quant"):
+            raise RuntimeError(f"unet_quant_descriptor_payload:{key}")
+        torch_dtype = _TORCH_DTYPE.get(dtype_name)
+        if torch_dtype is None:
+            raise RuntimeError(f"unet_source_plan_dtype:{dtype_name}")
+        if length <= 0:
+            raise RuntimeError(f"unet_source_plan_zero_length:{key}")
+        is_artifact = any(
+            key.endswith(suffix) for suffix in _QUANT_ARTIFACT_SUFFIXES)
+        if is_artifact:
+            continue
+        # The proof checks adopted tensors against ``torch_dtype``: F8
+        # entries normalize to BF16 at adoption, so specs declare the
+        # post-normalization dtype while ``source_dtype_name`` keeps the
+        # header truth for audit.
+        normalized_dtype = (
+            torch.bfloat16
+            if dtype_name in _QUANT_FP8_DTYPE_NAMES else torch_dtype)
+        source_specs[key] = {
+            "dtype_name": dtype_name,
+            "source_dtype_name": dtype_name,
+            "torch_dtype": normalized_dtype,
+            "shape": shape,
+            "offset": offset,
+            "length": length,
+        }
+    if not source_specs:
+        raise RuntimeError("unet_source_plan_empty")
+    fp8_keys = [
+        key for key, spec in source_specs.items()
+        if str(spec.get("dtype_name")) in _QUANT_FP8_DTYPE_NAMES
+    ]
+    if not fp8_keys:
+        raise RuntimeError("unet_quant_plan_no_fp8")
+    quant_layers: dict[str, dict[str, Any]] = {}
+    meta = metadata if isinstance(metadata, dict) else {}
+    raw_layers: dict[str, Any] = {}
+    try:
+        import json as _json
+
+        raw_meta = meta.get("_quantization_metadata")
+        if isinstance(raw_meta, str) and raw_meta:
+            parsed = _json.loads(raw_meta)
+            if isinstance(parsed, dict) and isinstance(
+                    parsed.get("layers"), dict):
+                raw_layers = dict(parsed["layers"])
+    except Exception:
+        raw_layers = {}
+    # Associate scale entries with layers by suffix convention (mirrors
+    # convert_old_quants legacy semantics for scale_weight/scale_input).
+    entry_keys = set()
+    try:
+        entry_keys = {str(item[0]) for item in items}
+    except Exception:
+        entry_keys = set()
+    layer_roots: set[str] = set()
+    for key in entry_keys:
+        for suffix in _QUANT_ARTIFACT_SUFFIXES:
+            if key.endswith(suffix) and key != suffix:
+                layer_roots.add(key[: -len(suffix)])
+    for key in list(source_specs.keys()):
+        candidate = key[: -len(".weight")] if key.endswith(".weight") else key
+        if candidate in layer_roots:
+            layer_roots.add(candidate)
+    for root in sorted(layer_roots):
+        try:
+            descriptor = None
+            raw_conf = raw_layers.get(root)
+            if isinstance(raw_conf, dict):
+                descriptor = dict(raw_conf)
+            weight_keys = sorted(
+                k for k in source_specs
+                if k == root or k.startswith(root + "."))
+            scale_keys_for_layer = sorted(
+                k for k in entry_keys
+                if k != root and k.startswith(root)
+                and k not in source_specs)
+            if weight_keys or scale_keys_for_layer or descriptor is not None:
+                quant_layers[root] = {
+                    "descriptor": descriptor,
+                    "weight_keys": weight_keys,
+                    "scale_keys": scale_keys_for_layer,
+                }
+        except Exception:
+            continue
+    dropped_quant_keys = sorted(
+        key for key in entry_keys if key not in source_specs)
+    try:
+        expected_growth_bytes = sum(
+            int(source_specs[key].get("length", 0) or 0)
+            for key in fp8_keys)
+    except Exception:
+        raise RuntimeError("unet_quant_plan_growth")
+    return {
+        "kind": "scaled_fp8",
+        "source_specs": source_specs,
+        "bindings": {},
+        "quant_layers": quant_layers,
+        "dropped_quant_keys": dropped_quant_keys,
+        "expected_growth_bytes": int(expected_growth_bytes),
+        "normalized_compute_dtype": "bfloat16",
+    }
+
+
 def derive_mixed_plan_bindings(
     source_plan: Any, prefix: Any
 ) -> dict[str, Any]:
@@ -12731,6 +12885,13 @@ async def golden_clip_load(
         })
         if not source_dtypes:
             raise RuntimeError("clip_source_state_dict_empty")
+        try:
+            print(
+                "[v2.clip_stage_phase] event=transport_done mono_ms={}".format(
+                    time.monotonic_ns() // 1_000_000),
+                flush=True)
+        except Exception:
+            pass
         mixed_source_dtype = len(source_dtypes) > 1
         source_dtype = source_dtypes[0] if not mixed_source_dtype else "mixed"
         if mixed_source_dtype:
@@ -14579,23 +14740,51 @@ async def golden_unet_load(
                     )
                 elif (_dtype_plan_class == "quant_fp8"
                         and _dtype_plan_mode == "scaled_fp8"):
+                    # Quant-FP8 admission: build the normalization plan.
+                    # Downstream construction adopts dequantized plain
+                    # tensors, so no QT module (and its meta-device trap)
+                    # can exist; uniform sources never reach this branch.
+                    source_plan = build_quant_fp8_source_plan(
+                        entries, metadata)
                     rec.event(
                         "unet_dtype_plan",
                         kind="quant_fp8",
-                        status="deferred",
+                        status="admitted",
                         requested_mode=_dtype_plan_mode,
-                        tensor_count=len(entries),
+                        tensor_count=len(source_plan["source_specs"]),
+                        expected_growth_bytes=int(
+                            source_plan.get("expected_growth_bytes", 0)),
                     )
-                    raise RuntimeError(
-                        f"unet_dtype_plan_not_built:{_dtype_plan_class}")
                 else:
                     raise RuntimeError(f"non_uniform_dtype:{sorted(dtype_names)}")
             view_dtype = _TORCH_DTYPE.get(next(iter(dtype_names)))
             if view_dtype is None:
                 raise RuntimeError("unknown_dtype")
 
+            # Quant-FP8 plan: normalize the DETECTION input to plain
+            # tensors (F8->BF16 dtype map, quant metadata scrubbed) so
+            # prefix detection, model-config inference, and inference-dtype
+            # selection run the proven uniform-file flow on shapes.  The
+            # file-truth plan (built above) still drives bindings, view
+            # normalization, and proof.  Uniform sources are untouched.
+            _quant_plan_active = (
+                isinstance(source_plan, dict)
+                and source_plan.get("kind") == "scaled_fp8")
+            if _quant_plan_active and isinstance(metadata, dict):
+                _detect_meta_clean = {
+                    k: v for k, v in metadata.items()
+                    if k != "_quantization_metadata"
+                }
+            else:
+                _detect_meta_clean = metadata
             meta_sd = {
-                name: torch.empty(tuple(shape), dtype=_TORCH_DTYPE[dtype_str], device="meta")
+                name: torch.empty(
+                    tuple(shape),
+                    dtype=(torch.bfloat16
+                           if (_quant_plan_active
+                               and dtype_str in _QUANT_FP8_DTYPE_NAMES)
+                           else _TORCH_DTYPE[dtype_str]),
+                    device="meta")
                 for name, dtype_str, shape, _s, _l in entries
             }
             prefix_fn = getattr(md, "unet_prefix_from_state_dict", None)
@@ -14605,7 +14794,7 @@ async def golden_unet_load(
             if not all(callable(x) for x in (prefix_fn, strip_fn, config_fn)):
                 raise RuntimeError("missing_comfy_helper")
             detect_sd, detect_meta, prefix = _native_detection_input(
-                meta_sd, metadata, prefix_fn, strip_fn, quant_fn
+                meta_sd, _detect_meta_clean, prefix_fn, strip_fn, quant_fn
             )
             model_config = config_fn(detect_sd, "", metadata=detect_meta)
             if model_config is None:
@@ -14771,6 +14960,40 @@ async def golden_unet_load(
         session.register_qd_owner(session.unet_owner)
         after_qd = checkpoint("after_qd_destination")
         rec.event("unet_qd_owner_created", role="unet", gpu_bytes=transport["stats"]["gpu_bytes"])
+        # Quant-FP8 plan: fold every FP8 view to BF16 (scales in) and drop
+        # all quant artifacts, so adoption binds proven plain tensors.
+        # Uniform/mixed sources skip this entirely.
+        if isinstance(source_plan, dict) and source_plan.get("kind") == "scaled_fp8":
+            from comfymodal_runtime.golden_generic_loaders import (
+                selective_fp8_bf16_upcast as _quant_normalize,
+            )
+            # Normalization allocates fresh tensors: inference mode forbids
+            # them (same publication boundary as the QD reader itself).
+            with torch.inference_mode(False):
+                views, _, _quant_report = _quant_normalize(
+                    views, {}, force_all_fp8=True, ignore_env=True)
+            try:
+                _orphans = [
+                    key for key in list(views.keys())
+                    if isinstance(key, str) and key.endswith((
+                        ".comfy_quant", ".weight_scale", ".input_scale",
+                        ".scale_weight", ".scale_input"))
+                ]
+                for _orphan in _orphans:
+                    views.pop(_orphan, None)
+            except Exception:
+                _orphans = []
+            try:
+                rec.event(
+                    "unet_quant_normalize",
+                    upcast_count=int((_quant_report or {}).get(
+                        "upcast_count", 0)),
+                    orphan_keys_dropped=len(_orphans or []),
+                    normalize_ms=float((_quant_report or {}).get(
+                        "elapsed_ms", 0.0)),
+                )
+            except Exception:
+                pass
         skeleton_peak_delta = None
         if peak_supported:
             skeleton_peak_delta = max(
@@ -14805,8 +15028,19 @@ async def golden_unet_load(
         adoption_end_ns = time.monotonic_ns()
         adoption_wall_ms = (adoption_end_ns - adoption_started_ns) / 1e6
         after_adoption = checkpoint("after_assign_adoption")
+        # Quant-FP8 plans legitimately grow allocation: the FP8->BF16 fold
+        # doubles FP8 bytes (documented in the plan as expected_growth).
+        # Uniform/mixed sources keep a zero allowance (behavior unchanged).
+        _quant_allowance = 0
+        try:
+            if isinstance(source_plan, dict) and source_plan.get(
+                    "kind") == "scaled_fp8":
+                _quant_allowance = int(
+                    source_plan.get("expected_growth_bytes", 0) or 0)
+        except Exception:
+            _quant_allowance = 0
         post_qd_delta = int(after_adoption["allocated_bytes"]) - int(after_qd["allocated_bytes"])
-        if post_qd_delta >= int(transport["stats"]["gpu_bytes"]):
+        if post_qd_delta >= int(transport["stats"]["gpu_bytes"]) + _quant_allowance:
             raise RuntimeError(f"unet_second_model_sized_allocation:{post_qd_delta}")
         adoption_peak_delta = None
         if peak_supported:
@@ -14814,7 +15048,7 @@ async def golden_unet_load(
                 int(after_adoption["peak_allocated_bytes"]) - int(after_qd["allocated_bytes"]),
                 0,
             )
-            if adoption_peak_delta >= int(transport["stats"]["gpu_bytes"]):
+            if adoption_peak_delta >= int(transport["stats"]["gpu_bytes"]) + _quant_allowance:
                 raise RuntimeError(f"unet_peak_model_sized_allocation:{adoption_peak_delta}")
         session.unet_cuda_allocation_checkpoints = allocation_checkpoints
         transport["stats"]["cuda_allocation_checkpoints"] = list(allocation_checkpoints)

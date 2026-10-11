@@ -2552,3 +2552,14 @@ change_requires = "deploy"
 runtime_exposed = false
 owner = "v2-core"
 description = "UNET staging chunk size in MiB."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_UNET_DTYPE_PLAN"
+type = "enum"
+default = "off"
+enum_values = ["off", "mixed", "scaled_fp8"]
+consumed_at = "request"
+change_requires = "deploy"
+runtime_exposed = true
+owner = "generic-unet"
+description = "UNET dtype-plan admission: off (default, fail-closed as today) or scaled_fp8 (admit quant_fp8 files via normalize-to-plain plan; uniform sources never consult it)."
