@@ -1242,12 +1242,18 @@ def force_plain_hostile_linears(root: Any, tag: str = "") -> dict[str, Any]:
     de-quantizable weight) gets its weight replaced by its de-quantized
     plain tensor with the layout nulled — numerically identical to today's
     per-op fallback, minus all of its overhead.  Aligned quantized layers
-    keep native FP8.  Operates on OUR constructed object only; no library
-    code is touched.  Never raises.
+    keep native FP8.  Additionally, any module carrying a ``_v`` offload-view
+    marker has it removed: ``_v`` forces the streaming gather path, whose
+    buffers are sized from stored dtype and crash on quantized-storage /
+    wider-compute combinations (observed live: FP8-stored, BF16-computed
+    gather needs exactly 2x the buffer).  Without the marker the module
+    takes the plain resident path — identical math to the working
+    non-staged construction.  Operates on OUR constructed object only; no
+    library code is touched.  Never raises.
     """
     report: dict[str, Any] = {
         "tag": str(tag or ""), "walked": 0, "normalized": 0,
-        "names": [], "elapsed_ms": 0.0,
+        "unmarked": 0, "names": [], "elapsed_ms": 0.0,
     }
     started_ns = time.monotonic_ns()
     try:
@@ -1264,6 +1270,23 @@ def force_plain_hostile_linears(root: Any, tag: str = "") -> dict[str, Any]:
             for name, mod in modules:
                 try:
                     report["walked"] += 1
+                    try:
+                        has_offload_view = hasattr(mod, "_v")
+                    except Exception:
+                        has_offload_view = False
+                    if has_offload_view:
+                        try:
+                            delattr(mod, "_v")
+                        except Exception:
+                            pass
+                        else:
+                            report["unmarked"] += 1
+                            if len(report["names"]) < 10:
+                                try:
+                                    report["names"].append(
+                                        "unmarked:" + str(name or "?"))
+                                except Exception:
+                                    pass
                     weight = getattr(mod, "weight", None)
                     data = getattr(weight, "data", None)
                     quant_weight = None
@@ -1327,9 +1350,10 @@ def force_plain_hostile_linears(root: Any, tag: str = "") -> dict[str, Any]:
         try:
             print(
                 "[v2.fp8_layer_dequant] tag={} walked={} normalized={} "
-                "names={} ms={}".format(
+                "unmarked={} names={} ms={}".format(
                     report["tag"], report["walked"],
-                    report["normalized"], report["names"],
+                    report["normalized"], report["unmarked"],
+                    report["names"],
                     report["elapsed_ms"]),
                 flush=True)
         except Exception:

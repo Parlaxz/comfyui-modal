@@ -211,6 +211,19 @@ class TestForcePlainHostileLinears:
             object(), tag="t")["normalized"] == 0
         assert ggl.force_plain_hostile_linears(None)["normalized"] == 0
 
+    def test_unmarks_offload_views_keeps_weights(self):
+        root = torch.nn.Module()
+        mod = torch.nn.Linear(2560, 2560)
+        mod._v = object()
+        before = mod.weight
+        root.marked = mod
+        rep = ggl.force_plain_hostile_linears(root, tag="t")
+        assert rep["unmarked"] == 1
+        assert rep["normalized"] == 0
+        assert not hasattr(root.marked, "_v")
+        assert root.marked.weight is before
+        assert any(n.startswith("unmarked:") for n in rep["names"])
+
 
 class TestLogGuard:
     def test_install_idempotent_and_caps(self):
