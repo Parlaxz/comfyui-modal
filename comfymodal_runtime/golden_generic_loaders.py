@@ -2028,6 +2028,20 @@ async def _substitute_unet_vae_loader(
                 folder="diffusion_models",
                 request_id=request_id,
             )
+            try:
+                print(
+                    "[v2.generic_attempt_walls] role=unet walls={}".format(
+                        json.dumps([{
+                            "arm": str(outcome.get("source_arm")
+                                       or "golden_unet"),
+                            "ok": bool(outcome.get("ok")),
+                            "elapsed_ms": float(
+                                outcome.get("elapsed_ms") or 0.0),
+                            "reason": str(outcome.get("reason") or ""),
+                        }])[:500]),
+                    flush=True)
+            except Exception:
+                pass
             if not outcome.get("ok"):
                 _stage_reason = str(outcome.get("reason") or "stage_failed")
                 outcome = await compose_generic_unet_load_qd(

@@ -13134,6 +13134,13 @@ async def golden_clip_load(
                 model_management.text_encoder_initial_device = native_initial_device
         if clip is None:
             raise RuntimeError("clip_construct_failed")
+        try:
+            print(
+                "[v2.clip_stage_phase] event=construct_done mono_ms={}".format(
+                    time.monotonic_ns() // 1_000_000),
+                flush=True)
+        except Exception:
+            pass
         if mixed_source_dtype:
             model_management.load_models_gpu([getattr(clip, "patcher", clip)])
             session.clip_residency_record.update({
