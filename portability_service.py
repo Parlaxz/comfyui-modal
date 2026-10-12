@@ -1184,8 +1184,15 @@ class PortabilityService:
             unique_ids = sorted(set(latest_ids))
             stamps: dict = {}
             unstamped: list[str] = []
+            try:
+                all_versions = self.store.versions.read()
+            except Exception:
+                all_versions = []
+            version_by_id = {
+                str(v.get("workflow_version_id", "")): v for v in all_versions
+            }
             for version_id in unique_ids:
-                version = self.store.get_version(version_id)
+                version = version_by_id.get(version_id)
                 if version:
                     stamps[version_id] = self.current_invalidation_stamp(version)
                 else:

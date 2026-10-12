@@ -22,8 +22,17 @@ import {
   deriveSingleResumeState,
   deriveRetryActionLabel,
   normalizeExportResponse,
+  normalizeFeedItem,
   normalizeHistoryOutput,
 } from "../web/history-v2-repository.js";
+import {
+  viewerDateText,
+  viewerFileSizeText,
+  viewerFileSizeValue,
+  viewerMergedParams,
+  viewerResolutionText,
+  viewerSnapshotText,
+} from "../web/studio-ui.js";
 
 const REPO_SRC = fs.readFileSync(
   path.join(import.meta.dirname, "..", "web", "history-v2-repository.js"),
@@ -391,6 +400,159 @@ function stubFetch(responder) {
   assert.equal(env.partial, true);
   assert.equal(env.reason, "write_failed");
   section("8. Per-variant Export projection: authoritative IDs/states, null when absent");
+}
+
+// ── 8b. Viewer-content projection: resolution + file size + workflow ──────
+//
+// A snapshot-less generation (no params, no workflow_name, no models) must
+// still resolve resolution from asset-measured output dims, file size from
+// the projected byte size, and workflow from the workflow_id fallback —
+// and omit each row (never fabricate) when its source is absent.
+{
+  const dimOut = normalizeHistoryOutput({ preview_url: "/p", width: 1024, height: 768, byte_size: 1234 });
+  assert.equal(dimOut.width, 1024);
+  assert.equal(dimOut.height, 768);
+  assert.equal(dimOut.byteSize, 1234);
+
+  const bareOut = normalizeHistoryOutput({ preview_url: "/p" });
+  assert.equal(bareOut.width, null);
+  assert.equal(bareOut.height, null);
+  assert.equal(bareOut.byteSize, null);
+
+  // Resolution: params win, asset dims fill a snapshot-less record.
+  assert.equal(viewerResolutionText({ width: 512, height: 512 }, {}), "512 \u00d7 512");
+  const snapshotLess = normalizeFeedItem({
+    id: "gen_nosnap", status: "completed",
+    outputs: [{ preview_url: "/p", width: 1024, height: 768, byte_size: 1234 }],
+    featured_output_index: 0,
+  });
+  assert.deepEqual(snapshotLess.params, {});
+  assert.equal(viewerResolutionText(snapshotLess.params, snapshotLess), "1024 \u00d7 768");
+  assert.equal(viewerFileSizeText(viewerFileSizeValue(snapshotLess)), "1.2 KB");
+  assert.equal(viewerResolutionText({}, {}), "");
+  assert.equal(viewerFileSizeValue({}), "");
+
+  // Workflow falls back to the backend-sent workflow_id when no name exists.
+  const idOnly = normalizeFeedItem({ id: "gen_wf", status: "completed", workflow_id: "wf_abc" });
+  assert.equal(idOnly.workflow, "wf_abc");
+  section("8b. Snapshot-less viewer content: asset resolution, file size, workflow_id fallback");
+}
+
+// ── 8c. Variant row + human dates ─────────────────────────────────────────
+//
+// The viewer answers "is this a preview?" with an always-visible Variant
+// row (Preview/Original/Thumbnail label from the shared asset policy),
+// and Started/Completed render as human dates, never raw ISO strings.
+{
+  const formatted = viewerDateText("2026-10-12T03:03:30Z");
+  assert.match(formatted, /Oct/, "human month, not ISO");
+  assert.doesNotMatch(formatted, /T\d\d:/, "no raw ISO timestamp");
+  assert.equal(viewerDateText(""), "");
+
+  const UI_SRC = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "web", "studio-ui.js"),
+    "utf8",
+  );
+  const PLAYGROUND_SRC = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "web", "studio-playground.js"),
+    "utf8",
+  );
+  assert.ok(UI_SRC.includes('["Variant", viewerFirst(opts.variant, "")]'),
+    "shared overlay renders the Variant row from opts.variant");
+  assert.ok(UI_SRC.includes('["Started", viewerDateText(record.startedAt)]'),
+    "Started renders through viewerDateText");
+  assert.ok(UI_SRC.includes('["Completed", viewerDateText(record.completedAt)]'),
+    "Completed renders through viewerDateText");
+  assert.ok(UI_SRC.includes("variant: opts.variant"),
+    "shell forwards variant to the shared overlay");
+  assert.ok(DETAIL_SRC.includes("variant: viewer.output"),
+    "History detail passes the resolved asset label as variant");
+  assert.ok(PLAYGROUND_SRC.includes("variant: _viewer.output"),
+    "Playground preview passes the resolved asset label as variant");
+  section("8c. Variant row threaded on both surfaces; Started/Completed human-formatted");
+}
+
+// ── 8d. Embedded-file recovery + file/lineage/note/styling ─────────────────
+//
+// Detail outputs carry embedded_params/embedded_models recovered from the
+// file's own prompt JSON: the params grid merges them at lowest priority
+// (snapshot/controls always win), and empty model lists backfill from them.
+// The File row (name + Open/Copy), lineage rows, and flat note editor are
+// pinned by source (they need DOM); colors/prompt size likewise.
+{
+  const embOut = normalizeHistoryOutput({
+    preview_url: "/p", filename: "gen.png", format: "png", path: "/data/gen.png",
+    embedded_params: { seed: 23, steps: 25, sampler: "euler" },
+    embedded_models: ["u.safetensors"],
+  });
+  assert.equal(embOut.filename, "gen.png");
+  assert.equal(embOut.format, "png");
+  assert.equal(embOut.path, "/data/gen.png");
+  assert.deepEqual(embOut.embeddedParams, { seed: 23, steps: 25, sampler: "euler" });
+  assert.deepEqual(embOut.embeddedModels, ["u.safetensors"]);
+
+  // Embedded fills a snapshot-less grid…
+  const thin = normalizeFeedItem({
+    id: "gen_thin", status: "completed",
+    outputs: [{
+      preview_url: "/p", width: 768, height: 1376,
+      embedded_params: { seed: 23, steps: 25, cfg: 1, sampler: "euler", scheduler: "simple", denoise: 1 },
+      embedded_models: ["u.safetensors"],
+    }],
+    featured_output_index: 0,
+  });
+  const grid = viewerMergedParams(thin);
+  assert.equal(grid.seed, 23);
+  assert.equal(grid.steps, 25);
+  assert.equal(grid.sampler, "euler");
+  assert.deepEqual(thin.models, ["u.safetensors"]);
+  assert.equal(viewerResolutionText(grid, thin), "768 \u00d7 1376");
+
+  // …but never overrides snapshot/controls.
+  const rich = normalizeFeedItem({
+    id: "gen_rich", status: "completed",
+    params: { seed: 99 },
+    outputs: [{ preview_url: "/p", embedded_params: { seed: 23, steps: 25 } }],
+    featured_output_index: 0,
+  });
+  assert.equal(viewerMergedParams(rich).seed, 99);
+  assert.equal(viewerMergedParams(rich).steps, 25);
+
+  // Snapshot lineage text states.
+  assert.equal(viewerSnapshotText({ replayCapable: true }), "saved");
+  assert.equal(viewerSnapshotText({ replayCapable: false, replayReason: "missing_request_snapshot" }),
+    "not saved for this run");
+  assert.equal(viewerSnapshotText({}), "");
+
+  const UI_SRC = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "web", "studio-ui.js"),
+    "utf8",
+  );
+  const STYLES_SRC = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "web", "studio-styles.js"),
+    "utf8",
+  );
+  assert.ok(UI_SRC.includes("buildViewerFileRow(record, opts.imageUrl"),
+    "File row mounted in the shared overlay");
+  assert.ok(UI_SRC.includes('data-testid": "viewer-file-open'),
+    "Open-file action rendered");
+  assert.ok(UI_SRC.includes('data-testid": "viewer-file-copy-path'),
+    "Copy-path action rendered");
+  assert.ok(UI_SRC.includes("buildViewerLineageRows(record)"),
+    "lineage rows mounted in the shared overlay");
+  assert.ok(UI_SRC.includes("Request snapshot"),
+    "snapshot state surfaced as lineage");
+  assert.ok(UI_SRC.includes('class: "comfymodal-studio-viewer-note-flat"'),
+    "note editor is flat, not a nested card");
+  assert.ok(STYLES_SRC.includes("background: #141414;"),
+    "viewer content background");
+  assert.ok(STYLES_SRC.includes("background: #191919;"),
+    "viewer card background");
+  assert.ok(STYLES_SRC.includes("background: transparent;"),
+    "viewer stage transparent");
+  assert.ok(STYLES_SRC.includes("font-size: 12px;"),
+    "prompt text smaller");
+  section("8d. Embedded recovery merges lowest-priority; file/lineage/flat-note/colors pinned");
 }
 
 // ── 9. F10 UI wiring pins (Export ≠ Browser Download) ────────────────────

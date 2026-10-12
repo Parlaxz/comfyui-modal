@@ -78,6 +78,7 @@ memory_mb = 24576
             "method": "run_golden_parallel_stream",
         },
         "resources": {"gpu": "H100", "cpu": 12, "memory_mb": 24576},
+        "region": "",
         "deployed": False,
     }
 
@@ -380,3 +381,81 @@ async def test_materialization_failure_fails_run_truthfully(monkeypatch, tmp_pat
     assert calls["meta"]["golden_method"] == "run_plan_stream"
     assert calls["meta"]["golden_executor"] == "generic"
     assert calls["update"][1]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_golden_fast_path_repairs_empty_dropdown_link(monkeypatch, tmp_path) -> None:
+    """The canonical fast path submits apply() output directly, so it must run
+    the empty-dropdown repair itself — otherwise "" reaches
+    ImageScaleToTotalPixels.megapixels and crashes remote execution AFTER
+    model loading (TypeError: str / int, live 2026-10-11)."""
+    target = {
+        "app": "configured-app",
+        "class": "ModalRuntimeEntrypointV2",
+        "method": "run_golden_serial_stream",
+    }
+    profile = profile_catalog.GoldenProfile(
+        name="golden-test",
+        owner="test",
+        target=target,
+        resources={"gpu": "H100", "cpu": 12, "memory_mb": 24576},
+        config=SimpleNamespace(),  # type: ignore[arg-type]
+        receipt=SimpleNamespace(deploy_fingerprint="deploy-test"),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(studio_golden_run, "resolve_golden_profile", lambda name: profile)
+    monkeypatch.setattr(studio_golden_run, "_canonical_golden_fast_path", lambda wf: True)
+
+    captured: dict = {}
+
+    class RemoteGenerator:
+        def aio(self, payload, **kwargs):
+            captured["payload"] = payload
+            captured["kwargs"] = kwargs
+
+            async def events():
+                yield {"type": "result", "sequence": 9, "data": {"image": "ok"}}
+
+            return events()
+
+    handle = SimpleNamespace(
+        run_golden_studio_stream=SimpleNamespace(remote_gen=RemoteGenerator()),
+    )
+    bundle = {
+        "status": "ok",
+        "workflow": {"workflow_id": "wf"},
+        "version": {"workflow_version_id": "wv"},
+        "preset": {"preset_id": "preset", "values": {}},
+        "defaults": {},
+        "control_schema": {},
+        "mapping": {"output_node_id": "15"},
+        "executable_prompt": {
+            "6": {"class_type": "PixaromaDropdown", "inputs": {"DropdownState": "{}"}},
+            "15": {
+                "class_type": "ImageScaleToTotalPixels",
+                "inputs": {"image": ["1", 0], "megapixels": ["6", 0]},
+            },
+        },
+    }
+    import studio_workflow_run
+    monkeypatch.setattr(
+        studio_workflow_run,
+        "resolve_workflow_run_bundle",
+        lambda *args, **kwargs: bundle,
+    )
+
+    store = GoldenStageEventStore(max_events=8, max_runs=2, ttl_seconds=60)
+    result = await studio_golden_run.run_golden_workflow(
+        workflow_id="wf",
+        version_id="wv",
+        preset_id="preset",
+        controls={},
+        request_id="studio-dropdown",
+        node_dir=tmp_path,
+        profile_name="golden-test",
+        event_store=store,
+        handle_factory=lambda *_args: handle,
+    )
+    assert result["status"] == "ok"
+    prompt = captured["payload"]["prompt"]
+    assert prompt["6"]["inputs"]["DropdownState"] == '{"type": "float", "value": 1.0}'
+    assert captured["payload"]["extra_data"]["repaired_empty_dropdowns"] != []

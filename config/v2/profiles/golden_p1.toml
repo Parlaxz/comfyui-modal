@@ -17,7 +17,9 @@ gpu = "rtx-pro-6000"
 cpu = 4
 memory_mb = 16384
 min_containers = 0
-scaledown_window = 4
+# Scaledown is in seconds: containers exit ~1s after use (cost-owned; every
+# run cold-starts by design, no idle H100 billing).
+scaledown_window = 1
 
 [workload]
 fresh_required = true
@@ -75,3 +77,6 @@ COMFYMODAL_OUTPUT_DURABILITY = "off"
 
 # Workflow SHA is evidence-only and never blocks Studio Golden execution.
 COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK = "0"
+# Pin Golden containers to the US region ("us", not "us-central"). Existing
+# unpinned deployment receipts are invalidated; redeploy is required.
+COMFYMODAL_V2_REGION = "us"

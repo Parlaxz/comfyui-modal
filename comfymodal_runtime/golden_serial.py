@@ -12810,6 +12810,15 @@ async def golden_clip_load(
                         f"fd_cache_hit={transport_record.get('fd_cache_hit')} "
                         f"source_wall_ms={transport_record.get('source_wall_ms')} "
                         f"source_gbps={transport_record.get('source_gbps')} "
+                        f"bytes_read={stats.get('bytes_read', stats.get('source_read_bytes'))} "
+                        f"file_bytes={stats.get('file_bytes')} "
+                        f"go_offset_ms={transport_record.get('source_go_offset_ms')} "
+                        f"child_ms={transport_record.get('source_child_wall_ms')} "
+                        f"fill_ms={transport_record.get('source_fill_wall_ms')} "
+                        f"layout_resolve_ms={transport_record.get('layout_resolve_ms')} "
+                        f"staging_wait_ms={stats.get('staging_wait_ms')} "
+                        f"staging_wait_events={stats.get('staging_wait_events')} "
+                        f"short_read_retries={stats.get('short_read_retries')} "
                         f"gpu_ready_wall_ms={transport_record.get('gpu_ready_wall_ms')} "
                         f"total_load_ms={transport_record.get('total_load_ms')}",
                         flush=True,
@@ -14757,7 +14766,26 @@ async def golden_unet_load(
             session._unet_layout_preresolve_holder = preresolve
             rec.event("unet_layout_preresolve", **dict(preresolve_record))
             shared_layout = shared_transport.inspect(unet_path)
-            shared_transport_task = asyncio.create_task(shared_transport.load(unet_path, role="unet"))
+            shared_transport_task = None
+            try:
+                _ticket = getattr(session, "_generic_unet_ticket", None)
+                _ticket_task = (_ticket.get("task")
+                                if isinstance(_ticket, dict) else None)
+                if (not isinstance(_ticket, dict)
+                        or str(_ticket.get("path") or "") != str(unet_path)
+                        or _ticket_task is None
+                        or bool(getattr(
+                            _ticket_task, "done", lambda: True)())):
+                    _ticket_task = None
+            except Exception:
+                _ticket_task = None
+            if _ticket_task is not None:
+                shared_transport_task = _ticket_task
+                rec.event("unet_load_ticket_consumed",
+                          path=os.path.basename(str(unet_path)))
+            else:
+                shared_transport_task = asyncio.create_task(
+                    shared_transport.load(unet_path, role="unet"))
             await asyncio.sleep(0)
 
         source_plan = None
@@ -15007,6 +15035,14 @@ async def golden_unet_load(
                     f"fd_cache_hit={transport_record.get('fd_cache_hit')} "
                     f"source_wall_ms={transport_record.get('source_wall_ms')} "
                     f"source_gbps={transport_record.get('source_gbps')} "
+                    f"bytes_read={loaded.stats.get('bytes_read', loaded.stats.get('source_read_bytes'))} "
+                    f"file_bytes={loaded.stats.get('file_bytes')} "
+                    f"go_offset_ms={transport_record.get('source_go_offset_ms')} "
+                    f"child_ms={transport_record.get('source_child_wall_ms')} "
+                    f"fill_ms={transport_record.get('source_fill_wall_ms')} "
+                    f"staging_wait_ms={loaded.stats.get('staging_wait_ms')} "
+                    f"staging_wait_events={loaded.stats.get('staging_wait_events')} "
+                    f"short_read_retries={loaded.stats.get('short_read_retries')} "
                     f"gpu_ready_wall_ms={transport_record.get('gpu_ready_wall_ms')} "
                     f"total_load_ms={transport_record.get('total_load_ms')}",
                     flush=True,

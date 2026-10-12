@@ -211,8 +211,16 @@ class ConfigResolver:
         sets: list[tuple[str, str]] | None = None,
         inherits: list[str] | None = None,
         inherit_from: Mapping[str, str] | None = None,
+        git_state: GitState | None = None,
     ) -> ResolvedConfig:
-        """Resolve the effective configuration (precedence per design §6)."""
+        """Resolve the effective configuration (precedence per design §6).
+
+        ``git_state`` is an explicit seam for multi-profile passes (the Golden
+        catalog resolves ~30 profiles): git state cannot change mid-pass, so
+        callers that already captured it pass it in instead of spawning three
+        git subprocesses per profile.  Omitted (the default) preserves the
+        historical per-resolve capture for every other caller.
+        """
         self.registry.load()
         rp = self.profiles.resolve(profile_name)
         cli_options = dict(cli_options or {})
@@ -310,7 +318,7 @@ class ConfigResolver:
             flags=flags,
             unregistered=unregistered,
             runtime_override_policy=str(rp.runtime_overrides.get("policy", "forbid")),
-            git=compute_git_state(self.repo_root),
+            git=git_state if git_state is not None else compute_git_state(self.repo_root),
         )
 
     # -- structural resolution --------------------------------------------

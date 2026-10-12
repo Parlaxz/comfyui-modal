@@ -185,6 +185,23 @@ export function normalizeHistoryOutput(raw, index) {
     originalUrl: _firstString(out.original_url, out.originalUrl),
     originalFailed: _toBool(out.original_failed, _toBool(out.originalFailed, false)),
     originalAvailable: _toBool(out.original_available, _toBool(out.originalAvailable, false)),
+    // Viewer-content projection: asset-measured dimensions (resolution) and
+    // managed-file size. Null when the backend projects none (older payloads
+    // or remote-only assets) so the viewer omits the row instead of guessing.
+    width: _toIntOrNull(out.width),
+    height: _toIntOrNull(out.height),
+    byteSize: _toIntOrNull(out.byte_size != null ? out.byte_size : out.byteSize),
+    // File identity for the viewer's File row (name + open/copy) and format.
+    filename: _firstString(out.filename),
+    format: _firstString(out.format),
+    path: _firstString(out.path),
+    // Embedded-file recovery (detail only): exact sampler params and loader
+    // model names read back from the file's own prompt JSON. {} / [] when
+    // absent so consumers merge/append without existence checks.
+    embeddedParams: out.embedded_params && typeof out.embedded_params === "object" && !Array.isArray(out.embedded_params)
+      ? out.embedded_params
+      : (out.embeddedParams && typeof out.embeddedParams === "object" && !Array.isArray(out.embeddedParams) ? out.embeddedParams : {}),
+    embeddedModels: _stringArray(out.embedded_models, out.embeddedModels),
     status: _firstString(out.status, "success"),
     // F10 configured-folder Export identity/state per variant.  The backend
     // projection is authoritative: an Asset ID is NEVER inferred from URL
@@ -539,11 +556,28 @@ function _normalizeGeneration(raw) {
     .filter(function (t) { return t && typeof t === "object" && Object.keys(t).length > 0; })
     .reduce(function (merged, t) { return Object.assign(merged, t); }, {});
 
+  // Model fallback for snapshot-less runs: when the stored model_stack is
+  // empty, use loader filenames recovered from the files' own embedded
+  // prompt JSON (projected per output on detail records). Stored models
+  // always win — this only fills a genuinely empty list.
+  let models = _stringArray(raw.models, extra.models);
+  if (models.length === 0) {
+    const seenModels = {};
+    outputs.forEach(function (out) {
+      const list = (out && (out.embedded_models || out.embeddedModels)) || [];
+      (Array.isArray(list) ? list : []).forEach(function (v) {
+        const s = v != null ? String(v) : "";
+        if (s && !seenModels[s]) { seenModels[s] = true; models.push(s); }
+      });
+    });
+  }
+
   return {
     id: _firstString(raw.id, raw.run_id, raw.runId),
     kind: "generation",
     status: status,
-    workflow: _firstString(raw.workflow, raw.workflow_name, extra.workflow_name, extra.workflow),
+    workflow: _firstString(raw.workflow, raw.workflow_name, extra.workflow_name, extra.workflow,
+      raw.workflow_id, extra.workflow_id),
     workflowVersion: _firstString(raw.workflow_version, raw.workflowVersion),
     preset: _firstString(raw.preset, raw.preset_id, raw.preset_label, extra.studio_preset_label, extra.studio_preset_id, extra.preset),
     prompt: _firstString(raw.prompt, extra.prompt, params.prompt),
@@ -554,7 +588,7 @@ function _normalizeGeneration(raw) {
     favorite: annotations.favorite,
     note: annotations.note,
     tags: _stringArray(raw.tags, extra.tags),
-    models: _stringArray(raw.models, extra.models),
+    models: models,
     outputCount: outputCount,
     hasImage: _hasImage(raw, outputs),
     previewOnly: previewOnly,
@@ -569,6 +603,8 @@ function _normalizeGeneration(raw) {
     // Durable replay-incapability marker (legacy snapshots): consumed by the
     // Generate Original / Resume eligibility gates.
     irreproducible: _toBool(raw.irreproducible, false),
+    // Machine-readable snapshot state for the viewer's lineage rows.
+    replayReason: _firstString(raw.replay_unavailable_reason, raw.replayUnavailableReason),
     featuredOutput: _featuredOutput(raw, outputs),
     runId: _firstString(raw.run_id, raw.runId, raw.id),
     params: params,
@@ -591,7 +627,8 @@ function _normalizeExperiment(raw) {
     kind: "experiment",
     name: _firstString(raw.name, raw.experiment_name, raw.title, raw.id),
     status: _coerceStatus(raw.status, EXPERIMENT_STATUSES, "running"),
-    workflow: _firstString(raw.workflow, raw.workflow_name, extra.workflow_name, extra.workflow),
+    workflow: _firstString(raw.workflow, raw.workflow_name, extra.workflow_name, extra.workflow,
+      raw.workflow_id, extra.workflow_id),
     preset: _firstString(raw.preset, raw.preset_id, raw.preset_label, extra.studio_preset_label, extra.studio_preset_id, extra.preset),
     prompt: _firstString(raw.prompt, extra.prompt),
     startedAt: _firstString(raw.started_at, raw.created_at, raw.timestamp, raw.startedAt),

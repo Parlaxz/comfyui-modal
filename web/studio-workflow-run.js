@@ -17,6 +17,7 @@ import {
   getWorkflowRunContext,
 } from "./studio-backend-api.js";
 import { listCachedWorkflows } from "./studio-workflow-picker.js";
+import { normalizeWorkflowType } from "./studio-bindable-inputs.js";
 
 import {
   saveWorkflowSelection,
@@ -24,6 +25,8 @@ import {
   clearWorkflowSelection,
   saveWorkflowHandoff,
   takeWorkflowHandoff,
+  saveSkipTextGenerate,
+  loadSkipTextGenerate,
 } from "./studio-playground-state.js";
 
 // Re-export persistence so consumers only need this one module.
@@ -33,6 +36,8 @@ export {
   clearWorkflowSelection,
   saveWorkflowHandoff,
   takeWorkflowHandoff,
+  saveSkipTextGenerate,
+  loadSkipTextGenerate,
 };
 
 // localStorage keys owned by studio-playground-state.js (kept in sync).
@@ -41,7 +46,23 @@ export const PERSISTENCE_KEYS = {
   workflowHandoff: "comfymodal.studio.playground.workflow-handoff.v1",
 };
 
-const FEATURE_ID = "txt2img";
+export function resolveWorkflowType(store) {
+  const ctx = (store && store.runContext) || {};
+  const workflow = ctx.workflow || {};
+  const version = ctx.version || {};
+  const raw = ctx.workflow_type || ctx.workflowType || ctx.type
+    || workflow.workflow_type || workflow.workflowType || workflow.type
+    || version.workflow_type || version.workflowType
+    || (store && (store.workflowType || store.featureId))
+    || "t2i";
+  return normalizeWorkflowType(raw);
+}
+
+export function resolveFeatureId(store) {
+  const type = resolveWorkflowType(store);
+  if (type === "t2i") return "txt2img";
+  return type;
+}
 
 // ΓöÇΓöÇ Store ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
@@ -58,6 +79,7 @@ export function createWorkflowRunStore() {
     versions: [],
     runContext: null,
     controlValues: {},
+    skipTextGenerate: false,
     status: "idle",
     error: "",
     reasons: [],
@@ -72,6 +94,7 @@ export function createWorkflowRunStore() {
       this.controlValues = dict && typeof dict === "object" ? { ...dict } : {};
     },
     setRunContext(ctx) { this.runContext = ctx || null; },
+    setSkipTextGenerate(value) { this.skipTextGenerate = value === true; },
     setLibrary(arr) { this.library = Array.isArray(arr) ? arr.slice() : []; },
     setVersions(arr) { this.versions = Array.isArray(arr) ? arr.slice() : []; },
     setStatus(s) { this.status = s || "idle"; },
@@ -87,6 +110,7 @@ export function createWorkflowRunStore() {
       this.versions = [];
       this.runContext = null;
       this.controlValues = {};
+      this.skipTextGenerate = false;
       this.status = "idle";
       this.error = "";
       this.reasons = [];
@@ -250,6 +274,7 @@ export async function selectWorkflow(apiBase, store, workflowId) {
     store.setVersionId("");
     store.setRunContext(null);
     store.controlValues = {};
+    store.setSkipTextGenerate(false);
     store.setWorkflowId(workflowId);
 
     const wf = (store.library || []).find((w) => String(w.workflow_id) === String(workflowId));
@@ -301,6 +326,7 @@ export async function selectWorkflow(apiBase, store, workflowId) {
 
     // Control defaults come from the version's own captured graph.
     store.controlValues = defaultValuesFromContext(store);
+    store.setSkipTextGenerate(loadSkipTextGenerate(workflowId, store.workflowVersionId));
     store.lastLoadedAt = Date.now();
     store.setStatus("ready");
     return { ok: true };
@@ -332,6 +358,7 @@ export async function selectVersion(apiBase, store, versionId) {
       return { ok: false, error: "no version selected", reasons: ["no version selected"] };
     }
     store.controlValues = {};
+    store.setSkipTextGenerate(false);
 
     const ctxResult = await loadRunContext(apiBase, store, store.workflowId, versionId);
     if (!ctxResult.ok) {
@@ -340,6 +367,7 @@ export async function selectVersion(apiBase, store, versionId) {
     }
 
     store.controlValues = defaultValuesFromContext(store);
+    store.setSkipTextGenerate(loadSkipTextGenerate(store.workflowId, versionId));
     store.lastLoadedAt = Date.now();
     store.setStatus("ready");
     return { ok: true };
@@ -421,6 +449,17 @@ export function defaultValuesFromContext(store) {
 // ΓöÇΓöÇ Validation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
+ * Image Tool Inputs (Source Image, Mask) reference files by name. The input
+ * directory changes on every upload, so a captured enum snapshot of its
+ * contents is never a closed vocabulary — membership must not gate these.
+ */
+export function isImageControlRole(key, entry) {
+  if (key === "source_image" || key === "mask") return true;
+  const kind = entry && entry.control_kind;
+  return kind === "image";
+}
+
+/**
  * Validate mapped control values against the control schema. No coercion:
  * 0, 0.0, false and "" are preserved verbatim. Returns only schema-known
  * keys plus errors for unknown keys / rule violations / missing required.
@@ -441,7 +480,8 @@ export function validateMappedValues(values, controlSchema) {
       continue;
     }
     const present = value !== undefined && value !== null;
-    if (Array.isArray(entry.enum_options) && entry.enum_options.length && present) {
+    if (!isImageControlRole(key, entry)
+      && Array.isArray(entry.enum_options) && entry.enum_options.length && present) {
       if (!entry.enum_options.some((opt) => opt === value)) {
         errors.push({ field: key, message: `must be one of: ${entry.enum_options.join(", ")}` });
       }
@@ -543,18 +583,24 @@ export function buildRunPayload(apiBase, store, modalOptions, trace) {
   const schema = getControlSchema(store);
   const { values } = validateMappedValues(store.controlValues || {}, schema);
   const version = store.runContext && store.runContext.version;
+  const workflowType = resolveWorkflowType(store);
   return {
     workflow_id: store.workflowId,
     workflow_version_id: store.workflowVersionId,
-    featureId: FEATURE_ID,
+    featureId: resolveFeatureId(store),
+    workflow_type: workflowType,
     controls: values,
-    modal_options: modalOptions && typeof modalOptions === "object" ? { ...modalOptions } : {},
+    modal_options: {
+      ...(modalOptions && typeof modalOptions === "object" ? modalOptions : {}),
+      skip_text_generate: store.skipTextGenerate === true,
+    },
     metadata: {
       source: "studio_playground",
       workflow_id: store.workflowId,
       workflow_version_id: store.workflowVersionId,
       workflow_name: store.workflowName || "",
       workflow_hash: (version && version.graph_hash) || null,
+      workflow_type: workflowType,
     },
     trace: trace && typeof trace === "object" ? trace : {},
   };

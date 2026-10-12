@@ -15,8 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .config import ConfigResolver, ResolvedConfig
-from .deployment_receipt import DeploymentReceipt, latest_deployment_receipt
+from .config import ConfigResolver, ResolvedConfig, compute_git_state
+from .deployment_receipt import (
+    DeploymentReceipt,
+    latest_deployment_receipt,
+    preload_receipt_metadata,
+)
 from .errors import FlagError, GateError, ProfileError
 from .fingerprints import FingerprintEngine
 from .profiles import Profiles, ResolvedProfile
@@ -46,11 +50,13 @@ class GoldenProfile:
         return self.receipt is not None
 
     def to_dict(self) -> dict[str, Any]:
+        region_flag = self.config.flag("COMFYMODAL_V2_REGION")
         return {
             "name": self.name,
             "owner": self.owner,
             "target": dict(self.target),
             "resources": dict(self.resources),
+            "region": str(region_flag.value or "") if region_flag is not None else "",
             "deployed": self.deployed,
         }
 
@@ -140,6 +146,7 @@ def _with_destination(root: Path, config: ResolvedConfig) -> ResolvedConfig:
 def _matching_receipt(
     root: Path,
     profile: GoldenProfile,
+    metadata: list[tuple[Path, Mapping[str, Any]]] | None = None,
 ) -> DeploymentReceipt | None:
     """Return a receipt only when target, resources, and config identity agree."""
     try:
@@ -150,6 +157,7 @@ def _matching_receipt(
             profile=profile.name,
             target=profile.target,
             workspace_id=str(destination.get("workspace_id") or "") or None,
+            metadata=metadata,
         )
     except (GateError, OSError, ValueError):
         # A corrupt authority is never replaced by an older receipt.
@@ -173,6 +181,7 @@ def _project(
     root: Path,
     resolved: ResolvedProfile,
     config: ResolvedConfig,
+    metadata: list[tuple[Path, Mapping[str, Any]]] | None = None,
 ) -> GoldenProfile | None:
     method = str(config.target.method).strip()
     if method not in GOLDEN_METHODS:
@@ -190,7 +199,7 @@ def _project(
         target=profile.target,
         resources=profile.resources,
         config=profile.config,
-        receipt=_matching_receipt(root, profile),
+        receipt=_matching_receipt(root, profile, metadata=metadata),
     )
 
 
@@ -246,11 +255,12 @@ def catalog_golden_profiles(repo_root: Path | None = None) -> list[GoldenProfile
     profiles.  No profile name is synthesized and no network is contacted.
 
     Memoised against the receipt directory and the profile directory. This is
-    called synchronously on the Golden run path, where a cold catalog scan
-    measured 9.4-9.7s because every one of the 29 profiles re-read the whole
-    receipts directory (412 files at the time of measurement). Deploy state must
-    never be stale, so the cache key is a live fingerprint of both directories
-    rather than a time-based expiry.
+    called synchronously on the Golden run path.  A cold pass shares one git
+    capture and one receipts-directory parse across all profiles (previously
+    every profile re-read the whole receipts directory, ~10s for ~30 profiles
+    x ~500 receipts); measured ~1.5s cold.  Deploy state must never be stale,
+    so the cache key is a live fingerprint of both directories rather than a
+    time-based expiry.
     """
     root = _repo_root(repo_root)
     key = str(root)
@@ -261,15 +271,18 @@ def catalog_golden_profiles(repo_root: Path | None = None) -> list[GoldenProfile
 
     profiles = Profiles(root / "config" / "v2" / "profiles")
     resolver = _resolver(root)
+    # One pass, one shared snapshot (see docstring for why).
+    shared_git = compute_git_state(root)
+    preloaded = preload_receipt_metadata(root)
     result: list[GoldenProfile] = []
     for name in profiles.available():
         try:
             resolved = profiles.resolve(name)
             config = _with_destination(
                 root,
-                resolver.resolve(profile_name=name),
+                resolver.resolve(profile_name=name, git_state=shared_git),
             )
-            projected = _project(root, resolved, config)
+            projected = _project(root, resolved, config, metadata=preloaded)
         except (ProfileError, FlagError, OSError, ValueError, TypeError):
             projected = None
         if projected is not None:

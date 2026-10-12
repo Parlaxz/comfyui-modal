@@ -349,6 +349,11 @@ def _refresh_ui_workflow_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
                 for entry in entries.values()
                 if entry.node_id and entry.input_name
             }
+            fresh_by_role = {
+                str(entry.semantic_role): entry.to_dict()
+                for entry in entries.values()
+                if entry.semantic_role
+            }
             refreshed_entries: list[dict[str, Any]] = []
             stored_bindings: set[tuple[str, str]] = set()
             for stored in stored_entries:
@@ -357,12 +362,28 @@ def _refresh_ui_workflow_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
                     str(stored.get("input_name") or ""),
                 )
                 fresh = fresh_by_binding.get(binding)
+                if fresh is None:
+                    # A stored catalog role can be the alias of the graph's
+                    # role (and older records may have an empty binding).
+                    # Reuse the fresh candidate while retaining the stored
+                    # semantic_role used by the UI and persistence layer.
+                    stored_role = str(stored["semantic_role"])
+                    fresh = fresh_by_role.get(
+                        stored_role,
+                    ) or fresh_by_role.get(
+                        _CONTROL_ROLE_ALIASES.get(stored_role, "")
+                    )
                 if fresh is not None:
                     alias = str(stored["semantic_role"])
                     refreshed_entry = copy.deepcopy(fresh)
                     refreshed_entry["semantic_role"] = alias
                     refreshed_entries.append(refreshed_entry)
-                    stored_bindings.add(binding)
+                    refreshed_binding = (
+                        str(refreshed_entry.get("node_id") or ""),
+                        str(refreshed_entry.get("input_name") or ""),
+                    )
+                    if all(refreshed_binding):
+                        stored_bindings.add(refreshed_binding)
                 else:
                     refreshed_entries.append(stored)
 
@@ -417,6 +438,55 @@ def _refresh_ui_workflow_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
 # ── Control validation / merge ───────────────────────────────────────────
 
 
+# The graph/domain layers historically used ``positive_prompt`` while the
+# Studio catalog and request API use ``prompt``.  This is deliberately the
+# only runtime role alias: stored mapping entries retain their original
+# semantic_role for display and persistence.
+_CONTROL_ROLE_ALIASES = {
+    "prompt": "positive_prompt",
+    "positive_prompt": "prompt",
+}
+
+
+def _control_schema_key(
+    control_schema: dict[str, Any],
+    role: str,
+) -> str | None:
+    """Resolve the requested role to the schema's stored role.
+
+    Prefer an exact, usable binding.  If an old schema contains an empty
+    catalog-role entry alongside a usable aliased entry, use the usable one;
+    this prevents a stale ``prompt`` placeholder from masking
+    ``positive_prompt`` (and vice versa).
+    """
+    if role in control_schema:
+        entry = control_schema.get(role)
+        if isinstance(entry, dict) and entry.get("node_id") and entry.get("input_name"):
+            return role
+        alias = _CONTROL_ROLE_ALIASES.get(role)
+        if alias in control_schema:
+            aliased = control_schema.get(alias)
+            if isinstance(aliased, dict) and aliased.get("node_id") and aliased.get("input_name"):
+                return alias
+        return role
+    alias = _CONTROL_ROLE_ALIASES.get(role)
+    if alias in control_schema:
+        return alias
+    return None
+
+
+def _normalize_controls_to_schema(
+    controls: dict[str, Any],
+    control_schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Key request/default values by the schema's stored semantic roles."""
+    normalized: dict[str, Any] = {}
+    for role, value in (controls or {}).items():
+        schema_role = _control_schema_key(control_schema, role)
+        normalized[schema_role or role] = value
+    return normalized
+
+
 def _is_numeric(value: Any) -> bool:
     """True for int/float (bool excluded) that can be compared numerically."""
     if isinstance(value, bool):
@@ -430,6 +500,18 @@ def _is_numeric(value: Any) -> bool:
         except (TypeError, ValueError):
             return False
     return False
+
+
+def _is_image_control(role: str, entry: dict[str, Any]) -> bool:
+    """True for Source Image / Mask inputs.
+
+    These reference files by name and the input directory changes on every
+    upload, so a captured ``enum_options`` snapshot of its contents is never
+    a closed vocabulary and must not gate the value.
+    """
+    if role in ("source_image", "mask"):
+        return True
+    return isinstance(entry, dict) and entry.get("control_kind") == "image"
 
 
 def validate_workflow_controls(
@@ -452,13 +534,14 @@ def validate_workflow_controls(
     """
     errors: list[dict[str, str]] = []
     for key, value in (controls or {}).items():
-        entry = control_schema.get(key)
+        schema_key = _control_schema_key(control_schema, key)
+        entry = control_schema.get(schema_key) if schema_key is not None else None
         if entry is None:
             errors.append({"field": key, "message": f"unknown control {key!r}"})
             continue
 
         enum_options = entry.get("enum_options") or []
-        if enum_options:
+        if enum_options and not _is_image_control(schema_key or key, entry):
             if value not in enum_options:
                 errors.append({
                     "field": key,
@@ -551,9 +634,9 @@ def merge_workflow_controls(
 
     Returns ``{"values": merged, "errors": [...]}``.
     """
-    defaults = defaults or {}
-    overrides = overrides or {}
     control_schema = control_schema or {}
+    defaults = _normalize_controls_to_schema(defaults or {}, control_schema)
+    overrides = _normalize_controls_to_schema(overrides or {}, control_schema)
 
     merged: dict[str, Any] = dict(defaults)
     for key, value in overrides.items():
@@ -675,6 +758,12 @@ def _build_plan_replay_meta(
         ),
         "request_metadata": request_metadata,
     }
+    request["skip_text_generate"] = bool(
+        request_metadata.get("skip_text_generate", False)
+    )
+    request["text_generate_node_id"] = request_metadata.get(
+        "text_generate_node_id"
+    )
     if modal_options is not None:
         request["modal_options"] = _plain_copy(modal_options)
 
@@ -687,6 +776,8 @@ def _build_plan_replay_meta(
             serialized.get("deployment_identity") or {}
         ),
         "model_stack": _plain_copy(serialized.get("model_stack") or {}),
+        "skip_text_generate": request_metadata.get("skip_text_generate", False),
+        "text_generate_node_id": request_metadata.get("text_generate_node_id"),
     }
 
 
@@ -778,7 +869,8 @@ def apply_workflow_values_to_prompt(
 
     resolved_targets: dict[str, tuple[str, str]] = {}
     for role, value in (values or {}).items():
-        entry = control_schema.get(role)
+        schema_role = _control_schema_key(control_schema, role)
+        entry = control_schema.get(schema_role) if schema_role is not None else None
         if entry is None:
             return {"error": f"control {role!r} has no mapping entry; cannot resolve"}
         node_id = str(entry.get("node_id", "") or "")
@@ -826,7 +918,8 @@ def apply_workflow_values_to_prompt(
     for role, value in (values or {}).items():
         target = resolved_targets.get(role)
         if target is None:
-            entry = control_schema.get(role)
+            schema_role = _control_schema_key(control_schema, role)
+            entry = control_schema.get(schema_role) if schema_role is not None else None
             if entry is None:
                 return {
                     "error": f"control {role!r} has no mapping entry; cannot resolve"
@@ -850,6 +943,170 @@ def apply_workflow_values_to_prompt(
             }
 
     return {"workflow": workflow}
+
+
+def _replace_text_generate_output_refs(
+    value: Any, node_id: str, replacement: Any
+) -> Any:
+    """Replace ComfyUI links to one node's generated-text output."""
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        if str(value[0]) == node_id and value[1] == 0:
+            return copy.deepcopy(replacement)
+    if isinstance(value, dict):
+        return {
+            key: _replace_text_generate_output_refs(item, node_id, replacement)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_text_generate_output_refs(item, node_id, replacement) for item in value]
+    if isinstance(value, tuple):
+        return tuple(
+            _replace_text_generate_output_refs(item, node_id, replacement)
+            for item in value
+        )
+    return value
+
+
+def _contains_text_generate_ref(value: Any, node_id: str) -> bool:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        try:
+            return str(value[0]) == node_id
+        except Exception:
+            return False
+    if isinstance(value, dict):
+        return any(_contains_text_generate_ref(item, node_id) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_text_generate_ref(item, node_id) for item in value)
+    return False
+
+
+def _validate_text_generate_target(
+    workflow: dict[str, Any], node_id: Any
+) -> str | None:
+    """Validate a stored TextGenerate bypass target against the effective graph."""
+    if node_id is None or node_id == "":
+        return "TextGenerate bypass is requested but the mapping has no bound node"
+    if not isinstance(node_id, str):
+        return "mapped text_generate_node_id must be a string or null"
+    node = workflow.get(node_id)
+    if not isinstance(node, dict):
+        return f"mapped TextGenerate node {node_id!r} is not present in the executable prompt"
+    if node.get("class_type") not in {"TextGenerate", "TextGenerateLTX2Prompt"}:
+        return "mapped text_generate_node_id must target TextGenerate or TextGenerateLTX2Prompt"
+    inputs = node.get("inputs")
+    if not isinstance(inputs, dict) or "prompt" not in inputs:
+        return f"mapped TextGenerate node {node_id!r} has no executable prompt input"
+    declared_outputs = next(
+        (node.get(key) for key in ("return_types", "output_types", "outputs")
+         if node.get(key) is not None),
+        None,
+    )
+    if declared_outputs is not None:
+        first = (
+            declared_outputs[0]
+            if isinstance(declared_outputs, (list, tuple)) and declared_outputs
+            else None
+        )
+        first_type = first.get("type") if isinstance(first, dict) else first
+        first_name = first.get("name") if isinstance(first, dict) else None
+        if str(first_type or "").upper() not in {"STRING", "STR"} or (
+            first_name is not None and str(first_name) != "generated_text"
+        ):
+            return f"mapped TextGenerate node {node_id!r} output slot 0 is not generated text"
+    # Both supported node classes expose generated text at slot 0.  Any
+    # consumed secondary output would be lost by removing the node.
+    for other in workflow.values():
+        if isinstance(other, dict) and _contains_text_generate_ref(
+            other.get("inputs"), node_id
+        ):
+            def _has_nonzero_ref(value: Any) -> bool:
+                if isinstance(value, (list, tuple)) and len(value) == 2:
+                    try:
+                        return str(value[0]) == node_id and value[1] != 0
+                    except Exception:
+                        return False
+                if isinstance(value, dict):
+                    return any(_has_nonzero_ref(item) for item in value.values())
+                if isinstance(value, (list, tuple)):
+                    return any(_has_nonzero_ref(item) for item in value)
+                return False
+            if _has_nonzero_ref(other.get("inputs")):
+                return f"TextGenerate node {node_id!r} has a consumed secondary output; it cannot be bypassed"
+    return None
+
+
+def prepare_effective_prompt(
+    executable_prompt: dict[str, Any],
+    control_schema: dict[str, Any],
+    values: dict[str, Any],
+    mapping: dict[str, Any] | None,
+    modal_options: dict[str, Any] | None = None,
+    ui_graph: Any = None,
+) -> dict[str, Any]:
+    """Apply controls, then perform the stored TextGenerate bypass if requested.
+
+    The returned workflow is always a deep copy.  The mapping is the sole
+    source of the bypass target; request options carry intent only.
+
+    When skipping, downstream consumes the Playground shelf prompt (the
+    merged ``prompt`` control value) — not the node's wired ``inputs.prompt``,
+    which is often a template/formula output.  The node input is only the
+    fallback when no shelf prompt value is present.
+    """
+    applied = apply_workflow_values_to_prompt(
+        executable_prompt, control_schema, values, ui_graph=ui_graph
+    )
+    if "error" in applied:
+        return applied
+    options = {} if modal_options is None else modal_options
+    if not isinstance(options, dict):
+        return {"error": "modal_options must be an object"}
+    skip = options.get("skip_text_generate", False)
+    if type(skip) is not bool:
+        return {"error": "modal_options.skip_text_generate must be a boolean"}
+    target = (mapping or {}).get("text_generate_node_id")
+    metadata = {
+        "skip_text_generate": skip,
+        "text_generate_node_id": target if target not in ("", None) else None,
+    }
+    workflow = applied["workflow"]
+    if not skip:
+        return {"workflow": workflow, "studio_meta": metadata}
+    error = _validate_text_generate_target(workflow, target)
+    if error:
+        return {"error": error}
+    node = workflow[str(target)]
+    prompt_role = _control_schema_key(control_schema, "prompt")
+    shelf_prompt = (
+        values.get(prompt_role)
+        if prompt_role is not None and isinstance(values, dict)
+        else None
+    )
+    if isinstance(shelf_prompt, str):
+        # Skip means "use exactly what I typed in the shelf", even when
+        # empty — the node's wired template/formula output is bypassed too.
+        replacement = copy.deepcopy(shelf_prompt)
+        metadata["text_generate_prompt_source"] = "shelf"
+    else:
+        # Fall back to the node's pre-control prompt: apply() may already
+        # have overwritten the applied copy with the unusable shelf value.
+        original = executable_prompt.get(str(target)) if isinstance(executable_prompt, dict) else None
+        original_inputs = original.get("inputs") if isinstance(original, dict) else None
+        if isinstance(original_inputs, dict) and "prompt" in original_inputs:
+            replacement = copy.deepcopy(original_inputs["prompt"])
+        else:
+            replacement = copy.deepcopy(node["inputs"]["prompt"])
+        metadata["text_generate_prompt_source"] = "node_input"
+    effective = _replace_text_generate_output_refs(workflow, str(target), replacement)
+    if _contains_text_generate_ref(effective, str(target)):
+        return {
+            "error": (
+                f"TextGenerate node {target!r} still has unsupported references "
+                "after bypass"
+            )
+        }
+    effective.pop(str(target), None)
+    return {"workflow": effective, "studio_meta": metadata}
 
 
 def _hydrate_missing_required_widget_defaults(
@@ -936,6 +1193,58 @@ def _build_workflow_studio_meta(
 # ── Execution plan ───────────────────────────────────────────────────────
 
 
+def _repair_empty_dropdown_links(workflow: dict[str, Any]) -> list[dict[str, Any]]:
+    """Repair links fed by unconfigured dropdowns (same family as the CLIP/VAE
+    repairs below: complete wiring the graph left incomplete, invent nothing).
+
+    A PixaromaDropdown with empty DropdownState outputs ``""`` for every slot
+    (verified: ``selected_values("") == ("", "", "", "")``). Linked into
+    ``ImageScaleToTotalPixels.megapixels`` (FLOAT) that crashes remote
+    execution with ``TypeError`` AFTER model loading — ``"" * 1048576`` is
+    silently legal, so nothing fails earlier. The repair injects the LEAN
+    state the browser itself would inject for a 1.0 float pick (Pixaroma's
+    documented wire format: ``{"type": "float", "value": ...}``), matching the
+    target node's own megapixel default of 1. Topology is preserved — no link
+    is severed, renamed, or retargeted; only the provably-empty state blob is
+    completed, exactly where the node reads it.
+
+    Deliberately narrow (one source class, one target input, empty state
+    only): anything outside this shape passes through untouched. Returns a
+    list of repair records for request metadata so the substitution is
+    auditable, never silent.
+    """
+    repairs: list[dict[str, Any]] = []
+    if not isinstance(workflow, dict):
+        return repairs
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") != "ImageScaleToTotalPixels":
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        mega = inputs.get("megapixels")
+        if not (isinstance(mega, (list, tuple)) and len(mega) == 2):
+            continue
+        src = workflow.get(str(mega[0]))
+        if not isinstance(src, dict) or src.get("class_type") != "PixaromaDropdown":
+            continue
+        src_inputs = src.get("inputs")
+        if not isinstance(src_inputs, dict):
+            continue
+        state = src_inputs.get("DropdownState", "")
+        if isinstance(state, str) and state.strip() in ("", "{}"):
+            src_inputs["DropdownState"] = '{"type": "float", "value": 1.0}'
+            repairs.append({
+                "source_node_id": str(mega[0]),
+                "target_node_id": str(node_id),
+                "target_input": "megapixels",
+                "injected": "float 1.0 (target's own megapixel default)",
+            })
+    return repairs
+
+
 def build_workflow_execution_plan(
     bundle: dict[str, Any],
     values: dict[str, Any],
@@ -987,13 +1296,26 @@ def build_workflow_execution_plan(
             is_ui_graph = is_ui_workflow_format(graph_json)
         except Exception:
             pass
-        applied = apply_workflow_values_to_prompt(
-            executable_prompt, runtime_bundle["control_schema"], values,
+        prepared = prepare_effective_prompt(
+            executable_prompt,
+            runtime_bundle["control_schema"],
+            values,
+            runtime_bundle.get("mapping"),
+            modal_options=modal_options,
             ui_graph=graph_json,
         )
-        if "error" in applied:
-            return None, applied["error"]
-        workflow = applied["workflow"]
+        if "error" in prepared:
+            return None, prepared["error"]
+        workflow = prepared["workflow"]
+        text_generate_meta = prepared.get("studio_meta") or {}
+        # Repair links fed by unconfigured dropdowns (same family as the
+        # CLIP/VAE repairs below: complete wiring the graph left incomplete).
+        dropdown_repairs = _repair_empty_dropdown_links(workflow)
+        if dropdown_repairs:
+            _log.warning(
+                "Studio repaired %d empty-dropdown link(s): %s",
+                len(dropdown_repairs), dropdown_repairs,
+            )
 
         # Repair legacy missing CLIP/VAE inputs on the applied deep copy
         # (same helpers as _default_build_execution_plan / build_single_run_spec).
@@ -1029,6 +1351,7 @@ def build_workflow_execution_plan(
             output_mode=output_mode,
         )
         studio_meta["selected_gpu"] = _selected_gpu
+        studio_meta.update(text_generate_meta)
         try:
             # Role transport for golden dispatch substitution: normalized
             # semantic-role -> node bindings travel in request metadata so
@@ -1053,6 +1376,8 @@ def build_workflow_execution_plan(
                     }
             if _role_bindings:
                 studio_meta["role_bindings"] = _role_bindings
+            if dropdown_repairs:
+                studio_meta["repaired_empty_dropdowns"] = dropdown_repairs
         except Exception:
             pass
 
@@ -1129,12 +1454,21 @@ def build_workflow_execution_plan(
                 deployment_identity=plan.deployment_identity,
             )
         else:
+            # Non-production direct plan: image Tool Inputs still need their
+            # bytes collected — otherwise source/mask filenames travel without
+            # payloads and the remote loader finds nothing.
+            try:
+                from canonical_execution import _collect_input_images as _direct_collect_images
+                _direct_images = _direct_collect_images(workflow, str(comfyui_root or ""))
+            except Exception:
+                _direct_images = {}
             plan = ExecutionPlan(
                 workflow=workflow,
                 workflow_hash=workflow_hash,
                 model_stack=extract_model_stack(workflow),
                 prompt_bundle=custom_prompt_bundle,
                 output_node_ids=output_node_ids,
+                input_images=_direct_images,
                 execution_options=ExecutionOptions(
                     production_enabled=False,
                     output_mode=output_mode,
@@ -1572,16 +1906,19 @@ async def _record_workflow_run_failure(
         else:
             workflow_json: dict[str, Any] = {}
             try:
-                applied = apply_workflow_values_to_prompt(
+                prepared = prepare_effective_prompt(
                     bundle.get("executable_prompt") or {},
                     bundle.get("control_schema") or {},
                     values,
+                    bundle.get("mapping"),
+                    modal_options=modal_options,
                     ui_graph=(bundle.get("version") or {}).get("graph_json"),
                 )
-                if "workflow" in applied:
-                    workflow_json = applied["workflow"]
+                if "workflow" in prepared:
+                    workflow_json = prepared["workflow"]
                     _repair_missing_clip_inputs(workflow_json)
                     _repair_missing_vae_inputs(workflow_json)
+                    _repair_empty_dropdown_links(workflow_json)
                 else:
                     workflow_json = _plain_copy(bundle.get("executable_prompt") or {})
             except Exception:

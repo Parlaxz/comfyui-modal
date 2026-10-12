@@ -577,12 +577,35 @@ class BootstrapState:
 
     def set_snapshot_certificate(self, cert: dict[str, Any]) -> None:
         self.snapshot_certificate = dict(cert)
-        # Validate inline - V2 certs use direct identity comparison
+        # Validate inline - V2/V3 certs use direct identity comparison
         # (cert_identity vs recomputed from identity_components).
         # V1/legacy certs fall back to the generic optimizer validator.
+        # Schema v3 is the semantic skip key: workflow + repair + cn-gen +
+        # registry/exec/config digests, WITHOUT the deployment hash (which
+        # churns per dirty tree / commit).  Schema v2 keeps its legacy field
+        # list.  The recompute here must stay byte-identical to
+        # modal_app._compute_v2_cert_identity for the matching schema.
         try:
             sv = cert.get("schema_version")
-            if sv == 2:
+            if sv == 3:
+                # V3 validation: recompute semantic identity from components.
+                import hashlib
+                stored_identity = str(cert.get("cert_identity", "") or cert.get("identity", ""))
+                components = cert.get("identity_components", {})
+                if isinstance(components, dict) and stored_identity:
+                    h = hashlib.sha256()
+                    h.update(f"cert_schema={components.get('schema_version', '3')}\n".encode())
+                    h.update(f"workflow_hash={components.get('workflow_hash', '')}\n".encode())
+                    h.update(f"repair_mode={components.get('repair_mode', '')}\n".encode())
+                    h.update(f"custom_nodes_generation={components.get('custom_nodes_generation', '')}\n".encode())
+                    h.update(f"registry_digest={components.get('registry_digest', '')}\n".encode())
+                    h.update(f"exec_env_digest={components.get('exec_env_digest', '')}\n".encode())
+                    h.update(f"config_digest={components.get('config_digest', '')}\n".encode())
+                    computed = h.hexdigest()
+                    self.snapshot_cert_valid = (stored_identity == computed)
+                else:
+                    self.snapshot_cert_valid = False
+            elif sv == 2:
                 # V2 validation: recompute identity from components
                 import hashlib
                 stored_identity = str(cert.get("cert_identity", "") or cert.get("identity", ""))
@@ -604,7 +627,7 @@ class BootstrapState:
                 self.snapshot_cert_valid = bool(result.get("valid"))
         except Exception:
             self.snapshot_cert_valid = False
-        if self.snapshot_cert_valid and cert.get("schema_version") == 2:
+        if self.snapshot_cert_valid and cert.get("schema_version") in (2, 3):
             self.snapshot_cert_identity = str(
                 cert.get("identity", "") or cert.get("cert_identity", "") or ""
             )

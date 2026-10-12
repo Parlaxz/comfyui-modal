@@ -520,6 +520,7 @@ async def run_golden_workflow(
     # argument so pre-collapse callers still work; nothing reads it.
     preset_id: str = "",
     workspace: Mapping[str, Any] | None = None,
+    modal_options: Mapping[str, Any] | None = None,
     event_store: GoldenStageEventStore = EVENT_STORE,
     handle_factory: Callable[[GoldenProfile, Mapping[str, Any] | None], Any] | None = None,
 ) -> dict[str, Any]:
@@ -530,10 +531,11 @@ async def run_golden_workflow(
     # Reuse the established Studio workflow seam read-only.  In particular,
     # this preserves version/preset ownership and verbatim control mapping.
     from studio_workflow_run import (
-        apply_workflow_values_to_prompt,
         build_workflow_execution_plan,
         merge_workflow_controls,
         _normalize_model_loader_names,
+        _repair_empty_dropdown_links,
+        prepare_effective_prompt,
         resolve_workflow_run_bundle,
     )
 
@@ -560,17 +562,45 @@ async def run_golden_workflow(
             ),
             "errors": merged["errors"],
         }
-    applied = apply_workflow_values_to_prompt(
-        bundle["executable_prompt"], bundle["control_schema"], merged["values"],
-        ui_graph=(bundle.get("version") or {}).get("graph_json"),
-    )
-    if "error" in applied:
+    if modal_options is not None and not isinstance(modal_options, Mapping):
         return {
             "status": "error",
             "error_code": "WORKFLOW_CONTROL_APPLICATION",
-            "message": str(applied["error"]),
+            "message": "modal_options must be an object",
         }
+    effective_options = dict(modal_options or {})
+    prepared = prepare_effective_prompt(
+        bundle["executable_prompt"],
+        bundle["control_schema"],
+        merged["values"],
+        bundle.get("mapping"),
+        modal_options=effective_options,
+        ui_graph=(bundle.get("version") or {}).get("graph_json"),
+    )
+    if "error" in prepared:
+        return {
+            "status": "error",
+            "error_code": "WORKFLOW_CONTROL_APPLICATION",
+            "message": str(prepared["error"]),
+        }
+    applied = prepared
     _normalize_model_loader_names(applied["workflow"])
+    # Same empty-dropdown repair as the generic plan seam: the fast path
+    # submits applied["workflow"] directly, so an unconfigured PixaromaDropdown
+    # would otherwise feed "" into ImageScaleToTotalPixels.megapixels and crash
+    # remote execution AFTER model loading (TypeError: str / int).
+    dropdown_repairs = _repair_empty_dropdown_links(applied["workflow"])
+    if dropdown_repairs:
+        _log.warning(
+            "Studio repaired %d empty-dropdown link(s): %s",
+            len(dropdown_repairs), dropdown_repairs,
+        )
+    from workflow_metadata import prompt_sha256
+
+    studio_meta = copy.deepcopy(applied.get("studio_meta") or {})
+    # The dedicated Golden adapter has no ExecutionPlan to compute this for
+    # it; hash the exact graph that will be submitted, after bypass.
+    studio_meta["workflow_hash"] = prompt_sha256(applied["workflow"])
     use_generic_executor = not _canonical_golden_fast_path(applied["workflow"])
 
     event_store.start(request_id)
@@ -595,8 +625,10 @@ async def run_golden_workflow(
             "workflow_id": str(workflow_id or ""),
             "workflow_version_id": str(version_id or ""),
             "studio_controls": copy.deepcopy(merged["values"]),
+            "repaired_empty_dropdowns": dropdown_repairs,
+            "studio_meta": studio_meta,
         },
-        "modal_options": {},
+        "modal_options": copy.deepcopy(effective_options),
         "stream_golden_stage_events": True,
         "c0_source_threads": _source_threads,
         "golden_mode": (
@@ -640,7 +672,7 @@ async def run_golden_workflow(
             plan, plan_error = build_workflow_execution_plan(
                 bundle,
                 merged["values"],
-                modal_options={},
+                modal_options=effective_options,
                 comfyui_root=str(node_dir),
             )
             if plan_error is not None or plan is None:

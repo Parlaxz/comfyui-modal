@@ -826,37 +826,84 @@ def _validate_class_types(workflow: dict, production_report: dict | None = None)
 
 
 def _collect_input_images(workflow: dict, comfyui_root: str) -> dict[str, str]:
-    """Base64-encode local images referenced by LoadImage nodes."""
+    """Base64-encode local images referenced by image/mask node inputs."""
     images: dict[str, str] = {}
     _WORKFLOW_IMAGE_SUFFIX_DIRS = {
         " [output]": "output",
         " [input]": "input",
         " [temp]": "temp",
     }
+    # The caller may pass the custom-node directory instead of the ComfyUI
+    # root (Studio's run adapter forwards its node dir). Search the given
+    # root plus up to two parents so `<ComfyUI>/input|output` is found either
+    # way. First hit wins; results are identical when the true root is given.
+    # Roots are canonicalized with realpath (matching candidate checks) so
+    # symlinked installs resolve consistently.
+    _roots: list[str] = []
+    _seen_roots: set[str] = set()
+    _cursor = os.path.realpath(comfyui_root or "")
+    for _ in range(3):
+        if not _cursor or _cursor in _seen_roots:
+            break
+        _seen_roots.add(_cursor)
+        _roots.append(_cursor)
+        _parent = os.path.dirname(_cursor)
+        if _parent == _cursor:
+            break
+        _cursor = _parent
+
+    def _within_roots(filepath: str) -> bool:
+        # Containment against symlink/`..` escapes (annotated references skip
+        # the component check above). Compares real paths so a symlink
+        # pointing outside the searched roots is never read.
+        try:
+            real = os.path.realpath(filepath)
+        except Exception:
+            return False
+        for root in _roots:
+            try:
+                if os.path.commonpath([real, root]) == root:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _resolve_candidates(filename: str) -> list[str]:
         name = (filename or "").strip()
         for suffix, directory in _WORKFLOW_IMAGE_SUFFIX_DIRS.items():
             if name.endswith(suffix):
                 base = name[: -len(suffix)].rstrip()
-                return [os.path.join(comfyui_root, directory, *base.replace("\\", "/").split("/"))]
+                base_parts = [p for p in base.replace("\\", "/").split("/") if p not in ("", ".")]
+                # No `..` escapes in annotated references either; containment
+                # below is the backstop.
+                if not base_parts or any(p == ".." for p in base_parts):
+                    return []
+                return [
+                    os.path.join(root, directory, *base_parts)
+                    for root in _roots
+                ]
         parts = [p for p in filename.replace("\\", "/").split("/") if p not in ("", ".")]
         if not parts or any(p == ".." for p in parts):
             return []
         return [
-            os.path.join(comfyui_root, d, *parts)
+            os.path.join(root, d, *parts)
+            for root in _roots
             for d in ("input", "output")
-            if os.path.isdir(os.path.join(comfyui_root, d))
+            if os.path.isdir(os.path.join(root, d))
         ]
 
     for node in workflow.values():
         if not isinstance(node, dict):
             continue
-        class_type = node.get("class_type", "")
-        if not class_type.startswith("LoadImage"):
+        # Generic contract: any node consuming an `image`/`mask` input needs
+        # its file bytes on the remote loader. LoadImage* is the common case,
+        # but Studio-mapped image roles may target other loader nodes, so
+        # match on the input names rather than the node class.
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
             continue
         for key in ("image", "mask"):
-            filename = node.get("inputs", {}).get(key, "")
+            filename = inputs.get(key, "")
             if not isinstance(filename, str) or not filename:
                 continue
             if filename in images:
@@ -865,7 +912,7 @@ def _collect_input_images(workflow: dict, comfyui_root: str) -> dict[str, str]:
                 continue
             candidates = _resolve_candidates(filename)
             for filepath in candidates:
-                if os.path.isfile(filepath):
+                if os.path.isfile(filepath) and _within_roots(filepath):
                     with open(filepath, "rb") as f:
                         images[filename] = base64.b64encode(f.read()).decode()
                     break

@@ -811,7 +811,7 @@ V2_SOURCE_MODULES = (
 # Certificates are stored on the runtime-state Volume keyed by a stable
 # identity that includes workflow struct hash and deployment identity.
 _V2_VALIDATION_CERT_ENABLED: bool = env_flag("COMFYMODAL_V2_VALIDATION_CERT", default=True)
-_V2_CERT_SCHEMA_VERSION: int = 2
+_V2_CERT_SCHEMA_VERSION: int = 3
 _V2_CERT_FILENAME_PREFIX: str = "v2_cert_"
 
 # Quiet console mode.  Set COMFYMODAL_V2_QUIET=1 to suppress the per-request
@@ -2318,33 +2318,201 @@ def _compute_v2_cert_identity(
     workflow_hash: str,
     repair_mode: str = "",
     custom_nodes_generation: str = "",
+    *,
+    registry_digest: str = "",
+    exec_env_digest: str = "",
+    config_digest: str = "",
 ) -> tuple[str, dict[str, str]]:
     """Build a deterministic certificate identity from *workflow_hash*,
-    the deployment's combined hash (``_V2_DEPLOYMENT_COMBINED_HASH``), and
-    mutable preflight context.
+    mutable preflight context, and semantic execution digests.
 
-    Returns ``(identity_hex, components_dict)``.  Identity is a SHA-256 hex
-    string.  When ``_V2_DEPLOYMENT_COMBINED_HASH`` is empty, only the
-    workflow_hash is used (deployment combined hash is empty — less
-    discrimination but still safe).
+    Schema v3 (semantic skip key): the identity covers what validation
+    outcomes depend on -- workflow, repair mode, custom-node generation,
+    live-registry digest, execution-code digest, and effective-config
+    digest.  The deployment combined hash is deliberately NOT part of the
+    skip key: it churns with every dirty tree / commit even when nothing
+    semantic changed.  It is still recorded in the payload as provenance
+    (see ``_write_v2_validation_certificate``), but a redeploy that
+    changes no semantic input reuses the vetted certificate.
+
+    ``registry_digest`` / ``exec_env_digest`` / ``config_digest`` default
+    to ``""`` (legacy-shaped identity minus deployment); empty digests
+    fail closed downstream by plain inequality against stored values.
+    Returns ``(identity_hex, components_dict)``.
     """
     import hashlib
-    dep_hash = _V2_DEPLOYMENT_COMBINED_HASH
     h = hashlib.sha256()
     h.update(f"cert_schema={_V2_CERT_SCHEMA_VERSION}\n".encode())
     h.update(f"workflow_hash={workflow_hash}\n".encode())
-    h.update(f"deployment_hash={dep_hash}\n".encode())
     h.update(f"repair_mode={repair_mode}\n".encode())
     h.update(f"custom_nodes_generation={custom_nodes_generation}\n".encode())
+    h.update(f"registry_digest={registry_digest or ''}\n".encode())
+    h.update(f"exec_env_digest={exec_env_digest or ''}\n".encode())
+    h.update(f"config_digest={config_digest or ''}\n".encode())
     identity = h.hexdigest()
+    # NOTE: deployment_hash is deliberately absent from the skip key (see
+    # docstring). It is recorded as payload provenance by the writer; every
+    # comparison below (exact or iterated) therefore decides on semantic
+    # identity only.
     components = {
         "schema_version": str(_V2_CERT_SCHEMA_VERSION),
         "workflow_hash": workflow_hash,
-        "deployment_hash": dep_hash,
         "repair_mode": repair_mode,
         "custom_nodes_generation": custom_nodes_generation,
+        "registry_digest": str(registry_digest or ""),
+        "exec_env_digest": str(exec_env_digest or ""),
+        "config_digest": str(config_digest or ""),
     }
     return identity, components
+
+
+def registry_digest_from_proof(registry_proof: Any) -> str:
+    """Digest a workflow registry proof into a cert identity component.
+
+    Covers proof completeness plus the sorted class->identity map, so
+    node-implementation drift busts vetted certificates.  Returns ``""``
+    when no usable proof is present (fail closed downstream by inequality).
+    Pure and total.  Never raises.
+    """
+    try:
+        if not isinstance(registry_proof, dict):
+            return ""
+        identities = registry_proof.get("identities")
+        if not isinstance(identities, dict) or not identities:
+            return ""
+        import hashlib as _hl
+        import json as _js
+        canonical = _js.dumps(
+            {"complete": bool(registry_proof.get("complete", False)),
+             "identities": {str(k): str(v) for k, v in sorted(identities.items())}},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
+        return _hl.sha256(canonical.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+_EXEC_ENV_DIGEST_CACHE: dict[str, str] = {}
+_EXEC_ENV_DIGEST_ERROR: dict[str, str] = {}
+# Runtime files whose content change alters execution semantics (and must
+# therefore bust vetted certificates).  Broad by design: anything imported
+# at request time inside the container.  Never tests/, tools/, web/, docs/.
+_EXEC_ENV_DIGEST_TOPLEVEL = (
+    "comfyapp.py",
+    "studio_workflow_run.py",
+    "production_workflow.py",
+    "canonical_execution.py",
+    "execution_runtime.py",
+)
+
+
+def execution_environment_digest() -> str:
+    """Digest the container's execution-code content for the cert skip key.
+
+    SHA-256 over ``relpath:file-sha`` pairs for every ``*.py`` directly
+    under ``comfymodal_runtime/`` plus the top-level request-execution
+    modules.  Cached per process (content is deploy-static).  Returns
+    ``""`` when unreadable (fail closed downstream).  Never raises.
+    """
+    try:
+        cached = _EXEC_ENV_DIGEST_CACHE.get("digest", "")
+        if cached:
+            return cached
+        import hashlib as _hl
+        from pathlib import Path as _P
+        runtime_dir = _P(__file__).resolve().parent
+        repo_root = runtime_dir.parent
+        entries: list[str] = []
+        _py_files = sorted(runtime_dir.glob("*.py"))
+        if not _py_files:
+            _EXEC_ENV_DIGEST_ERROR["reason"] = "no_runtime_py_files"
+            return ""
+        for child in _py_files:
+            try:
+                data = child.read_bytes()
+            except Exception:
+                _EXEC_ENV_DIGEST_ERROR["reason"] = f"unreadable_runtime:{child.name}"
+                return ""
+            entries.append(f"comfymodal_runtime/{child.name}:{_hl.sha256(data).hexdigest()}")
+        for name in _EXEC_ENV_DIGEST_TOPLEVEL:
+            try:
+                data = (repo_root / name).read_bytes()
+            except Exception:
+                _EXEC_ENV_DIGEST_ERROR["reason"] = f"missing_toplevel:{name}"
+                return ""
+            entries.append(f"{name}:{_hl.sha256(data).hexdigest()}")
+        if not entries:
+            _EXEC_ENV_DIGEST_ERROR["reason"] = "no_entries"
+            return ""
+        digest = _hl.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+        _EXEC_ENV_DIGEST_CACHE["digest"] = digest
+        _EXEC_ENV_DIGEST_ERROR["reason"] = ""
+        return digest
+    except Exception as _exc:
+        _EXEC_ENV_DIGEST_ERROR["reason"] = f"error:{type(_exc).__name__}"
+        return ""
+
+
+_RUNTIME_CONFIG_DIGEST_CACHE: dict[str, str] = {}
+# Environ keys that change per request/container and must never bust a
+# vetted certificate. COMFYMODAL_RESTORED_INSTANCE_ID is set fresh for
+# every request (uuid); anything matching these fragments is volatile
+# identity, not configuration. A missed fragment fails closed elsewhere
+# (digest inequality), but every known-volatile key belongs here.
+_RUNTIME_CONFIG_DIGEST_VOLATILE_FRAGMENTS = (
+    "RESTORED_INSTANCE",
+    "POST_RESTORE_NONCE",
+    "NONCE",
+    "SESSION_ID",
+    "TASK_ID",
+    "REQUEST_ID",
+    "INPUT_ID",
+    "CONTAINER_ID",
+    "UUID",
+)
+
+
+def runtime_config_digest() -> str:
+    """Digest effective runtime configuration for the cert skip key.
+
+    Covers every ``COMFYMODAL_*`` environ value (deploy-baked per
+    container) plus interpreter/torch versions, so a flag or dependency
+    change that alters execution busts vetted certificates.  Per-request
+    volatile keys (instance/session/task/request ids, nonces) are
+    excluded: they churn every run and carry no execution semantics.
+    Cached per process.  Returns ``""`` when uncomputable (fail closed
+    downstream).  Never raises.
+    """
+    try:
+        cached = _RUNTIME_CONFIG_DIGEST_CACHE.get("digest", "")
+        if cached:
+            return cached
+        import hashlib as _hl
+        import json as _js
+        import os as _os
+        import sys as _sys
+        pairs = sorted(
+            (str(k), str(v))
+            for k, v in _os.environ.items()
+            if str(k).startswith("COMFYMODAL_")
+            and not any(
+                _frag in str(k).upper()
+                for _frag in _RUNTIME_CONFIG_DIGEST_VOLATILE_FRAGMENTS
+            )
+        )
+        versions: dict[str, str] = {"python": str(_sys.version.split()[0])}
+        try:
+            import torch as _t  # type: ignore[import-not-found]
+            versions["torch"] = str(getattr(_t, "__version__", ""))
+        except Exception:
+            versions["torch"] = ""
+        canonical = _js.dumps({"env": pairs, "versions": versions},
+                              sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        digest = _hl.sha256(canonical.encode("utf-8")).hexdigest()
+        _RUNTIME_CONFIG_DIGEST_CACHE["digest"] = digest
+        return digest
+    except Exception:
+        return ""
 
 
 def _v2_cert_filename(cert_identity: str) -> str:
@@ -2397,6 +2565,9 @@ async def _write_v2_validation_certificate(
             "outputs_to_execute": outputs_to_execute,
             "node_errors": dict(node_errors or {}),
             "preflight_ok": bool(preflight_ok),
+            # Provenance only (never part of the skip key): which deployment
+            # vetted this certificate.  Readers ignore unknown fields.
+            "deployment_hash": _V2_DEPLOYMENT_COMBINED_HASH,
         }
         if components:
             payload["identity_components"] = dict(components)
@@ -2426,6 +2597,54 @@ async def _write_v2_validation_certificate(
             flush=True,
         )
         return False
+
+
+def build_pending_cert_write(
+    scheduled: bool,
+    preflight_ran: bool,
+    cert_identity: str,
+    outputs_to_execute: list,
+    node_errors: dict,
+    components: dict | None,
+) -> dict | None:
+    """Build a deferred cert-write stash, or ``None`` when no write is due.
+
+    Pure constructor for the post-yield cert deferral: the volume
+    write+commit must not sit on the response critical path, so the
+    success path stashes this payload (consumed by
+    ``_finalize_pending_cert_write`` at the deferred tail) instead of
+    awaiting the write inline.  Returns ``None`` under exactly the same
+    condition as the inline write (scheduled AND preflight actually ran).
+    Never raises.
+    """
+    try:
+        if not should_write_validation_cert(scheduled, preflight_ran):
+            return None
+        if not cert_identity:
+            return None
+        return {
+            "identity": str(cert_identity),
+            "outputs_to_execute": list(outputs_to_execute or []),
+            "node_errors": dict(node_errors or {}),
+            "identity_components": dict(components or {}),
+        }
+    except Exception:
+        return None
+
+
+def cert_cache_lookup_label(*, cached_present: bool, evict_reason: str) -> tuple[str, str]:
+    """Label a process-cache cert lookup for the ``[v2.cert]`` line.
+
+    A lookup with nothing stored is a plain miss (fresh container), not an
+    eviction — labelling it ``cache_evict`` with an empty reason misleads.
+    Returns ``(label, reason)``.  Pure and total.  Never raises.
+    """
+    try:
+        if cached_present:
+            return ("cache_evict", str(evict_reason or "revalidation_failed"))
+        return ("cache_miss", "no_process_entry")
+    except Exception:
+        return ("cache_miss", "label_error")
 
 
 def _validate_cert_dict_payload(
@@ -12219,6 +12438,15 @@ class ModalRuntimeEntrypoint:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count
 
         _t_start = time.perf_counter()
+        # Preamble: restore() entry (compat symlink, flag checks, dispatch)
+        # before the first instrumented mark. Tiles the total with the tail
+        # mark below so no restore wall is unattributed.
+        try:
+            _restore_preamble_ms = round(
+                (_t_start - restore_perf_start) * 1000.0, 3
+            )
+        except Exception:
+            _restore_preamble_ms = 0.0
         # Project the genuine pre-capture snapshot content proof captured at the
         # snap=True boundary.  It is stored on the snapshotted self._restore_timing
         # and survives restore, so the minimal path only exposes the existing
@@ -12233,6 +12461,10 @@ class ModalRuntimeEntrypoint:
         telemetry: dict[str, Any] = {
             "minimal_restore_start": time.monotonic_ns(),
         }
+        try:
+            telemetry["restore_preamble_ms"] = _restore_preamble_ms
+        except Exception:
+            pass
         if isinstance(_preserved_snapshot_proof, Mapping):
             telemetry["golden_snapshot_content_proof"] = dict(_preserved_snapshot_proof)
 
@@ -12291,6 +12523,7 @@ class ModalRuntimeEntrypoint:
             # Fail closed: never silently fall back to the legacy restore.
             raise
 
+        _t_tail = time.perf_counter()
         _v2_container_restore_count += 1
         self._restore_count = _v2_container_restore_count
         restore_session_id = uuid.uuid4().hex
@@ -12350,12 +12583,20 @@ class ModalRuntimeEntrypoint:
         )
 
         _state = getattr(getattr(self, "bootstrap", None), "state", None)
+        try:
+            telemetry["restore_tail_ms"] = round(
+                (time.perf_counter() - _t_tail) * 1000.0, 3
+            )
+        except Exception:
+            pass
         print(
             "[v2.golden_minimal_restore] "
             f"status=ok minimal_restore_total_ms={restore_total_ms} "
+            f"restore_preamble_ms={telemetry.get('restore_preamble_ms')} "
             f"mutable_state_reset_ms={telemetry.get('mutable_state_reset_ms')} "
             f"logical_gpu_repair_ms={telemetry.get('logical_gpu_repair_ms')} "
-            f"models_generation_check_ms={telemetry.get('models_generation_check_ms')}",
+            f"models_generation_check_ms={telemetry.get('models_generation_check_ms')} "
+            f"restore_tail_ms={telemetry.get('restore_tail_ms')}",
             flush=True,
         )
         return {
@@ -16115,14 +16356,33 @@ class ModalRuntimeEntrypoint:
                         and bool(_v2_custom_nodes_gen)
                     )
                     if _cert_eligible:
-                        # Compute cert identity WITH timing
+                        # Compute cert identity WITH timing (schema v3 semantic
+                        # skip key: registry/exec/config digests included, the
+                        # churning deployment hash excluded by design).
                         _cert_identity_build_start = time.perf_counter()
                         _v2_cert_identity, _v2_cert_components = _compute_v2_cert_identity(
                             _cert_wf_hash,
                             repair_mode=_v2_repair_mode,
                             custom_nodes_generation=_v2_custom_nodes_gen,
+                            registry_digest=registry_digest_from_proof(
+                                (plan.deployment_identity or {}).get("registry_proof")
+                            ),
+                            exec_env_digest=execution_environment_digest(),
+                            config_digest=runtime_config_digest(),
                         )
                         _diag_cert_identity_build_ms = round((time.perf_counter() - _cert_identity_build_start) * 1000, 3)
+                        try:
+                            print(
+                                f"[v2.cert] digests "
+                                f"registry={_v2_cert_components.get('registry_digest', '')[:12]} "
+                                f"exec={_v2_cert_components.get('exec_env_digest', '')[:12]} "
+                                f"exec_err={_EXEC_ENV_DIGEST_ERROR.get('reason', '')[:48]} "
+                                f"config={_v2_cert_components.get('config_digest', '')[:12]} "
+                                f"identity={_v2_cert_identity[:16]}",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
 
                         # -- Snapshot-memory certificate check --
                         # On exact hit (full identity_components match or cert_identity),
@@ -16262,10 +16522,16 @@ class ModalRuntimeEntrypoint:
                                     flush=True,
                                 )
                             else:
-                                # Revalidation failure -- evict cache entry and fall through
+                                # Revalidation failure -- evict cache entry and fall through.
+                                # (A lookup with nothing stored is a plain miss on a
+                                # fresh container, not an eviction -- label it so.)
                                 _V2_CERT_PROCESS_CACHE.pop(_cache_key, None)
+                                _cache_label, _cache_label_reason = cert_cache_lookup_label(
+                                    cached_present=_cached is not None,
+                                    evict_reason=_evict_reason,
+                                )
                                 print(
-                                    f"[v2.cert] cache_evict reason={_evict_reason} "
+                                    f"[v2.cert] {_cache_label} reason={_cache_label_reason} "
                                     f"identity={_v2_cert_identity[:16]}",
                                     flush=True,
                                 )
@@ -16548,10 +16814,17 @@ class ModalRuntimeEntrypoint:
                 if not _v2_cert_identity:
                     _cert_wf_hash = plan.workflow_hash or ""
                     if _cert_wf_hash and _V2_VALIDATION_CERT_ENABLED:
+                        # Fallback compute (lookup did not run): same semantic
+                        # inputs as the lookup site so both agree exactly.
                         _v2_cert_identity, _v2_cert_components = _compute_v2_cert_identity(
                             _cert_wf_hash,
                             repair_mode=_v2_repair_mode,
                             custom_nodes_generation=_v2_custom_nodes_gen,
+                            registry_digest=registry_digest_from_proof(
+                                (plan.deployment_identity or {}).get("registry_proof")
+                            ),
+                            exec_env_digest=execution_environment_digest(),
+                            config_digest=runtime_config_digest(),
                         )
                 if _v2_cert_identity:
                     _v2_schedule_cert_write = True
@@ -18229,45 +18502,28 @@ class ModalRuntimeEntrypoint:
                 )
             except Exception:
                 pass
-            if should_write_validation_cert(_v2_schedule_cert_write, _v2_preflight_ran):
-                _cert_write_ok = await _write_v2_validation_certificate(
-                    _v2_cert_identity,
-                    outputs_to_execute,
-                    node_errors,
-                    components=_v2_cert_components,
-                    preflight_ok=True,
-                )
-                _bs_write = getattr(getattr(self, "bootstrap", None), "state", None)
-                if _bs_write is not None:
-                    if _cert_write_ok:
-                        _fresh_cert = {
-                            "schema_version": _V2_CERT_SCHEMA_VERSION,
-                            "identity": _v2_cert_identity,
-                            "preflight_ok": True,
-                            "outputs_to_execute": list(outputs_to_execute),
-                            "node_errors": copy.deepcopy(node_errors) if node_errors else {},
-                            "identity_components": dict(_v2_cert_components),
-                        }
-                        _bs_write.set_snapshot_certificate(_fresh_cert)
-                        if _bs_write.snapshot_cert_valid:
-                            _bs_write.snapshot_cert_retained = True
-                            _bs_write.snapshot_cert_identity = _v2_cert_identity
-                            _bs_write.snapshot_cert_workflow_hash = _v2_cert_components.get("workflow_hash", "")
-                            _bs_write.snapshot_cert_reason = "request_write"
-                            print(
-                                f"[v2.cert] snapshot_retained_updated "
-                                f"reason=request_write identity={_v2_cert_identity[:16]}",
-                                flush=True,
-                            )
-                        else:
-                            _bs_write.invalidate_snapshot_certificate(reason="request_write_invalid")
-                    else:
-                        _bs_write.invalidate_snapshot_certificate(reason="certificate_write_failed")
-                        print(
-                            f"[v2.cert] snapshot_retained_invalidated "
-                            f"reason=certificate_write_failed identity={_v2_cert_identity[:16]}",
-                            flush=True,
-                        )
+            if (_pending_cert_write := build_pending_cert_write(
+                _v2_schedule_cert_write,
+                _v2_preflight_ran,
+                _v2_cert_identity,
+                outputs_to_execute,
+                node_errors,
+                _v2_cert_components,
+            )) is not None:
+                # Defer the volume write+commit past the terminal yield (see
+                # _finalize_pending_cert_write at the deferred tail): the
+                # response wall must not cover the ~1.6 s volume commit.
+                # Perf-only exposure: if the container recycles before the
+                # tail runs, the next run pays full preflight (never wrong).
+                self._v2_pending_cert_write = _pending_cert_write
+                try:
+                    print(
+                        f"[v2.post_result] stage=cert_deferred "
+                        f"identity={_v2_cert_identity[:16]}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
 
 
             # ── Post-result span mark: cert-write exit (diagnostic only) ──
@@ -18975,6 +19231,90 @@ class ModalRuntimeEntrypoint:
             "detail": detail,
             "skipped": False,
         }
+
+    async def _finalize_pending_cert_write(self) -> None:
+        """Deferred-tail cert write: volume write+commit AFTER the terminal yield.
+
+        Consumes ``self._v2_pending_cert_write`` (stashed by
+        ``_execute_v2_prompt_executor`` on the success path when a write is
+        due).  Idempotent (stash cleared on first call) and MUST never raise
+        -- a failure here must not mask the terminal result or an in-flight
+        exception.  The in-memory snapshot-certificate update (previously
+        inline) also moves here; it is cheap and preserves the
+        ``snapshot_retained_updated`` semantics for process reuse.
+        """
+        _pending = getattr(self, "_v2_pending_cert_write", None)
+        self._v2_pending_cert_write = None
+        if not isinstance(_pending, dict) or not _pending.get("identity"):
+            return
+        _identity = str(_pending.get("identity") or "")
+        _t0 = time.perf_counter()
+        _cert_write_ok = False
+        try:
+            _cert_write_ok = await _write_v2_validation_certificate(
+                _identity,
+                list(_pending.get("outputs_to_execute") or []),
+                dict(_pending.get("node_errors") or {}),
+                components=dict(_pending.get("identity_components") or {}),
+                preflight_ok=True,
+            )
+        except Exception as _cert_tail_exc:
+            _cert_write_ok = False
+            try:
+                print(
+                    f"[v2.cert] write identity={_identity[:16]} "
+                    f"status=error error={str(_cert_tail_exc)[:120]}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+        try:
+            _bs_write = getattr(getattr(self, "bootstrap", None), "state", None)
+            if _bs_write is not None:
+                if _cert_write_ok:
+                    _fresh_cert = {
+                        "schema_version": _V2_CERT_SCHEMA_VERSION,
+                        "identity": _identity,
+                        "preflight_ok": True,
+                        "outputs_to_execute": list(_pending.get("outputs_to_execute") or []),
+                        "node_errors": copy.deepcopy(_pending.get("node_errors")) if _pending.get("node_errors") else {},
+                        "identity_components": dict(_pending.get("identity_components") or {}),
+                        "deployment_hash": _V2_DEPLOYMENT_COMBINED_HASH,
+                    }
+                    _bs_write.set_snapshot_certificate(_fresh_cert)
+                    if _bs_write.snapshot_cert_valid:
+                        _bs_write.snapshot_cert_retained = True
+                        _bs_write.snapshot_cert_identity = _identity
+                        _bs_write.snapshot_cert_workflow_hash = str(
+                            (_pending.get("identity_components") or {}).get("workflow_hash", "")
+                        )
+                        _bs_write.snapshot_cert_reason = "request_write"
+                        print(
+                            f"[v2.cert] snapshot_retained_updated "
+                            f"reason=request_write identity={_identity[:16]}",
+                            flush=True,
+                        )
+                    else:
+                        _bs_write.invalidate_snapshot_certificate(reason="request_write_invalid")
+                else:
+                    _bs_write.invalidate_snapshot_certificate(reason="certificate_write_failed")
+                    print(
+                        f"[v2.cert] snapshot_retained_invalidated "
+                        f"reason=certificate_write_failed identity={_identity[:16]}",
+                        flush=True,
+                    )
+        except Exception:
+            pass
+        try:
+            print(
+                f"[v2.post_result] stage=cert_exit "
+                f"mono_ns={time.monotonic_ns()} "
+                f"wall_unix_ns={time.time_ns()} "
+                f"commit_ms={round((time.perf_counter() - _t0) * 1000, 3)}",
+                flush=True,
+            )
+        except Exception:
+            pass
 
     def read_output_asset(self, backend_path: str, expected_sha256: str = "") -> dict[str, Any]:
         volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
@@ -20909,6 +21249,7 @@ class ModalRuntimeEntrypoint:
             self._deferred_commit_task = None
             self._deferred_commit_diag = None
             self._deferred_commit_pending = False
+            self._v2_pending_cert_write = None
         # ── Cooperative remote-cancel bridge (per-invocation watcher) ─────
         # One daemon watcher per invocation polls the hydrated control Queue
         # partition while execution is busy.  It is stopped/joined boundedly in
@@ -23038,6 +23379,13 @@ class ModalRuntimeEntrypoint:
             )
         except Exception:
             pass
+        # Deferred cert write rides the same post-yield seam as the asset
+        # commit: the volume write+commit ran here (never on the response
+        # wall).  Consumes the stash idempotently and never raises.
+        try:
+            await self._finalize_pending_cert_write()
+        except Exception:
+            pass
         _deferred_commit_event = await self._finalize_deferred_commit(request_id=request_id)
         if _deferred_commit_event is not None:
             # The deferred commit runs AFTER the result event was already
@@ -24387,6 +24735,7 @@ def _build_decorated_v2_class() -> type:
         self._snapshot_eviction_retained_model_type = ""
         self._snapshot_eviction_retained_release_status = "not_run"
         self._v2_pending_production_cleanup: dict[str, Any] | None = None
+        self._v2_pending_cert_write: dict[str, Any] | None = None
         self._deferred_commit_task = None
         self._deferred_commit_diag = None
         self._deferred_commit_pending = False

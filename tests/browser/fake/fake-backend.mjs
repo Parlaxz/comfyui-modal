@@ -4399,12 +4399,26 @@ function _wfPresetRecord(pid, def, isDefault) {
 
 /** Build the immutable, per-session (deep-copied) workflow seed dataset. */
 function _buildWorkflowSeed() {
+  const _imageEntry = (role, nodeId, inputName, required) => ({
+    semantic_role: role, node_id: nodeId, input_name: inputName,
+    kind: "node_input", control_kind: "image", data_type: "IMAGE", required: !!required,
+  });
   const mappings = {
     wm1_latest: { mapping_id: "wm1_latest", workflow_version_id: "wv1_latest", output_node_id: "4", entries: WF_MAPPING_ENTRIES.map((e) => Object.assign({}, e)) },
     wm1_old: { mapping_id: "wm1_old", workflow_version_id: "wv1_old", output_node_id: "4", entries: WF_MAPPING_ENTRIES.map((e) => Object.assign({}, e)) },
     wm_fail: { mapping_id: "wm_fail", workflow_version_id: "wv_fail", output_node_id: "4", entries: WF_MAPPING_ENTRIES.map((e) => Object.assign({}, e)) },
     wm_cancel: { mapping_id: "wm_cancel", workflow_version_id: "wv_cancel", output_node_id: "4", entries: WF_MAPPING_ENTRIES.map((e) => Object.assign({}, e)) },
     wm_interrupt: { mapping_id: "wm_interrupt", workflow_version_id: "wv_interrupt", output_node_id: "4", entries: WF_MAPPING_ENTRIES.map((e) => Object.assign({}, e)) },
+    wm_i2i: { mapping_id: "wm_i2i", workflow_version_id: "wv_i2i", output_node_id: "4", entries: [...WF_MAPPING_ENTRIES.map((e) => Object.assign({}, e)), _imageEntry("source_image", "10", "image", true)] },    wm_inpaint: { mapping_id: "wm_inpaint", workflow_version_id: "wv_inpaint", output_node_id: "4", entries: [...WF_MAPPING_ENTRIES.map((e) => Object.assign({}, e)), _imageEntry("source_image", "10", "image", true), _imageEntry("mask", "11", "mask", true)] },
+    wm_sketch: { mapping_id: "wm_sketch", workflow_version_id: "wv_sketch", output_node_id: "4", entries: [...WF_MAPPING_ENTRIES.map((e) => Object.assign({}, e)), _imageEntry("source_image", "10", "image", true), _imageEntry("mask", "11", "mask", false)] },
+    wm_outpaint: { mapping_id: "wm_outpaint", workflow_version_id: "wv_outpaint", output_node_id: "4", entries: [...WF_MAPPING_ENTRIES.map((e) => Object.assign({}, e)), _imageEntry("source_image", "10", "image", true), _imageEntry("mask", "11", "mask", false)] },
+    // Graph-era role spellings for the same product inputs (prompt/cfg/seed
+    // under legacy names). Exercises alias-aware workspace carry.
+    wm_legacy: { mapping_id: "wm_legacy", workflow_version_id: "wv_legacy", output_node_id: "4", entries: [
+      { semantic_role: "positive_prompt", node_id: "6", input_name: "text", kind: "node_input", control_kind: "multiline", data_type: "STRING", multiline: true, required: true },
+      { semantic_role: "seed", node_id: "3", input_name: "seed", kind: "node_input", control_kind: "integer", data_type: "INT", minimum: -1, step: 1, required: true },
+      _imageEntry("source_image", "10", "image", true),
+    ] },
   };
   const presets = {};
   for (const [pid, def] of Object.entries(WF_PRESET_DEFS)) {
@@ -4476,6 +4490,51 @@ function _buildWorkflowSeed() {
       compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
       default_preset_id: "wpres_interrupt",
     },
+    {
+      workflow_version_id: "wv_i2i", workflow_id: "wf_i2i", version_number: 1,
+      created_at: "2026-01-03T00:00:00.000Z", updated_at: "2026-01-03T00:00:00.000Z",
+      graph_hash: WF_HASH_FAIL, mapping_id: "wm_i2i", mapping: mappings.wm_i2i,
+      preset_count: 0, executable_prompt: _deepCopyWFGraph(),
+      state: { status: "ready", reasons: [], runnable: true },
+      compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
+      default_preset_id: "",
+    },
+    {
+      workflow_version_id: "wv_inpaint", workflow_id: "wf_inpaint", version_number: 1,
+      created_at: "2026-01-03T00:00:00.000Z", updated_at: "2026-01-03T00:00:00.000Z",
+      graph_hash: WF_HASH_FAIL, mapping_id: "wm_inpaint", mapping: mappings.wm_inpaint,
+      preset_count: 0, executable_prompt: _deepCopyWFGraph(),
+      state: { status: "ready", reasons: [], runnable: true },
+      compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
+      default_preset_id: "",
+    },
+    {
+      workflow_version_id: "wv_sketch", workflow_id: "wf_sketch", version_number: 1,
+      created_at: "2026-01-03T00:00:00.000Z", updated_at: "2026-01-03T00:00:00.000Z",
+      graph_hash: WF_HASH_FAIL, mapping_id: "wm_sketch", mapping: mappings.wm_sketch,
+      preset_count: 0, executable_prompt: _deepCopyWFGraph(),
+      state: { status: "ready", reasons: [], runnable: true },
+      compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
+      default_preset_id: "",
+    },
+    {
+      workflow_version_id: "wv_outpaint", workflow_id: "wf_outpaint", version_number: 1,
+      created_at: "2026-01-03T00:00:00.000Z", updated_at: "2026-01-03T00:00:00.000Z",
+      graph_hash: WF_HASH_FAIL, mapping_id: "wm_outpaint", mapping: mappings.wm_outpaint,
+      preset_count: 0, executable_prompt: _deepCopyWFGraph(),
+      state: { status: "ready", reasons: [], runnable: true },
+      compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
+      default_preset_id: "",
+    },
+    {
+      workflow_version_id: "wv_legacy", workflow_id: "wf_legacy_edit", version_number: 1,
+      created_at: "2026-01-03T00:00:00.000Z", updated_at: "2026-01-03T00:00:00.000Z",
+      graph_hash: WF_HASH_FAIL, mapping_id: "wm_legacy", mapping: mappings.wm_legacy,
+      preset_count: 0, executable_prompt: _deepCopyWFGraph(),
+      state: { status: "ready", reasons: [], runnable: true },
+      compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
+      default_preset_id: "",
+    },
   ];
 
   const workflows = [
@@ -4487,6 +4546,7 @@ function _buildWorkflowSeed() {
       default_preset_id: "wpres_a", default_preset_name: "Preset A",
       compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
       version_count: 2, updated_at: "2026-01-02T00:00:00.000Z",
+      workflow_type: "t2i",
     },
     {
       workflow_id: "wf_incomplete", name: "Incomplete Workflow",
@@ -4548,6 +4608,56 @@ function _buildWorkflowSeed() {
         stale: null,
         analyzed_at: "2026-08-21T08:00:00.000Z",
       },
+    },
+    {
+      workflow_id: "wf_i2i", name: "Image Edit Workflow",
+      description: "Seeded image-edit workflow", folder: "", tags: ["i2i"],
+      favorite: false, latest_version_id: "wv_i2i", latest_version_number: 1,
+      latest_version_state: { status: "ready", reasons: [], runnable: true },
+      default_preset_id: "", default_preset_name: null,
+      compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
+      version_count: 1, updated_at: "2026-01-03T00:00:00.000Z",
+      workflow_type: "i2i",
+    },
+    {
+      workflow_id: "wf_inpaint", name: "Inpaint Workflow",
+      description: "Seeded inpaint workflow", folder: "", tags: ["inpaint"],
+      favorite: false, latest_version_id: "wv_inpaint", latest_version_number: 1,
+      latest_version_state: { status: "ready", reasons: [], runnable: true },
+      default_preset_id: "", default_preset_name: null,
+      compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
+      version_count: 1, updated_at: "2026-01-03T00:00:00.000Z",
+      workflow_type: "inpaint",
+    },
+    {
+      workflow_id: "wf_sketch", name: "Sketch Workflow",
+      description: "Seeded sketch workflow", folder: "", tags: ["sketch"],
+      favorite: false, latest_version_id: "wv_sketch", latest_version_number: 1,
+      latest_version_state: { status: "ready", reasons: [], runnable: true },
+      default_preset_id: "", default_preset_name: null,
+      compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
+      version_count: 1, updated_at: "2026-01-03T00:00:00.000Z",
+      workflow_type: "sketch",
+    },
+    {
+      workflow_id: "wf_outpaint", name: "Outpaint Workflow",
+      description: "Seeded outpaint workflow", folder: "", tags: ["outpaint"],
+      favorite: false, latest_version_id: "wv_outpaint", latest_version_number: 1,
+      latest_version_state: { status: "ready", reasons: [], runnable: true },
+      default_preset_id: "", default_preset_name: null,
+      compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
+      version_count: 1, updated_at: "2026-01-03T00:00:00.000Z",
+      workflow_type: "outpaint",
+    },
+    {
+      workflow_id: "wf_legacy_edit", name: "Legacy Edit Workflow",
+      description: "Seeded image-edit workflow with graph-era role names", folder: "", tags: ["i2i"],
+      favorite: false, latest_version_id: "wv_legacy", latest_version_number: 1,
+      latest_version_state: { status: "ready", reasons: [], runnable: true },
+      default_preset_id: "", default_preset_name: null,
+      compatible_models: ["sd15_v2.safetensors", "krea_model.safetensors"],
+      version_count: 1, updated_at: "2026-01-03T00:00:00.000Z",
+      workflow_type: "i2i",
     },
   ];
 
@@ -5553,6 +5663,22 @@ export function getOutput(id, filename) {
   const bytes = session.outputs.get(filename);
   if (!bytes) return { ok: false };
   return { ok: true, contentType: "image/png", bytes };
+}
+
+// ── Public: ComfyUI-native image upload (test double for /upload/image) ──
+
+export function storeUpload(id, filename, bytes) {
+  const session = getSession(id);
+  const clean = String(filename || "upload.png").split("/").pop().split("\\").pop() || "upload.png";
+  let name = clean;
+  let n = 1;
+  while (session.outputs.has(name)) {
+    n += 1;
+    const dot = clean.lastIndexOf(".");
+    name = (dot === -1 ? clean : clean.slice(0, dot)) + "-" + n + (dot === -1 ? "" : clean.slice(dot));
+  }
+  session.outputs.set(name, bytes);
+  return name;
 }
 
 // ── Public: test control ────────────────────────────────────────────────

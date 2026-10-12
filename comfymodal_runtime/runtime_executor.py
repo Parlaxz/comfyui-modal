@@ -2947,7 +2947,31 @@ def install_pre_sampler_hooks() -> None:
                 _force_plain(self, tag="llm-generate")
             except Exception:
                 pass
-            return _orig_llm_generate(self, embeds, *args, **kwargs)
+            try:
+                import time as _llm_time
+                _llm_start_ns = int(_llm_time.monotonic_ns())
+            except Exception:
+                _llm_time = None  # type: ignore[assignment]
+                _llm_start_ns = 0
+            try:
+                return _orig_llm_generate(self, embeds, *args, **kwargs)
+            finally:
+                try:
+                    if _llm_time is not None and _llm_start_ns:
+                        _llm_end_ns = int(_llm_time.monotonic_ns())
+                        if _llm_end_ns >= _llm_start_ns:
+                            from comfymodal_runtime.gantt_telemetry import (
+                                register_gantt_span as _llm_register_span,
+                            )
+                            _llm_register_span(
+                                "TextGenerate",
+                                start_mono_ns=_llm_start_ns,
+                                end_mono_ns=_llm_end_ns,
+                                lane="GPU",
+                                metadata={"op": "llm_generate"},
+                            )
+                except Exception:
+                    pass
 
         _BaseGenerate.generate = _patched_llm_generate
 

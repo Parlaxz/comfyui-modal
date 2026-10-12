@@ -689,12 +689,16 @@ async def compose_generic_unet_load(
     request_id: str,
     path_resolver: Callable[[str, str], str | None] | None = None,
     volume: Any = None,
+    unet_ticket: Any = None,
 ) -> dict[str, Any]:
     """Load UNET via the SHARED ``golden_unet_load`` stage (imported).
 
     Scaled-FP8 / non-uniform / unknown-dtype files are rejected by the
     stage contract itself (clean fallback reason, never an exception
-    here).  Returns ``{"ok": True, "loaded": patcher, "session": ...,
+    here).  An early-load ticket (started while CLIP work ran) is
+    attached to the session when it names this same resolved file; the
+    stage joins it instead of starting a second read.  Returns
+    ``{"ok": True, "loaded": patcher, "session": ...,
     "owners": [...], "source_arm": "golden_unet", ...}`` or ``{"ok":
     False, "reason": ...}``.  Never raises.
     """
@@ -737,6 +741,11 @@ async def compose_generic_unet_load(
             volume=volume,
         )
         session.model_paths = {"unet": path}
+        try:
+            if _match_unet_ticket(unet_ticket, path):
+                session._generic_unet_ticket = unet_ticket
+        except Exception:
+            pass
         vram_ok, vram_detail = _ensure_stage_dynamic_vram(None, request_id)
         if not vram_ok:
             elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
@@ -2434,14 +2443,17 @@ def _select_substitution(
 
 
 async def _substitute_unet_vae_loader(
-    *, role: str, inputs: Any, request_id: str
+    *, role: str, inputs: Any, request_id: str,
+    unet_ticket: Any = None,
 ) -> dict[str, Any]:
     """Shared UNET/VAE tail for dispatch substitution (imported stages).
 
     Returns ``{"ok": True, "tuple": (...), "owners": [...], "source_arm":
     ...}`` or ``{"ok": False, "reason": ...}``.  Stage contracts reject
     unsupported files (scaled-FP8 UNET, non-uniform dtypes) with clean
-    reasons; the caller falls back to native.  Never raises.
+    reasons; the caller falls back to native.  An early UNET load ticket
+    (from the overlap launcher) is handed to the stage, which joins it
+    instead of starting a second read.  Never raises.
     """
     try:
         given = inputs if isinstance(inputs, dict) else {}
@@ -2465,6 +2477,7 @@ async def _substitute_unet_vae_loader(
                 unet_filenames=[unet_name],
                 folder="diffusion_models",
                 request_id=request_id,
+                unet_ticket=unet_ticket,
             )
             try:
                 print(
@@ -2703,6 +2716,14 @@ async def _run_native_with_kitchen_option(
                 reason=f"scope_setup:{type(setup_exc).__name__}",
             )
             try:
+                print(
+                    f"[generic_kitchen_attention] node={node_id} "
+                    f"outcome=skipped reason=scope_setup:{type(setup_exc).__name__}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            try:
                 return await original(
                     prompt_id, unique_id, obj, input_data_all,
                     execution_block_cb=execution_block_cb,
@@ -2729,6 +2750,14 @@ async def _run_native_with_kitchen_option(
             node_id=node_id, requested="comfy_kitchen",
             outcome="engaged", selected=selected, calls=calls,
         )
+        try:
+            print(
+                f"[generic_kitchen_attention] node={node_id} "
+                f"outcome=engaged selected_callable={selected} calls={calls}",
+                flush=True,
+            )
+        except Exception:
+            pass
         return result
     except Exception:
         _record_sampling_span()
@@ -2755,8 +2784,21 @@ async def _run_substituted_loader(
     try:
         given = inputs if isinstance(inputs, dict) else {}
         if role != "clip":
+            _ticket = None
+            try:
+                _candidate = (ctx.get("unet_ticket")
+                              if isinstance(ctx, Mapping) else None)
+                _raw_name = str(given.get("unet_name") or "").strip()
+                _resolved = (_default_path_resolver(
+                    "diffusion_models", _raw_name)
+                    if _raw_name else None)
+                if _resolved and _match_unet_ticket(_candidate, _resolved):
+                    _ticket = _candidate
+            except Exception:
+                _ticket = None
             return await _substitute_unet_vae_loader(
-                role=role, inputs=given, request_id=request_id)
+                role=role, inputs=given, request_id=request_id,
+                unet_ticket=_ticket)
         classification = classify_loader_node(
             "CLIPLoader", inputs if isinstance(inputs, dict) else {}
         )
@@ -3010,6 +3052,97 @@ def _install_overlap_pick_policy(
         return None
 
 
+def _match_unet_ticket(ticket: Any, path: Any) -> bool:
+    """Whether a prepared UNET ticket may serve this load (pure logic).
+
+    Requires a mapping ticket for the identical resolved path with a
+    task handle present.  A finished task is explicitly ACCEPTED: joining
+    a completed read is free, and a failed one raises into the stage's
+    existing fallback handling.  Rejecting finished tickets (as an
+    earlier revision did) defeats the ticket exactly when the early read
+    wins its race.  Never raises.
+    """
+    try:
+        if not isinstance(ticket, dict):
+            return False
+        if str(ticket.get("path") or "") != str(path or ""):
+            return False
+        return ticket.get("task") is not None
+    except Exception:
+        return False
+
+
+def _overlap_launch_unet_load(active: Any) -> dict[str, Any]:
+    """Start the shared-transport UNET load early (async ticket).
+
+    Called once CLIP has loaded successfully so the UNET read overlaps
+    the text chain and encode instead of serializing after them.  Uses
+    the exact shared-transport call the stage itself would make; the
+    stage joins this future at UNET dispatch instead of starting its
+    own read.  Request-scoped (stored on the active context), cancelled
+    at teardown when never consumed.  Never raises.
+    """
+    try:
+        if not isinstance(active, Mapping):
+            return {"started": False, "reason": "no_active_context"}
+        plan = active.get("overlap_plan") or {}
+        if not plan.get("eligible") or not plan.get("unet_node_id"):
+            return {"started": False, "reason": "overlap_not_eligible"}
+        if isinstance(active.get("unet_ticket"), dict):
+            return {"started": False, "reason": "ticket_already_exists"}
+        spec = active.get("overlap_unet_spec") or {}
+        filename = spec.get("unet_name")
+        if not isinstance(filename, str) or not filename.strip():
+            return {"started": False, "reason": "unet_filename_unresolved"}
+        path = _default_path_resolver("diffusion_models", filename)
+        if not path:
+            return {"started": False, "reason": "unet_path_unresolvable"}
+        try:
+            import asyncio as _asyncio_launch
+            loop = _asyncio_launch.get_running_loop()
+        except Exception:
+            return {"started": False, "reason": "no_running_loop"}
+        try:
+            from .golden_model_transport import (
+                get_golden_model_transport as _get_transport,
+            )
+            transport = _get_transport()
+        except Exception:
+            return {"started": False, "reason": "transport_unavailable"}
+        if transport is None:
+            return {"started": False, "reason": "transport_unavailable"}
+        try:
+            task = loop.create_task(transport.load(path, role="unet"))
+        except Exception as exc:  # noqa: BLE001 - launch is best-effort
+            return {"started": False,
+                    "reason": f"task_create_failed:{type(exc).__name__}"}
+        try:
+            active["unet_ticket"] = {
+                "path": path,
+                "task": task,
+                "started_ns": time.monotonic_ns(),
+                "consumed": False,
+            }
+            try:
+                print(
+                    f"[v2.overlap] unet_ticket_launched "
+                    f"path={str(path).split('/')[-1]} "
+                    f"mono_ns={active['unet_ticket']['started_ns']}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+        except Exception:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+            return {"started": False, "reason": "ticket_store_failed"}
+        return {"started": True, "reason": "", "path": path}
+    except Exception as exc:  # noqa: BLE001 - launch contract: never raise
+        return {"started": False, "reason": type(exc).__name__}
+
+
 def install_execution_dispatch_substitution(
     *,
     role_bindings: Any,
@@ -3129,6 +3262,26 @@ def install_execution_dispatch_substitution(
                                 reason=str(_adv.get("reason") or ""))
             except Exception:
                 pass
+            try:
+                _spec_name: Any = None
+                _wf_spec = workflow if isinstance(workflow, Mapping) else {}
+                _unet_spec_node = _wf_spec.get(
+                    str(overlap_plan.get("unet_node_id") or ""))
+                if isinstance(_unet_spec_node, Mapping):
+                    _unet_spec_inputs = _unet_spec_node.get("inputs")
+                    if isinstance(_unet_spec_inputs, Mapping):
+                        _spec_name = _unet_spec_inputs.get("unet_name")
+                active_spec: dict[str, Any] = {
+                    "node_id": str(overlap_plan.get("unet_node_id") or ""),
+                    "unet_name": (
+                        str(_spec_name)
+                        if isinstance(_spec_name, str) and _spec_name.strip()
+                        else None
+                    ),
+                }
+            except Exception:
+                active_spec = {"node_id": None, "unet_name": None}
+            ctx["overlap_unet_spec"] = active_spec
             try:
                 ctx["overlap_pick_restore"] = _install_overlap_pick_policy(
                     trace_emit=trace_emit,
@@ -3252,12 +3405,35 @@ def install_execution_dispatch_substitution(
                 elapsed_ms=sub.get("elapsed_ms", 0.0),
                 phases=sub.get("phases", {}),
             )
+            try:
+                if str(decision.get("role") or "") == "clip":
+                    _launch = _overlap_launch_unet_load(active)
+                    _emit_trace(
+                        active.get("trace_emit"), "generic_overlap_launch",
+                        node_id=str(decision["node_id"]),
+                        role="model_unet",
+                        started=bool(_launch.get("started")),
+                        reason=str(_launch.get("reason") or ""))
+            except Exception:
+                pass
             return output, {}, False, False
 
         _execution_mod.get_output_data = _substituting_get_output_data  # type: ignore[method-assign]
 
         def _restore_dispatch() -> None:
             global _ACTIVE_DISPATCH_CTX
+            try:
+                _ticket = ctx.get("unet_ticket")
+                _task = (_ticket or {}).get("task") if isinstance(
+                    _ticket, dict) else None
+                if _task is not None and not bool(
+                        getattr(_task, "done", lambda: True)()):
+                    try:
+                        _task.cancel()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             try:
                 _pick_restore = ctx.get("overlap_pick_restore")
                 if callable(_pick_restore):

@@ -63,6 +63,7 @@ body.comfymodal-body-scroll-lock {
 }
 
 .comfymodal-studio-help,
+.comfymodal-studio-restart,
 .comfymodal-testing-close {
   display: grid;
   place-items: center;
@@ -78,6 +79,7 @@ body.comfymodal-body-scroll-lock {
 }
 
 .comfymodal-studio-help:hover,
+.comfymodal-studio-restart:hover,
 .comfymodal-testing-close:hover {
   border-color: #333;
   background: #1a1a1a;
@@ -85,9 +87,37 @@ body.comfymodal-body-scroll-lock {
 }
 
 .comfymodal-studio-help:focus-visible,
+.comfymodal-studio-restart:focus-visible,
 .comfymodal-testing-close:focus-visible {
   outline: 2px solid var(--color-accent, #5a7fdb);
   outline-offset: 2px;
+}
+
+.comfymodal-studio-restart:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* While the reboot reconnect probe runs, hide the glyph and show the
+   shared spinning ring (comfymodal-spin keyframe, defined with the wizard
+   spinner). Driven solely by aria-busy — no JS DOM swapping. */
+.comfymodal-studio-restart[aria-busy="true"] {
+  position: relative;
+  color: transparent;
+  opacity: 1;
+}
+
+.comfymodal-studio-restart[aria-busy="true"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 14px;
+  height: 14px;
+  border: 2px solid #3a3a3a;
+  border-top-color: #e0e0e0;
+  border-radius: 50%;
+  animation: comfymodal-spin 0.8s linear infinite;
 }
 
 .comfymodal-studio-topnav {
@@ -1759,7 +1789,9 @@ body.comfymodal-body-scroll-lock {
 .comfymodal-studio-viewer-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.84);
+  /* Opaque: the ComfyUI canvas behind is blue-tinted and bled through the
+     old 0.84 backdrop as a muddy blue wash around the dialog. */
+  background: #000;
 }
 .comfymodal-studio-viewer-content {
   position: relative;
@@ -1775,7 +1807,7 @@ body.comfymodal-body-scroll-lock {
   padding: 18px;
   border: 1px solid #2b2f38;
   border-radius: 10px;
-  background: #0d0e12;
+  background: #141414;
   box-shadow: 0 22px 70px rgba(0, 0, 0, 0.55);
 }
 .comfymodal-studio-viewer-close {
@@ -1814,7 +1846,7 @@ body.comfymodal-body-scroll-lock {
   min-width: 0;
   min-height: 0;
   padding: 18px;
-  background: #090a0d;
+  background: transparent;
   border-radius: 6px;
   overflow: hidden;
 }
@@ -1868,12 +1900,40 @@ body.comfymodal-body-scroll-lock {
 .comfymodal-studio-viewer-card {
   border: 1px solid #2a2a2a;
   border-radius: 8px;
-  background: #0f0f0f;
+  background: #191919;
   padding: 10px;
   display: flex;
   flex-direction: column;
   gap: 6px;
   min-width: 0;
+}
+/* Note editor: flat section sharing the card background — never a nested
+   card inside the Metadata card. */
+.comfymodal-studio-viewer-note-flat {
+  background: #191919;
+  border-radius: 8px;
+  padding: 10px 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+/* File row actions (Open file / Copy path) sit inline with the filename. */
+.comfymodal-studio-viewer-file-value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.comfymodal-studio-viewer-file-name {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+a.comfymodal-studio-viewer-file-btn,
+button.comfymodal-studio-viewer-file-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  text-decoration: none;
 }
 .comfymodal-studio-viewer-card-title {
   font-size: 10px;
@@ -1966,6 +2026,8 @@ body.comfymodal-body-scroll-lock {
   overflow-wrap: anywhere;
   color: #e5e7eb;
   border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.55;
 }
 .comfymodal-studio-viewer-prompt-value:focus-visible {
   outline: 2px solid var(--color-accent, #5a7fdb);
@@ -1977,7 +2039,7 @@ body.comfymodal-body-scroll-lock {
   right: 0;
   bottom: 0;
   height: 22px;
-  background: linear-gradient(transparent, #0f0f0f 85%);
+  background: linear-gradient(transparent, #191919 85%);
   pointer-events: none;
 }
 .comfymodal-studio-viewer-prompt-value.is-expanded {
@@ -7528,6 +7590,10 @@ button.comfymodal-studio-feature-chip {
 }
 .comfymodal-studio-shelf-row.is-drop-above::before { top: -4px; }
 .comfymodal-studio-shelf-row.is-drop-below::after { bottom: -4px; }
+.comfymodal-studio-shelf-row.is-drop-target {
+  outline: 1px dashed var(--color-accent, #5a7fdb);
+  outline-offset: 3px;
+}
 
 .comfymodal-studio-shelf-card-head {
   display: flex;
@@ -7582,6 +7648,10 @@ button.comfymodal-studio-feature-chip {
   flex-direction: column;
   gap: 6px;
   margin-top: 6px;
+}
+.comfymodal-studio-shelf-advanced.is-drop-target {
+  outline: 1px dashed var(--color-accent, #5a7fdb);
+  outline-offset: 4px;
 }
 
 /* Stale output: right-side canvas dims until a new run completes. */

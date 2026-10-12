@@ -1296,3 +1296,164 @@ class TestGenericOverlapPick:
                 restore()
             monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP",
                                raising=False)
+
+
+class TestOverlapUnetTicket:
+    """Early UNET load ticket: launch, match, restore-cancel."""
+
+    @staticmethod
+    def _ctx(**kw):
+        base = {"overlap_plan": {
+            "eligible": True, "clip_node_id": "62",
+            "unet_node_id": "66", "forward_node_id": "67",
+            "deferral_allowed": True},
+            "overlap_unet_spec": {
+                "node_id": "66", "unet_name": "z.safetensors"}}
+        base.update(kw)
+        return base
+
+    def test_match_ticket(self):
+        class _T:
+            def done(self):
+                return False
+
+        good = {"path": "/m/u.safetensors", "task": _T()}
+        assert ggl._match_unet_ticket(good, "/m/u.safetensors") is True
+        assert ggl._match_unet_ticket(good, "/m/other.safetensors") is False
+        # A finished ticket is accepted: joining a completed read is free,
+        # and a failed one raises into the stage's existing fallback.
+        done = {"path": "/m/u.safetensors",
+                "task": type("D", (), {"done": lambda self: True})()}
+        assert ggl._match_unet_ticket(done, "/m/u.safetensors") is True
+        for bad in (None, [], "x", {}, {"path": "/m/u.safetensors"}):
+            assert ggl._match_unet_ticket(bad, "/m/u.safetensors") is False
+        assert ggl._match_unet_ticket(good, None) is False
+
+    def test_launch_rejections_never_raise(self):
+        assert ggl._overlap_launch_unet_load({})["started"] is False
+        assert ggl._overlap_launch_unet_load(None)["started"] is False
+        noplan = {"overlap_plan": {"eligible": False}}
+        assert ggl._overlap_launch_unet_load(noplan)["started"] is False
+        nospec = {"overlap_plan": {"eligible": True},
+                  "overlap_unet_spec": {"node_id": "66",
+                                        "unet_name": None}}
+        assert ggl._overlap_launch_unet_load(nospec)["started"] is False
+
+    def test_launch_no_running_loop(self, monkeypatch):
+        active = self._ctx()
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver", lambda _f, _n: "/m/u.safetensors")
+        out = ggl._overlap_launch_unet_load(active)
+        assert out["started"] is False
+        assert out["reason"] == "no_running_loop"
+        assert "unet_ticket" not in active
+
+    def test_launch_starts_ticket(self, monkeypatch):
+        import asyncio as _asyncio
+        import sys as _sys
+        import types as _types
+
+        seen = {}
+
+        class _Transport:
+            async def load(self, path, role=None):
+                seen["path"] = path
+                seen["role"] = role
+                return {"views": "V"}
+
+        fake_mod = _types.ModuleType(
+            "comfymodal_runtime.golden_model_transport")
+        setattr(fake_mod, "get_golden_model_transport",
+                lambda: _Transport())
+        monkeypatch.setitem(
+            _sys.modules,
+            "comfymodal_runtime.golden_model_transport", fake_mod)
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver", lambda _f, _n: "/m/u.safetensors")
+        active = self._ctx()
+
+        async def _drive():
+            return ggl._overlap_launch_unet_load(active)
+
+        out = _asyncio.run(_drive())
+        assert out["started"] is True
+        ticket = active.get("unet_ticket")
+        assert isinstance(ticket, dict)
+        assert ticket["path"] == "/m/u.safetensors"
+
+        async def _join():
+            return await ticket["task"]
+
+        assert _asyncio.run(_join()) == {"views": "V"}
+        assert seen == {"path": "/m/u.safetensors", "role": "unet"}
+        # Second launch refuses (ticket exists).
+        out2 = _asyncio.run(_drive())
+        assert out2["started"] is False
+        assert out2["reason"] == "ticket_already_exists"
+
+    def test_launch_transport_unavailable(self, monkeypatch):
+        import asyncio as _asyncio
+        import sys as _sys
+        import types as _types
+
+        fake_mod = _types.ModuleType(
+            "comfymodal_runtime.golden_model_transport")
+        setattr(fake_mod, "get_golden_model_transport", lambda: None)
+        monkeypatch.setitem(
+            _sys.modules,
+            "comfymodal_runtime.golden_model_transport", fake_mod)
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver", lambda _f, _n: "/m/u.safetensors")
+        active = self._ctx()
+
+        async def _drive():
+            return ggl._overlap_launch_unet_load(active)
+
+        out = _asyncio.run(_drive())
+        assert out["started"] is False
+        assert out["reason"] == "transport_unavailable"
+
+    def test_restore_cancels_pending_ticket(self, monkeypatch):
+        calls = []
+        _install_fake_execution(monkeypatch, calls)
+        monkeypatch.setenv("COMFYMODAL_V2_GENERIC_OVERLAP", "1")
+        wf = TestGenericOverlapPlan._zit_workflow()
+        sink = []
+        restore = None
+        try:
+            restore = ggl.install_execution_dispatch_substitution(
+                role_bindings=TestGenericOverlapPlan._zit_bindings(),
+                holder=ggl.GenericLoaderHolder(),
+                trace_emit=(lambda name, **kw: sink.append(
+                    (name, kw.get("metadata", {})))),
+                request_id="r1",
+                workflow=wf,
+            )
+            assert restore is not None
+            log = []
+
+            class _Task:
+                def done(self):
+                    return False
+
+                def cancel(self):
+                    log.append("cancelled")
+
+            stored = ggl._ACTIVE_DISPATCH_CTX
+            assert stored is not None
+            stored["unet_ticket"] = {"path": "/m/u.safetensors",
+                                     "task": _Task()}
+            restore()
+            assert log == ["cancelled"]
+            events = [n for n, _m in sink if n == "generic_overlap_plan"]
+            assert events
+        finally:
+            monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP",
+                               raising=False)
+
+    def test_compose_accepts_ticket_kwarg(self):
+        out = asyncio.run(ggl.compose_generic_unet_load(
+            unet_filenames=[], folder="diffusion_models",
+            request_id="r1", unet_ticket={"path": "x"}))
+        assert out["ok"] is False
+        assert out["reason"] == "unet_filenames_missing"

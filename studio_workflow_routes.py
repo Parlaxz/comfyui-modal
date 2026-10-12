@@ -202,6 +202,9 @@ def _enrich_workflow_summary(
     service: WorkflowDomainService,
     raw: dict[str, Any],
     preloaded_versions: list[dict[str, Any]] | None = None,
+    *,
+    version_by_id: dict[str, dict[str, Any]] | None = None,
+    mapping_by_version: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Lightweight summary for library lists (no heavy per-item enrichment)."""
     summary = {
@@ -219,16 +222,28 @@ def _enrich_workflow_summary(
     latest_id = str(raw.get("latest_version_id", ""))
     latest = None
     if latest_id:
-        for v in versions:
-            if v.get("workflow_version_id") == latest_id:
-                latest = v
-                break
+        if version_by_id is not None:
+            latest = version_by_id.get(latest_id)
+        else:
+            for v in versions:
+                if v.get("workflow_version_id") == latest_id:
+                    latest = v
+                    break
     summary["latest_version_number"] = (
         int(latest.get("version_number", 0)) if latest else None
     )
-    summary["latest_version_state"] = (
-        service.derive_version_state(latest_id).to_dict() if latest else None
-    )
+    if latest is None:
+        summary["latest_version_state"] = None
+    elif version_by_id is not None and mapping_by_version is not None:
+        mapping = mapping_by_version.get(latest_id)
+        state = service.derive_version_state_for_records(
+            latest_id, latest, mapping, raw
+        )
+        summary["latest_version_state"] = state.to_dict()
+    else:
+        summary["latest_version_state"] = (
+            service.derive_version_state(latest_id).to_dict()
+        )
     return summary
 
 
@@ -345,12 +360,21 @@ def register_workflow_routes(
     @server.routes.get("/comfymodal/studio/workflows")
     async def workflows_list(request: web.Request) -> web.Response:
         try:
-            workflows = service.list_workflows()
+            snap = service.store.snapshot_all()
+            workflows = snap.get("workflows", [])
+            all_versions = snap.get("versions", [])
+            all_mappings = snap.get("mappings", [])
             versions_by_workflow: dict[str, list[dict[str, Any]]] = {}
-            for version in service.store.list_versions():
+            for version in all_versions:
                 versions_by_workflow.setdefault(
                     str(version.get("workflow_id", "")), []
                 ).append(version)
+            version_by_id = {
+                str(v.get("workflow_version_id", "")): v for v in all_versions
+            }
+            mapping_by_version = {
+                str(m.get("workflow_version_id", "")): m for m in all_mappings
+            }
             search = (request.query.get("search") or "").strip().lower()
             tag = (request.query.get("tag") or "").strip()
             folder = (request.query.get("folder") or "").strip()
@@ -374,6 +398,8 @@ def register_workflow_routes(
                         service,
                         wf,
                         versions_by_workflow.get(str(wf.get("workflow_id", "")), []),
+                        version_by_id=version_by_id,
+                        mapping_by_version=mapping_by_version,
                     )
                 )
             # Derived-only list chips: cache reads only, ZERO live analysis.
@@ -571,19 +597,79 @@ def register_workflow_routes(
         wf_id = request.match_info.get("workflow_id", "")
         version_id = request.query.get("version_id") or ""
         try:
+            # Shelves must paint in <500ms on Studio open: serve local snapshot
+            # truth immediately, refresh inventory in background. Steady-state
+            # cost is one dict lookup; cold-cache Modal fetch no longer blocks
+            # the Playground bundle.
             asyncio.create_task(_refresh_remote_inventory())
-            workflow = service.get_workflow(wf_id)
+            snap = service.store.snapshot_all()
+            workflow_by_id = {
+                str(w.get("workflow_id", "")): w for w in snap.get("workflows", [])
+            }
+            version_by_id = {
+                str(v.get("workflow_version_id", "")): v
+                for v in snap.get("versions", [])
+            }
+            mapping_by_version = {
+                str(m.get("workflow_version_id", "")): m
+                for m in snap.get("mappings", [])
+            }
+            workflow = workflow_by_id.get(wf_id)
+            if workflow is None:
+                workflow = service.get_workflow(wf_id)
             if not version_id:
                 version_id = str(workflow.get("latest_version_id", ""))
             version = None
             mapping = None
             state = {"status": "incomplete", "reasons": ["no versions"], "runnable": False}
             if version_id:
-                version = service.get_version(version_id)
-                state = service.derive_version_state(version_id).to_dict()
-                mapping = service.get_mapping(version_id)
+                version = version_by_id.get(version_id)
+                if version is None:
+                    try:
+                        version = service.get_version(version_id)
+                    except Exception:
+                        version = None
+                if version is not None:
+                    mapping = mapping_by_version.get(version_id)
+                    state = service.derive_version_state_for_records(
+                        version_id,
+                        version,
+                        mapping,
+                        workflow,
+                    ).to_dict()
+                    if mapping is None:
+                        try:
+                            mapping = service.get_mapping(version_id)
+                        except Exception:
+                            mapping = None
+                    # Mirror service._enrich_version/_enrich_mapping (no extra
+                    # I/O: reuse the derived state). The Playground run gate
+                    # requires version.state, and shelves read the enriched
+                    # mapping defaults — raw snapshot rows carry neither.
+                    # Copy first: snapshot rows alias the store cache.
+                    if mapping is not None:
+                        mapping = dict(mapping)
+                        mapping.setdefault("text_generate_node_id", None)
+                        mapping["version_state"] = state
+                    version = dict(version)
+                    version["state"] = state
+                    version["mapping_id"] = (
+                        mapping.get("mapping_id") if mapping else None
+                    )
+                    version["mapping"] = mapping
             control_schema: dict[str, Any] = {}
-            workflow_config = service.get_workflow_config(wf_id)
+            # Shelf-critical config without the get_workflow_config deepcopy:
+            # static_graph is megabytes and unread on this path — reference
+            # the snapshot row read-only instead of copying it.
+            workflow_config = {
+                "workflow_type": (workflow or {}).get("workflow_type", "t2i"),
+                "static_graph": (workflow or {}).get("static_graph", {}),
+                "bindings": (workflow or {}).get("bindings", {}),
+                "output_binding": (workflow or {}).get("output_binding", {}),
+                "saved_values": (workflow or {}).get("saved_values", {}),
+                "layout_profile": (workflow or {}).get("layout_profile", {}),
+                "allowed_options": (workflow or {}).get("allowed_options", {}),
+            }
             for role, entry in (workflow_config.get("bindings") or {}).items():
                 if isinstance(entry, dict):
                     control_schema[str(role)] = entry
@@ -600,22 +686,31 @@ def register_workflow_routes(
             # Runnable UI-graph versions whose stored prompt has stale widget
             # values would otherwise poison UI defaults (e.g. a stale
             # control_after_generate value surfacing as a numeric control).
+            # API-prompt versions skip the second service instantiation and
+            # graph regen entirely: the stored prompt is already authoritative.
             if version_id and isinstance(version, dict):
+                _needs_regen = False
                 try:
-                    from studio_workflow_run import (
-                        resolve_workflow_run_bundle as _resolve_run_bundle,
-                    )
-                    _bundle = _resolve_run_bundle(
-                        wf_id, version_id, node_dir,
-                        remote_model_readiness=True,
-                    )
+                    from studio_domain.graph import is_ui_workflow_format as _is_ui_fmt
+                    _needs_regen = bool(_is_ui_fmt(version.get("graph_json")))
                 except Exception:
-                    _bundle = None
-                if isinstance(_bundle, dict) and _bundle.get("status") == "ok":
-                    version = copy.deepcopy(version)
-                    version["executable_prompt"] = (
-                        _bundle.get("executable_prompt") or {}
-                    )
+                    _needs_regen = False
+                if _needs_regen:
+                    try:
+                        from studio_workflow_run import (
+                            resolve_workflow_run_bundle as _resolve_run_bundle,
+                        )
+                        _bundle = _resolve_run_bundle(
+                            wf_id, version_id, node_dir,
+                            remote_model_readiness=True,
+                        )
+                    except Exception:
+                        _bundle = None
+                    if isinstance(_bundle, dict) and _bundle.get("status") == "ok":
+                        version = copy.deepcopy(version)
+                        version["executable_prompt"] = (
+                            _bundle.get("executable_prompt") or {}
+                        )
             return web.json_response({
                 "status": "ok",
                 "workflow": workflow,
@@ -724,6 +819,7 @@ def register_workflow_routes(
                 version_id,
                 entries=body.get("entries") or {},
                 output_node_id=str(body.get("output_node_id", "")),
+                text_generate_node_id=body.get("text_generate_node_id"),
             )
             return web.json_response({"status": "ok", "mapping": mapping})
         except WorkflowVersionNotFoundError as exc:
@@ -774,6 +870,7 @@ def register_workflow_routes(
                 version_id,
                 entries=body.get("entries") or {},
                 output_node_id=str(body.get("output_node_id", "")),
+                text_generate_node_id=body.get("text_generate_node_id"),
             )
             return web.json_response({"status": "ok", "version": version})
         except WorkflowVersionNotFoundError as exc:

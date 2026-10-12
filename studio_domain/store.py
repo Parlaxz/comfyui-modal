@@ -61,13 +61,19 @@ class WorkflowDomainStore:
 
     # ── generic helpers ──────────────────────────────────────────────────
 
-    def _find(
-        self, store: StudioJsonStore, id_key: str, record_id: str
+    @staticmethod
+    def find_in(
+        rows: list[dict], id_key: str, record_id: str
     ) -> dict | None:
-        for item in store.read():
+        for item in rows:
             if item.get(id_key) == record_id:
                 return item
         return None
+
+    def _find(
+        self, store: StudioJsonStore, id_key: str, record_id: str
+    ) -> dict | None:
+        return self.find_in(store.read(), id_key, record_id)
 
     def _replace_in_list(self, data: list[dict], id_key: str, item: dict) -> None:
         for i, existing in enumerate(data):

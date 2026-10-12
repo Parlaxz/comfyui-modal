@@ -25,13 +25,16 @@ function input(definition) {
 
 // The names and order here are product API.  Add a new entry for a new
 // capability; do not expose a user-defined field type or rename these keys.
+// Tool Inputs: a Prompt is a Prompt across every workflow type; the workflow
+// type decides whether a given Tool Input is required/optional.
+const IMAGE_TYPES = Object.freeze(["t2i", "i2i", "inpaint", "sketch", "outpaint"]);
 export const BINDABLE_INPUTS = Object.freeze({
   prompt: input({
     key: "prompt",
     name: "Prompt",
     block: "multiline",
     inputKind: "multiline",
-    requiredFor: ["t2i"],
+    requiredFor: [...IMAGE_TYPES],
     optionalFor: [],
     experimentEligible: true,
     rules: Object.freeze({ multiline: true }),
@@ -41,7 +44,7 @@ export const BINDABLE_INPUTS = Object.freeze({
     name: "Seed",
     block: "integer",
     inputKind: "integer",
-    requiredFor: ["t2i"],
+    requiredFor: [...IMAGE_TYPES],
     optionalFor: [],
     experimentEligible: true,
     rules: INTEGER_RULES.seed,
@@ -52,7 +55,7 @@ export const BINDABLE_INPUTS = Object.freeze({
     block: "integer",
     inputKind: "integer",
     requiredFor: [],
-    optionalFor: ["t2i"],
+    optionalFor: [...IMAGE_TYPES],
     experimentEligible: true,
     rules: Object.freeze({ minimum: 1, step: 1, allowNegative: false }),
   }),
@@ -62,7 +65,7 @@ export const BINDABLE_INPUTS = Object.freeze({
     block: "float",
     inputKind: "float",
     requiredFor: [],
-    optionalFor: ["t2i"],
+    optionalFor: [...IMAGE_TYPES],
     experimentEligible: true,
     rules: Object.freeze({ minimum: 0, step: "any" }),
   }),
@@ -72,16 +75,36 @@ export const BINDABLE_INPUTS = Object.freeze({
     block: "dropdown",
     inputKind: "dropdown",
     requiredFor: [],
-    optionalFor: ["t2i"],
+    optionalFor: [...IMAGE_TYPES],
     experimentEligible: true,
     rules: Object.freeze({}),
+  }),
+  width: input({
+    key: "width",
+    name: "Width",
+    block: "integer",
+    inputKind: "integer",
+    requiredFor: [],
+    optionalFor: [...IMAGE_TYPES],
+    experimentEligible: true,
+    rules: Object.freeze({ minimum: 64, maximum: 4096, step: 8, allowNegative: false }),
+  }),
+  height: input({
+    key: "height",
+    name: "Height",
+    block: "integer",
+    inputKind: "integer",
+    requiredFor: [],
+    optionalFor: [...IMAGE_TYPES],
+    experimentEligible: true,
+    rules: Object.freeze({ minimum: 64, maximum: 4096, step: 8, allowNegative: false }),
   }),
   model_unet: input({
     key: "model_unet",
     name: "Model UNET",
     block: "model-picker",
     inputKind: "model",
-    requiredFor: ["t2i"],
+    requiredFor: [...IMAGE_TYPES],
     optionalFor: [],
     experimentEligible: true,
     rules: Object.freeze({ modelType: "unet" }),
@@ -91,7 +114,7 @@ export const BINDABLE_INPUTS = Object.freeze({
     name: "VAE",
     block: "model-picker",
     inputKind: "model",
-    requiredFor: ["t2i"],
+    requiredFor: [...IMAGE_TYPES],
     optionalFor: [],
     experimentEligible: true,
     rules: Object.freeze({ modelType: "vae" }),
@@ -101,10 +124,30 @@ export const BINDABLE_INPUTS = Object.freeze({
     name: "CLIP",
     block: "model-picker",
     inputKind: "model",
-    requiredFor: ["t2i"],
+    requiredFor: [...IMAGE_TYPES],
     optionalFor: [],
     experimentEligible: true,
     rules: Object.freeze({ modelType: "clip" }),
+  }),
+  source_image: input({
+    key: "source_image",
+    name: "Source Image",
+    block: "image",
+    inputKind: "image",
+    requiredFor: ["i2i", "inpaint", "sketch", "outpaint"],
+    optionalFor: [],
+    experimentEligible: false,
+    rules: Object.freeze({}),
+  }),
+  mask: input({
+    key: "mask",
+    name: "Mask",
+    block: "image",
+    inputKind: "image",
+    requiredFor: ["inpaint"],
+    optionalFor: ["sketch", "outpaint"],
+    experimentEligible: false,
+    rules: Object.freeze({}),
   }),
 });
 
@@ -118,9 +161,25 @@ export const OUTPUT_BINDING = Object.freeze({
     exact: true,
     cardinality: "one",
   }),
-  requiredFor: ["t2i"],
+  requiredFor: [...IMAGE_TYPES],
   block: null,
 });
+
+export const WORKFLOW_TYPES = IMAGE_TYPES;
+
+const WORKFLOW_TYPE_ALIASES = Object.freeze({
+  txt2img: "t2i",
+  text_to_image: "t2i",
+  img2img: "i2i",
+  image_to_image: "i2i",
+  image_edit: "i2i",
+});
+
+export function normalizeWorkflowType(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "t2i";
+  return WORKFLOW_TYPE_ALIASES[raw] || raw;
+}
 
 export const T2I_REQUIRED_INPUTS = Object.freeze([
   "prompt",
@@ -134,6 +193,79 @@ export const T2I_OPTIONAL_INPUTS = Object.freeze([
   "step_count",
   "cfg_scale",
   "sampler",
+  "width",
+  "height",
+]);
+
+export const I2I_REQUIRED_INPUTS = Object.freeze([
+  "prompt",
+  "seed",
+  "model_unet",
+  "vae",
+  "clip",
+  "source_image",
+]);
+
+export const I2I_OPTIONAL_INPUTS = Object.freeze([
+  "step_count",
+  "cfg_scale",
+  "sampler",
+  "width",
+  "height",
+]);
+
+export const INPAINT_REQUIRED_INPUTS = Object.freeze([
+  "prompt",
+  "seed",
+  "model_unet",
+  "vae",
+  "clip",
+  "source_image",
+  "mask",
+]);
+
+export const INPAINT_OPTIONAL_INPUTS = Object.freeze([
+  "step_count",
+  "cfg_scale",
+  "sampler",
+  "width",
+  "height",
+]);
+
+export const SKETCH_REQUIRED_INPUTS = Object.freeze([
+  "prompt",
+  "seed",
+  "model_unet",
+  "vae",
+  "clip",
+  "source_image",
+]);
+
+export const SKETCH_OPTIONAL_INPUTS = Object.freeze([
+  "step_count",
+  "cfg_scale",
+  "sampler",
+  "width",
+  "height",
+  "mask",
+]);
+
+export const OUTPAINT_REQUIRED_INPUTS = Object.freeze([
+  "prompt",
+  "seed",
+  "model_unet",
+  "vae",
+  "clip",
+  "source_image",
+]);
+
+export const OUTPAINT_OPTIONAL_INPUTS = Object.freeze([
+  "step_count",
+  "cfg_scale",
+  "sampler",
+  "width",
+  "height",
+  "mask",
 ]);
 
 export function getBindableInput(key) {
@@ -145,7 +277,7 @@ export function listBindableInputs() {
 }
 
 export function getWorkflowInputKeys(workflowType, required) {
-  const type = workflowType || "t2i";
+  const type = normalizeWorkflowType(workflowType || "t2i");
   return listBindableInputs()
     .filter((entry) => (required ? entry.requiredFor : entry.optionalFor).includes(type))
     .map((entry) => entry.key);

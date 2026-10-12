@@ -59,7 +59,7 @@ class CanonicalRoleTests(unittest.TestCase):
                     "sampler", "model_unet", "vae", "clip"):
             self.assertEqual(canonical_role(key), key)
         self.assertEqual(set(LEGACY_ROLE_MAP.values()) | {
-            "seed", "sampler", "prompt", "vae", "clip",
+            "seed", "sampler", "width", "height", "prompt", "vae", "clip",
         }, set(CANONICAL_KEYS))
 
     def test_unknown_roles_untouched(self):

@@ -7432,6 +7432,7 @@ if _server:
                             request_id=_golden_request_id,
                             node_dir=_golden_node_dir,
                             profile_name=_golden_profile,
+                            modal_options=(body or {}).get("modal_options"),
                             # The handle factory needs Modal credentials to
                             # build a client. Without this the run failed with
                             # "requires an active Modal workspace".
@@ -7583,6 +7584,72 @@ if _server:
             return web.json_response(error_payload, status=500)
 
     # ── Studio run / experiment routes ─────────────────────────────────
+    def _write_golden_profile_region(profile_path: Path, region: str) -> None:
+        """Update the region flag in one config-owned Golden profile atomically."""
+        import tempfile
+
+        text = profile_path.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        environment_start = None
+        environment_end = len(lines)
+        region_line = None
+        for index, line in enumerate(lines):
+            section = re.match(r"^\s*\[([^]]+)\]", line)
+            if section:
+                if environment_start is not None:
+                    environment_end = index
+                    break
+                if section.group(1).strip() == "environment":
+                    environment_start = index
+                continue
+            if environment_start is not None:
+                ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+                body = line[:-len(ending)] if ending else line
+                key = re.match(r"^(\s*COMFYMODAL_V2_REGION\s*=)(.*)$", body)
+                if key:
+                    region_line = environment_start, index, key, ending
+                    break
+
+        newline = "\r\n" if "\r\n" in text else "\n"
+        if region_line is not None:
+            _section_start, index, key, ending = region_line
+            comment = ""
+            rhs = key.group(2)
+            if "#" in rhs:
+                comment = " " + rhs[rhs.index("#"):].strip()
+            lines[index] = key.group(1) + " \"" + region + "\"" + comment + ending
+            updated = "".join(lines)
+        elif environment_start is not None:
+            insert_at = environment_end
+            prefix = "".join(lines[:insert_at])
+            suffix = "".join(lines[insert_at:])
+            if prefix and not prefix.endswith(("\n", "\r")):
+                prefix += newline
+            updated = prefix + f'COMFYMODAL_V2_REGION = "{region}"{newline}' + suffix
+        else:
+            separator = newline if text and not text.endswith(("\n", "\r")) else ""
+            updated = (
+                text + separator
+                + f"[environment]{newline}"
+                + f'COMFYMODAL_V2_REGION = "{region}"{newline}'
+            )
+
+        fd, temporary = tempfile.mkstemp(
+            dir=str(profile_path.parent), prefix=profile_path.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(updated)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, profile_path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
     @_server.routes.get("/comfymodal/studio/golden/profiles")
     async def studio_golden_profiles(request: web.Request) -> web.Response:
         """Return the config-owned, read-only Golden profile catalog."""
@@ -7605,6 +7672,49 @@ if _server:
                 "defaultProfile": None,
                 "profiles": [],
             })
+
+    @_server.routes.post("/comfymodal/studio/golden/region")
+    async def studio_golden_region(request: web.Request) -> web.Response:
+        """Persist the selected Golden profile's config-owned region pin."""
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response(
+                {"status": "error", "error": "expected a JSON body"}, status=400
+            )
+
+        raw_name = (body or {}).get("profile") if isinstance(body, dict) else None
+        name = raw_name.strip() if isinstance(raw_name, str) else ""
+        region = (body or {}).get("region") if isinstance(body, dict) else None
+        if region not in ("us", "us-central", ""):
+            return web.json_response(
+                {"status": "error", "error": "region must be exactly 'us', 'us-central' or ''"},
+                status=400,
+            )
+        if not name or any(token in name for token in ("/", "\\", "..")):
+            return web.json_response(
+                {"status": "error", "error": "unknown Golden profile"}, status=400
+            )
+
+        profiles_dir = Path(__file__).parent / "config" / "v2" / "profiles"
+        try:
+            from tools.v2_control.profiles import Profiles
+
+            if name not in Profiles(profiles_dir).available():
+                return web.json_response(
+                    {"status": "error", "error": "unknown Golden profile"}, status=400
+                )
+            profile_path = profiles_dir / (name + ".toml")
+            _write_golden_profile_region(profile_path, region)
+            from tools.v2_control.profile_catalog import invalidate_catalog_cache
+
+            invalidate_catalog_cache()
+        except (OSError, TypeError) as exc:
+            _log.warning("Golden profile region update failed: %s", exc)
+            return web.json_response(
+                {"status": "error", "error": "could not update Golden profile"}, status=500
+            )
+        return web.json_response({"status": "ok", "profile": name, "region": region})
 
     # Golden deploys are long-running (tens of seconds to minutes), so the UI
     # starts one and polls for the outcome instead of holding a request open.

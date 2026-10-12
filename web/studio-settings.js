@@ -22,7 +22,10 @@ import {
   saveGoldenProfileSelection,
   clearGoldenProfileSelection,
 } from "./studio-playground-state.js";
-import { getGoldenProfileDeployStatus } from "./studio-backend-api.js";
+import {
+  getGoldenProfileDeployStatus,
+  setGoldenProfileRegion,
+} from "./studio-backend-api.js";
 
 // ΓöÇΓöÇ Constants ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
@@ -1422,7 +1425,78 @@ export function renderSettings(state, context) {
         onclick: () => deployGoldenProfile(base, host, selectedProfile.name, deployStatus, deployButton),
       });
       profileBar.appendChild(deployButton);
+      const star = el("button", {
+        class: "comfymodal-secondary-btn",
+        "data-testid": "settings-golden-profile-favorite",
+        "data-profile-name": selectedProfile.name,
+        "aria-pressed": favoriteProfileNames().has(selectedProfile.name) ? "true" : "false",
+        text: favoriteProfileNames().has(selectedProfile.name) ? "\u2605" : "\u2606",
+        title: "Favorite this profile",
+        onclick: () => {
+          toggleFavoriteProfile(selectedProfile.name);
+          renderGoldenProfileHost(host, base, select.value);
+        },
+      });
+      profileBar.appendChild(star);
       host.appendChild(profileBar);
+      const regionPin = el("select", {
+        class: "comfymodal-input",
+        "data-testid": "settings-golden-profile-region-pin",
+        "aria-label": "Golden profile region pin",
+      });
+      [
+        ["", "Provider default (unpinned)"],
+        ["us", "US"],
+        ["us-central", "US Central"],
+      ].forEach(([value, label]) => {
+        const option = el("option", { value: value, text: label });
+        if ((selectedProfile.region || "") === value) option.selected = true;
+        regionPin.appendChild(option);
+      });
+      regionPin.value = selectedProfile.region || "";
+      const regionHint = el("span", {
+        class: "comfymodal-studio-settings-hint",
+        text: "Overwrites the profile TOML (COMFYMODAL_V2_REGION); takes effect on (re)deploy.",
+      });
+      const regionRow = el("div", {
+        class: "comfymodal-studio-settings-hint",
+        style: "display:flex;align-items:center;gap:8px;width:100%;",
+      }, [
+        el("label", {}, [document.createTextNode("Region pin "), regionPin]),
+        regionHint,
+      ]);
+      regionPin.addEventListener("change", async () => {
+        const previous = selectedProfile.region || "";
+        regionPin.disabled = true;
+        try {
+          const response = await setGoldenProfileRegion(
+            base,
+            selectedProfile.name,
+            regionPin.value,
+          );
+          if (!response || response.status !== "ok") {
+            throw new Error((response && (response.error || response.message)) || "request failed");
+          }
+          // The POST already confirmed server truth, so update the in-memory
+          // profile and re-render synchronously. A full refresh would force a
+          // ~10s cold catalog rescan (the save invalidated the memoised
+          // catalog) and blank the section meanwhile. Marking undeployed is
+          // exact, not optimistic: region is a deploy-baked flag, so the
+          // changed fingerprint can no longer match the previous receipt.
+          selectedProfile.region = regionPin.value;
+          selectedProfile.deployed = false;
+          renderGoldenProfileHost(host, base, select.value, deployState);
+        } catch (error) {
+          regionPin.value = previous;
+          const errorEl = host.querySelector('[data-testid="settings-golden-profile-save-error"]');
+          if (errorEl) {
+            errorEl.textContent = "Could not save Golden profile region: "
+              + (error.message || "request failed");
+          }
+          regionPin.disabled = false;
+        }
+      });
+      host.appendChild(regionRow);
       host.appendChild(deployStatus);
       if (isDeploying) {
         startGoldenDeployPoll(base, selectedProfile.name, deployStatus, deployButton, host).catch((error) => {
@@ -1435,36 +1509,6 @@ export function renderSettings(state, context) {
       host.appendChild(profileBar);
     }
 
-    const catalogList = el("div", {
-      class: "comfymodal-studio-settings-golden-profile-catalog",
-      "data-testid": "settings-golden-profile-catalog",
-    });
-    goldenProfiles.forEach((profile) => {
-      const target = profile.target && typeof profile.target === "object" ? profile.target : {};
-      const row = el("div", {
-        class: "comfymodal-studio-settings-hint",
-        "data-testid": "settings-golden-profile-row",
-        "data-profile-name": profile.name,
-        text: profile.name + " ┬╖ owner: " + (profile.owner || "unknown")
-          + " ┬╖ method: " + (target.method || "unknown")
-          + " ┬╖ " + (profile.deployed === true ? "deployed" : "undeployed ΓÇö must be deployed before use"),
-      });
-      const star = el("button", {
-        class: "comfymodal-secondary-btn",
-        "data-testid": "settings-golden-profile-favorite",
-        "data-profile-name": profile.name,
-        "aria-pressed": favoriteProfileNames().has(profile.name) ? "true" : "false",
-        text: favoriteProfileNames().has(profile.name) ? "\u2605" : "\u2606",
-        title: "Favorite this profile",
-        onclick: () => {
-          toggleFavoriteProfile(profile.name);
-          renderGoldenProfileHost(host, base, select.value);
-        },
-      });
-      row.appendChild(star);
-      catalogList.appendChild(row);
-    });
-    host.appendChild(catalogList);
     host.appendChild(el("p", {
       class: "comfymodal-studio-settings-hint",
       "data-testid": "settings-golden-profile-save-error",

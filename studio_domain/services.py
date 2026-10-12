@@ -98,48 +98,76 @@ def _normalize_folder_path(value: Any, *, allow_empty: bool = False) -> str:
 # but users cannot redefine their type or binding semantics.  The keys are
 # product API; graph-specific legacy role names are adapted only at the
 # internal Mapping compatibility seam below.
+_IMAGE_TYPES = ("t2i", "i2i", "inpaint", "sketch", "outpaint")
 _EXACT_BINDING = {"kind": "widget", "exact": True, "cardinality": "one"}
 BINDABLE_INPUT_CATALOG: dict[str, dict[str, Any]] = {
     "prompt": {"key": "prompt", "name": "Prompt", "block": "multiline",
-               "input_kind": "multiline", "required_for": ("t2i",),
+               "input_kind": "multiline", "required_for": _IMAGE_TYPES,
                "optional_for": (), "experiment_eligible": True,
                "rules": {"multiline": True}, "binding": _EXACT_BINDING},
     "seed": {"key": "seed", "name": "Seed", "block": "integer",
-             "input_kind": "integer", "required_for": ("t2i",),
+             "input_kind": "integer", "required_for": _IMAGE_TYPES,
              "optional_for": (), "experiment_eligible": True,
              "rules": {"minimum": None, "allow_negative": True},
              "binding": _EXACT_BINDING},
     "step_count": {"key": "step_count", "name": "Step count", "block": "integer",
                     "input_kind": "integer", "required_for": (),
-                    "optional_for": ("t2i",), "experiment_eligible": True,
+                    "optional_for": _IMAGE_TYPES, "experiment_eligible": True,
                     "rules": {"minimum": 1, "step": 1, "allow_negative": False},
                     "binding": _EXACT_BINDING},
     "cfg_scale": {"key": "cfg_scale", "name": "CFG scale", "block": "float",
                    "input_kind": "float", "required_for": (),
-                   "optional_for": ("t2i",), "experiment_eligible": True,
+                   "optional_for": _IMAGE_TYPES, "experiment_eligible": True,
                    "rules": {"minimum": 0, "allow_negative": False},
                    "binding": _EXACT_BINDING},
     "sampler": {"key": "sampler", "name": "Sampler", "block": "dropdown",
-                "input_kind": "dropdown", "required_for": (),
-                "optional_for": ("t2i",), "experiment_eligible": True,
-                "rules": {}, "binding": _EXACT_BINDING},
+                 "input_kind": "dropdown", "required_for": (),
+                 "optional_for": _IMAGE_TYPES, "experiment_eligible": True,
+                 "rules": {}, "binding": _EXACT_BINDING},
+    "width": {"key": "width", "name": "Width", "block": "integer",
+               "input_kind": "integer", "required_for": (),
+               "optional_for": _IMAGE_TYPES, "experiment_eligible": True,
+               "rules": {"minimum": 64, "maximum": 4096, "step": 8,
+                         "allow_negative": False}, "binding": _EXACT_BINDING},
+    "height": {"key": "height", "name": "Height", "block": "integer",
+                "input_kind": "integer", "required_for": (),
+                "optional_for": _IMAGE_TYPES, "experiment_eligible": True,
+                "rules": {"minimum": 64, "maximum": 4096, "step": 8,
+                          "allow_negative": False}, "binding": _EXACT_BINDING},
     "model_unet": {"key": "model_unet", "name": "Model UNET", "block": "model-picker",
-                    "input_kind": "model", "required_for": ("t2i",),
+                    "input_kind": "model", "required_for": _IMAGE_TYPES,
                     "optional_for": (), "experiment_eligible": True,
                     "rules": {"model_type": "unet"}, "binding": _EXACT_BINDING},
     "vae": {"key": "vae", "name": "VAE", "block": "model-picker",
-            "input_kind": "model", "required_for": ("t2i",),
+            "input_kind": "model", "required_for": _IMAGE_TYPES,
             "optional_for": (), "experiment_eligible": True,
             "rules": {"model_type": "vae"}, "binding": _EXACT_BINDING},
     "clip": {"key": "clip", "name": "CLIP", "block": "model-picker",
-             "input_kind": "model", "required_for": ("t2i",),
+             "input_kind": "model", "required_for": _IMAGE_TYPES,
              "optional_for": (), "experiment_eligible": True,
              "rules": {"model_type": "clip"}, "binding": _EXACT_BINDING},
+    "source_image": {"key": "source_image", "name": "Source Image", "block": "image",
+                     "input_kind": "image",
+                     "required_for": ("i2i", "inpaint", "sketch", "outpaint"),
+                     "optional_for": (), "experiment_eligible": False,
+                     "rules": {}, "binding": _EXACT_BINDING},
+    "mask": {"key": "mask", "name": "Mask", "block": "image",
+             "input_kind": "image", "required_for": ("inpaint",),
+             "optional_for": ("sketch", "outpaint"), "experiment_eligible": False,
+             "rules": {}, "binding": _EXACT_BINDING},
 }
 T2I_REQUIRED_INPUTS = ("prompt", "seed", "model_unet", "vae", "clip")
-T2I_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler")
+T2I_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler", "width", "height")
+I2I_REQUIRED_INPUTS = ("prompt", "seed", "model_unet", "vae", "clip", "source_image")
+I2I_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler", "width", "height")
+INPAINT_REQUIRED_INPUTS = ("prompt", "seed", "model_unet", "vae", "clip", "source_image", "mask")
+INPAINT_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler", "width", "height")
+SKETCH_REQUIRED_INPUTS = ("prompt", "seed", "model_unet", "vae", "clip", "source_image")
+SKETCH_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler", "width", "height", "mask")
+OUTPAINT_REQUIRED_INPUTS = ("prompt", "seed", "model_unet", "vae", "clip", "source_image")
+OUTPAINT_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler", "width", "height", "mask")
 OUTPUT_BINDING = {"key": "output", "name": "Output", "block": None,
-                  "required_for": ("t2i",),
+                  "required_for": _IMAGE_TYPES,
                   "binding": {"kind": "output", "exact": True, "cardinality": "one"}}
 _ROLE_ALIASES = {
     "positive_prompt": "prompt", "steps": "step_count", "cfg": "cfg_scale",
@@ -150,7 +178,40 @@ WORKFLOW_TYPE_PROFILES: dict[str, dict[str, tuple[str, ...]]] = {
         "required": T2I_REQUIRED_INPUTS,
         "optional": T2I_OPTIONAL_INPUTS,
     },
+    "i2i": {
+        "required": I2I_REQUIRED_INPUTS,
+        "optional": I2I_OPTIONAL_INPUTS,
+    },
+    "inpaint": {
+        "required": INPAINT_REQUIRED_INPUTS,
+        "optional": INPAINT_OPTIONAL_INPUTS,
+    },
+    "sketch": {
+        "required": SKETCH_REQUIRED_INPUTS,
+        "optional": SKETCH_OPTIONAL_INPUTS,
+    },
+    "outpaint": {
+        "required": OUTPAINT_REQUIRED_INPUTS,
+        "optional": OUTPAINT_OPTIONAL_INPUTS,
+    },
 }
+# Canonical workflow-type spellings for durable storage. Aliases resolve to
+# the canonical key wherever workflow types are normalized.
+WORKFLOW_TYPE_ALIASES = {
+    "txt2img": "t2i",
+    "text_to_image": "t2i",
+    "img2img": "i2i",
+    "image_to_image": "i2i",
+    "image_edit": "i2i",
+}
+
+
+def normalize_workflow_type(value: Any) -> str:
+    """Resolve a workflow-type string to its canonical spelling."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "t2i"
+    return WORKFLOW_TYPE_ALIASES.get(raw, raw)
 
 
 class WorkflowDomainService:
@@ -181,6 +242,11 @@ class WorkflowDomainService:
         """
         kind = entry.control_kind
         if kind == "enum":
+            # Source Image / Mask reference files by name and the input
+            # directory changes on every upload: a captured directory
+            # snapshot is never a closed vocabulary (see studio_workflow_run).
+            if role in ("source_image", "mask"):
+                return None
             if value not in entry.enum_options:
                 return (
                     f"invalid value {value!r} for {role!r}, "
@@ -272,6 +338,18 @@ class WorkflowDomainService:
         ui_graph = version.get("graph_json")
         problems: list[str] = []
         for role, entry in entries.items():
+            if entry.kind == "node_output":
+                # Mapping entries bind controls to node inputs/widgets; the
+                # workflow output travels separately as output_node_id. An
+                # output binding can never receive a control value and fails
+                # at run time with "no node/input binding", so reject it
+                # here at save time with an actionable message.
+                problems.append(
+                    f"binding {role!r} must name one concrete node input/widget, "
+                    "not a node output; re-bind it to the input field that "
+                    "consumes the value"
+                )
+                continue
             if entry.kind not in INPUT_BINDING_KINDS:
                 continue
             node_id = str(entry.node_id or "")
@@ -336,6 +414,89 @@ class WorkflowDomainService:
             problems.append(message)
         if problems:
             raise WorkflowDomainValidationError("; ".join(problems))
+
+    @staticmethod
+    def _normalize_text_generate_node_id(value: Any) -> Optional[str]:
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str):
+            raise WorkflowDomainValidationError(
+                "text_generate_node_id must be a string or null"
+            )
+        return value
+
+    @staticmethod
+    def _references_output(value: Any, node_id: str, output_index: Optional[int] = None) -> bool:
+        """Return whether *value* contains a ComfyUI output connection."""
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            try:
+                if str(value[0]) == node_id and (
+                    output_index is None or value[1] == output_index
+                ):
+                    return True
+            except Exception:
+                pass
+        if isinstance(value, dict):
+            return any(
+                WorkflowDomainService._references_output(item, node_id, output_index)
+                for item in value.values()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(
+                WorkflowDomainService._references_output(item, node_id, output_index)
+                for item in value
+            )
+        return False
+
+    def _validate_text_generate_binding(
+        self, node_id: Optional[str], version: dict[str, Any]
+    ) -> Optional[str]:
+        """Validate the optional bypass target against the stored executable graph."""
+        if node_id is None:
+            return None
+        executable = version.get("executable_prompt") or {}
+        node = executable.get(node_id) if isinstance(executable, dict) else None
+        if not isinstance(node, dict):
+            raise WorkflowDomainValidationError(
+                f"text_generate_node_id {node_id!r} is not present in the executable prompt"
+            )
+        class_type = str(node.get("class_type", ""))
+        if class_type not in {"TextGenerate", "TextGenerateLTX2Prompt"}:
+            raise WorkflowDomainValidationError(
+                "text_generate_node_id must target TextGenerate or TextGenerateLTX2Prompt"
+            )
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict) or "prompt" not in inputs:
+            raise WorkflowDomainValidationError(
+                f"TextGenerate node {node_id!r} has no executable prompt input"
+            )
+        declared_outputs = next(
+            (node.get(key) for key in ("return_types", "output_types", "outputs")
+             if node.get(key) is not None),
+            None,
+        )
+        if declared_outputs is not None:
+            first = declared_outputs[0] if isinstance(declared_outputs, (list, tuple)) and declared_outputs else None
+            first_type = first.get("type") if isinstance(first, dict) else first
+            first_name = first.get("name") if isinstance(first, dict) else None
+            if str(first_type or "").upper() not in {"STRING", "STR"} or (
+                first_name is not None and str(first_name) != "generated_text"
+            ):
+                raise WorkflowDomainValidationError(
+                    f"TextGenerate node {node_id!r} output slot 0 is not generated text"
+                )
+        # The two authoritative ComfyUI classes expose generated text at slot 0.
+        # A secondary output is safe only when the graph does not consume it;
+        # otherwise removing the node would silently change another input.
+        for other_id, other in executable.items():
+            if isinstance(other, dict) and self._references_output(
+                other.get("inputs"), node_id, 1
+            ):
+                raise WorkflowDomainValidationError(
+                    f"TextGenerate node {node_id!r} has a consumed secondary output; "
+                    "it cannot be bypassed"
+                )
+        return node_id
 
     # ── Workflow ─────────────────────────────────────────────────────────
 
@@ -526,7 +687,7 @@ class WorkflowDomainService:
         workflow_type = fields.get("workflow_type", "t2i")
         if not isinstance(workflow_type, str) or not workflow_type.strip():
             raise WorkflowDomainValidationError("workflow_type must be a non-empty string")
-        workflow_type = workflow_type.strip()
+        workflow_type = normalize_workflow_type(workflow_type)
         graph = fields.get("static_graph", {})
         if not isinstance(graph, dict):
             raise WorkflowDomainValidationError("static_graph must be an object")
@@ -778,6 +939,7 @@ class WorkflowDomainService:
         *,
         entries: dict[str, dict[str, Any]],
         output_node_id: str = "",
+        text_generate_node_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Change a Mapping by creating a NEW immutable Workflow Version.
 
@@ -801,6 +963,9 @@ class WorkflowDomainService:
         now = now_iso()
         normalized = self._normalize_entries(entries)
         self._validate_entries_against_graph(normalized, source)
+        text_generate_node_id = self._validate_text_generate_binding(
+            self._normalize_text_generate_node_id(text_generate_node_id), source
+        )
         output_node_id = self.normalize_output_node_id(
             output_node_id,
             source.get("executable_prompt") or {},
@@ -833,6 +998,7 @@ class WorkflowDomainService:
             created_at=now,
             updated_at=now,
             output_node_id=str(output_node_id or ""),
+            text_generate_node_id=text_generate_node_id,
             entries=normalized,
         )
         self.store.insert_mapping(mapping)
@@ -874,8 +1040,13 @@ class WorkflowDomainService:
         versions.sort(key=lambda v: int(v.get("version_number", 0)))
         return [self._enrich_version(v) for v in versions]
 
-    def derive_version_state(self, workflow_version_id: str) -> VersionState:
-        version = self.store.get_version(workflow_version_id)
+    def derive_version_state_for_records(
+        self,
+        workflow_version_id: str,
+        version: dict[str, Any] | None,
+        mapping: dict[str, Any] | None,
+        workflow_row: dict[str, Any] | None = None,
+    ) -> VersionState:
         if version is None:
             return VersionState(
                 status="incomplete",
@@ -886,7 +1057,6 @@ class WorkflowDomainService:
         executable = version.get("executable_prompt") or {}
         if not executable:
             reasons.append("no executable prompt")
-        mapping = self.store.get_mapping_for_version(workflow_version_id)
         if mapping is None:
             reasons.append("missing mapping")
         else:
@@ -941,6 +1111,42 @@ class WorkflowDomainService:
             )
             if not output_ok:
                 reasons.append("no output node")
+            # Profile completeness: a version missing a required Tool Input
+            # for its workflow type cannot run. Without this, an image tool
+            # version saved without its Source Image binding reports ready and
+            # fails opaquely at submit/run time instead.
+            try:
+                # Graph-era spellings canonicalize exactly like the binding
+                # map does, so legacy-mapped workflows keep their status.
+                mapped_roles = {
+                    _ROLE_ALIASES.get(str(raw_entry.get("semantic_role", "")),
+                                      str(raw_entry.get("semantic_role", "")))
+                    for raw_entry in entries_raw
+                    if isinstance(raw_entry, dict) and raw_entry.get("semantic_role")
+                }
+                raw_type = str(
+                    version.get("workflow_type", "")
+                    or (workflow_row or {}).get("workflow_type", "")
+                    or ""
+                ).strip().lower()
+                if raw_type:
+                    canonical_type = normalize_workflow_type(raw_type)
+                    profile = WORKFLOW_TYPE_PROFILES.get(canonical_type, {})
+                    # Only image Tool Inputs are enforced here (Source Image,
+                    # Mask): model roles have long-standing triple-mapping and
+                    # dependency-provider semantics that completeness must not
+                    # renegotiate. An image tool saved without its image
+                    # binding would otherwise report ready and fail opaquely
+                    # at submit/run time.
+                    for role in profile.get("required", ()):
+                        if BINDABLE_INPUT_CATALOG.get(role, {}).get("input_kind") != "image":
+                            continue
+                        if role not in mapped_roles:
+                            reasons.append(
+                                f"missing required binding {role!r} for workflow type {canonical_type!r}"
+                            )
+            except Exception:
+                pass
         if self._dependency_provider is not None:
             try:
                 extra = self._dependency_provider(version)
@@ -958,6 +1164,28 @@ class WorkflowDomainService:
             state.runnable = False
         return state
 
+    def derive_version_state(self, workflow_version_id: str) -> VersionState:
+        snap = self.store.snapshot_all()
+        version = self.store.find_in(
+            snap.get("versions", []), "workflow_version_id", workflow_version_id
+        )
+        mapping = None
+        workflow_row = None
+        if version is not None:
+            mapping = self.store.find_in(
+                snap.get("mappings", []),
+                "workflow_version_id",
+                workflow_version_id,
+            )
+            workflow_row = self.store.find_in(
+                snap.get("workflows", []),
+                "workflow_id",
+                str(version.get("workflow_id", "")),
+            )
+        return self.derive_version_state_for_records(
+            workflow_version_id, version, mapping, workflow_row
+        )
+
     def assert_runnable(self, workflow_version_id: str) -> None:
         state = self.derive_version_state(workflow_version_id)
         if not state.runnable:
@@ -974,6 +1202,7 @@ class WorkflowDomainService:
         *,
         entries: dict[str, dict[str, Any]],
         output_node_id: str = "",
+        text_generate_node_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Attach the (single, immutable) Mapping to a Workflow Version.
 
@@ -997,6 +1226,9 @@ class WorkflowDomainService:
         now = now_iso()
         normalized = self._normalize_entries(entries)
         self._validate_entries_against_graph(normalized, version)
+        text_generate_node_id = self._validate_text_generate_binding(
+            self._normalize_text_generate_node_id(text_generate_node_id), version
+        )
         output_node_id = self.normalize_output_node_id(
             output_node_id,
             version.get("executable_prompt") or {},
@@ -1008,6 +1240,7 @@ class WorkflowDomainService:
             created_at=now,
             updated_at=now,
             output_node_id=str(output_node_id or ""),
+            text_generate_node_id=text_generate_node_id,
             entries=normalized,
         )
         stored = self.store.insert_mapping(mapping)
@@ -1052,6 +1285,8 @@ class WorkflowDomainService:
     def _enrich_mapping(self, mapping: dict[str, Any]) -> dict[str, Any]:
         version_id = mapping.get("workflow_version_id", "")
         enriched = dict(mapping)
+        # Records written before TextGenerate bypass support are unbound.
+        enriched.setdefault("text_generate_node_id", None)
         enriched["version_state"] = self.derive_version_state(version_id).to_dict()
         return enriched
 

@@ -315,6 +315,7 @@ class Mapping:
     created_at: str = ""
     updated_at: str = ""
     output_node_id: str = ""
+    text_generate_node_id: Optional[str] = None
     entries: dict[str, MappingEntry] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -324,6 +325,7 @@ class Mapping:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "output_node_id": self.output_node_id,
+            "text_generate_node_id": self.text_generate_node_id,
             "entries": [e.to_dict() for e in self.entries.values()],
         }
 
@@ -341,6 +343,11 @@ class Mapping:
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
             output_node_id=str(data.get("output_node_id", "")),
+            text_generate_node_id=(
+                None
+                if data.get("text_generate_node_id") in (None, "")
+                else str(data.get("text_generate_node_id"))
+            ),
             entries=entries,
         )
 

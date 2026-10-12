@@ -53,7 +53,7 @@ import {
 } from "./studio-playground-run.js";
 import { updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
 import { createHistoryRepository } from "./history-v2-repository.js";
-import { requestHistoryRecordFocus } from "./studio-history-v2.js";
+import { renderHistoryV2 } from "./studio-history-v2.js";
 
 const PLAYGROUND_PREVIEW_KEY = "comfymodal.studio.playground-preview.v1";
 const PLAYGROUND_VIEW_KEY = "comfymodal.studio.playground-view.v1";
@@ -166,6 +166,81 @@ if (typeof window !== "undefined" && typeof window.addEventListener === "functio
   });
 }
 
+// Latest live render trio so mapping-saved refreshes (below) can act on
+// the current Playground state without a browser reload. Refreshed on
+// every control-panel render; the shell state object itself is live.
+var _latestPlaygroundTrio = null;
+var _mappingSavedChain = null;
+
+async function _refreshPlaygroundAfterMappingSaved(workflowId, versionId) {
+  var ref = _latestPlaygroundTrio;
+  if (!ref) return;
+  var state = ref.state, context = ref.context, actions = ref.actions;
+  var pg = state && state.playground;
+  var store = pg && pg._workflowRun;
+  var wf = pg && pg._workflowRunModule;
+  // Playground never initialized (or state replaced): the next mount
+  // fetches a fresh bundle anyway, so there is nothing to refresh.
+  if (!store || !wf) return;
+  // A save for a workflow the shelf is not showing must not disturb it.
+  if (String(store.workflowId || "") !== workflowId) return;
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  _flushShelfSave(state);
+  if (versionId && String(store.workflowVersionId || "") !== versionId) {
+    // The save created a new immutable version: adopt it exactly like an
+    // explicit version switch (fresh bundle, graph defaults, saved values,
+    // persisted selection). This matches what a browser refresh lands on.
+    var res = null;
+    try {
+      res = await wf.selectVersion(apiBase, store, versionId);
+    } catch (_e) { res = null; }
+    if (!res || !res.ok) return;
+    try { await _loadWorkflowModelLibrary(state, apiBase); } catch (_e) { /* best-effort */ }
+    try {
+      wf.saveWorkflowSelection({
+        workflowId: store.workflowId,
+        workflowVersionId: store.workflowVersionId,
+        workflowName: store.workflowName || "",
+      });
+    } catch (_e) { /* best-effort */ }
+    try { _rememberSelection(state); } catch (_e) { /* best-effort */ }
+  } else {
+    // Same version, new/changed mapping: re-fetch the bundle in place,
+    // keeping the user's current edits and filling graph defaults only
+    // for roles that have no value yet (e.g. newly exposed shelf fields).
+    var ok = false;
+    try {
+      ok = await _refreshRunContext(state, context);
+    } catch (_e) { ok = false; }
+    if (!ok) return;
+    try {
+      var fresh = (wf.defaultValuesFromContext && wf.defaultValuesFromContext(store)) || {};
+      Object.keys(fresh).forEach(function (role) {
+        if (store.controlValues[role] === undefined) store.controlValues[role] = fresh[role];
+      });
+    } catch (_e) { /* defaults are best-effort */ }
+  }
+  if (String((store && store.workflowId) || "") !== workflowId) return;
+  _rerenderWorkflowSection(state, context, actions, { applySaved: true });
+}
+
+// A Wizard mapping save (first mapping or revision) leaves any live
+// Playground shelf showing the pre-save bundle: new/changed roles stay
+// invisible until a browser refresh re-fetches them. Refresh the affected
+// selection in place instead. Same guard style as the settings listener.
+if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+  document.addEventListener("comfymodal:mapping-saved", function (event) {
+    var detail = (event && event.detail) || {};
+    var workflowId = detail.workflowId != null ? String(detail.workflowId) : "";
+    var versionId = detail.workflowVersionId != null ? String(detail.workflowVersionId) : "";
+    if (!workflowId) return;
+    // Serialize refreshes; each re-reads live state when it runs.
+    _mappingSavedChain = (_mappingSavedChain || Promise.resolve()).then(function () {
+      return _refreshPlaygroundAfterMappingSaved(workflowId, versionId);
+    }).catch(function () { /* refresh is best-effort */ });
+  });
+}
+
 // Compatibility seam for the retired legacy History renderer. Experiment
 // details now belong to History V2; route the old tile action through its
 // supported focus request instead of reviving the deleted legacy loader.
@@ -188,6 +263,10 @@ import {
   saveShelfLayout,
   loadShelfValues,
   saveShelfValues,
+  saveSkipTextGenerate,
+  loadToolWorkflows,
+  saveToolWorkflows,
+  loadToolDefault,
 } from "./studio-playground-state.js";
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Polling helper for experiment status ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
@@ -804,9 +883,17 @@ export async function hydratePlayground(state, context) {
   // 2. No backend presets exist any more: the selected Workflow (and its
   // current Version) is the only run identity, and the run store hydrates it.
   const featureId = (saved && saved.featureId) || "txt2img";
+  var savedTool = "";
+  try {
+    savedTool = _storageGet("comfymodal.studio.playground.tool.v1") || "";
+  } catch (_e) {}
   if (state.playground) {
     state.playground.featureId = featureId;
     state.playground.selectedBackendId = "";
+    state.playground.activeTool = normalizeToolId(savedTool || featureId || "t2i");
+    state.playground.toolId = state.playground.activeTool;
+    _SHELF_TYPE_FALLBACK = state.playground.activeTool;
+    _restoreCanvasImage(state);
   }
   const targetPresetId = "";
 
@@ -979,6 +1066,7 @@ function renderControlPanel(state, context) {
   // Actions for state mutations (called by event handlers)
   const actions = buildActions(state, context);
   if (state.playground) state.playground._runActions = actions;
+  _latestPlaygroundTrio = { state: state, context: context, actions: actions };
   const apiBase = (context && context.apiBase) || "/comfymodal";
 
   // Hydrate: restore saved state.
@@ -1025,6 +1113,9 @@ function renderControlPanel(state, context) {
 
   // Experiment toggle (always at top of control panel)
   panel.appendChild(renderExperimentToggle(state, actions));
+
+  // Studio tool strip: one workspace, five workflow-backed tools.
+  panel.appendChild(renderToolStrip(state, context, actions));
 
   // If experiment mode, render experiment-mode controls (context passed explicitly)
   if (isExperiment) {
@@ -1301,6 +1392,10 @@ function buildActions(state, context) {
         // Persist primary output URL so canvas shows result
         if (runState.primaryOutput) {
           state.playground.lastRunOutput = runState.primaryOutput;
+          _setCanvasImage(state, runState.primaryOutput);
+          try {
+            _recordImageEdge(state, runState.primaryOutput, _completionSource(state));
+          } catch (_e) { /* lineage is best-effort */ }
         }
         // Keep preset/feature selected
          if (!_isModernRunSelected(state)) {
@@ -1346,10 +1441,14 @@ function buildActions(state, context) {
           }
           if (matched) {
             state.playground._selectedRun = matched;
-            // Never nullify lastRunOutput ├óΓé¼ΓÇ¥ primaryOutput has already been set.
+            // Never nullify lastRunOutput — primaryOutput has already been set.
             // Only overwrite if the matched run carries a valid imageUrl.
             if (matched.imageUrl) {
               state.playground.lastRunOutput = matched.imageUrl;
+              _setCanvasImage(state, matched.imageUrl);
+              try {
+                _recordImageEdge(state, matched.imageUrl, _completionSource(state));
+              } catch (_e) { /* lineage is best-effort */ }
             }
             // Persist the finalized run result to localStorage
              const completedKey = resolveSelectionResultKey(state);
@@ -1546,6 +1645,192 @@ function workflowGatingInfo(store, wf, state) {
   return { text: reasons.length ? reasons.join("; ") : "Not runnable", color: "#d9a441" };
 }
 
+function _syncActiveToolToSelection(state) {
+  try {
+    var pg = state && state.playground;
+    var store = pg && pg._workflowRun;
+    if (!pg || !store || !store.workflowId) return false;
+    var row = (store.library || []).find(function (w) { return String(w.workflow_id) === String(store.workflowId); });
+    var ctx = store.runContext;
+    var wf = ctx && ctx.workflow;
+    var raw = (row && (row.workflow_type || row.workflowType || row.type))
+      || (ctx && (ctx.workflow_type || ctx.workflowType))
+      || (wf && (wf.workflow_type || wf.workflowType))
+      || "";
+    var canonical = normalizeToolId(raw);
+    var known = STUDIO_TOOLS.some(function (t) { return t.id === canonical; });
+    if (!raw || !known) return false;
+    if (pg.activeTool !== canonical) {
+      pg.activeTool = canonical;
+      pg.toolId = canonical;
+      _SHELF_TYPE_FALLBACK = canonical;
+      try {
+        _storageSet("comfymodal.studio.playground.tool.v1", canonical);
+      } catch (_e) {}
+      return true;
+    }
+    return false;
+  } catch (_e) { /* selection sync is best-effort */ return false; }
+}
+
+// One workspace, not one sandbox per workflow: the Playground remembers the
+// last workflow per tool and carries workspace values (prompt, seed,
+// sampler controls, source image) across workflow switches. Values travel
+// through the normal validated commit path, so unknown/invalid roles are
+// dropped and gating stays truthful. Each workflow's durable autosave still
+// keeps its own copy.
+var _WORKSPACE_CARRY_ROLES = ["prompt", "seed", "width", "height"];
+// Sampler-tuning roles are deliberately absent above: steps/scheduler/cfg/
+// sampler are workflow-specific — each workflow keeps its own — in either
+// spelling (see the explicit graph-era list in _applyWorkspaceCarry).
+// The same family starts collapsed in the Advanced shelf section on fresh
+// layouts (see _shelfLayoutFor).
+var _DEFAULT_ADVANCED_ROLES = ["steps", "step_count", "cfg", "cfg_scale", "scheduler"];
+// Carry targets include graph-era spellings: the loop below commits only
+// roles present in the NEW schema, resolving each through _carryValue so
+// `steps` seeds `step_count` and vice versa.
+// Durable browser memory: localStorage survives refresh and restart.
+// Reads fall back to sessionStorage once so selections stored by older
+// builds migrate forward instead of being dropped.
+function _storageGet(key) {
+  try {
+    if (typeof localStorage !== "undefined") {
+      var v = localStorage.getItem(key);
+      if (v) return v;
+    }
+  } catch (_e) {}
+  try {
+    if (typeof sessionStorage !== "undefined") return sessionStorage.getItem(key) || "";
+  } catch (_e) {}
+  return "";
+}
+
+function _storageSet(key, value) {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(key, value);
+  } catch (_e) {}
+}
+
+function _rememberSelection(state) {
+  try {
+    var pg = state && state.playground;
+    var store = pg && pg._workflowRun;
+    if (!pg || !store || !store.workflowId) return;
+    var row = (store.library || []).find(function (w) { return String(w.workflow_id) === String(store.workflowId); });
+    var tool = row ? _workflowTypeOfRow(row) : "";
+    if (!tool) return;
+    if (!pg.toolWorkflows || typeof pg.toolWorkflows !== "object") pg.toolWorkflows = {};
+    pg.toolWorkflows[tool] = String(store.workflowId);
+    saveToolWorkflows(pg.toolWorkflows);
+  } catch (_e) { /* memory is best-effort */ }
+}
+
+function _rememberedToolWorkflow(state, toolId) {
+  var pg = state && state.playground;
+  if (!pg || !toolId) return "";
+  if (!pg.toolWorkflows || typeof pg.toolWorkflows !== "object") {
+    try {
+      pg.toolWorkflows = loadToolWorkflows() || {};
+    } catch (_e) { pg.toolWorkflows = {}; }
+  }
+  var id = pg.toolWorkflows[toolId];
+  return id ? String(id) : "";
+}
+
+// Preferred workflow for a tool with no live selection: the tool's last
+// selection first, then its marked default. The caller validates the id
+// against the loaded library (type included) before selecting.
+function _preferredToolWorkflow(state, toolId) {
+  var remembered = _rememberedToolWorkflow(state, toolId);
+  if (remembered) return remembered;
+  try {
+    var def = loadToolDefault(toolId);
+    return def ? String(def) : "";
+  } catch (_e) { return ""; }
+}
+
+function _preferredToolRow(state, store, toolId) {
+  var id = _preferredToolWorkflow(state, toolId);
+  if (!id || !store || !store.library) return "";
+  var row = (store.library || []).find(function (w) { return String(w.workflow_id) === String(id); });
+  if (row && _workflowTypeOfRow(row) === toolId) return String(id);
+  return "";
+}
+
+function _applyWorkspaceCarry(state, context, actions, prevValues) {
+  // Seed the new selection with the previous workflow's workspace values.
+  // Runs after saved-values restore, so the latest edit wins — exactly the
+  // "same prompt/seed as the last edit" continuity. Unknown roles never
+  // reach the store (schema check); values are preserved verbatim by the
+  // commit path and anything invalid surfaces truthfully through run gating
+  // instead of running.
+  // Every role commits independently: one bad value can never abort the rest.
+  if (!prevValues || typeof prevValues !== "object") return;
+  var ready = _shelfReady(state);
+  if (!ready) return;
+  var schema = {};
+  try { schema = ready.wf.getControlSchema(ready.store) || {}; } catch (_e) { schema = {}; }
+  function safeCommit(role, value) {
+    try {
+      if (!Object.prototype.hasOwnProperty.call(schema, role)) return false;
+      commitShelfValue(state, context, actions, role, value);
+      var kept = ready.store.controlValues ? ready.store.controlValues[role] : undefined;
+      return kept !== undefined && kept !== null && kept !== "";
+    } catch (_e) { return false; }
+  }
+  var carriedSource = false;
+  // A current output is newer than any carried file: when one exists, leave
+  // Source Image empty so the post-selection chain fetches the actual
+  // current image. Otherwise carry the previous file instantly (no re-upload).
+  var hasCurrentOutput = !!_shelfCurrentImageUrl(state);
+  if (!hasCurrentOutput && prevValues.source_image && !ready.store.controlValues.source_image) {
+    carriedSource = safeCommit("source_image", prevValues.source_image);
+  }
+  _WORKSPACE_CARRY_ROLES.forEach(function (role) {
+    var v = _carryValue(prevValues, role);
+    if (v === undefined || v === null || v === "") return;
+    safeCommit(role, v);
+  });
+  // Graph-era target spellings (a legacy-mapped workflow has no `prompt`
+  // key to iterate — resolve each schema spelling explicitly). Tuning roles
+  // (steps/cfg/…) are intentionally not here: they never carry.
+  ["positive_prompt"].forEach(function (role) {
+    var v = _carryValue(prevValues, role);
+    if (v === undefined || v === null || v === "") return;
+    safeCommit(role, v);
+  });
+  // A mask only makes sense for the image it was painted on — carry it only
+  // together with its source image, never onto a freshly chained one.
+  if (carriedSource && prevValues.mask && !ready.store.controlValues.mask) {
+    safeCommit("mask", prevValues.mask);
+  }
+  try { _refreshShelfSection(state, context, actions); } catch (_e) { /* best-effort */ }
+}
+
+// Graph-era role spellings for the same product input (the backend run path
+// aliases prompt/positive_prompt identically). Carry resolves both so a
+// legacy-mapped workflow still seeds the shared prompt, and vice versa.
+// (steps/cfg spellings stay listed only as documentation — those roles never
+// carry; see _WORKSPACE_CARRY_ROLES.)
+var _CARRY_ALIASES = {
+  prompt: ["positive_prompt"],
+  positive_prompt: ["prompt"],
+  step_count: ["steps"],
+  steps: ["step_count"],
+  cfg_scale: ["cfg"],
+  cfg: ["cfg_scale"],
+};
+
+function _carryValue(prevValues, role) {
+  if (!prevValues || typeof prevValues !== "object") return undefined;
+  if (prevValues[role] !== undefined) return prevValues[role];
+  var alts = _CARRY_ALIASES[role] || [];
+  for (var i = 0; i < alts.length; i++) {
+    if (prevValues[alts[i]] !== undefined) return prevValues[alts[i]];
+  }
+  return undefined;
+}
+
 function _workflowSelectEl(state, actions, context) {
   const store = state && state.playground && state.playground._workflowRun;
   const select = el("select", {
@@ -1560,12 +1845,23 @@ function _workflowSelectEl(state, actions, context) {
   const placeholder = el("option", { value: "", text: "Select a workflow\u2026", disabled: true });
   if (!store.workflowId) placeholder.selected = true;
   select.appendChild(placeholder);
-  (store.library || []).forEach((w) => {
+  var tool = activeToolOf(state);
+  var rows = (store.library || []).filter(function (w) {
+    var t = _workflowTypeOfRow(w);
+    if (!t) return true;
+    return t === tool;
+  });
+  if (!rows.length) {
+    select.appendChild(el("option", { value: "", text: "No workflows for this tool yet", disabled: true, selected: true }));
+    select.disabled = true;
+    return select;
+  }
+  rows.forEach((w) => {
     const opt = el("option", { value: String(w.workflow_id), text: _workflowOptionLabel(w) });
     if (store.workflowId && String(store.workflowId) === String(w.workflow_id)) opt.selected = true;
     select.appendChild(opt);
   });
-  select.disabled = (store.library || []).length === 0;
+  select.disabled = rows.length === 0;
   select.addEventListener("change", () => {
     _handleWorkflowChange(state, context, actions, select.value);
   });
@@ -1588,7 +1884,10 @@ function _workflowTypeLabel(state) {
     i2i: "Image to image",
     img2img: "Image to image",
     image_to_image: "Image to image",
+    image_edit: "Image to image",
     inpaint: "Inpainting",
+    sketch: "Sketch",
+    outpaint: "Outpaint",
     upscale: "Upscaling",
   };
   return labels[key] || (raw ? String(raw).replace(/[._-]+/g, " ") : "Not specified");
@@ -1873,6 +2172,19 @@ async function initWorkflowRun(state, context, actions) {
         return;
       }
 
+      // b2) No global selection (fresh profile, cleared storage, or the saved
+      // workflow was deleted): fall back to this tool's last selection, then
+      // its marked default, so the tool is not left empty after a refresh.
+      try {
+        const tool = activeToolOf(state);
+        const preferred = _preferredToolRow(state, store, tool);
+        if (preferred) {
+          await _restoreWorkflowSelection(state, context, actions, wf, store, { workflowId: preferred });
+          _rerenderWorkflowSection(state, context, actions, { applySaved: true });
+          return;
+        }
+      } catch (_e) { /* fall through to library-only */ }
+
       // c) No handoff / saved selection: library only. Run stays on the
       //    legacy preset path until the user selects a workflow.
       store.setStatus("ready");
@@ -1906,6 +2218,8 @@ function _failWorkflowHandoff(wf, store, error) {
 async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
   const missing = "Requested workflow/version no longer available";
+  _flushShelfSave(state);
+  var prevValues = Object.assign({}, store.controlValues || {});
 
   const wfRes = await wf.selectWorkflow(apiBase, store, handoff.workflowId);
   if (!wfRes.ok) {
@@ -1937,7 +2251,14 @@ async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff
     workflowVersionId: store.workflowVersionId,
     workflowName: store.workflowName || "",
   });
+  _rememberSelection(state);
+  _syncActiveToolToSelection(state);
   _loadPersistedSelectionResult(state, store, null, context);
+  _rerenderWorkflowSection(state, context, actions, { applySaved: true });
+  _applyWorkspaceCarry(state, context, actions, prevValues);
+  // A cross-type handoff must remount the whole Playground (tool strip +
+  // editors), not just the selector/Shelf slice.
+  if (context && context.setPage) context.setPage("playground");
 }
 
 async function _restoreWorkflowSelection(state, context, actions, wf, store, saved) {
@@ -1975,6 +2296,9 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
     // Snap to whatever the workflow's latest is now rather than failing when
     // the saved version is gone: the run context is version-agnostic to the
     // user, who has no way to pick a different one any more.
+    // Shelves gate on store.workflowVersionId + runContext.mapping, which
+    // selectWorkflow above already populated: skip the second run-context
+    // fetch when already on the target version.
     const wanted = String(saved.workflowVersionId);
     const versions = store.versions || [];
     const target =
@@ -1988,13 +2312,17 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
       store.setReasons(["Requested version no longer available"]);
       return;
     }
-    const verRes = await wf.selectVersion(apiBase, store, target.workflow_version_id);
-    if (!verRes.ok) {
-      store.statusLine = verRes.error || "Requested version no longer available";
-      return;
+    if (String(store.workflowVersionId || "") !== String(target.workflow_version_id || "")) {
+      const verRes = await wf.selectVersion(apiBase, store, target.workflow_version_id);
+      if (!verRes.ok) {
+        store.statusLine = verRes.error || "Requested version no longer available";
+        return;
+      }
     }
   }
-  await _loadWorkflowModelLibrary(state, apiBase);
+  // Model library is not on the shelf paint path: refresh in background so
+  // shelves paint as soon as run-context lands.
+  _loadWorkflowModelLibrary(state, apiBase).catch(() => {});
   wf.saveWorkflowSelection({
     workflowId: store.workflowId,
     workflowVersionId: store.workflowVersionId,
@@ -2002,6 +2330,12 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
     workflowName: store.workflowName || "",
     presetName: store.presetName || "",
   });
+  _rememberSelection(state);
+  if (_syncActiveToolToSelection(state) && context && context.setPage) {
+    // Restored a cross-type workflow: remount strip + editors, not Shelf only.
+    context.setPage("playground");
+    return;
+  }
   _loadPersistedSelectionResult(state, store, null, context);
 }
 
@@ -2009,20 +2343,11 @@ async function _handleWorkflowChange(state, context, actions, workflowId) {
   const store = state && state.playground && state.playground._workflowRun;
   const wf = state && state.playground && state.playground._workflowRunModule;
   if (!store || !wf || !workflowId) return;
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  store.handoffError = null;
-  const result = await wf.selectWorkflow(apiBase, store, workflowId);
-  await _loadWorkflowModelLibrary(state, apiBase);
-  if (result && result.ok) {
-    wf.saveWorkflowSelection({
-      workflowId: store.workflowId,
-      workflowVersionId: store.workflowVersionId,
-      workflowName: store.workflowName || "",
-    });
-    _loadPersistedSelectionResult(state, store, null, context);
-  }
-  // Shelf: a new Workflow loads its own durably autosaved field values.
-  _rerenderWorkflowSection(state, context, actions, { applySaved: true });
+  // Flush pending keystrokes into the outgoing workflow, then snapshot its
+  // workspace values so the incoming workflow starts from the last edit.
+  _flushShelfSave(state);
+  var prevValues = Object.assign({}, store.controlValues || {});
+  await _runSelectionFlow(state, context, actions, workflowId, prevValues);
 }
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Run button gating (modern mode) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
@@ -2249,6 +2574,13 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   payload.request_id = requestId;
   payload.profile_name = loadGoldenProfileSelection() || modalOptions.golden_profile || null;
   ctrl.mark("build_end");
+  // Lineage ownership: stash the submitted source with the request. Poll-path
+  // completion must attribute the output to what was actually submitted, not
+  // whatever the live shelf holds when the response lands (single-flight UI:
+  // one stash slot, consumed once).
+  if (state && state.playground) {
+    state.playground._submittedSource = (merged.values && merged.values.source_image) || "";
+  }
 
   ctrl.mark("http_invoked");
   if (payload.profile_name) {
@@ -2855,6 +3187,11 @@ function _handleDirectRunResult(result, state, context, actions, controls, calle
   if (normalized) {
     if (state.playground) {
       state.playground.lastRunOutput = normalized.imageUrl || primaryOutput;
+      _setCanvasImage(state, normalized.imageUrl || primaryOutput);
+      try {
+        _recordImageEdge(state, normalized.imageUrl || primaryOutput,
+          (controls && controls.source_image) || "");
+      } catch (_e) { /* lineage is best-effort */ }
       state.playground._selectedRun = normalized;
     }
     // Persist via the shared selection key so reload queries the same entry.
@@ -3841,17 +4178,18 @@ function renderNoteEditor(nr, actions, apiBase) {
 
 function renderWorkspace(state, context) {
   // Shelf: the right-side workspace is the single result panel (output
-  // canvas, progress, metadata, recent filmstrip) ΓÇö never a movable card.
+  // canvas, progress, metadata, recent filmstrip) — never a movable card.
   const workspace = el("div", { class: "comfymodal-studio-workspace", "data-testid": "workspace", "data-shelf-output-panel": "true" });
+  var wsActions = (state.playground && state.playground._runActions) || buildActions(state, context);
 
   // Canvas area
-  workspace.appendChild(renderCanvas(state, context));
+  workspace.appendChild(renderCanvas(state, context, wsActions));
 
   // Progress section (shared progress display)
   workspace.appendChild(renderProgressSection(state, context));
 
   // Recent runs filmstrip
-  workspace.appendChild(renderFilmstrip(state, context));
+  workspace.appendChild(renderHistoryCarousel(state, context));
 
   return workspace;
 }
@@ -3883,7 +4221,7 @@ function renderFeatureTabs(state, context) {
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Canvas ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
-function renderCanvas(state, context) {
+function renderCanvas(state, context, actions) {
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
   const currentSpec = FEATURE_SPECS.find((f) => f.id === currentFeatureId);
 
@@ -3892,7 +4230,7 @@ function renderCanvas(state, context) {
     "data-testid": "canvas-area",
   });
 
-  const outputUrl = state.playground && state.playground.lastRunOutput;
+  const outputUrl = _canvasImageUrl(state);
   // Shelf: a Workflow switch marks the previous output stale until a new
   // run completes. The right-side canvas dims and carries an explicit note.
   if (outputUrl && state.playground && state.playground._shelfStaleOutput) {
@@ -3985,11 +4323,12 @@ function renderCanvas(state, context) {
             return updateRunAnnotation(_apiBase, _runId, patch);
           }
 
-          var _viewer = resolveViewerInput(_record, outputUrl);
-           _preview = buildViewerShell({
-             record: _viewer.record,
-             imageUrl: _viewer.imageUrl,
-             timing: _viewer.timing,
+           var _viewer = resolveViewerInput(_record, outputUrl);
+            _preview = buildViewerShell({
+              record: _viewer.record,
+              imageUrl: _viewer.imageUrl,
+              timing: _viewer.timing,
+              variant: _viewer.output && _viewer.output.label ? _viewer.output.label : "",
              onClose: function () {
                if (state.playground) state.playground._previewOpen = false;
                _clearPlaygroundPreviewId();
@@ -4048,7 +4387,331 @@ function renderCanvas(state, context) {
     }));
   }
 
+  var toolEditor = _renderToolEditor(state, context, actions || ((state.playground && state.playground._runActions) || null));
+  if (toolEditor) canvas.appendChild(toolEditor);
+
+  var lineageStrip = _renderLineageStrip(state, context, outputUrl);
+  if (lineageStrip) canvas.appendChild(lineageStrip);
+
   return canvas;
+}
+
+function _renderLineageStrip(state, context, canvasUrl) {
+  // Minimal ancestry UI for the working image: where it came from (parent)
+  // and what was made from it (children). Clicking either makes it the
+  // working canvas image. Absent when the image has no recorded lineage.
+  var node = _lineageNodeForCanvas(state, canvasUrl);
+  if (!node) return null;
+  var kids = (node.children || []).filter(function (k) { return k && k !== node.key; });
+  if (!node.parent && !kids.length) return null;
+  var strip = el("div", {
+    class: "comfymodal-studio-lineage-strip",
+    "data-testid": "lineage-strip",
+    style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:11px;color:#888;",
+  });
+  function thumbButton(key, testid, label) {
+    var btn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": testid,
+      title: label + ": " + _lineageDisplayUrl(key),
+      "aria-label": label,
+    });
+    var img = el("img", {
+      src: _lineageDisplayUrl(key),
+      alt: label,
+      style: "width:40px;height:40px;object-fit:cover;border-radius:4px;display:block;",
+    });
+    btn.appendChild(img);
+    btn.addEventListener("click", function () {
+      _setCanvasImage(state, _lineageDisplayUrl(key));
+      if (context && context.setPage) context.setPage("playground");
+    });
+    return btn;
+  }
+  if (node.parent) {
+    strip.appendChild(el("span", { text: "From", "data-testid": "lineage-from-label" }));
+    strip.appendChild(thumbButton(node.parent, "lineage-parent", "Parent image"));
+  }
+  if (kids.length) {
+    strip.appendChild(el("span", {
+      text: kids.length === 1 ? "1 edit" : kids.length + " edits",
+      "data-testid": "lineage-children-count",
+    }));
+    kids.slice(0, 12).forEach(function (k, i) {
+      strip.appendChild(thumbButton(k, "lineage-child-" + i, "Derived image " + (i + 1)));
+    });
+  }
+  return strip;
+}
+
+function _editorBaseImageUrl(state) {
+  var pg = state && state.playground;
+  var store = pg && pg._workflowRun;
+  var vals = (store && store.controlValues) || {};
+  var src = vals.source_image ? String(vals.source_image) : "";
+  if (src) {
+    if (/^(blob:|data:|https?:\/\/|\/)/.test(src)) return src;
+    return "/view?filename=" + encodeURIComponent(src) + "&type=input";
+  }
+  if (pg && pg.lastRunOutput) return String(pg.lastRunOutput);
+  var sel = pg && pg._selectedRun;
+  if (sel && sel.imageUrl) return String(sel.imageUrl);
+  return "";
+}
+
+function _renderToolEditor(state, context, actions) {
+  var tool = activeToolOf(state);
+  if (tool === "inpaint" || tool === "sketch") return _renderPaintEditor(state, tool, context, actions);
+  if (tool === "outpaint") return _renderOutpaintEditor(state, context, actions);
+  return null;
+}
+
+function _renderPaintEditor(state, tool, context, actions) {
+  var isMask = tool === "inpaint";
+  var box = el("div", {
+    class: "comfymodal-studio-paint-editor",
+    "data-testid": tool + "-editor",
+    style: "margin-top:10px;padding:10px;border:1px solid #2a2a2a;border-radius:8px;background:#0a0a0a;",
+  });
+  box.appendChild(el("p", {
+    text: isMask ? "Paint the mask (white = edit area)." : "Sketch over the image. Save flattens strokes into the Source Image.",
+    style: "font-size:12px;color:#aaa;margin:0 0 8px;",
+    "data-testid": tool + "-editor-hint",
+  }));
+  var controls = el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;" });
+  var mode = "brush";
+  var size = 24;
+  var brushBtn = el("button", { type: "button", class: "comfymodal-secondary-btn is-on", text: "Brush", "data-testid": tool + "-brush" });
+  var eraseBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Erase", "data-testid": tool + "-erase" });
+  brushBtn.addEventListener("click", function () { mode = "brush"; brushBtn.classList.add("is-on"); eraseBtn.classList.remove("is-on"); });
+  eraseBtn.addEventListener("click", function () { mode = "erase"; eraseBtn.classList.add("is-on"); brushBtn.classList.remove("is-on"); });
+  var sizeInput = el("input", { type: "range", min: "4", max: "96", value: "24", "data-testid": tool + "-brush-size", "aria-label": "Brush size" });
+  sizeInput.addEventListener("input", function () { size = Number(sizeInput.value) || 24; });
+  var clearBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Clear", "data-testid": tool + "-clear" });
+  var saveBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: isMask ? "Save mask" : "Save sketch", "data-testid": tool + "-save" });
+  controls.appendChild(brushBtn);
+  controls.appendChild(eraseBtn);
+  controls.appendChild(sizeInput);
+  controls.appendChild(clearBtn);
+  controls.appendChild(saveBtn);
+  box.appendChild(controls);
+  var wrap = el("div", { style: "position:relative;display:inline-block;max-width:100%;", "data-testid": tool + "-canvas-wrap" });
+  var base = el("img", { "data-testid": tool + "-base-image", alt: "Base image", style: "display:block;max-width:480px;max-height:360px;" });
+  var baseUrl = _editorBaseImageUrl(state);
+  if (baseUrl) base.src = baseUrl;
+  var paint = document.createElement("canvas");
+  paint.setAttribute("data-testid", tool + "-canvas");
+  paint.style.position = "absolute";
+  paint.style.inset = "0";
+  paint.style.width = "100%";
+  paint.style.height = "100%";
+  paint.style.cursor = "crosshair";
+  wrap.appendChild(base);
+  wrap.appendChild(paint);
+  box.appendChild(wrap);
+  var preview = el("p", {
+    class: "comfymodal-studio-control-note",
+    text: "Mask preview appears after painting.",
+    "data-testid": tool + "-mask-preview",
+  });
+  box.appendChild(preview);
+
+  function fitCanvas() {
+    var w = base.naturalWidth || base.clientWidth || 480;
+    var h = base.naturalHeight || base.clientHeight || 360;
+    if (!w || !h) return;
+    paint.width = w;
+    paint.height = h;
+  }
+  base.addEventListener("load", fitCanvas);
+  if (base.complete) setTimeout(fitCanvas, 0);
+
+  var drawing = false;
+  var last = null;
+  function pos(ev) {
+    var r = paint.getBoundingClientRect();
+    var cx = (ev.touches && ev.touches[0] ? ev.touches[0].clientX : ev.clientX);
+    var cy = (ev.touches && ev.touches[0] ? ev.touches[0].clientY : ev.clientY);
+    return {
+      x: (cx - r.left) * (paint.width / Math.max(1, r.width)),
+      y: (cy - r.top) * (paint.height / Math.max(1, r.height)),
+    };
+  }
+  function stroke(to) {
+    var ctx = paint.getContext("2d");
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    if (mode === "erase") {
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.strokeStyle = "rgba(0,0,0,1)";
+    } else {
+      ctx.globalCompositeOperation = "source-over";
+      ctx.strokeStyle = isMask ? "rgba(255,255,255,0.95)" : "rgba(255,60,60,0.9)";
+    }
+    ctx.lineWidth = size;
+    ctx.beginPath();
+    ctx.moveTo(last.x, last.y);
+    ctx.lineTo(to.x, to.y);
+    ctx.stroke();
+    last = to;
+    preview.textContent = "Mask has paint — Save to use it.";
+  }
+  paint.addEventListener("pointerdown", function (ev) { drawing = true; last = pos(ev); paint.setPointerCapture(ev.pointerId); });
+  paint.addEventListener("pointermove", function (ev) { if (drawing && last) stroke(pos(ev)); });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(function (n) {
+    paint.addEventListener(n, function () { drawing = false; last = null; });
+  });
+  clearBtn.addEventListener("click", function () {
+    var ctx = paint.getContext("2d");
+    ctx.clearRect(0, 0, paint.width, paint.height);
+    preview.textContent = "Mask cleared.";
+  });
+  saveBtn.addEventListener("click", async function () {
+    try {
+      var store = _shelfStore(state);
+      var identity = _selectionIdentity(store);
+      // Read the live base image, not the URL captured at construct — the
+      // source may have changed (chaining, Use current) since this editor
+      // was mounted.
+      var liveBase = (base && base.isConnected && base.getAttribute("src")) || _editorBaseImageUrl(state);
+      var out = document.createElement("canvas");
+      out.width = paint.width || 512;
+      out.height = paint.height || 512;
+      var octx = out.getContext("2d");
+      if (isMask) {
+        octx.fillStyle = "#000";
+        octx.fillRect(0, 0, out.width, out.height);
+        octx.drawImage(paint, 0, 0);
+      } else {
+        if (liveBase) {
+          var img = new Image();
+          img.crossOrigin = "anonymous";
+          await new Promise(function (res, rej) { img.onload = res; img.onerror = rej; img.src = liveBase; });
+          octx.drawImage(img, 0, 0, out.width, out.height);
+        }
+        octx.drawImage(paint, 0, 0);
+      }
+      var blob = await new Promise(function (res) { out.toBlob(res, "image/png"); });
+      if (!blob) return;
+      var mod = await import("./studio-field-blocks.js");
+      var name = await mod.uploadImageBlob(blob, mod.uniqueImageName(isMask ? "studio-mask" : "studio-sketch"));
+      if (_selectionIdentity(_shelfStore(state)) !== identity) {
+        preview.textContent = "Workflow changed during save — value discarded.";
+        return;
+      }
+      var targetRole = isMask ? "mask" : "source_image";
+      if (isMask && !_schemaHasRole(state, "mask")) {
+        preview.textContent = "This workflow has no Mask binding — mask not saved (map one in the Wizard to use it).";
+        return;
+      }
+      commitShelfValue(state, context, actions, targetRole, name);
+      _recordImageEdge(state, name, liveBase);
+      preview.textContent = isMask ? "Mask saved: " + name : "Sketch saved as Source Image: " + name;
+      _refreshShelfSection(state, context, actions);
+      _syncEditorBaseImage(state);
+      if (!isMask) {
+        _clearBoundMask(state, context, actions);
+        _setCanvasImage(state, _lineageDisplayUrl(name), context);
+      }
+    } catch (_e) { preview.textContent = "Save failed — try again."; }
+  });
+  return box;
+}
+
+function _renderOutpaintEditor(state, context, actions) {
+  var box = el("div", {
+    class: "comfymodal-studio-outpaint-editor",
+    "data-testid": "outpaint-editor",
+    style: "margin-top:10px;padding:10px;border:1px solid #2a2a2a;border-radius:8px;background:#0a0a0a;",
+  });
+  box.appendChild(el("p", {
+    text: "Extend the canvas. Save produces an expanded Source Image plus a Mask for the new area.",
+    style: "font-size:12px;color:#aaa;margin:0 0 8px;",
+    "data-testid": "outpaint-editor-hint",
+  }));
+  var grid = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;" });
+  var fields = {};
+  [["top", "Top"], ["right", "Right"], ["bottom", "Bottom"], ["left", "Left"]].forEach(function (pair) {
+    var key = pair[0];
+    var label = pair[1];
+    var input = el("input", {
+      type: "number", min: "0", max: "1024", step: "8", value: key === "right" ? "256" : "0",
+      class: "comfymodal-input", style: "width:90px;",
+      "data-testid": "outpaint-" + key, "aria-label": "Expand " + label,
+    });
+    fields[key] = input;
+    grid.appendChild(el("label", { text: label + " ", style: "font-size:11px;color:#888;" }, [input]));
+  });
+  var saveBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: "Save expansion", "data-testid": "outpaint-save" });
+  grid.appendChild(saveBtn);
+  box.appendChild(grid);
+  var status = el("p", { class: "comfymodal-studio-control-note", text: "Original stays centered; new area is masked.", "data-testid": "outpaint-preview-note" });
+  box.appendChild(status);
+  saveBtn.addEventListener("click", async function () {
+    try {
+      var outStore = _shelfStore(state);
+      var outIdentity = _selectionIdentity(outStore);
+      var baseUrl = _editorBaseImageUrl(state);
+      if (!baseUrl) { status.textContent = "No source image yet."; return; }
+      var img = new Image();
+      img.crossOrigin = "anonymous";
+      await new Promise(function (res, rej) { img.onload = res; img.onerror = rej; img.src = baseUrl; });
+      var t = Math.max(0, Number(fields.top.value) || 0);
+      var r = Math.max(0, Number(fields.right.value) || 0);
+      var b = Math.max(0, Number(fields.bottom.value) || 0);
+      var l = Math.max(0, Number(fields.left.value) || 0);
+      var W = img.naturalWidth + l + r;
+      var H = img.naturalHeight + t + b;
+      if (!W || !H) return;
+      var expanded = document.createElement("canvas");
+      expanded.width = W;
+      expanded.height = H;
+      var ectx = expanded.getContext("2d");
+      ectx.fillStyle = "#808080";
+      ectx.fillRect(0, 0, W, H);
+      ectx.drawImage(img, l, t);
+      var mask = document.createElement("canvas");
+      mask.width = W;
+      mask.height = H;
+      var mctx = mask.getContext("2d");
+      mctx.fillStyle = "#fff";
+      mctx.fillRect(0, 0, W, H);
+      mctx.fillStyle = "#000";
+      mctx.fillRect(l, t, img.naturalWidth, img.naturalHeight);
+      var blobOf = function (c) { return new Promise(function (res) { c.toBlob(res, "image/png"); }); };
+      var mod = await import("./studio-field-blocks.js");
+      var expName = await mod.uploadImageBlob(await blobOf(expanded), mod.uniqueImageName("studio-outpaint"));
+      var maskName = await mod.uploadImageBlob(await blobOf(mask), mod.uniqueImageName("studio-outpaint-mask"));
+      if (_selectionIdentity(_shelfStore(state)) !== outIdentity) {
+        status.textContent = "Workflow changed during save — values discarded.";
+        return;
+      }
+      commitShelfValue(state, context, actions, "source_image", expName);
+      _recordImageEdge(state, expName, baseUrl);
+      if (_schemaHasRole(state, "mask")) {
+        commitShelfValue(state, context, actions, "mask", maskName);
+        _recordImageEdge(state, maskName, expName);
+        status.textContent = "Expanded " + W + "x" + H + " — original at (" + l + "," + t + ").";
+      } else {
+        status.textContent = "Expanded " + W + "x" + H + " — original at (" + l + "," + t + "). No Mask binding on this workflow; mask skipped.";
+      }
+      _setCanvasImage(state, _lineageDisplayUrl(expName));
+      _refreshShelfSection(state, context, actions);
+    } catch (_e) { status.textContent = "Expansion failed — try again."; }
+  });
+  return box;
+}
+
+function _schemaHasRole(state, role) {
+  try {
+    var pg = state && state.playground;
+    var store = pg && pg._workflowRun;
+    if (!store) return false;
+    var wf = pg._workflowRunModule;
+    var schema = wf ? wf.getControlSchema(store) : (store.runContext && store.runContext.control_schema) || {};
+    return !!(schema && Object.prototype.hasOwnProperty.call(schema, role));
+  } catch (_e) { return false; }
 }
 
 function renderLiveReturnControl(state, context) {
@@ -4717,9 +5380,23 @@ function renderFilmstrip(state, context) {
             requestHistoryRecordFocus(nr.experimentId, "experiment");
             if (context && context.setPage) context.setPage("history");
           } else if (imageUrl && state.playground) {
-            // Ordinary run ├óΓé¼ΓÇ¥ update canvas with this run's output
+            // Ordinary run — make this run's output THE workspace image. Image
+            // Tool Inputs follow it: stale source/mask values belong to the
+            // previous image, so they reset and the chain refills the source
+            // from the newly selected output.
+            var prevCanvas = _canvasImageUrl(state);
             state.playground.lastRunOutput = imageUrl;
             state.playground._selectedRun = nr;
+            _setCanvasImage(state, imageUrl);
+            if (!_sameWorkspaceImage(prevCanvas, imageUrl)) {
+              var _actions = state.playground._runActions;
+              ["source_image", "mask"].forEach(function (role) {
+                try {
+                  if (_schemaHasRole(state, role)) commitShelfValue(state, context, _actions, role, "");
+                } catch (_e) { /* reset is best-effort */ }
+              });
+              try { _chainCurrentImageToSource(state, context, _actions); } catch (_e) { /* best-effort */ }
+            }
             rerender();
           }
         },
@@ -4804,8 +5481,9 @@ function _normalizeShelfControlSchema(state) {
 // Left-sidebar bound field cards for the selected Workflow:
 // - Prompt card fixed at top (never draggable, never in Advanced); output
 //   stays the right-side result panel (never a movable card).
-// - Every other bound field: drag-handle reorder, Advanced placement,
-//   same-row grouping, autosaved workflow-type layout with a subtle
+// - Every other bound field: drag-handle reorder, Advanced placement, and
+//   same-row grouping by dropping into a row, with an autosaved
+//   workflow-type layout and a subtle
 //   autosaved indicator (no Save button).
 // - Workflow switching goes through the shared picker
 //   (web/studio-workflow-picker.js) with a reuse-values prompt; the old
@@ -4816,7 +5494,240 @@ function _normalizeShelfControlSchema(state) {
 //   Shelf lane); experiment-only state lives in the separate local draft
 //   lane and never overwrites Workflow values.
 
-var _SHELF_TYPE = "t2i";
+var _SHELF_TYPE_FALLBACK = "t2i";
+
+export const STUDIO_TOOLS = Object.freeze([
+  { id: "t2i", label: "Text to Image" },
+  { id: "i2i", label: "Image Edit" },
+  { id: "inpaint", label: "Inpaint" },
+  { id: "sketch", label: "Sketch" },
+  { id: "outpaint", label: "Outpaint" },
+]);
+
+const _TOOL_ALIASES = Object.freeze({
+  txt2img: "t2i",
+  text_to_image: "t2i",
+  img2img: "i2i",
+  image_to_image: "i2i",
+  image_edit: "i2i",
+});
+
+export function normalizeToolId(value) {
+  var raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "t2i";
+  return _TOOL_ALIASES[raw] || raw;
+}
+
+export function activeToolOf(state) {
+  var pg = state && state.playground;
+  var raw = (pg && (pg.activeTool || pg.toolId)) || "";
+  if (!raw) {
+    var store = pg && pg._workflowRun;
+    var ctx = store && store.runContext;
+    var wf = ctx && ctx.workflow;
+    raw = (ctx && (ctx.workflow_type || ctx.workflowType))
+      || (wf && (wf.workflow_type || wf.workflowType))
+      || (pg && pg.featureId)
+      || "t2i";
+  }
+  var canonical = normalizeToolId(raw);
+  var known = STUDIO_TOOLS.some(function (t) { return t.id === canonical; });
+  return known ? canonical : "t2i";
+}
+
+function _workflowTypeOfRow(w) {
+  if (!w || typeof w !== "object") return "";
+  return normalizeToolId(w.workflow_type || w.workflowType || w.type || "");
+}
+
+function _setActiveTool(state, context, actions, toolId) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  var next = normalizeToolId(toolId);
+  if (pg.activeTool === next) return;
+  pg.activeTool = next;
+  pg.toolId = next;
+  _SHELF_TYPE_FALLBACK = next;
+  try {
+    _storageSet("comfymodal.studio.playground.tool.v1", next);
+  } catch (_e) {}
+  var store = pg._workflowRun;
+  var prevValues = Object.assign({}, (store && store.controlValues) || {});
+  pg._pendingChainUrl = _shelfCurrentImageUrl(state);
+  var autoSelect = "";
+  if (store && store.library) {
+    var current = (store.library || []).find(function (w) { return String(w.workflow_id) === String(store.workflowId); });
+    var currentType = current ? _workflowTypeOfRow(current) : "";
+    if (current && currentType && currentType !== next) {
+      _flushShelfSave(state);
+      store.setWorkflowId("");
+      store.setVersionId("");
+      store.setRunContext(null);
+      store.controlValues = {};
+      store.setStatus("idle");
+      store.setReasons([]);
+      pg._shelfStaleOutput = false;
+    } else if (store && store.workflowId) {
+      _chainCurrentImageToSource(state, context, actions);
+    }
+    if (store && !store.workflowId) {
+      autoSelect = _preferredToolRow(state, store, next);
+      if (!autoSelect) pg._pendingCarryValues = prevValues;
+    }
+  } else {
+    pg._pendingCarryValues = prevValues;
+  }
+  if (context && context.setPage) context.setPage("playground");
+  else {
+    _refreshShelfSection(state, context, actions);
+    _rerenderWorkflowSection(state, context, actions);
+  }
+  // Returning to a tool restores its most recently selected workflow, seeded
+  // with the values just left behind — the workspace continues, it restarts.
+  if (autoSelect) {
+    _runSelectionFlow(state, context, actions, autoSelect, prevValues);
+  }
+}
+
+async function _runSelectionFlow(state, context, actions, workflowId, prevValues) {
+  // Shared select → saved-values → carry → chain flow for the dropdown,
+  // tool-switch restore, and handoff paths. Callers snapshot prevValues
+  // before invoking; nothing here reads the outgoing selection.
+  var pg = state && state.playground;
+  var store = pg && pg._workflowRun;
+  var wf = pg && pg._workflowRunModule;
+  if (!store || !wf || !workflowId) return { ok: false };
+  var prev = Object.assign({}, prevValues || {});
+  if (pg._pendingCarryValues) {
+    prev = Object.assign({}, pg._pendingCarryValues, prev);
+    pg._pendingCarryValues = null;
+  }
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  store.handoffError = null;
+  const result = await wf.selectWorkflow(apiBase, store, workflowId);
+  await _loadWorkflowModelLibrary(state, apiBase);
+  if (result && result.ok) {
+    wf.saveWorkflowSelection({
+      workflowId: store.workflowId,
+      workflowVersionId: store.workflowVersionId,
+      workflowName: store.workflowName || "",
+    });
+    _rememberSelection(state);
+  }
+  var _toolChanged = _syncActiveToolToSelection(state);
+  _loadPersistedSelectionResult(state, store, null, context);
+  if (_toolChanged && context && context.setPage) {
+    context.setPage("playground");
+    return result || { ok: false };
+  }
+  _rerenderWorkflowSection(state, context, actions, { applySaved: true });
+  _applyWorkspaceCarry(state, context, actions, prev);
+  _chainCurrentImageToSource(state, context, actions);
+  return result || { ok: false };
+}
+
+function _selectionIdentity(store) {
+  return (store ? String(store.workflowId || "") : "")
+    + "::" + (store ? String(store.workflowVersionId || "") : "");
+}
+
+function _syncEditorBaseImage(state) {
+  try {
+    var url = _editorBaseImageUrl(state);
+    if (!url) return;
+    ["inpaint-base-image", "sketch-base-image"].forEach(function (testid) {
+      var img = document.querySelector('[data-testid="' + testid + '"]');
+      if (img && img.isConnected && img.getAttribute("src") !== url) {
+        img.setAttribute("src", url);
+        // Strokes painted against the previous base would corrupt the new
+        // one — clear the overlay so the next paint starts clean.
+        var wrap = img.parentElement;
+        var paint = wrap && wrap.querySelector("canvas");
+        if (paint) {
+          var ctx = paint.getContext("2d");
+          if (ctx) ctx.clearRect(0, 0, paint.width, paint.height);
+        }
+      }
+    });
+  } catch (_e) { /* best-effort paint only */ }
+}
+
+async function _chainCurrentImageToSource(state, context, actions) {
+  try {
+    var pg = state && state.playground;
+    var store = pg && pg._workflowRun;
+    if (!pg || !store || !store.controlValues) return;
+    var schema = {};
+    try {
+      var wf = pg._workflowRunModule;
+      schema = wf ? wf.getControlSchema(store) : (store.runContext && store.runContext.control_schema) || {};
+    } catch (_e) { schema = {}; }
+    if (!schema || !schema.source_image) {
+      // The tab's bundle can predate a Wizard save — refresh the same
+      // version once before concluding there is nothing to chain into.
+      await _refreshRunContext(state, context);
+      try {
+        schema = wf ? wf.getControlSchema(store) : (store.runContext && store.runContext.control_schema) || {};
+      } catch (_e) { schema = {}; }
+    }
+    if (!schema || !schema.source_image) return;
+    if (store.controlValues.source_image) { pg._pendingChainUrl = ""; return; }
+    var url = pg._pendingChainUrl || _shelfCurrentImageUrl(state);
+    if (!url) return;
+    var identity = _selectionIdentity(store);
+    // Prefer the on-drive file behind the canvas image over re-uploading
+    // its pixels as a duplicate.
+    var hit = _resolveCanvasFile(state, url);
+    if (hit && hit.filename) {
+      if (_selectionIdentity(store) !== identity) return;
+      pg._pendingChainUrl = "";
+      if (store.controlValues.source_image) return;
+      commitShelfValue(state, context, actions, "source_image", hit.filename);
+      if (state.playground) state.playground.sourceFollowsCanvas = true;
+      _recordImageEdge(state, hit.filename, url);
+      _refreshShelfSection(state, context, actions);
+      _syncEditorBaseImage(state);
+      return;
+    }
+    var resp = await fetch(url);
+    if (!resp || !resp.ok) return;
+    var blob = await resp.blob();
+    var mod = await import("./studio-field-blocks.js");
+    var name = await mod.uploadImageBlob(blob, mod.uniqueImageName("studio-current"));
+    if (_selectionIdentity(store) !== identity) return;
+    pg._pendingChainUrl = "";
+    if (store.controlValues.source_image) return;
+    commitShelfValue(state, context, actions, "source_image", name);
+    if (state.playground) state.playground.sourceFollowsCanvas = true;
+    _recordImageEdge(state, name, url);
+    _refreshShelfSection(state, context, actions);
+    _syncEditorBaseImage(state);
+  } catch (_e) { /* chaining is best-effort */ }
+}
+
+export function renderToolStrip(state, context, actions) {
+  var current = activeToolOf(state);
+  var strip = el("div", {
+    class: "comfymodal-studio-tool-strip",
+    "data-testid": "studio-tool-strip",
+    role: "toolbar",
+    "aria-label": "Studio tools",
+  });
+  STUDIO_TOOLS.forEach(function (tool) {
+    var isActive = tool.id === current;
+    var btn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn comfymodal-studio-tool-btn" + (isActive ? " is-on active" : ""),
+      text: tool.label,
+      "data-testid": "studio-tool-" + tool.id,
+      "data-tool": tool.id,
+    });
+    btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+    btn.addEventListener("click", function () { _setActiveTool(state, context, actions, tool.id); });
+    strip.appendChild(btn);
+  });
+  return strip;
+}
 
 // Mapped roles that are deliberately NOT rendered as Shelf fields. These are
 // model-loader inputs: the files are chosen in the Model Library and already
@@ -4829,9 +5740,11 @@ var _shelfPointerDrag = null;
 function _shelfClearDropIndicators() {
   Array.prototype.forEach.call(document.querySelectorAll(
     ".comfymodal-studio-shelf-card.is-drop-before, .comfymodal-studio-shelf-card.is-drop-after, "
-      + ".comfymodal-studio-shelf-row.is-drop-above, .comfymodal-studio-shelf-row.is-drop-below"
+      + ".comfymodal-studio-shelf-row.is-drop-above, .comfymodal-studio-shelf-row.is-drop-below, "
+      + ".comfymodal-studio-shelf-row.is-drop-target, "
+      + ".comfymodal-studio-shelf-advanced.is-drop-target"
   ), function (node) {
-    node.classList.remove("is-drop-before", "is-drop-after", "is-drop-above", "is-drop-below");
+    node.classList.remove("is-drop-before", "is-drop-after", "is-drop-above", "is-drop-below", "is-drop-target");
   });
 }
 
@@ -4843,11 +5756,32 @@ function _shelfRowRoles(row) {
 
 function _shelfDropAtPoint(draggedRole, clientX, clientY) {
   var hit = document.elementFromPoint(clientX, clientY);
+  var advancedBox = hit && hit.closest ? hit.closest("[data-testid='shelf-advanced-section']") : null;
+  if (advancedBox && !advancedBox.hidden) {
+    var advancedTarget = hit.closest("[data-testid^='shelf-field-']");
+    if (advancedTarget && advancedTarget.getAttribute("data-role") !== draggedRole) {
+      var advancedRect = advancedTarget.getBoundingClientRect();
+      return {
+        mode: clientY < advancedRect.top + advancedRect.height / 2 ? "advanced-before" : "advanced-after",
+        targetRole: advancedTarget.getAttribute("data-role"),
+        row: advancedBox,
+      };
+    }
+    return { mode: "advanced", row: advancedBox };
+  }
   var target = hit && hit.closest ? hit.closest("[data-testid^='shelf-field-']") : null;
   if (target && target.getAttribute("data-role") !== draggedRole) {
     var targetRow = target.closest(".comfymodal-studio-shelf-row");
     var rowCards = targetRow ? targetRow.querySelectorAll("[data-testid^='shelf-field-']") : [];
     var rect = target.getBoundingClientRect();
+    if (clientY >= rect.top + rect.height * 0.25 && clientY <= rect.bottom - rect.height * 0.25) {
+      return {
+        mode: "row-join",
+        targetRole: target.getAttribute("data-role"),
+        row: targetRow,
+        targetRow: targetRow ? Number(targetRow.getAttribute("data-row")) : 0,
+      };
+    }
     var after = rowCards.length > 1
       ? clientX >= rect.left + rect.width / 2
       : clientY >= rect.top + rect.height / 2;
@@ -4926,6 +5860,75 @@ function _shelfRoleOf(entry) {
   return (entry && (entry.semantic_role || entry.input_name)) || "";
 }
 
+const _TEXT_GENERATE_NODE_TYPES = ["TextGenerate", "TextGenerateLTX2Prompt"];
+
+function _textGenerateBindingStatus(store) {
+  var ctx = store && store.runContext;
+  var mapping = ctx && ctx.mapping;
+  var raw = mapping && mapping.mapping && typeof mapping.mapping === "object" ? mapping.mapping : mapping;
+  var binding = raw && raw.text_generate_node_id;
+  if (binding == null || String(binding).trim() === "") {
+    binding = ctx && ctx.text_generate_binding;
+    if (binding && typeof binding === "object") binding = binding.node_id != null ? binding.node_id : binding.nodeId;
+  }
+  if (binding == null || String(binding).trim() === "") return { bound: false, valid: false, nodeId: "", reason: "" };
+  var targetId = String(binding);
+  var graph = ctx && ctx.version && (ctx.version.graph_json || ctx.version.graphJson);
+  var nodes = Array.isArray(graph) ? graph : graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+  var node = nodes.find(function (candidate) {
+    return candidate && (String(candidate.id) === targetId || String(candidate.nodeId) === targetId);
+  });
+  if (!node && ctx && ctx.version && ctx.version.executable_prompt
+    && typeof ctx.version.executable_prompt === "object") {
+    var promptNode = ctx.version.executable_prompt[targetId];
+    if (promptNode && typeof promptNode === "object") {
+      node = { id: targetId, class_type: promptNode.class_type, type: promptNode.class_type };
+    }
+  }
+  var valid = !!(node && _TEXT_GENERATE_NODE_TYPES.indexOf(node.class_type || node.type) !== -1);
+  return {
+    bound: true,
+    valid: valid,
+    nodeId: targetId,
+    reason: valid ? "" : "The saved text-generation node is not available in this version."
+  };
+}
+
+function _renderSkipTextGenerateOption(state, context, actions) {
+  var store = _shelfStore(state);
+  var status = _textGenerateBindingStatus(store);
+  if (!status.bound) return null;
+  var wrap = el("div", {
+    class: "comfymodal-studio-execution-option",
+    "data-testid": "skip-text-generate-option",
+    style: "margin:16px 0 4px;padding:12px 14px;border:1px solid rgba(255,255,255,.10);border-radius:8px;",
+  });
+  var label = el("label", { style: "display:flex;gap:10px;align-items:flex-start;cursor:pointer;" });
+  var input = el("input", {
+    type: "checkbox",
+    class: "comfymodal-input",
+    "data-testid": "skip-text-generate",
+    "aria-label": "Skip text generation — use the shelf prompt directly",
+    disabled: !status.valid,
+  });
+  input.checked = status.valid && store.skipTextGenerate === true;
+  input.setAttribute("aria-pressed", input.checked ? "true" : "false");
+  input.addEventListener("change", function () {
+    store.setSkipTextGenerate(input.checked);
+    saveSkipTextGenerate(store.workflowId, store.workflowVersionId, input.checked);
+    input.setAttribute("aria-pressed", input.checked ? "true" : "false");
+    _syncWorkflowGating(state, context, actions);
+  });
+  var copy = el("span", {}, [
+    el("strong", { text: "Skip text generation — use the shelf prompt directly", style: "display:block;font-size:12px;line-height:1.35;" }),
+    el("span", { text: status.valid ? "Bypasses the saved text-generation node for this run." : status.reason, style: "display:block;font-size:10px;color:#888;margin-top:3px;line-height:1.4;" }),
+  ]);
+  label.appendChild(input);
+  label.appendChild(copy);
+  wrap.appendChild(label);
+  return wrap;
+}
+
 // Catalog-owned role name. Unknown schema roles fall back to the mapping
 // display_name (backend truth) ΓÇö never a second hardcoded name table.
 function _shelfDisplayName(role, entry) {
@@ -4963,12 +5966,538 @@ function _shelfBlockKind(entry) {
   if (kind === "integer") return "integer";
   if (kind === "number" || kind === "float") return "float";
   if (kind === "enum") return "dropdown";
-  if (kind === "file" || kind === "image" || kind === "model") return "model-picker";
+  if (kind === "image") return "image";
+  if (kind === "file" || kind === "model") return "model-picker";
   if (entry && Array.isArray(entry.enum_options) && entry.enum_options.length) return "dropdown";
   return "";
 }
 
-function _shelfRenderInput(role, entry, value, onChange) {
+function _shelfCurrentImageUrl(state) {
+  // The workspace image: explicit canvas selection first, then the latest
+  // run output, then the selected run. The canvas is workflow-independent —
+  // it is what the user is actively working on, not just "the last result".
+  var canvas = _canvasImageUrl(state);
+  if (canvas) return canvas;
+  var pg = state && state.playground;
+  if (!pg) return "";
+  if (pg.lastRunOutput) return String(pg.lastRunOutput);
+  var sel = pg._selectedRun;
+  if (sel && sel.imageUrl) return String(sel.imageUrl);
+  return "";
+}
+
+function _canvasImageUrl(state) {
+  var pg = state && state.playground;
+  if (!pg) return "";
+  if (pg.canvasImageUrl) return String(pg.canvasImageUrl);
+  if (pg.lastRunOutput) return String(pg.lastRunOutput);
+  return "";
+}
+
+// Resolve the canvas image to the on-drive file behind it instead of
+// re-uploading its pixels as a duplicate. Returns { filename } or null
+// when the URL has no file behind it (asset blobs, blob:/data: URLs).
+// Annotated output/temp references round-trip through the loader,
+// collector, and remote materializer, all of which split the annotation.
+function _outputFileFromUrl(url) {
+  var s = String(url || "");
+  if (!s) return "";
+  var m = s.match(/[?&]filename=([^&]+)/);
+  if (m) {
+    var t = s.match(/[?&]type=([^&]+)/);
+    var type = t ? decodeURIComponent(t[1]) : "input";
+    var name = decodeURIComponent(m[1]);
+    if (!name || name[0] === "/" || name.indexOf("..") !== -1) return "";
+    if (type === "input") return name;
+    if (type === "output" || type === "temp") return name + " [" + type + "]";
+    return "";
+  }
+  m = s.match(/\/comfymodal\/studio\/outputs\/([^/?#]+)/);
+  if (m) return decodeURIComponent(m[1]) + " [output]";
+  return "";
+}
+
+function _runOutputFile(nr) {
+  // Best-effort output filename behind a recent-run record: explicit fields
+  // first, then any featured/output URL that resolves to a file.
+  if (!nr || typeof nr !== "object") return "";
+  var direct = nr.output_path
+    || (Array.isArray(nr.output_paths) && nr.output_paths[0])
+    || (nr.featuredOutput && (nr.featuredOutput.originalFilename || nr.featuredOutput.filename))
+    || "";
+  if (direct) {
+    var d = String(direct);
+    if (/ \[(input|output|temp)\]$/.test(d)) return d;
+    return d + " [output]";
+  }
+  var urls = [nr.imageUrl];
+  [nr.featuredOutput].concat(nr.cover || []).forEach(function (f) {
+    if (!f || typeof f !== "object") return;
+    urls.push(f.thumbUrl, f.previewUrl, f.originalUrl, f.url);
+  });
+  for (var i = 0; i < urls.length; i++) {
+    var hit = _outputFileFromUrl(urls[i]);
+    if (hit) return hit;
+  }
+  return "";
+}
+
+function _resolveCanvasFile(state, url) {
+  var s = String(url || "");
+  if (!s) return null;
+  var direct = _outputFileFromUrl(s);
+  if (direct) return { filename: direct };
+  // History asset URLs: match the run's recorded output file, if known.
+  try {
+    var runs = getRecentRuns() || [];
+    for (var i = 0; i < runs.length; i++) {
+      var nr = runs[i];
+      if (!nr || String(nr.imageUrl || "") !== s) continue;
+      var file = _runOutputFile(nr);
+      if (file) return { filename: file };
+    }
+  } catch (_e) { /* fall through to upload */ }
+  return null;
+}
+
+// Same workspace image under different references: exact match or shared
+// ?filename= identity only. Bare basenames are NOT compared — two different
+// directories can hold the same filename, and mistaking them would silently
+// run one image against another's source.
+function _sameWorkspaceImage(a, b) {  var sa = String(a || "");
+  var sb = String(b || "");
+  if (!sa || !sb) return false;
+  if (sa === sb) return true;
+  function fileParam(s) {
+    var m = String(s).match(/[?&]filename=([^&]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
+  var fa = fileParam(sa);
+  var fb = fileParam(sb);
+  if (fa && fb) return fa === fb;
+  if (fa) return fa === sb;
+  if (fb) return fb === sa;
+  return false;
+}
+
+function _setCanvasImage(state, url, context) {
+  var pg = state && state.playground;
+  if (!pg || !url) return;
+  pg.canvasImageUrl = String(url);
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem("comfymodal.studio.playground.canvas.v1", String(url));
+    }
+  } catch (_e) { /* best-effort */ }
+  // Sync the live canvas element without a full remount (preserves shelf
+  // input focus); renders from state catch up on the next pass. When the
+  // workspace is still showing its empty state there is no element to sync,
+  // so remount once instead — otherwise a first upload would vanish.
+  try {
+    var img = document.querySelector('[data-testid="canvas-output"]');
+    if (img && img.isConnected) {
+      img.setAttribute("src", String(url));
+      return;
+    }
+  } catch (_e) { /* fall through to remount */ }
+  try {
+    if (context && context.setPage) context.setPage("playground");
+    else if (typeof window !== "undefined" && window.__studioApi
+      && typeof window.__studioApi.setPage === "function") {
+      window.__studioApi.setPage("playground");
+    }
+  } catch (_e) { /* best-effort */ }
+}
+
+// A new source image invalidates any bound mask: the mask was painted for a
+// different image. Uses the normal commit/gating path so Run truthfully
+// reports the missing mask until a new one is painted.
+function _clearBoundMask(state, context, actions) {
+  try {
+    if (_schemaHasRole(state, "mask")) commitShelfValue(state, context, actions, "mask", "");
+  } catch (_e) { /* best-effort */ }
+}
+
+function _restoreCanvasImage(state) {
+  try {
+    var pg = state && state.playground;
+    if (!pg || pg.canvasImageUrl) return;
+    if (typeof sessionStorage === "undefined") return;
+    var saved = sessionStorage.getItem("comfymodal.studio.playground.canvas.v1") || "";
+    if (saved) pg.canvasImageUrl = saved;
+  } catch (_e) { /* best-effort */ }
+}
+
+// Image lineage: every workspace image knows what it came from (parent)
+// and what was made from it (children, many allowed). Keys are the exact
+// strings that flow through the workspace — output URLs for run results,
+// uploaded filenames for sources — so edges recorded at run/submit time
+// resolve without guessing.
+var _LINEAGE_KEY = "comfymodal.studio.playground.lineage.v2";
+var _LINEAGE_CAP = 200;
+
+// One identity per image: input-directory files canonicalize to
+// `input:<filename>` (with the view `type` when present) no matter whether
+// they arrive as a bare name or a /view URL; anything else keeps its full
+// URL. Equivalent references always form one node; distinct files never merge.
+function _lineageKey(value) {
+  var s = String(value || "");
+  if (!s) return "";
+  var m = s.match(/[?&]filename=([^&]+)/);
+  if (m) {
+    var t = s.match(/[?&]type=([^&]+)/);
+    return (t ? decodeURIComponent(t[1]) : "input") + ":" + decodeURIComponent(m[1]);
+  }
+  // Annotated file references ("name [output]") keep their directory so
+  // input and output files with the same basename never merge.
+  m = s.match(/^(.*) \[([^\]]+)\]$/);
+  if (m && (m[2] === "input" || m[2] === "output" || m[2] === "temp")) {
+    return m[2] + ":" + m[1];
+  }
+  if (/^(blob:|data:|https?:\/\/|\/)/.test(s)) return "url:" + s;
+  return "input:" + s;
+}
+
+function _lineageNodes(state) {
+  var pg = state && state.playground;
+  if (!pg) return {};
+  if (!pg.imageLineage || typeof pg.imageLineage !== "object"
+    || !pg.imageLineage.nodes || typeof pg.imageLineage.nodes !== "object") {
+    var nodes = {};
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        var raw = sessionStorage.getItem(_LINEAGE_KEY) || "";
+        var parsed = raw ? JSON.parse(raw) : null;
+        if (parsed && typeof parsed === "object") nodes = parsed;
+      }
+    } catch (_e) { nodes = {}; }
+    pg.imageLineage = { nodes: nodes };
+  }
+  return pg.imageLineage.nodes;
+}
+
+function _lineageProtectedKeys(state) {
+  var keep = {};
+  try {
+    var pg = state && state.playground;
+    [pg && pg.canvasImageUrl, pg && pg.lastRunOutput,
+      pg && pg._selectedRun && pg._selectedRun.imageUrl].forEach(function (u) {
+      if (!u) return;
+      keep[_lineageKey(u)] = true;
+    });
+  } catch (_e) { /* best-effort */ }
+  return keep;
+}
+
+function _pruneLineage(state) {
+  // Hard in-memory bound with coherent edges: delete oldest unprotected
+  // nodes first, rewiring each deleted node's children to its own parent
+  // (or root) and scrubbing every children array. Runs before every persist
+  // and does not depend on storage succeeding.
+  var pg = state && state.playground;
+  var nodes = pg && pg.imageLineage && pg.imageLineage.nodes;
+  if (!nodes || typeof nodes !== "object") return;
+  function drop(key) {
+    var dead = nodes[key];
+    if (!dead) return;
+    delete nodes[key];
+    Object.keys(nodes).forEach(function (k) {
+      var n = nodes[k];
+      if (!n || typeof n !== "object") return;
+      if (Array.isArray(n.children)) {
+        n.children = n.children.filter(function (c) { return c !== key; });
+      }
+      if (n.parent === key) n.parent = (dead.parent && nodes[dead.parent]) ? dead.parent : "";
+    });
+    if (dead.parent && nodes[dead.parent] && Array.isArray(dead.children)) {
+      dead.children.forEach(function (c) {
+        if (nodes[c] && nodes[dead.parent].children.indexOf(c) === -1) {
+          nodes[dead.parent].children.push(c);
+        }
+      });
+    }
+  }
+  var guard = 0;
+  while (Object.keys(nodes).length > _LINEAGE_CAP && guard++ < 1000) {
+    var keep = _lineageProtectedKeys(state);
+    var victim = Object.keys(nodes)
+      .filter(function (k) { return !keep[k]; })
+      .sort(function (a, b) {
+        return String((nodes[a] && nodes[a].at) || "") < String((nodes[b] && nodes[b].at) || "") ? -1 : 1;
+      })[0];
+    if (!victim) break;
+    drop(victim);
+  }
+}
+
+function _persistLineage(state) {
+  try {
+    var pg = state && state.playground;
+    if (!pg || !pg.imageLineage) return;
+    _pruneLineage(state);
+    if (typeof sessionStorage === "undefined") return;
+    sessionStorage.setItem(_LINEAGE_KEY, JSON.stringify(pg.imageLineage.nodes || {}));
+  } catch (_e) { /* best-effort */ }
+}
+
+function _recordImageEdge(state, childValue, parentValue) {
+  try {
+    var ck = _lineageKey(childValue);
+    if (!ck) return null;
+    var nodes = _lineageNodes(state);
+    if (!nodes[ck]) nodes[ck] = { key: ck, parent: "", children: [], at: new Date().toISOString() };
+    var child = nodes[ck];
+    var pk = _lineageKey(parentValue);
+    if (pk) {
+      // First ancestry wins: an output is generated once, from one source.
+      // Later completion paths (poll after direct) must not reparent it from
+      // live editing state.
+      if (child.parent && child.parent !== pk) return child;
+      if (!nodes[pk]) nodes[pk] = { key: pk, parent: "", children: [], at: child.at };
+      child.parent = pk;
+      var parent = nodes[pk];
+      if (parent.children.indexOf(ck) === -1) parent.children.push(ck);
+    }
+    _persistLineage(state);
+    return child;
+  } catch (_e) { return null; }
+}
+
+function _consumeSubmittedSource(state) {
+  // One-shot read of the source stashed at submit time.
+  try {
+    var pg = state && state.playground;
+    if (!pg || !("_submittedSource" in pg)) return "";
+    var src = pg._submittedSource || "";
+    pg._submittedSource = "";
+    return String(src);
+  } catch (_e) { return ""; }
+}
+
+async function _refreshRunContext(state, context) {
+  // The Wizard saves mappings as NEW versions: a tab holding the previously
+  // selected version keeps a stale bundle (roles bound since are "unknown").
+  // Re-fetch the SAME version (never silently jump versions) so a commit can
+  // proceed against truth. Returns true when a usable schema is present.
+  try {
+    var pg = state && state.playground;
+    var store = pg && pg._workflowRun;
+    var wf = pg && pg._workflowRunModule;
+    // Same version only: never silently jump versions, and never conjure a
+    // bundle when nothing is selected.
+    if (!store || !wf || !store.workflowId || !store.workflowVersionId) return false;
+    var apiBase = (context && context.apiBase) || "/comfymodal";
+    var res = await wf.loadRunContext(apiBase, store, store.workflowId, store.workflowVersionId || "");
+    if (!res || !res.ok) return false;
+    _normalizeShelfControlSchema(state);
+    var schema = {};
+    try { schema = wf.getControlSchema(store) || {}; } catch (_e) { schema = {}; }
+    return Object.keys(schema).length > 0;
+  } catch (_e) { return false; }
+}
+
+function _completionSource(state) {
+  // Ancestry for a finished run: submitted controls first (immune to
+  // mid-flight shelf edits), live store only when no submission was stashed.
+  var submitted = _consumeSubmittedSource(state);
+  if (submitted) return submitted;
+  try {
+    var store = state && state.playground && state.playground._workflowRun;
+    return (store && store.controlValues && store.controlValues.source_image) || "";
+  } catch (_e) { return ""; }
+}
+
+function _lineageDisplayUrl(key) {
+  var k = String(key || "");
+  if (!k) return "";
+  var m = k.match(/^(input|output|temp):(.*)$/);
+  if (m) return "/view?filename=" + encodeURIComponent(m[2]) + "&type=" + m[1];
+  if (k.indexOf("url:") === 0) return k.slice(4);
+  if (/^(blob:|data:|https?:\/\/|\/)/.test(k)) return k;
+  return "/view?filename=" + encodeURIComponent(k) + "&type=input";
+}
+
+function _lineageNodeForCanvas(state, canvasUrl) {
+  try {
+    var nodes = _lineageNodes(state);
+    var node = nodes[_lineageKey(canvasUrl)];
+    return node || null;
+  } catch (_e) { return null; }
+}
+
+function _setLinkState(state, busy, error) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  pg._sourceLinkBusy = !!busy;
+  pg._sourceLinkError = error || "";
+}
+
+async function _linkUrlAsSource(state, context, actions, role, url, prefix) {
+  // Shared fetch → upload → commit flow for canvas/history links. The flag
+  // is set only when the value actually sticks, so the checkmark never
+  // claims a link that failed. Failures name the exact stage (fetch, upload,
+  // or save) both on screen and in the console for remote diagnosis.
+  // Returns the filename or "".
+  function bomb(stage, detail) {
+    var err = new Error(stage);
+    err.stage = stage;
+    err.detail = detail;
+    throw err;
+  }
+  var store = _shelfStore(state);
+  var identity = _selectionIdentity(store);
+  _setLinkState(state, true, "");
+  _refreshShelfSection(state, context, actions);
+  try {
+    var hit = _resolveCanvasFile(state, url);
+    if (hit && hit.filename) {
+      if (_selectionIdentity(_shelfStore(state)) !== identity) return "";
+      commitShelfValue(state, context, actions, role, hit.filename);
+      var keptFile = store.controlValues ? store.controlValues[role] : "";
+      if (!keptFile) bomb("saving the value (it was rejected)", hit.filename);
+      if (state.playground) state.playground.sourceFollowsCanvas = true;
+      _recordImageEdge(state, hit.filename, url);
+      return String(hit.filename);
+    }
+    var resp = null;
+    try {
+      resp = await fetch(url);
+    } catch (fetchErr) {
+      bomb("fetching the canvas image", String((fetchErr && fetchErr.message) || fetchErr));
+    }
+    if (!resp || !resp.ok) bomb("fetching the canvas image (HTTP " + (resp && resp.status) + ")", url);
+    var blob = null;
+    try {
+      blob = await resp.blob();
+    } catch (blobErr) {
+      bomb("reading the canvas image", String((blobErr && blobErr.message) || blobErr));
+    }
+    var mod = await import("./studio-field-blocks.js");
+    var name = await mod.uploadImageBlob(blob, mod.uniqueImageName(prefix || "studio-link"));
+    if (_selectionIdentity(_shelfStore(state)) !== identity) return "";
+    // The tab's bundle can predate a Wizard save (new versions): when the
+    // role is unknown, refresh the same version once before giving up.
+    var _storeNow = _shelfStore(state);
+    var _wfNow = state.playground && state.playground._workflowRunModule;
+    var _schemaNow = {};
+    try { _schemaNow = (_wfNow && _storeNow) ? _wfNow.getControlSchema(_storeNow) || {} : {}; } catch (_e) { _schemaNow = {}; }
+    if (!Object.prototype.hasOwnProperty.call(_schemaNow, role)) {
+      await _refreshRunContext(state, context);
+      try { _schemaNow = (_wfNow && _storeNow) ? _wfNow.getControlSchema(_storeNow) || {} : {}; } catch (_e) { _schemaNow = {}; }
+    }
+    if (!Object.prototype.hasOwnProperty.call(_schemaNow, role)) {
+      bomb("saving the value (Source Image is not mapped in this workflow version — bind it in the Workflow Setup Wizard)", name);
+    }
+    try {
+      commitShelfValue(state, context, actions, role, name);
+    } catch (commitErr) {
+      bomb("saving the value", String((commitErr && commitErr.message) || commitErr));
+    }
+    var kept = store.controlValues ? store.controlValues[role] : "";
+    if (!kept) {
+      var why = "";
+      try {
+        var rs = store.reasons;
+        if (Array.isArray(rs) && rs.length) {
+          why = String(rs[0]);
+        } else {
+          var sch = (store.runContext && store.runContext.control_schema) || {};
+          var names = sch && typeof sch === "object" ? Object.keys(sch) : [];
+          why = names.length ? "schema roles: " + names.join(", ") : "empty control schema";
+        }
+      } catch (__e) { why = ""; }
+      bomb("saving the value (it was rejected" + (why ? ": " + why : "") + ")", name);
+    }
+    if (state.playground) state.playground.sourceFollowsCanvas = true;
+    _recordImageEdge(state, name, url);
+    return String(name);
+  } catch (_e) {
+    var stage = (_e && _e.stage) || "linking the image";
+    var detail = (_e && _e.detail) || ((_e && _e.message) || "");
+    try { console.debug("[Studio canvas link] failed at " + stage, detail); } catch (__e) { /* noop */ }
+    _setLinkState(state, false, "Could not use that image — " + stage + ".");
+    _refreshShelfSection(state, context, actions);
+    return "";
+  } finally {
+    _setLinkState(state, false, (state.playground && state.playground._sourceLinkError) || "");
+    _refreshShelfSection(state, context, actions);
+  }
+}
+
+async function _shelfUseCurrentAsSource(state, context, actions, role) {
+  var url = _shelfCurrentImageUrl(state);
+  if (!url) return;
+  await _linkUrlAsSource(state, context, actions, role, url, "studio-current");
+  _syncEditorBaseImage(state);
+}
+
+function _shelfToggleCanvasLink(state, context, actions, role, on) {
+  // The checkmark binds the input to the canvas image when on, and releases
+  // it when off. Checking with an already-linked value is a no-op.
+  try {
+    var pg = state && state.playground;
+    if (!on) {
+      if (pg) pg.sourceFollowsCanvas = false;
+      commitShelfValue(state, context, actions, role, "");
+      _clearBoundMask(state, context, actions);
+      _refreshShelfSection(state, context, actions);
+      return;
+    }
+    var store = _shelfStore(state);
+    var current = store && store.controlValues ? store.controlValues[role] : "";
+    if (current && _sameWorkspaceImage(_lineageDisplayUrl(current), _shelfCurrentImageUrl(state))) {
+      if (pg) pg.sourceFollowsCanvas = true;
+      _refreshShelfSection(state, context, actions);
+      return;
+    }
+    _shelfUseCurrentAsSource(state, context, actions, role);
+  } catch (_e) { /* best-effort */ }
+}
+
+function _historyPickerItems(state) {
+  try {
+    var runs = getRecentRuns() || [];
+    var out = [];
+    runs.forEach(function (nr) {
+      if (!nr || !nr.imageUrl) return;
+      var label = nr.prompt || nr.label || nr.id || "Run";
+      out.push({ label: String(label).slice(0, 60), url: String(nr.imageUrl) });
+      if (out.length >= 30) return;
+    });
+    return out;
+  } catch (_e) { return []; }
+}
+
+async function _shelfUseHistoryAsSource(state, context, actions, role, url) {
+  // A history image lives behind a run URL, not the input directory: fetch
+  // its bytes and upload so the workflow receives a real mapped filename.
+  // The pick also replaces the working canvas image.
+  if (!url) return;
+  var store = _shelfStore(state);
+  var identity = _selectionIdentity(store);
+  // Prefer the on-drive file when the URL resolves to one (no duplicate).
+  var hit = null;
+  try { hit = _resolveCanvasFile(state, url); } catch (_e) { hit = null; }
+  if (hit && hit.filename) {
+    if (_selectionIdentity(_shelfStore(state)) !== identity) return;
+    commitShelfValue(state, context, actions, role, hit.filename);
+    if (state.playground) state.playground.sourceFollowsCanvas = true;
+    _recordImageEdge(state, hit.filename, url);
+    _setCanvasImage(state, url, context);
+    _clearBoundMask(state, context, actions);
+    _refreshShelfSection(state, context, actions);
+    _syncEditorBaseImage(state);
+    return;
+  }
+  var name = await _linkUrlAsSource(state, context, actions, role, url, "studio-history");
+  if (!name) return;
+  _setCanvasImage(state, _lineageDisplayUrl(name), context);
+  _clearBoundMask(state, context, actions);
+  _refreshShelfSection(state, context, actions);
+  _syncEditorBaseImage(state);
+}
+
+function _shelfRenderInput(role, entry, value, onChange, extra) {
   var kind = _shelfBlockKind(entry);
   var testid = "shelf-input-" + role;
   if (kind === "boolean") {
@@ -4987,6 +6516,28 @@ function _shelfRenderInput(role, entry, value, onChange) {
     });
     input.addEventListener("input", function () { onChange(input.value); });
     return input;
+  }
+  if (kind === "image") {
+    var imgProps = {
+      value: value,
+      testid: testid,
+      label: _shelfDisplayName(role, entry),
+      onChange: onChange,
+      previewUrl: extra && extra.previewUrl ? extra.previewUrl : "",
+    };
+    if (extra && typeof extra.onUseCurrent === "function") imgProps.onUseCurrent = extra.onUseCurrent;
+    if (extra && typeof extra.onToggleLink === "function") {
+      imgProps.onToggleLink = extra.onToggleLink;
+      imgProps.canvasLinked = !!extra.canvasLinked;
+      imgProps.linkBusy = !!extra.linkBusy;
+      imgProps.linkError = extra.linkError || "";
+    }
+    if (extra && typeof extra.onPickHistory === "function"
+      && Array.isArray(extra.historyItems) && extra.historyItems.length) {
+      imgProps.onPickHistory = extra.onPickHistory;
+      imgProps.historyItems = extra.historyItems;
+    }
+    return block.render(imgProps);
   }
   // Model/file roles without options stay read-only: the value comes from
   // the preset/graph (upload is out of scope, same as the mapped controls).
@@ -5022,7 +6573,8 @@ function _shelfRenderInput(role, entry, value, onChange) {
 // part of the order list.
 function _shelfLayoutFor(entries, promptRole) {
   var roles = entries.map(_shelfRoleOf).filter(function (r) { return r && r !== promptRole; });
-  var saved = loadShelfLayout(_SHELF_TYPE) || { order: [], rows: {}, advanced: [] };
+  var savedRaw = loadShelfLayout(_SHELF_TYPE_FALLBACK);
+  var saved = savedRaw || { order: [], rows: {}, advanced: [] };
   var order = (saved.order || []).filter(function (r) { return roles.indexOf(r) !== -1; });
   roles.forEach(function (r) { if (order.indexOf(r) === -1) order.push(r); });
   var rows = {};
@@ -5034,11 +6586,19 @@ function _shelfLayoutFor(entries, promptRole) {
     if (row > maxRow) maxRow = row;
   });
   var advanced = (saved.advanced || []).filter(function (r) { return roles.indexOf(r) !== -1; });
+  if (!savedRaw) {
+    // Fresh shelf: sampler-tuning roles start collapsed in Advanced. Saved
+    // layouts (even with an emptied Advanced section) are never rewritten —
+    // the user owns their arrangement after the first touch.
+    roles.forEach(function (r) {
+      if (_DEFAULT_ADVANCED_ROLES.indexOf(r) !== -1 && advanced.indexOf(r) === -1) advanced.push(r);
+    });
+  }
   return { order: order, rows: rows, advanced: advanced, maxRow: maxRow };
 }
 
 function _shelfPersistLayout(layout) {
-  saveShelfLayout(_SHELF_TYPE, { order: layout.order, rows: layout.rows, advanced: layout.advanced });
+  saveShelfLayout(_SHELF_TYPE_FALLBACK, { order: layout.order, rows: layout.rows, advanced: layout.advanced });
   _paintShelfAutosaved();
 }
 
@@ -5180,7 +6740,13 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
           drop.row && drop.row.querySelector('[data-role="' + drop.targetRole + '"]')
             .classList.add(drop.mode === "before" ? "is-drop-before" : "is-drop-after");
         } else if (drop.row) {
-          drop.row.classList.add(drop.mode === "row-before" ? "is-drop-above" : "is-drop-below");
+          if (drop.mode === "advanced" || drop.mode === "advanced-before" || drop.mode === "advanced-after") {
+            drop.row.classList.add("is-drop-target");
+          } else if (drop.mode === "row-join") {
+            drop.row.classList.add("is-drop-target");
+          } else {
+            drop.row.classList.add(drop.mode === "row-before" ? "is-drop-above" : "is-drop-below");
+          }
         }
       }
       function onUp(upEvent) {
@@ -5201,6 +6767,12 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
           _shelfMoveAfter(state, context, actions, role, drop.targetRole, drop.targetRow);
         } else if (drop.mode === "row-before" || drop.mode === "row-after") {
           _shelfMoveToRow(state, context, actions, role, drop.targetRole, drop.mode === "row-before" ? "before" : "after");
+        } else if (drop.mode === "row-join") {
+          _shelfMoveIntoRow(state, context, actions, role, drop.targetRole);
+        } else if (drop.mode === "advanced") {
+          _shelfMoveToAdvanced(state, context, actions, role);
+        } else if (drop.mode === "advanced-before" || drop.mode === "advanced-after") {
+          _shelfMoveToAdvanced(state, context, actions, role, drop.targetRole, drop.mode === "advanced-before" ? "before" : "after");
         }
       }
       document.addEventListener("pointermove", onMove, true);
@@ -5214,72 +6786,158 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
     text: _shelfDisplayName(role, entry),
   }));
   if (!fixed) {
-    var inAdvanced = layout.advanced.indexOf(role) !== -1;
-    var groupBtn = el("button", {
-      type: "button",
-      class: "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn",
-      "data-testid": "shelf-group-" + role,
-      text: "Same row",
-      title: "Group with the previous card in the same row",
-    });
-    groupBtn.setAttribute("aria-pressed", "false");
-    groupBtn.addEventListener("click", function () {
-      _shelfToggleGroup(state, context, actions, role);
-    });
-    head.appendChild(groupBtn);
-    var advBtn = el("button", {
-      type: "button",
-      class: "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn" + (inAdvanced ? " is-on" : ""),
-      "data-testid": "shelf-advanced-" + role,
-      text: "Advanced",
-      title: inAdvanced ? "Remove from Advanced" : "Move to Advanced",
-    });
-    advBtn.setAttribute("aria-pressed", inAdvanced ? "true" : "false");
-    advBtn.addEventListener("click", function () {
-      _shelfToggleAdvanced(state, context, actions, role);
-    });
-    head.appendChild(advBtn);
   }
   card.appendChild(head);
 
   var body = el("div", { class: "comfymodal-studio-shelf-card-body" });
-  body.appendChild(_shelfRenderInput(role, entry, value, function (next) {
-    commitShelfValue(state, context, actions, role, next);
-  }));
+  if (role === "prompt" || role === "positive_prompt") {
+    body.appendChild(_shelfPromptInput(state, context, actions, role, entry, value));
+  } else {
+    var extra = null;
+    if (role === "source_image") {
+      var _pg = state && state.playground;
+      extra = {
+        onToggleLink: function (on) { _shelfToggleCanvasLink(state, context, actions, role, on); },
+        canvasLinked: !!(_pg && _pg.sourceFollowsCanvas && value),
+        linkBusy: !!(_pg && _pg._sourceLinkBusy),
+        linkError: (_pg && _pg._sourceLinkError) || "",
+        onPickHistory: function (url) { _shelfUseHistoryAsSource(state, context, actions, role, url); },
+        historyItems: _historyPickerItems(state),
+        previewUrl: "",
+      };
+    }
+    // Ownership token for slow async completions (file upload): the commit
+    // below is dropped when the selection changed mid-upload.
+    var _renderIdentity = _selectionIdentity(_shelfStore(state));
+    body.appendChild(_shelfRenderInput(role, entry, value, function (next) {
+      // A slow file upload may finish after the user switched workflows —
+      // never commit it into the newly selected workflow.
+      if ((role === "source_image" || role === "mask")
+        && _selectionIdentity(_shelfStore(state)) !== _renderIdentity) {
+        _refreshShelfSection(state, context, actions);
+        return;
+      }
+      commitShelfValue(state, context, actions, role, next);
+      // Image commits (upload, Clear) change what the paint/outpaint editors
+      // must show — refresh their base the same way chaining does. A newly
+      // chosen source file also becomes the working canvas image, and a
+      // manual file choice unlinks canvas-following.
+      if (role === "source_image" || role === "mask") _syncEditorBaseImage(state);
+      if (role === "source_image" && next) {
+        if (state.playground) state.playground.sourceFollowsCanvas = false;
+        _recordImageEdge(state, next, "");
+        _setCanvasImage(state, _lineageDisplayUrl(next), context);
+        _clearBoundMask(state, context, actions);
+      }
+    }, extra));
+  }
   card.appendChild(body);
   return card;
 }
 
-function _shelfToggleAdvanced(state, context, actions, role) {
-  var entries = _shelfEntries(state);
-  var promptRole = _shelfPromptRole(entries);
-  if (!role || role === promptRole) return;
-  var layout = _shelfLayoutFor(entries, promptRole);
-  var idx = layout.advanced.indexOf(role);
-  if (idx === -1) layout.advanced.push(role);
-  else layout.advanced.splice(idx, 1);
-  _shelfPersistLayout(layout);
-  _refreshShelfSection(state, context, actions);
+function _structuredDraftKey(state) {
+  var pg = state && state.playground;
+  var store = pg && pg._workflowRun;
+  return (store && store.workflowId ? String(store.workflowId) : "noid")
+    + "::" + (store && store.workflowVersionId ? String(store.workflowVersionId) : "nover");
 }
 
-function _shelfToggleGroup(state, context, actions, role) {
-  var entries = _shelfEntries(state);
-  var promptRole = _shelfPromptRole(entries);
-  if (!role || role === promptRole) return;
-  var layout = _shelfLayoutFor(entries, promptRole);
-  var visible = layout.order.filter(function (r) { return layout.advanced.indexOf(r) === -1; });
-  var pos = visible.indexOf(role);
-  if (pos <= 0) return;
-  var prev = visible[pos - 1];
-  if (layout.rows[role] === layout.rows[prev]) {
-    // Already grouped: assign a fresh row (ungroup).
-    layout.maxRow += 1;
-    layout.rows[role] = layout.maxRow;
-  } else {
-    layout.rows[role] = layout.rows[prev];
+function _shelfStructuredParts(state, value) {
+  var pg = state && state.playground;
+  var drafts = (pg && pg._structuredPromptParts) || {};
+  var hit = drafts[_structuredDraftKey(state)];
+  if (hit && typeof hit === "object") {
+    return {
+      subject: hit.subject || "",
+      style: hit.style || "",
+      details: hit.details || "",
+      composition: hit.composition || "",
+    };
   }
-  _shelfPersistLayout(layout);
-  _refreshShelfSection(state, context, actions);
+  var text = value != null ? String(value) : "";
+  return { subject: text, style: "", details: "", composition: "" };
+}
+
+function _storeStructuredParts(state, parts) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  if (!pg._structuredPromptParts || typeof pg._structuredPromptParts !== "object") pg._structuredPromptParts = {};
+  pg._structuredPromptParts[_structuredDraftKey(state)] = {
+    subject: parts.subject || "",
+    style: parts.style || "",
+    details: parts.details || "",
+    composition: parts.composition || "",
+  };
+}
+
+function _shelfComposeStructured(parts) {
+  return [parts.subject, parts.style, parts.details, parts.composition]
+    .map(function (p) { return String(p || "").trim(); })
+    .filter(Boolean)
+    .join(", ");
+}
+
+function _shelfPromptInput(state, context, actions, role, entry, value) {
+  var wrap = el("div", { "data-testid": "shelf-prompt-wrap" });
+  var mode = (state.playground && state.playground._promptMode) || "text";
+  var tabs = el("div", { class: "comfymodal-studio-shelf-prompt-tabs", "data-testid": "shelf-prompt-tabs" });
+  ["text", "structured"].forEach(function (m) {
+    var btn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn" + (mode === m ? " is-on" : ""),
+      text: m === "text" ? "Text" : "Structured",
+      "data-testid": "shelf-prompt-mode-" + m,
+    });
+    btn.setAttribute("aria-pressed", mode === m ? "true" : "false");
+    btn.addEventListener("click", function () {
+      state.playground._promptMode = m;
+      _refreshShelfSection(state, context, actions);
+    });
+    tabs.appendChild(btn);
+  });
+  wrap.appendChild(tabs);
+  if (mode === "structured") {
+    var parts = _shelfStructuredParts(state, value);
+    _storeStructuredParts(state, parts);
+    var box = el("div", { "data-testid": "shelf-prompt-structured" });
+    [["subject", "Subject"], ["style", "Style"], ["details", "Details"], ["composition", "Composition"]].forEach(function (pair) {
+      var key = pair[0];
+      var label = pair[1];
+      var input = el("input", {
+        type: "text",
+        class: "comfymodal-input comfymodal-studio-text-input",
+        value: parts[key] || "",
+        placeholder: label,
+        "data-testid": "shelf-prompt-structured-" + key,
+        "aria-label": label,
+      });
+      input.addEventListener("input", function () {
+        parts[key] = input.value;
+        _storeStructuredParts(state, parts);
+        preview.textContent = _shelfComposeStructured(parts) || "Structured prompt preview appears here.";
+        commitShelfValue(state, context, actions, role, _shelfComposeStructured(parts));
+      });
+      box.appendChild(el("label", { text: label, style: "font-size:11px;color:#888;" }, [input]));
+    });
+    var preview = el("p", {
+      class: "comfymodal-studio-control-note",
+      text: _shelfComposeStructured(parts) || "Structured prompt preview appears here.",
+      "data-testid": "shelf-prompt-structured-preview",
+    });
+    box.appendChild(preview);
+    wrap.appendChild(box);
+    return wrap;
+  }
+  wrap.appendChild(_shelfRenderInput(role, entry, value, function (next) {
+    // A manual Text edit supersedes the structured field breakdown — drop
+    // the stored parts so the next Structured open derives from this text.
+    try {
+      var pg = state && state.playground;
+      if (pg && pg._structuredPromptParts) delete pg._structuredPromptParts[_structuredDraftKey(state)];
+    } catch (_e) { /* draft clearing is best-effort */ }
+    commitShelfValue(state, context, actions, role, next);
+  }));
+  return wrap;
 }
 
 function _shelfMoveBefore(state, context, actions, dragged, before, targetRow) {
@@ -5292,6 +6950,7 @@ function _shelfMoveBefore(state, context, actions, dragged, before, targetRow) {
   if (at === -1) order.push(dragged);
   else order.splice(at, 0, dragged);
   layout.order = order;
+  layout.advanced = layout.advanced.filter(function (r) { return r !== dragged; });
   if (targetRow != null && Number.isFinite(Number(targetRow))) {
     layout.rows[dragged] = Number(targetRow);
     if (Number(targetRow) > layout.maxRow) layout.maxRow = Number(targetRow);
@@ -5310,6 +6969,7 @@ function _shelfMoveAfter(state, context, actions, dragged, after, targetRow) {
   if (at === -1) order.push(dragged);
   else order.splice(at + 1, 0, dragged);
   layout.order = order;
+  layout.advanced = layout.advanced.filter(function (r) { return r !== dragged; });
   if (targetRow != null && Number.isFinite(Number(targetRow))) {
     layout.rows[dragged] = Number(targetRow);
   }
@@ -5334,8 +6994,41 @@ function _shelfMoveToRow(state, context, actions, dragged, anchor, position) {
   if (position === "before") order.splice(anchorIndex, 0, dragged);
   else order.splice(anchorIndex + 1, 0, dragged);
   layout.order = order;
+  layout.advanced = layout.advanced.filter(function (r) { return r !== dragged; });
   layout.rows[dragged] = newRow;
   layout.maxRow += 1;
+  _shelfPersistLayout(layout);
+  _refreshShelfSection(state, context, actions);
+}
+
+function _shelfMoveIntoRow(state, context, actions, dragged, anchor) {
+  var entries = _shelfEntries(state);
+  var promptRole = _shelfPromptRole(entries);
+  if (!dragged || !anchor || dragged === anchor || dragged === promptRole || anchor === promptRole) return;
+  var layout = _shelfLayoutFor(entries, promptRole);
+  var order = layout.order.filter(function (r) { return r !== dragged; });
+  var anchorIndex = order.indexOf(anchor);
+  if (anchorIndex === -1) return;
+  order.splice(anchorIndex + 1, 0, dragged);
+  layout.order = order;
+  layout.rows[dragged] = Number(layout.rows[anchor]);
+  layout.advanced = layout.advanced.filter(function (r) { return r !== dragged; });
+  _shelfPersistLayout(layout);
+  _refreshShelfSection(state, context, actions);
+}
+
+function _shelfMoveToAdvanced(state, context, actions, dragged, anchor, position) {
+  var entries = _shelfEntries(state);
+  var promptRole = _shelfPromptRole(entries);
+  if (!dragged || dragged === promptRole) return;
+  var layout = _shelfLayoutFor(entries, promptRole);
+  layout.advanced = layout.advanced.filter(function (r) { return r !== dragged; });
+  var at = anchor ? layout.advanced.indexOf(anchor) : -1;
+  if (at === -1) {
+    layout.advanced.push(dragged);
+  } else {
+    layout.advanced.splice(position === "before" ? at : at + 1, 0, dragged);
+  }
   _shelfPersistLayout(layout);
   _refreshShelfSection(state, context, actions);
 }
@@ -5425,6 +7118,12 @@ function _populateShelfSection(section, state, context, actions) {
     fieldsBox.appendChild(rowEl);
   });
   section.appendChild(fieldsBox);
+
+  var skipOption = null;
+  try {
+    skipOption = _renderSkipTextGenerateOption(state, context, actions);
+  } catch (_e) { skipOption = null; }
+  if (skipOption) section.appendChild(skipOption);
 
   if (layout.advanced.length) {
     var advWrap = el("div", { class: "comfymodal-studio-shelf-advanced-wrap" });
@@ -5531,6 +7230,7 @@ function _openShelfPickerDialog(state, context, actions) {
   dialog.appendChild(renderWorkflowPicker({
     apiBase: apiBase,
     mode: "single",
+    workflowType: activeToolOf(state),
     selectedIds: currentId ? [currentId] : [],
     confirmLabel: "Use workflow",
     onConfirm: function (ids) {
@@ -5666,6 +7366,9 @@ async function _performShelfSwitch(state, context, actions, nextId, reuse) {
       workflowVersionId: store.workflowVersionId,
       workflowName: store.workflowName || "",
     });
+    _rememberSelection(state);
+    _syncActiveToolToSelection(state);
+    _chainCurrentImageToSource(state, context, actions);
   }
   // Old output stays visible but stale until a new run completes.
   if (hadOutput) pg._shelfStaleOutput = true;

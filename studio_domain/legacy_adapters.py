@@ -22,7 +22,7 @@ Role mapping (old → canonical):
     unet            → model_unet
 
 Already-canonical keys pass through unchanged: prompt, seed, step_count,
-cfg_scale, sampler, model_unet, vae, clip.
+cfg_scale, sampler, width, height, model_unet, vae, clip.
 
 Any other key is UNKNOWN: it passes through VERBATIM (same value, never
 dropped, never invented) and is reported visibly via ``unmapped_roles``.
@@ -86,6 +86,8 @@ CANONICAL_KEYS: frozenset[str] = frozenset({
     "step_count",
     "cfg_scale",
     "sampler",
+    "width",
+    "height",
     "model_unet",
     "vae",
     "clip",

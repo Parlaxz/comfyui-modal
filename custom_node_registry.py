@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -156,6 +157,35 @@ class CustomNodeDiscovery:
         except Exception:
             return None
 
+    @staticmethod
+    def _probe_entry(entry: Path) -> CustomNodeRecord | None:
+        """Git-probe one candidate directory; ``None`` when it must be skipped.
+
+        Pure function of *entry* (only static/class git helpers): safe to run
+        on worker threads.  Never raises — mirrors the sequential walk's
+        per-entry ``except Exception: continue``.
+        """
+        try:
+            return CustomNodeRecord(
+                name=entry.name,
+                install_path=str(entry),
+                repo_url=CustomNodeDiscovery._own_git_remote(entry),
+                installed_commit=CustomNodeDiscovery._git(entry, ["rev-parse", "HEAD"]),
+                updated_at=_now_iso(),
+            )
+        except Exception:
+            return None
+
+    def _probe_entries(
+        self, candidates: list[Path]
+    ) -> list[CustomNodeRecord | None]:
+        """Probe candidate directories concurrently, preserving entry order."""
+        if not candidates:
+            return []
+        workers = min(16, len(candidates))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(CustomNodeDiscovery._probe_entry, candidates))
+
     def discover(
         self,
         comfyui_root: str | Path,
@@ -179,6 +209,7 @@ class CustomNodeDiscovery:
                 entries = sorted(custom_nodes_dir.iterdir())
             except Exception:
                 entries = []
+            candidates: list[Path] = []
             for entry in entries:
                 try:
                     if not entry.is_dir():
@@ -191,17 +222,20 @@ class CustomNodeDiscovery:
                     has_python = any(p.suffix == ".py" for p in entry.iterdir())
                     if not has_python:
                         continue
-                    record = CustomNodeRecord(
-                        name=name,
-                        install_path=str(entry),
-                        repo_url=self._own_git_remote(entry),
-                        installed_commit=self._git(entry, ["rev-parse", "HEAD"]),
-                        updated_at=_now_iso(),
-                    )
-                    records.append(record)
-                    by_path[entry.resolve()] = record
+                    candidates.append(entry)
                 except Exception:
                     continue
+            # Git probing is one subprocess spawn per query (~dozens of ms on
+            # Windows) times several queries per directory; sequential probing
+            # dominated cold discovery (~2s). Probes are independent, so run
+            # them concurrently and collect in entry order — output (order,
+            # content, failure skips) is identical to the sequential walk.
+            probed = self._probe_entries(candidates)
+            for entry, record in zip(candidates, probed):
+                if record is None:
+                    continue
+                records.append(record)
+                by_path[entry.resolve()] = record
 
         core_classes: set[str] = set()
         try:

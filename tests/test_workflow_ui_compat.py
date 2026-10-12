@@ -84,6 +84,63 @@ def test_ui_refresh_preserves_aliases_and_refreshes_stale_metadata():
     assert refreshed["mapping"]["output_node_id"] == "213"
 
 
+@pytest.mark.parametrize(
+    ("schema_role", "request_role"),
+    [("positive_prompt", "prompt"), ("prompt", "positive_prompt")],
+)
+def test_prompt_role_alias_applies_against_schema(schema_role, request_role):
+    schema = {
+        schema_role: {
+            "semantic_role": schema_role,
+            "node_id": "1",
+            "input_name": "prompt",
+            "required": True,
+        },
+    }
+    prompt = {"1": {"class_type": "PromptNode", "inputs": {"prompt": "old"}}}
+
+    assert swr.validate_workflow_controls({request_role: "new"}, schema) == []
+    merged = swr.merge_workflow_controls({}, {request_role: "new"}, schema)
+    assert merged["errors"] == []
+    applied = swr.apply_workflow_values_to_prompt(
+        prompt, schema, {request_role: "new"},
+    )
+    assert applied["workflow"]["1"]["inputs"]["prompt"] == "new"
+
+
+def test_ui_refresh_fills_stored_prompt_alias_from_fresh_positive_candidate():
+    stored = [{
+        "semantic_role": "prompt",
+        "node_id": "",
+        "input_name": "",
+        "control_kind": "multiline",
+    }]
+    fresh = {
+        "positive_prompt": _entry(
+            "positive_prompt", "1", "prompt", control_kind="multiline",
+        ),
+    }
+    regenerated = {
+        "1": {"class_type": "PromptNode", "inputs": {"prompt": "old"}},
+    }
+    bundle = {
+        "version": {"graph_json": {"nodes": [{"id": 1}]}},
+        "mapping": {"entries": stored, "output_node_id": ""},
+        "executable_prompt": {},
+        "control_schema": {},
+        "defaults": {},
+    }
+    with patch("studio_domain.graph.ui_graph_to_api_prompt", return_value=regenerated), \
+         patch("studio_domain.graph.derive_mapping_candidates", return_value=(fresh, "")):
+        refreshed = swr._refresh_ui_workflow_bundle(bundle)
+
+    assert refreshed["mapping"]["entries"] == [{
+        **fresh["positive_prompt"].to_dict(),
+        "semantic_role": "prompt",
+    }]
+    assert refreshed["control_schema"]["prompt"]["input_name"] == "prompt"
+
+
 def test_ui_refresh_preserves_stored_output_node_when_regenerated_graph_contains_it():
     regenerated = {
         "6": {"class_type": "SaveImage", "inputs": {}},

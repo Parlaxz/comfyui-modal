@@ -387,6 +387,7 @@ function _deepCloneObject(obj) {
 const SHELF_LAYOUT_KEY = "comfymodal.studio.shelf.layout.v1";
 const SHELF_VALUES_KEY = "comfymodal.studio.shelf.values.v1";
 const SHELF_EXPERIMENT_DRAFT_KEY = "comfymodal.studio.shelf.experiment.v1";
+const SKIP_TEXT_GENERATE_KEY = "comfymodal.studio.playground.skip-text-generate.v1";
 
 function _shelfValuesKey(workflowId, versionId) {
   return `${workflowId || ""}::${versionId || ""}`;
@@ -505,6 +506,46 @@ export function clearShelfValues(workflowId, versionId) {
 }
 
 /**
+ * Load the persisted TextGenerate-skip toggle for a workflow+version.
+ * @param {string} workflowId
+ * @param {string} versionId
+ * @returns {boolean} false when nothing saved
+ */
+export function loadSkipTextGenerate(workflowId, versionId) {
+  if (!workflowId) return false;
+  try {
+    if (typeof localStorage === "undefined") return false;
+    const raw = localStorage.getItem(SKIP_TEXT_GENERATE_KEY);
+    if (!raw) return false;
+    const all = JSON.parse(raw);
+    if (!all || typeof all !== "object") return false;
+    return all[_shelfValuesKey(workflowId, versionId)] === true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Persist the TextGenerate-skip toggle for a workflow+version.
+ * @param {string} workflowId
+ * @param {string} versionId
+ * @param {boolean} value
+ */
+export function saveSkipTextGenerate(workflowId, versionId, value) {
+  if (!workflowId) return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    const raw = localStorage.getItem(SKIP_TEXT_GENERATE_KEY);
+    const all = raw ? JSON.parse(raw) : {};
+    const store = all && typeof all === "object" ? all : {};
+    store[_shelfValuesKey(workflowId, versionId)] = value === true;
+    localStorage.setItem(SKIP_TEXT_GENERATE_KEY, JSON.stringify(store));
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
  * Load the local Shelf experiment draft (experiment-only state).
  * Never touches the durable values/layout lane.
  * @returns {{workflowIds: string[], axes: object, uniqueValues: object}|null}
@@ -576,6 +617,114 @@ export function clearShelfExperimentDraft() {
 
 const WORKFLOW_SELECTION_STORAGE_KEY = "comfymodal.studio.playground.workflow.v1";
 const WORKFLOW_HANDOFF_STORAGE_KEY = "comfymodal.studio.playground.workflow-handoff.v1";
+const TOOL_WORKFLOWS_STORAGE_KEY = "comfymodal.studio.playground.tool-workflows.v1";
+const TOOL_DEFAULTS_STORAGE_KEY = "comfymodal.studio.playground.tool-defaults.v1";
+
+function _readJsonMap(key) {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") return parsed;
+      }
+    }
+  } catch (e) { /* fall through to session fallback */ }
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      const raw = sessionStorage.getItem(key);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") return parsed;
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return {};
+}
+
+function _writeJsonMap(key, map) {
+  const clean = map && typeof map === "object" ? map : {};
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(key, JSON.stringify(clean));
+    }
+  } catch (e) { /* quota/unavailable — silently ignore */ }
+}
+
+/**
+ * Load the remembered last-selected workflow per tool.
+ * Durable in localStorage so it survives refresh; older sessionStorage
+ * values migrate forward on first read.
+ * @returns {object} { [toolId]: workflowId }
+ */
+export function loadToolWorkflows() {
+  return _readJsonMap(TOOL_WORKFLOWS_STORAGE_KEY);
+}
+
+/**
+ * Persist the remembered last-selected workflow per tool.
+ * @param {object} map { [toolId]: workflowId }
+ */
+export function saveToolWorkflows(map) {
+  _writeJsonMap(TOOL_WORKFLOWS_STORAGE_KEY, map);
+}
+
+/**
+ * Load the explicit default workflow per tool (marked in Workflows tab).
+ * @returns {object} { [toolId]: workflowId }
+ */
+export function loadToolDefaults() {
+  return _readJsonMap(TOOL_DEFAULTS_STORAGE_KEY);
+}
+
+/**
+ * Load the explicit default workflow id for one tool.
+ * @param {string} toolId
+ * @returns {string} workflow id or ""
+ */
+export function loadToolDefault(toolId) {
+  if (!toolId) return "";
+  const id = _readJsonMap(TOOL_DEFAULTS_STORAGE_KEY)[String(toolId)];
+  return typeof id === "string" && id ? id : "";
+}
+
+/**
+ * Mark (or replace) the explicit default workflow for one tool.
+ * @param {string} toolId
+ * @param {string} workflowId
+ */
+export function saveToolDefault(toolId, workflowId) {
+  if (!toolId || !workflowId) return;
+  const all = _readJsonMap(TOOL_DEFAULTS_STORAGE_KEY);
+  all[String(toolId)] = String(workflowId);
+  _writeJsonMap(TOOL_DEFAULTS_STORAGE_KEY, all);
+}
+
+/**
+ * Clear the explicit default for one tool, or drop references to a deleted
+ * workflow id across all tools when toolId is empty.
+ * @param {string} toolId
+ * @param {string} workflowId
+ */
+export function clearToolDefault(toolId, workflowId) {
+  const all = _readJsonMap(TOOL_DEFAULTS_STORAGE_KEY);
+  if (!toolId && !workflowId) return;
+  if (!toolId && workflowId) {
+    let changed = false;
+    Object.keys(all).forEach((tool) => {
+      if (String(all[tool]) === String(workflowId)) {
+        delete all[tool];
+        changed = true;
+      }
+    });
+    if (changed) _writeJsonMap(TOOL_DEFAULTS_STORAGE_KEY, all);
+    return;
+  }
+  if (toolId && Object.prototype.hasOwnProperty.call(all, String(toolId))) {
+    delete all[String(toolId)];
+    _writeJsonMap(TOOL_DEFAULTS_STORAGE_KEY, all);
+  }
+}
 
 /**
  * Normalize a raw selection/handoff object into the canonical string-field

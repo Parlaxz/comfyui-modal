@@ -125,6 +125,45 @@ class WorkflowDomainTestCase(unittest.TestCase):
             "output_node_id": output_node_id,
         }
 
+    def test_prompt_input_derives_positive_prompt_candidate(self):
+        capture = make_capture({
+            "1": {
+                "class_type": "CustomPromptNode",
+                "inputs": {"prompt": "a landscape"},
+            },
+        })
+
+        def node_def(class_type: str):
+            if class_type == "CustomPromptNode":
+                return ({"prompt": ("STRING", {"multiline": True})}, {})
+            return None
+
+        entries, _ = derive_mapping_candidates(capture, node_def_provider=node_def)
+
+        assert entries["positive_prompt"].node_id == "1"
+        assert entries["positive_prompt"].input_name == "prompt"
+
+    def test_negative_prompt_candidate_is_not_required(self):
+        capture = make_capture({
+            "1": {
+                "class_type": "CustomPromptNode",
+                "inputs": {"prompt": "a landscape", "negative_prompt": ""},
+            },
+        })
+
+        def node_def(class_type: str):
+            if class_type == "CustomPromptNode":
+                return ({"prompt": ("STRING", {"multiline": True}),
+                         "negative_prompt": ("STRING", {"multiline": True})}, {})
+            return None
+
+        entries, _ = derive_mapping_candidates(capture, node_def_provider=node_def)
+
+        assert entries["positive_prompt"].required is True
+        assert entries["negative_prompt"].node_id == "1"
+        assert entries["negative_prompt"].input_name == "negative_prompt"
+        assert entries["negative_prompt"].required is False
+
     def full_mapping_dict(self, prompt: dict | None = None) -> dict:
         return self.mapping_from_capture(make_capture(prompt or txt2img_prompt()))
 
@@ -615,6 +654,36 @@ class BindingResolutionTests(WorkflowDomainTestCase):
         self.assertIn("204", message)
         # Points at the fix, not just the failure.
         self.assertIn("163", message)
+        # Nothing persisted.
+        self.assertIsNone(
+            self.service.store.get_mapping_for_version(version["workflow_version_id"])
+        )
+
+    def test_set_mapping_rejects_node_output_binding_for_input_role(self):
+        # Regression: a prompt row captured from a node *output* (empty
+        # input_name, kind node_output) passed save-time validation and
+        # failed every run with "mapped control 'prompt' has no node/input
+        # binding". Mapping entries bind values INTO inputs; outputs are
+        # never valid here.
+        wf = self.create_workflow()
+        version = self.create_version(wf["workflow_id"], linked_seed_prompt())
+        bad = {
+            "prompt": {
+                "semantic_role": "prompt",
+                "node_id": "204",
+                "input_name": "",
+                "kind": "node_output",
+                "control_kind": "multiline",
+                "display_name": "Prompt",
+            }
+        }
+        with self.assertRaises(WorkflowDomainValidationError) as ctx:
+            self.service.set_mapping(
+                version["workflow_version_id"], entries=bad, output_node_id="199"
+            )
+        message = str(ctx.exception)
+        self.assertIn("'prompt'", message)
+        self.assertIn("node output", message)
         # Nothing persisted.
         self.assertIsNone(
             self.service.store.get_mapping_for_version(version["workflow_version_id"])

@@ -944,8 +944,8 @@ export function createZoomableImageEl(imageUrl, alt, opts) {
 // ONE record contract (see buildSharedViewerOverlay) with one zoom stage,
 // one card/accordion vocabulary, and one timing flow.
 
-var _VIEWER_PARAM_ORDER = ["seed", "steps", "cfg", "guidance", "sampler", "scheduler", "denoise", "width", "height"];
-var _VIEWER_PARAM_SKIP = ["prompt", "negative_prompt", "negativePrompt"];
+var _VIEWER_PARAM_ORDER = ["seed", "steps", "cfg", "guidance", "sampler", "scheduler", "denoise", "resolution"];
+var _VIEWER_PARAM_SKIP = ["prompt", "negative_prompt", "negativePrompt", "width", "height"];
 
 export function viewerValueText(v) {
   if (v == null || v === "") return "";
@@ -971,6 +971,109 @@ export function viewerDurationText(v) {
   return _timingDuration(n);
 }
 
+// Single "Resolution" field derived from width x height (or a precomposed
+// resolution value). Width/height never render as separate params — they
+// fold into this one viewer-content field alongside preview, file size,
+// model used, and workflow used.
+export function viewerResolutionText(source, record) {
+  function num(v) {
+    if (v == null || v === "") return null;
+    var n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  function pairText(w, h) {
+    if (w != null && h != null) return w + " \u00d7 " + h;
+    if (w != null) return String(w);
+    if (h != null) return String(h);
+    return "";
+  }
+  var s = source && typeof source === "object" ? source : {};
+  var r = record && typeof record === "object" ? record : {};
+  // Precomposed resolution wins when it is a non-empty string.
+  var pre = [s.resolution, s.dimensions, r.resolution, r.dimensions];
+  for (var i = 0; i < pre.length; i++) {
+    var v = pre[i];
+    if (typeof v === "string" && v.trim() !== "") return v.trim();
+    if (Array.isArray(v) && v.length >= 2) {
+      var aw = num(v[0]);
+      var ah = num(v[1]);
+      var at = pairText(aw, ah);
+      if (at) return at;
+    } else if (v && typeof v === "object") {
+      var ow = num(v.width != null ? v.width : v.w);
+      var oh = num(v.height != null ? v.height : v.h);
+      var ot = pairText(ow, oh);
+      if (ot) return ot;
+    }
+  }
+  var w = num(s.width != null && s.width !== "" ? s.width : r.width);
+  var h = num(s.height != null && s.height !== "" ? s.height : r.height);
+  if (w == null && r.raw && typeof r.raw === "object") {
+    if (w == null) w = num(r.raw.width);
+    if (h == null) h = num(r.raw.height);
+  }
+  // Snapshot-less fallback: asset-measured dimensions projected on the
+  // featured output / outputs (always available when an image exists).
+  // Params still win — this only fills what the snapshot did not provide.
+  if (w == null || h == null) {
+    var feat = r.featuredOutput && typeof r.featuredOutput === "object" ? r.featuredOutput : {};
+    if (w == null) w = num(feat.width);
+    if (h == null) h = num(feat.height);
+    var outs = Array.isArray(r.outputs) ? r.outputs : [];
+    for (var k = 0; k < outs.length; k++) {
+      var o = outs[k] || {};
+      if (w == null) w = num(o.width);
+      if (h == null) h = num(o.height);
+      if (w != null && h != null) break;
+    }
+  }
+  return pairText(w, h);
+}
+
+// Human-readable file size ("1.2 MB"). Returns "" when unknown so callers
+// omit the row instead of fabricating a value.
+export function viewerFileSizeText(bytes) {
+  if (bytes == null || bytes === "") return "";
+  var n = Number(bytes);
+  if (!Number.isFinite(n) || n < 0) return "";
+  if (n < 1024) return n + " B";
+  var units = ["KB", "MB", "GB", "TB"];
+  var u = -1;
+  var f = n;
+  while (f >= 1024 && u < units.length - 1) { f /= 1024; u += 1; }
+  var rounded = f >= 100 ? Math.round(f) : Math.round(f * 10) / 10;
+  return rounded + " " + units[u];
+}
+
+// First known file-size value on a viewer record (or its outputs), else "".
+// Checks every shape a size can arrive in without inventing one.
+export function viewerFileSizeValue(record) {
+  var rec = record && typeof record === "object" ? record : {};
+  var candidates = [
+    rec.fileSize, rec.file_size, rec.fileSizeBytes, rec.file_size_bytes,
+    rec.byteCount, rec.byte_count, rec.byteSize, rec.byte_size,
+    rec.bytes, rec.size, rec.sizeBytes, rec.size_bytes,
+  ];
+  var feat = rec.featuredOutput && typeof rec.featuredOutput === "object" ? rec.featuredOutput : {};
+  candidates.push(
+    feat.fileSize, feat.file_size, feat.byteCount, feat.byte_count,
+    feat.byteSize, feat.byte_size, feat.bytes, feat.size,
+  );
+  var outs = Array.isArray(rec.outputs) ? rec.outputs : [];
+  for (var i = 0; i < outs.length; i++) {
+    var o = outs[i] || {};
+    candidates.push(o.fileSize, o.file_size, o.byteCount, o.byte_count, o.byte_size, o.bytes, o.size);
+  }
+  for (var j = 0; j < candidates.length; j++) {
+    var v = candidates[j];
+    if (v != null && v !== "") {
+      var n = Number(v);
+      if (Number.isFinite(n) && n >= 0) return n;
+    }
+  }
+  return "";
+}
+
 // Merge every shape a run record can carry controls in: normalized
 // requested/resolved controls, raw/extra controls, params, and flat
 // top-level seed/steps/etc fields the feed normalizer may leave out.
@@ -988,10 +1091,25 @@ export function viewerMergedParams(record) {
     }
   });
   ["seed", "steps", "cfg", "guidance", "sampler", "scheduler", "denoise", "width", "height",
+    "resolution", "dimensions",
     "prompt", "negative_prompt", "negativePrompt"].forEach(function (key) {
     if ((merged[key] == null || merged[key] === "") && r[key] != null && r[key] !== "") merged[key] = r[key];
     if ((merged[key] == null || merged[key] === "") && raw[key] != null && raw[key] !== "") merged[key] = raw[key];
     if ((merged[key] == null || merged[key] === "") && extra[key] != null && extra[key] !== "") merged[key] = extra[key];
+  });
+  // Embedded-file recovery (PNG prompt JSON on detail outputs): lowest
+  // priority — every source above wins per key, so snapshot and control
+  // values are never overridden by file-derived ones.
+  var embeddedSources = [];
+  var featOut = r.featuredOutput && typeof r.featuredOutput === "object" ? r.featuredOutput : {};
+  [featOut].concat(Array.isArray(r.outputs) ? r.outputs : []).forEach(function (o) {
+    var ep = o && typeof o === "object" ? (o.embeddedParams || o.embedded_params) : null;
+    if (ep && typeof ep === "object" && !Array.isArray(ep)) embeddedSources.push(ep);
+  });
+  embeddedSources.forEach(function (source) {
+    Object.keys(source).forEach(function (k) {
+      if (merged[k] == null || merged[k] === "") merged[k] = source[k];
+    });
   });
   return merged;
 }
@@ -1040,10 +1158,20 @@ export function buildViewerPromptAccordion(prompt, negative) {
 
 // Parameter grid.  The container (with its testid) always renders —
 // prompts live in the accordion above, so they are skipped here.
-export function buildViewerParamsGrid(params, testid) {
+export function buildViewerParamsGrid(params, testid, record) {
   var source = params && typeof params === "object" ? params : {};
   var items = [];
   _VIEWER_PARAM_ORDER.forEach(function (key) {
+    if (key === "resolution") {
+      var text = viewerResolutionText(source, record);
+      if (text) {
+        items.push(el("div", { class: "comfymodal-studio-viewer-param" }, [
+          el("span", { class: "comfymodal-studio-viewer-param-key", text: "resolution" }),
+          el("strong", { class: "comfymodal-studio-viewer-param-value", text: text }),
+        ]));
+      }
+      return;
+    }
     if (source[key] != null && source[key] !== "") {
       items.push(el("div", { class: "comfymodal-studio-viewer-param" }, [
         el("span", { class: "comfymodal-studio-viewer-param-key", text: key }),
@@ -1176,10 +1304,14 @@ export function buildViewerShell(opts = {}) {
   });
   // A record produces the full shared composition (Run / Run Data /
   // Metadata + timing); without one the shell mounts a bare body.
+  // `variant` is data (the displayed image's Preview/Original/Thumbnail
+  // label from the shared asset policy), not cosmetic: it renders the
+  // always-visible Variant row so the viewer answers "is this a preview?".
   content.appendChild(opts.record ? buildSharedViewerOverlay({
     record: opts.record,
     imageUrl: opts.imageUrl,
     timing: opts.timing,
+    variant: opts.variant,
     persistence: opts.persistence,
   }) : buildViewerBody(opts));
   overlay.appendChild(content);
@@ -1190,6 +1322,7 @@ export function buildViewerShell(opts = {}) {
       record: record,
       imageUrl: extra.imageUrl != null ? extra.imageUrl : opts.imageUrl,
       timing: extra.timing != null ? extra.timing : opts.timing,
+      variant: extra.variant != null ? extra.variant : opts.variant,
       persistence: opts.persistence,
     };
     while (content.firstChild) content.removeChild(content.firstChild);
@@ -1208,8 +1341,10 @@ export function buildViewerShell(opts = {}) {
 }
 
 // The one viewer composition used by every full-size output surface.
-// Callers pass DATA only: an already-resolved record plus imageUrl/timing
-// and an optional behavioral `persistence` adapter
+// Callers pass DATA only: an already-resolved record plus imageUrl/timing,
+// an optional `variant` label (the displayed image's Preview/Original/
+// Thumbnail kind from the shared asset policy), and an optional behavioral
+// `persistence` adapter
 // ({ setFavorite(record, next), setNote(record, text), onChanged() }).
 // The fav star, note editor, params grid, and timing section are fixed here —
 // there are no cosmetic opts — so no surface can drift apart from another.
@@ -1217,7 +1352,10 @@ export function buildViewerShell(opts = {}) {
 // Record contract (neutral — no surface's vocabulary): { status, startedAt,
 // completedAt, durationMs, runId, id, workflow, workflowVersion, prompt,
 // negativePrompt, controls, models[], tags[], favorite, note,
-// fullRenderFailed, timing }.
+// resolution/width/height, file size aliases, fullRenderFailed, timing }.
+// Viewer-content fields: preview (zoom stage imageUrl), variant (Preview vs
+// Original vs Thumbnail), resolution (single "W x H" field), file size,
+// model used (Models), workflow used (Workflow).
 function _viewerPersistence(opts) {
   var p = (opts && opts.persistence) || {};
   return {
@@ -1258,12 +1396,14 @@ export function buildViewerFavoriteStar(record, persistence) {
 }
 
 // Note editor for the viewer's Metadata accordion: Save/Cancel plus an
-// Unsaved-changes affordance, with viewer-* testids.
+// Unsaved-changes affordance, with viewer-* testids. Deliberately NOT a
+// nested card — a flat section sharing the card background, so it reads as
+// part of Metadata instead of a box-in-a-box.
 export function buildViewerNoteEditor(record, persistence) {
   var rec = record || {};
   var persist = persistence || { setNote: async function () {}, onChanged: null };
   var sec = el("div", {
-    class: "comfymodal-studio-viewer-card",
+    class: "comfymodal-studio-viewer-note-flat",
     "data-testid": "viewer-note-editor",
   }, [
     el("div", { class: "comfymodal-studio-viewer-card-title", text: "Note" }),
@@ -1324,6 +1464,130 @@ export function buildViewerNoteEditor(record, persistence) {
   return sec;
 }
 
+// Lineage rows for the viewer's Metadata: where this image came from —
+// generation/run identity, each attempt's mode + status, and whether the
+// immutable request snapshot was saved. Flat rows (no sub-card). Returns an
+// array (possibly empty); the caller filters/appends.
+export function viewerSnapshotText(record) {
+  var rec = record || {};
+  if (rec.replayCapable == null) return "";
+  if (rec.replayCapable) return "saved";
+  var reason = viewerFirst(rec.replayReason, rec.replay_unavailable_reason);
+  if (/missing_request_snapshot/.test(reason)) return "not saved for this run";
+  return reason ? "unavailable (" + reason + ")" : "unavailable";
+}
+
+export function buildViewerLineageRows(record) {
+  var rec = record || {};
+  var rows = [];
+  function row(key, value) {
+    if (value == null || value === "") return;
+    rows.push(el("div", { class: "comfymodal-studio-viewer-row" }, [
+      el("span", { class: "comfymodal-studio-viewer-row-key", text: key }),
+      el("span", { class: "comfymodal-studio-viewer-row-value", text: String(value) }),
+    ]));
+  }
+  if (rec.id) row("Generation", rec.id);
+  if (rec.runId && rec.runId !== rec.id) row("Run", rec.runId);
+  var attempts = Array.isArray(rec.attempts) ? rec.attempts : [];
+  attempts.forEach(function (a, i) {
+    var mode = (a && a.mode) || "run";
+    var status = (a && a.status) || "";
+    row(attempts.length > 1 ? "Attempt " + (i + 1) : "Attempt",
+      status ? mode + " \u00b7 " + status : mode);
+  });
+  var snap = viewerSnapshotText(rec);
+  if (snap) row("Request snapshot", snap);
+  return rows;
+}
+
+// Clipboard write with a non-Clipboard-API fallback (older contexts).
+function _copyTextToClipboard(text, done) {
+  if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+    return;
+  }
+  try {
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = document.execCommand("copy");
+    if (ta.parentNode) ta.parentNode.removeChild(ta);
+    done(!!ok);
+  } catch (err) {
+    done(false);
+  }
+}
+
+// File row for the viewer's Metadata: stored filename plus an Open-file
+// action (opens the displayed image URL) and a copy-path action (copies the
+// managed path / remote URI). Flat row, no card. Returns null when neither
+// a filename nor a path is known.
+export function buildViewerFileRow(record, imageUrl) {
+  var rec = record || {};
+  var outs = Array.isArray(rec.outputs) ? rec.outputs : [];
+  var feat = rec.featuredOutput && typeof rec.featuredOutput === "object" ? rec.featuredOutput : {};
+  function first(key) {
+    var keys = Array.isArray(key) ? key : [key];
+    var sources = [feat].concat(outs);
+    for (var i = 0; i < sources.length; i++) {
+      var o = sources[i] || {};
+      for (var j = 0; j < keys.length; j++) {
+        var v = o[keys[j]];
+        if (v != null && v !== "") return String(v);
+      }
+    }
+    return "";
+  }
+  var filename = first("filename");
+  var path = first("path");
+  if (!filename && !path) return null;
+  var valueWrap = el("span", { class: "comfymodal-studio-viewer-row-value comfymodal-studio-viewer-file-value" });
+  valueWrap.appendChild(el("span", {
+    class: "comfymodal-studio-viewer-file-name",
+    text: filename || path,
+    title: path || filename,
+  }));
+  if (imageUrl) {
+    valueWrap.appendChild(el("a", {
+      class: "comfymodal-secondary-btn comfymodal-studio-viewer-file-btn",
+      href: imageUrl,
+      target: "_blank",
+      rel: "noopener",
+      "data-testid": "viewer-file-open",
+      text: "Open file",
+    }));
+  }
+  if (path) {
+    var copyBtn = el("button", {
+      class: "comfymodal-secondary-btn comfymodal-studio-viewer-file-btn",
+      type: "button",
+      "data-testid": "viewer-file-copy-path",
+      text: "Copy path",
+      title: "Copy the file path",
+    });
+    copyBtn.addEventListener("click", function () {
+      copyBtn.disabled = true;
+      _copyTextToClipboard(path, function (ok) {
+        copyBtn.textContent = ok ? "Copied" : "Copy failed";
+        setTimeout(function () {
+          copyBtn.disabled = false;
+          copyBtn.textContent = "Copy path";
+        }, 1200);
+      });
+    });
+    valueWrap.appendChild(copyBtn);
+  }
+  return el("div", { class: "comfymodal-studio-viewer-row" }, [
+    el("span", { class: "comfymodal-studio-viewer-row-key", text: "File" }),
+    valueWrap,
+  ]);
+}
+
 export function buildSharedViewerOverlay(opts = {}) {
   var record = opts.record || {};
   var persistence = _viewerPersistence(opts);
@@ -1341,15 +1605,22 @@ export function buildSharedViewerOverlay(opts = {}) {
     buildViewerCard("Run", [el("div", { class: "comfymodal-studio-viewer-run-line" }, runLine)]),
     buildViewerCard("Run Data", [
       buildViewerPromptAccordion(prompt, negative),
-      buildViewerParamsGrid(params, "preview-parameters"),
+      buildViewerParamsGrid(params, "preview-parameters", record),
     ]),
   ];
   var metaRows = [
     ["Run ID", record.runId || record.id],
-    ["Started", record.startedAt],
-    ["Completed", record.completedAt],
+    ["Variant", viewerFirst(opts.variant, "")],
+    ["Started", viewerDateText(record.startedAt)],
+    ["Completed", viewerDateText(record.completedAt)],
     ["Workflow", viewerFirst(record.workflow, record.preset)],
     ["Version", record.workflowVersion],
+    ["Resolution", viewerResolutionText(params, record)],
+    ["File size", viewerFileSizeText(viewerFileSizeValue(record))],
+    ["Format", viewerFirst(
+      record.featuredOutput && record.featuredOutput.format,
+      Array.isArray(record.outputs) && record.outputs[0] ? record.outputs[0].format : ""
+    )],
   ].map(function (pair) {
     var text = viewerValueText(pair[1]);
     return text ? el("div", { class: "comfymodal-studio-viewer-row" }, [
@@ -1357,6 +1628,8 @@ export function buildSharedViewerOverlay(opts = {}) {
       el("span", { class: "comfymodal-studio-viewer-row-value", text: text }),
     ]) : null;
   });
+  var fileRow = buildViewerFileRow(record, opts.imageUrl || "");
+  if (fileRow) metaRows.push(fileRow);
   if (Array.isArray(record.models) && record.models.length) {
     metaRows.push(el("div", { class: "comfymodal-studio-viewer-row" }, [
       el("span", { class: "comfymodal-studio-viewer-row-key", text: "Models" }),
@@ -1369,6 +1642,9 @@ export function buildSharedViewerOverlay(opts = {}) {
       el("span", { class: "comfymodal-studio-viewer-row-value", text: record.tags.join(", ") }),
     ]));
   }
+  // Lineage: flat rows (no sub-card) — generation/run identity, attempts,
+  // request-snapshot state.
+  buildViewerLineageRows(record).forEach(function (row) { if (row) metaRows.push(row); });
   metaRows.push(buildViewerNoteEditor(record, persistence));
   right.push(buildViewerAccordion("Metadata", metaRows));
 

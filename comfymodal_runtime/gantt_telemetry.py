@@ -719,12 +719,15 @@ def render_zoomed_gantt(
 
 
 def emit_gantt_records(trace: Any, *, request_id: str = "") -> None:
-    """Emit ALL fixed-width Gantt windows as one coherent multiline log block.
+    """Emit ONE full-overview Gantt as a single coherent multiline log block.
 
-    Called at request completion.  No-op when the gate is off or no trace.
-    Also measures the render/log overhead itself (``gantt_render_wall_ms`` /
-    ``gantt_log_payload_bytes`` / window count / max physical line length) so
-    logging cost is measured, not guessed.
+    Single-gantt contract: exactly one `V2 REMOTE GANTT` full-overview
+    render per request (all spans, including CLIP/UNET/VAE loader spans,
+    on one common monotonic axis). Legacy multi-window renders
+    (`render_gantt_windows`) and the separate canonical-ledger Gantt are
+    intentionally not emitted here so console, artifact, and waterfall
+    can never disagree. Called at request completion. No-op when the
+    gate is off or no trace. Never raises.
     """
     if not _gantt_enabled():
         return
@@ -732,27 +735,24 @@ def emit_gantt_records(trace: Any, *, request_id: str = "") -> None:
         rid = str(getattr(trace, "request_id", "") or request_id or "")
         _render_started = time.monotonic_ns()
         full = render_gantt_trace(trace, title=f"V2 REMOTE GANTT request={rid}")
-        windows = render_gantt_windows(trace)
         _render_wall_ms = round(
             (time.monotonic_ns() - _render_started) / 1_000_000, 3
         )
         _payload_bytes = sum(len(line.encode("utf-8", "replace")) for line in full)
-        _payload_bytes += sum(len(line.encode("utf-8", "replace")) for line in windows)
         _max_line = max(
-            [len(line.encode("utf-8", "replace")) for line in full + windows]
+            [len(line.encode("utf-8", "replace")) for line in full]
             or [0]
         )
         print(
             f"[v2.gantt_overhead] request={rid} "
             f"gantt_render_wall_ms={_render_wall_ms} "
             f"gantt_log_payload_bytes={_payload_bytes} "
-            f"full_lines={len(full)} window_lines={len(windows)} "
-            f"window_count={windows.count('') + 1 if windows else 0} "
+            f"full_lines={len(full)} window_lines=0 "
+            f"window_count=1 "
             f"physical_max_line={_max_line}",
             flush=True,
         )
         print("\n".join(full), flush=True)
-        print("\n".join(windows), flush=True)
     except Exception:
         pass
 

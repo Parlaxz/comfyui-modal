@@ -12,6 +12,7 @@
 
 import { el, renderEmptyState, statusBadge } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
+import { normalizeWorkflowType } from "./studio-bindable-inputs.js";
 import {
   buildManagerModelIndex,
   buildManagerPackIndex,
@@ -68,6 +69,11 @@ import {
   listCachedWorkflows,
   renderWorkflowPicker,
 } from "./studio-workflow-picker.js";
+import {
+  loadToolDefault,
+  saveToolDefault,
+  clearToolDefault,
+} from "./studio-playground-state.js";
 
 // ── Module-level view state ────────────────────────────────────────────────
 // Persists across shell re-renders so navigating away and back preserves
@@ -111,7 +117,7 @@ const _view = {
     commitError: "",
     result: null,
   },
-  filters: { query: "", tag: "", folder: "", favoritesOnly: false, usageModel: "" },
+  filters: { query: "", tag: "", folder: "", favoritesOnly: false, usageModel: "", workflowType: "" },
   folderMove: { open: false, workflowId: "", workflowIds: [], busy: false, error: "" },
   folderCreate: { open: false, path: "", busy: false, error: "" },
   deleteConfirm: { open: false, mode: "", workflowId: "", workflowName: "", workflowIds: [], busy: false },
@@ -680,7 +686,7 @@ export function renderWorkflows(state, context) {
   // Already-mapped versions keep the legacy "Edit mapping" revision path
   // untouched. A missing version context falls back to the detail page.
 
-  function openVersionSetupWizard(wfId, versionId, notice, initialStep, initialMapping) {
+  function openVersionSetupWizard(wfId, versionId, notice, initialStep, initialMapping, workflowType) {
     import("./studio-workflow-setup-wizard.js").then(({ openWorkflowSetupWizard }) => {
       if (stale()) return;
       if (!wfId || !versionId) {
@@ -694,6 +700,7 @@ export function renderWorkflows(state, context) {
         workflowVersionId: versionId,
         initialStep: initialStep || "features",
         initialMapping: initialMapping || null,
+        workflowType: workflowType || ((_view.data.workflow && (_view.data.workflow.workflow_type || _view.data.workflow.workflowType)) || ""),
       });
     }).catch(() => {
       openWorkflowDetail(wfId, versionId, notice);
@@ -742,6 +749,11 @@ export function renderWorkflows(state, context) {
       if (_view.filters.tag && !(w.tags || []).includes(_view.filters.tag)) return false;
       if (_view.filters.folder && !String(w.folder || "").startsWith(_view.filters.folder)) return false;
       if (_view.filters.favoritesOnly && !w.favorite) return false;
+      if (_view.filters.workflowType) {
+        const t = normalizeWorkflowType(w.workflow_type || w.workflowType || w.type || "t2i");
+        const want = normalizeWorkflowType(_view.filters.workflowType);
+        if (t !== want) return false;
+      }
       return true;
     });
   }
@@ -842,7 +854,7 @@ export function renderWorkflows(state, context) {
         type: "button",
         text: "Clear filters",
         onclick: () => {
-          _view.filters = { query: "", tag: "", folder: "", favoritesOnly: false, usageModel: "" };
+          _view.filters = { query: "", tag: "", folder: "", favoritesOnly: false, usageModel: "", workflowType: "" };
           render();
         },
       }),
@@ -937,6 +949,19 @@ export function renderWorkflows(state, context) {
       el("div", { class: "comfymodal-studio-workflow-card-meta" }, [
         _stateBadge(state, "workflow-card-state"),
         el("span", { text: wf.mapping_id ? "Mapped" : "Not mapped" }),
+        el("span", {
+          text: (function () {
+            const raw = normalizeWorkflowType(wf.workflow_type || wf.workflowType || wf.type || "t2i");
+            const labels = { t2i: "Text to Image", i2i: "Image Edit", inpaint: "Inpaint", sketch: "Sketch", outpaint: "Outpaint" };
+            return labels[raw] || raw;
+          })(),
+          "data-testid": "workflow-card-type",
+        }),
+        _isDefaultWorkflow(wf) ? el("span", {
+          class: "comfymodal-studio-wf-chip cm-chip default",
+          "data-testid": "workflow-card-default",
+          text: "Default",
+        }) : null,
         renderCardPortabilityChip(wf),
       ]),
       (wf.source_url || wf.source_author)
@@ -953,6 +978,19 @@ export function renderWorkflows(state, context) {
       role: "menu",
       style: "display:none;",
     }, [
+      el("button", {
+        type: "button",
+        class: "comfymodal-studio-workflow-menu-item",
+        "data-testid": "workflow-set-default",
+        role: "menuitem",
+        text: _isDefaultWorkflow(wf) ? "Default ✓" : "Set as default",
+        onclick: (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          _toggleDefaultWorkflow(wf);
+        },
+        onkeydown: (e) => e.stopPropagation(),
+      }),
       el("button", {
         type: "button",
         class: "comfymodal-studio-workflow-menu-item",
@@ -1040,8 +1078,29 @@ export function renderWorkflows(state, context) {
       }
       _view.data.workflows = (_view.data.workflows || []).filter((item) => item.workflow_id !== confirmation.workflowId);
       _view.selectedWorkflowIds.delete(confirmation.workflowId);
-      _view.data.notice = { text: "Workflow deleted", error: false };
+      try { clearToolDefault("", confirmation.workflowId); } catch (_e) {}
       clearDeleteConfirmation();
+      // Deleting from the detail page must leave it: the deleted workflow no
+      // longer exists, so return to the library instead of rendering a
+      // detail view with no backing record.
+      if (_view.mode === "detail" && String(_view.selectedWorkflowId) === String(confirmation.workflowId)) {
+        _view.mode = "library";
+        _view.selectedWorkflowId = "";
+        _view.selectedVersionId = "";
+        _view.editorMode = "";
+        _view.detailEditing = false;
+        _view.revisionConfirm = false;
+        _view.data.workflow = null;
+        _view.data.versions = [];
+        _view.data.version = null;
+        _view.data.mapping = null;
+        _view.data.dependencies = null;
+        _view.data.notice = { text: "Workflow deleted", error: false };
+        render();
+        loadLibrary(true);
+        return;
+      }
+      _view.data.notice = { text: "Workflow deleted", error: false };
       render();
       return;
     }
@@ -1052,7 +1111,10 @@ export function renderWorkflows(state, context) {
       try {
         const result = await deleteWorkflow(apiBase, workflowId);
         if (!result || result.status === "error" || result._httpStatus >= 400) failed.push(workflowId);
-        else _view.selectedWorkflowIds.delete(workflowId);
+        else {
+          _view.selectedWorkflowIds.delete(workflowId);
+          try { clearToolDefault("", workflowId); } catch (_e) {}
+        }
       } catch (err) { failed.push(workflowId); }
     }
     _view.bulkAction = { busy: false, label: "" };
@@ -1527,7 +1589,22 @@ export function renderWorkflows(state, context) {
       },
     });
 
-    viewEl.appendChild(el("div", { class: "comfymodal-studio-workflows-toolbar" }, [searchInput, tagSelect, favToggle]));
+    const typeSelect = el("select", {
+      class: "comfymodal-studio-workflows-select",
+      "data-testid": "workflows-type-filter",
+      "aria-label": "Filter by workflow type",
+      onchange: (e) => { _view.filters.workflowType = e.currentTarget.value; loadLibrary(); },
+    }, [
+      el("option", { value: "", text: "All types" }),
+      el("option", { value: "t2i", text: "Text to Image" }),
+      el("option", { value: "i2i", text: "Image Edit" }),
+      el("option", { value: "inpaint", text: "Inpaint" }),
+      el("option", { value: "sketch", text: "Sketch" }),
+      el("option", { value: "outpaint", text: "Outpaint" }),
+    ]);
+    typeSelect.value = _view.filters.workflowType || "";
+
+    viewEl.appendChild(el("div", { class: "comfymodal-studio-workflows-toolbar" }, [searchInput, tagSelect, typeSelect, favToggle]));
     const bulkActions = renderBulkActions();
     if (bulkActions) viewEl.appendChild(bulkActions);
 
@@ -2458,7 +2535,33 @@ export function renderWorkflows(state, context) {
     wrap.appendChild(renderMappingSection(wf, version));
     if (version) wrap.appendChild(renderDependenciesSection(version));
     if (version) wrap.appendChild(renderPortabilitySection(version));
+    if (_view.deleteConfirm.open) wrap.appendChild(renderDeleteConfirmation());
     return wrap;
+  }
+
+  function _workflowToolOf(wf) {
+    return normalizeWorkflowType((wf && (wf.workflow_type || wf.workflowType || wf.type)) || "t2i");
+  }
+
+  function _isDefaultWorkflow(wf) {
+    try {
+      if (!wf || !wf.workflow_id) return false;
+      return String(loadToolDefault(_workflowToolOf(wf))) === String(wf.workflow_id);
+    } catch (_e) { return false; }
+  }
+
+  function _toggleDefaultWorkflow(wf) {
+    try {
+      if (!wf || !wf.workflow_id) return;
+      const tool = _workflowToolOf(wf);
+      const wasDefault = _isDefaultWorkflow(wf);
+      if (wasDefault) clearToolDefault(tool);
+      else saveToolDefault(tool, wf.workflow_id);
+      _view.data.notice = wasDefault
+        ? { text: "Default for this tool type cleared", error: false }
+        : { text: "Marked as the default workflow for its type", error: false };
+    } catch (_e) { /* best-effort */ }
+    render();
   }
 
   function renderDetailHeader(wf) {
@@ -2470,9 +2573,27 @@ export function renderWorkflows(state, context) {
       el("h3", { class: "comfymodal-studio-workflow-detail-title", "data-testid": "workflow-detail-name", text: wf.name || "Untitled workflow" }),
       renderFavoriteButton(wf, false),
       el("button", {
+        type: "button",
+        class: "comfymodal-secondary-btn",
+        "data-testid": "workflow-detail-default",
+        "aria-pressed": _isDefaultWorkflow(wf) ? "true" : "false",
+        title: "Mark as the default workflow for its type",
+        text: _isDefaultWorkflow(wf) ? "Default ✓" : "Set as default",
+        onclick: () => _toggleDefaultWorkflow(wf),
+      }),
+      el("button", {
         class: "comfymodal-secondary-btn",
         text: _view.detailEditing ? "Cancel" : "Edit",
         onclick: () => { _view.detailEditing = !_view.detailEditing; render(); },
+      }),
+      el("button", {
+        type: "button",
+        class: "comfymodal-destructive-btn",
+        "data-testid": "workflow-detail-delete",
+        "aria-label": "Delete workflow " + (wf.name || "Untitled workflow"),
+        title: "Delete workflow",
+        text: "Delete",
+        onclick: () => deleteSingleWorkflow(wf),
       }),
     ]));
 

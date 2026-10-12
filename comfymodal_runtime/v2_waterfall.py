@@ -1611,6 +1611,60 @@ def _detail_stages(
             provenance="remote_trace",
             accounting_role="child",
         ))
+    # ── Generic substitution loader rows (accurate stage walls) ──────────
+    # Single source of truth for CLIP/UNET/VAE load timing on the generic
+    # path: the `generic_dispatch_substitution` trace events emitted by the
+    # dispatch wrapper (elapsed_ms + source_arm + actual). These are the
+    # same numbers printed as `[v2.generic_attempt_walls]` in the worker
+    # log, so waterfall, gantt, and console can never disagree.
+    for sub_meta in _metadata_events(result, "generic_dispatch_substitution"):
+        try:
+            _role = str(sub_meta.get("role") or "").strip().lower()
+            _node = str(sub_meta.get("node_id") or "").strip()
+            _arm = str(sub_meta.get("source_arm") or "unknown").strip()
+            _actual = str(sub_meta.get("actual") or "").strip()
+            _reason = str(sub_meta.get("reason") or "").strip()
+            _elapsed = sub_meta.get("elapsed_ms")
+            _elapsed_ms = float(_elapsed) if isinstance(_elapsed, (int, float)) and not isinstance(_elapsed, bool) else None
+            if _role in ("clip",):
+                _key, _label = "clip_load", f"CLIP load [{_arm}]"
+            elif _role in ("unet", "model_unet"):
+                _key, _label = "unet_load", f"UNET load [{_arm}]"
+            elif _role in ("vae",):
+                _key, _label = "vae_load_substitution", f"VAE load [{_arm}]"
+            else:
+                continue
+            if _node:
+                _label += f" node {_node}"
+            if _actual and _actual != "shared_core":
+                _label += f" ({_actual})"
+            if _reason and _actual != "shared_core":
+                _label += f" {_reason[:80]}"
+            _sub_candidate = _candidate_from_duration(
+                _elapsed_ms,
+                source_fields=("generic_dispatch_substitution.elapsed_ms",),
+            )
+            details.append(WaterfallStage(
+                key=_key,
+                label=_label,
+                group="detail",
+                start_ns=None,
+                end_ns=None,
+                duration_ms=_sub_candidate.duration_ms,
+                cumulative_ms=None,
+                percentage=_percentage(_sub_candidate.duration_ms, total_ms, total_wall_ms),
+                source="substitution",
+                status=_sub_candidate.status,
+                is_detail=True,
+                parent_key="pre_sampler_execution",
+                included_in_total=False,
+                clock_scope="metadata",
+                source_fields=_sub_candidate.source_fields,
+                provenance="remote_trace",
+                accounting_role="child",
+            ))
+        except Exception:
+            continue
     _per_node_timings = _as_mapping(structured).get("per_node_timings", ())
     # Wait windows are only needed when node rows will actually render; compute
     # once, lazily, and never let a wait_attribution failure break rendering.
@@ -2470,6 +2524,9 @@ _CURATED_DETAIL_KEYS = frozenset({
     "conditioning_cache_lookup",   # conditioning cache decision/lookup
     "clip_encode",                 # CLIP encode (clearest single CLIP row)
     "clip_encode_skipped",         # status text when encode was skipped (cache hit)
+    "clip_load",                   # generic substitution CLIP load (accurate stage wall)
+    "unet_load",                   # generic substitution UNET load (accurate stage wall)
+    "vae_load_substitution",       # generic substitution VAE load (accurate stage wall)
     "unet_checkpoint_read",        # real active-read span
     "unet_read_to_construction",   # construction
     "unet_get_model",              # required get_model

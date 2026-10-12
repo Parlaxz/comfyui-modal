@@ -246,7 +246,7 @@ function _isStudioUiTarget(target) {
   ));
 }
 
-export function beginGraphBindingCapture({ bindingKey, label, onCapture, onCancel }) {
+export function beginGraphBindingCapture({ bindingKey, label, onCapture, onCancel, allowOutput }) {
   // Guard: if already active, cancel cleanly first
   if (_captureState.active) {
     _captureState.active = false;
@@ -256,6 +256,12 @@ export function beginGraphBindingCapture({ bindingKey, label, onCapture, onCance
     }
     _removeCaptureHints();
   }
+  // Input rows bind a value INTO a widget/input field: a node output can
+  // never receive a control value, so callers capturing for an input row
+  // pass allowOutput:false and outputs are not offered at all (a click on
+  // an output-only node then reports "no bindable fields"). Defaults to
+  // true so the output row keeps working unchanged.
+  const outputsSelectable = allowOutput !== false;
 
   const ctx = getComfyGraphContext();
   if (!ctx.ok) {
@@ -287,7 +293,9 @@ export function beginGraphBindingCapture({ bindingKey, label, onCapture, onCance
     e.preventDefault();
     e.stopPropagation();
 
-    const candidates = extractNodeCandidates(targetNode);
+    const candidates = extractNodeCandidates(targetNode).filter(
+      (c) => outputsSelectable || !c || c.kind !== "output"
+    );
     const result = {
       bindingKey,
       nodeId: String(targetNode.id),

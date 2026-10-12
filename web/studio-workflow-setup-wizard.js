@@ -35,6 +35,7 @@ import {
   getMapping,
   createMapping,
   createMappingRevision,
+  updateWorkflow,
   getVersionDependencies,
   batchInstallModels,
   rescanModels,
@@ -56,16 +57,26 @@ import {
   OUTPUT_BINDING,
   T2I_REQUIRED_INPUTS,
   T2I_OPTIONAL_INPUTS,
+  I2I_REQUIRED_INPUTS,
+  I2I_OPTIONAL_INPUTS,
+  INPAINT_REQUIRED_INPUTS,
+  INPAINT_OPTIONAL_INPUTS,
+  SKETCH_REQUIRED_INPUTS,
+  SKETCH_OPTIONAL_INPUTS,
+  OUTPAINT_REQUIRED_INPUTS,
+  OUTPAINT_OPTIONAL_INPUTS,
+  normalizeWorkflowType,
 } from "./studio-bindable-inputs.js";
 
 // ── Catalog-backed feature definitions ───────────────────────────────────
 // Leaf 1.2.1 follow-up: the wizard lists ONLY the code-owned bindable-input
-// catalog (Prompt, Seed, Step count, CFG scale, Sampler, Model UNET, VAE,
-// CLIP) plus the separate required Output binding. Graph inputs outside the
-// catalog are ignored everywhere: they get no row, no suggestion, and never
-// satisfy the save gate.
+// catalog (Prompt, Seed, Step count, CFG scale, Sampler, Width, Height, Model
+// UNET, VAE, CLIP, Source Image, Mask) plus the separate required Output binding. Graph
+// inputs outside the catalog are ignored everywhere: they get no row, no
+// suggestion, and never satisfy the save gate.
 //
-// The single Text-to-Image profile is the only workflow type in this slice.
+// Workflow-backed image tools share one generic profile mechanism: the
+// workflow type selects required/optional Tool Inputs from the catalog.
 // "txt2img" is the server-facing feature id; "t2i" is accepted as an alias
 // wherever feature ids are resolved so older/newer records agree.
 
@@ -98,30 +109,43 @@ function _catalogHelpText(entry) {
     step_count: "Bind the exact step-count widget/field.",
     cfg_scale: "Bind the exact CFG-scale widget/field.",
     sampler: "Bind the exact sampler widget/field.",
+    width: "Bind the exact width widget/field.",
+    height: "Bind the exact height widget/field.",
     model_unet: "Bind the exact UNET model widget/field.",
     vae: "Bind the exact VAE widget/field.",
     clip: "Bind the exact CLIP widget/field.",
+    source_image: "Bind the exact source-image widget/field (LoadImage image).",
+    mask: "Bind a filename-consuming image field this workflow reads as its mask (e.g. a loader `image` input wired to ImageToMask, or a node mask input). Studio delivers a black/white PNG filename — the graph owns any IMAGE→MASK conversion.",
   };
   return hints[entry.key] || `Bind the exact ${entry.name} widget/field.`;
 }
 
+function _featureDefFor(required, optional, id, label, description) {
+  return {
+    id,
+    label,
+    description,
+    requiredBindings: [...required, OUTPUT_BINDING.key]
+      .map(_catalogBindingDef)
+      .filter(Boolean),
+    optionalBindings: [...optional]
+      .map(_catalogBindingDef)
+      .filter(Boolean),
+  };
+}
+
 const FEATURE_DEFS = {
-  txt2img: {
-    id: "txt2img",
-    label: "Text-to-Image",
-    description: "Standard text-to-image generation",
-    requiredBindings: [...T2I_REQUIRED_INPUTS, OUTPUT_BINDING.key]
-      .map(_catalogBindingDef)
-      .filter(Boolean),
-    optionalBindings: [...T2I_OPTIONAL_INPUTS]
-      .map(_catalogBindingDef)
-      .filter(Boolean),
-  },
+  txt2img: _featureDefFor(T2I_REQUIRED_INPUTS, T2I_OPTIONAL_INPUTS, "txt2img", "Text-to-Image", "Standard text-to-image generation"),
+  i2i: _featureDefFor(I2I_REQUIRED_INPUTS, I2I_OPTIONAL_INPUTS, "i2i", "Image Edit", "Edit a source image from a prompt"),
+  inpaint: _featureDefFor(INPAINT_REQUIRED_INPUTS, INPAINT_OPTIONAL_INPUTS, "inpaint", "Inpaint", "Masked/local image editing"),
+  sketch: _featureDefFor(SKETCH_REQUIRED_INPUTS, SKETCH_OPTIONAL_INPUTS, "sketch", "Sketch", "Sketch/annotation-guided editing"),
+  outpaint: _featureDefFor(OUTPAINT_REQUIRED_INPUTS, OUTPAINT_OPTIONAL_INPUTS, "outpaint", "Outpaint", "Expand the canvas beyond the source image"),
 };
 
 function _normalizeFeatureId(fid) {
-  if (fid === "t2i" || fid === "txt2img") return "txt2img";
-  return fid;
+  const canonical = normalizeWorkflowType(fid);
+  if (canonical === "t2i") return "txt2img";
+  return canonical;
 }
 
 function _featureDef(featureId) {
@@ -144,6 +168,8 @@ const ROLE_SUGGESTIONS = Object.freeze({
   step_count: Object.freeze([{ nodeType: "KSampler", widget: "steps" }]),
   cfg_scale: Object.freeze([{ nodeType: "KSampler", widget: "cfg" }]),
   sampler: Object.freeze([{ nodeType: "KSampler", widget: "sampler_name" }]),
+  width: Object.freeze([{ nodeType: "EmptyLatentImage", widget: "width" }]),
+  height: Object.freeze([{ nodeType: "EmptyLatentImage", widget: "height" }]),
   model_unet: Object.freeze([
     { nodeType: "UNETLoader", widget: "unet_name" },
     { nodeType: "CheckpointLoaderSimple", widget: "ckpt_name" },
@@ -156,11 +182,73 @@ const ROLE_SUGGESTIONS = Object.freeze({
     { nodeType: "CLIPLoader", widget: "clip_name" },
     { nodeType: "CheckpointLoaderSimple", widget: "ckpt_name" },
   ]),
+  source_image: Object.freeze([
+    { nodeType: "LoadImage", widget: "image" },
+  ]),
+  // No static suggestion for masks: native LoadImage exposes only `image`
+  // (its MASK comes from alpha), and mask consumers vary per workflow
+  // (mask input, ImageToMask, inpaint node, ...). Bind via capture click
+  // against the exact input this workflow reads.
+  mask: Object.freeze([]),
   output: Object.freeze([
     { nodeType: "SaveImage", output: "images" },
     { nodeType: "PreviewImage", output: "images" },
   ]),
 });
+
+// This is deliberately not a catalog binding: the backend stores only the
+// selected node id in the mapping, outside `entries`.
+const TEXT_GENERATE_NODE_TYPES = Object.freeze(["TextGenerate", "TextGenerateLTX2Prompt"]);
+
+function _textGenerateNodeTargets(graphJson) {
+  const ui = _graphNodes(graphJson).filter((node) => {
+    return TEXT_GENERATE_NODE_TYPES.indexOf(_nodeTypeOf(node)) !== -1;
+  }).map((node) => ({
+    nodeId: node.id,
+    nodeType: _nodeTypeOf(node),
+    nodeTitle: _nodeTitleOf(node),
+  }));
+  if (ui.length) return ui;
+  // API-prompt fallback: {"8": {"class_type": "TextGenerate", ...}}.
+  // _graphNodes only understands UI graphs, so a stored API-format graph
+  // would otherwise scan as empty even with a TextGenerate node present.
+  try {
+    if (graphJson && typeof graphJson === "object"
+      && !Array.isArray(graphJson) && !Array.isArray(graphJson.nodes)) {
+      const out = [];
+      Object.keys(graphJson).forEach((id) => {
+        const node = graphJson[id];
+        if (!node || typeof node !== "object") return;
+        const t = node.class_type || "";
+        if (TEXT_GENERATE_NODE_TYPES.indexOf(t) === -1) return;
+        out.push({ nodeId: id, nodeType: t, nodeTitle: node.title || t });
+      });
+      return out;
+    }
+  } catch (_e) { /* best-effort */ }
+  return ui;
+}
+
+function _textGenerateCanvasTargets() {
+  try {
+    const context = getComfyGraphContext();
+    const nodes = context && context.ok && context.graph
+      ? (context.graph.nodes || context.graph._nodes || []) : [];
+    return (Array.isArray(nodes) ? nodes : Object.values(nodes)).filter((node) => {
+      return node && TEXT_GENERATE_NODE_TYPES.indexOf(_nodeTypeOf(node)) !== -1;
+    }).map((node) => ({ nodeId: node.id, nodeType: _nodeTypeOf(node), nodeTitle: _nodeTitleOf(node) }));
+  } catch (_e) {
+    return [];
+  }
+}
+
+function _textGenerateBindingFromMapping(mapping) {
+  const source = mapping && mapping.mapping && typeof mapping.mapping === "object"
+    ? mapping.mapping : mapping;
+  const nodeId = source && source.text_generate_node_id;
+  if (nodeId == null || String(nodeId).trim() === "") return null;
+  return { nodeId, nodeType: "", nodeTitle: "" };
+}
 
 function _graphNodes(graphJson) {
   if (!graphJson) return [];
@@ -179,11 +267,41 @@ function _nodeTitleOf(node) {
 }
 
 /**
+ * Subgraph definitions by id. Mirrors studio_domain/graph.py::
+ * _subgraph_defs_by_id — ComfyUI packs subgraph interiors under
+ * definitions.subgraphs (list or dict) while the top-level nodes list
+ * holds only the container nodes. Never throws.
+ */
+function _subgraphDefs(graphJson) {
+  const out = {};
+  try {
+    if (!graphJson || typeof graphJson !== "object") return out;
+    const definitions = graphJson.definitions;
+    if (!definitions || typeof definitions !== "object") return out;
+    const subgraphs = definitions.subgraphs;
+    let items = null;
+    if (Array.isArray(subgraphs)) items = subgraphs;
+    else if (subgraphs && typeof subgraphs === "object") items = Object.values(subgraphs);
+    else return out;
+    items.forEach((sg) => {
+      if (!sg || typeof sg !== "object" || sg.id == null) return;
+      out[String(sg.id)] = sg;
+    });
+  } catch (e) { /* best-effort */ }
+  return out;
+}
+
+/**
  * Suggest likely graph targets for one catalog role.
  * Pure: scans the given graph JSON for nodes matching the role's known
  * node types and returns concrete {nodeId, nodeType, nodeTitle,
  * widgetName/inputName/outputIndex} proposals. Non-catalog roles and graph
  * nodes outside the catalog patterns yield [] — they are ignored.
+ * Subgraph-packed graphs are scanned too: a top-level container node's
+ * type is its subgraph definition id (same linkage the backend uses), and
+ * inner hits carry the composite outer:inner nodeId the mapping and
+ * execution layers already resolve. Single level only — nested containers
+ * inside definitions are left alone.
  * Suggestions are proposals only; callers must get explicit user
  * confirmation before storing one as a binding.
  */
@@ -191,14 +309,14 @@ export function suggestBindingTargets(graphJson, roleKey) {
   const patterns = ROLE_SUGGESTIONS[roleKey];
   if (!patterns) return [];
   const out = [];
-  _graphNodes(graphJson).forEach((node) => {
-    if (!node) return;
+  const pushMatch = (node, nodeId) => {
+    if (!node || nodeId == null) return;
     const nodeType = _nodeTypeOf(node);
     patterns.forEach((pattern) => {
       if (nodeType !== pattern.nodeType) return;
       if (pattern.widget) {
         out.push({
-          nodeId: node.id,
+          nodeId,
           nodeType,
           nodeTitle: _nodeTitleOf(node),
           widgetName: pattern.widget,
@@ -211,7 +329,7 @@ export function suggestBindingTargets(graphJson, roleKey) {
         const named = outputs.findIndex((o) => o && (o.name === pattern.output || o.type === pattern.output));
         if (named !== -1) outputIndex = named;
         out.push({
-          nodeId: node.id,
+          nodeId,
           nodeType,
           nodeTitle: _nodeTitleOf(node),
           widgetName: null,
@@ -220,7 +338,25 @@ export function suggestBindingTargets(graphJson, roleKey) {
         });
       }
     });
+  };
+  const topNodes = _graphNodes(graphJson);
+  topNodes.forEach((node) => {
+    if (!node) return;
+    pushMatch(node, node.id);
   });
+  const defs = _subgraphDefs(graphJson);
+  if (Object.keys(defs).length > 0) {
+    topNodes.forEach((node) => {
+      if (!node || node.id == null) return;
+      const def = defs[String(node.type)];
+      if (!def) return;
+      const inner = Array.isArray(def.nodes) ? def.nodes : [];
+      inner.forEach((innerNode) => {
+        if (!innerNode || innerNode.id == null) return;
+        pushMatch(innerNode, String(node.id) + ":" + String(innerNode.id));
+      });
+    });
+  }
   return out;
 }
 
@@ -246,9 +382,23 @@ function _likelyTargetHint(roleKey) {
  * widget/input/output field. A nodeId alone (e.g. from an unconfirmed
  * suggestion) never satisfies the save gate.
  */
-export function isValidConcreteBinding(val) {
+/**
+ * True only for a valid concrete binding: an exact node plus the confirmed
+ * widget/input/output field. A nodeId alone (e.g. from an unconfirmed
+ * suggestion) never satisfies the save gate.
+ *
+ * Input rows (every catalog key) bind values INTO a widget/input field, so a
+ * node-output capture is never valid there — it can never receive a control
+ * value and fails at run time with "no node/input binding". Only the output
+ * row may hold an output binding.
+ */
+export function isValidConcreteBinding(val, key) {
   if (!val || val.nodeId == null) return false;
-  return !!(val.widgetName || val.inputName || val.outputIndex != null);
+  if (key === OUTPUT_BINDING.key) {
+    return val.outputIndex != null || val.kind === "output";
+  }
+  if (val.kind === "output" || val.outputIndex != null) return false;
+  return !!(val.widgetName || val.inputName);
 }
 
 function _mappingToBindings(mapping) {
@@ -280,6 +430,11 @@ function _mappingToBindings(mapping) {
       bindingKind = "input";
       inputBindingName = inputName || null;
     } else if (kind === "node_output") {
+      // Stored output bindings are only meaningful on the output row. An
+      // output stored under an input role (e.g. a prompt captured from a
+      // node output) can never receive a value — drop it so the row shows
+      // "Not bound" instead of a binding the save gate must reject.
+      if (role !== OUTPUT_BINDING.key) return;
       bindingKind = "output";
       const rawIndex = entry.output_index != null ? entry.output_index
         : entry.outputIndex != null ? entry.outputIndex
@@ -341,6 +496,8 @@ function makeInitialState(options) {
     step: "features",           // features | bindings | details | saving | saved | error
     selectedFeatures: [],
     bindings: {},               // { [bindingKey]: bindingTarget | null }
+    textGenerateBinding: null,  // optional execution target, never a catalog row
+    suggestedTextGenerateTargets: [],
     bindingCaptureActive: null, // bindingKey currently being captured, or null
     captureNotice: null, // { key, message } when a capture found no bindable fields
     viewNotice: null, // { key, message } when View found no node to highlight
@@ -399,11 +556,16 @@ function makeInitialState(options) {
     // The detail-page Edit mapping action is a deep link into the binding
     // page. Keep the normal setup flow unchanged for new mappings.
     if (versionOpt.initialStep === "bindings") {
-      state.selectedFeatures = ["txt2img"];
+      const storedType = normalizeWorkflowType(
+        versionOpt.workflowType || versionOpt.initialWorkflowType || ""
+      );
+      const known = storedType && FEATURE_DEFS[_normalizeFeatureId(storedType)];
+      state.selectedFeatures = [known ? _normalizeFeatureId(storedType) : "txt2img"];
       state.step = "bindings";
     }
     if (versionOpt.initialMapping && versionOpt.initialStep === "bindings") {
       Object.assign(state.bindings, _mappingToBindings(versionOpt.initialMapping));
+      state.textGenerateBinding = _textGenerateBindingFromMapping(versionOpt.initialMapping);
     }
   }
 
@@ -630,6 +792,14 @@ export function clearWizardDraft() {
 
 function renderWizard(panel, state) {
   const scrollTop = panel.scrollTop;
+  // The body (.comfymodal-studio-wizard-body) is the actual scroller
+  // (overflow-y:auto); the panel itself has overflow:hidden so panel.scrollTop
+  // is always 0. Preserve the body scroll across same-step re-renders (e.g.
+  // binding-row button clicks) so the user is not jumped to the top. Step
+  // navigation resets to the top via the step-change check below.
+  const prevBody = panel.querySelector && panel.querySelector(".comfymodal-studio-wizard-body");
+  const prevBodyScroll = prevBody ? prevBody.scrollTop : 0;
+  const sameStep = panel.dataset && panel.dataset.wizardStep === state.step;
   while (panel.firstChild) panel.removeChild(panel.firstChild);
   // The View highlight lives on document.body (outside the wizard DOM), so
   // clear it explicitly whenever the wizard re-renders.
@@ -853,6 +1023,11 @@ function renderWizard(panel, state) {
   }
   panel.appendChild(footer);
   panel.scrollTop = scrollTop;
+  if (panel.dataset) panel.dataset.wizardStep = state.step;
+  if (sameStep) {
+    const nextBody = panel.querySelector && panel.querySelector(".comfymodal-studio-wizard-body");
+    if (nextBody) nextBody.scrollTop = prevBodyScroll;
+  }
 
   // Persist the current step/bindings/details for a version-setup wizard so a
   // browser refresh resumes here; Done/save clears it. `saving` is transient
@@ -979,6 +1154,119 @@ function renderBindingsStep(body, state) {
   const requiredDefs = featureDef ? featureDef.requiredBindings : [];
   const optionalDefs = featureDef ? featureDef.optionalBindings : [];
 
+  // Text-generation bypass row: lives inside the optional list below, not
+  // as its own section. It is an optional node picker, not a catalog value
+  // binding, and never counts toward the save gate.
+  const execution = el("div", {
+    class: "comfymodal-studio-wizard-execution-option",
+    "data-testid": "wizard-text-generate-option",
+    "data-binding-key": "text_generate",
+    style: "margin:4px 0;padding:10px 12px;border:1px solid rgba(255,255,255,.10);border-radius:8px;",
+  }, [
+    el("strong", { text: "Text generation bypass", style: "font-size:12px;display:block;margin-bottom:3px;" }),
+    el("p", { text: "If this workflow has a TextGenerate node, bind it here to offer a “skip text generation” toggle in the Playground. Most workflows don't have one — leave this unbound.", style: "font-size:10px;color:#888;margin:0 0 9px;" }),
+  ]);
+  const storedTargets = (state.suggestedTextGenerateTargets && state.suggestedTextGenerateTargets.length
+    ? state.suggestedTextGenerateTargets : []);
+  // Merge the stored-graph scan with the live canvas: the canvas may hold a
+  // TextGenerate node the stored graph lacks (or vice versa). Dedupe by id.
+  const _tgSeen = new Set();
+  const textTargets = [...storedTargets, ..._textGenerateCanvasTargets()].filter((t) => {
+    if (!t || t.nodeId == null) return false;
+    const k = String(t.nodeId);
+    if (_tgSeen.has(k)) return false;
+    _tgSeen.add(k);
+    return true;
+  });
+  const selectedId = state.textGenerateBinding && state.textGenerateBinding.nodeId != null
+    ? String(state.textGenerateBinding.nodeId) : "";
+  if (state.textGenerateBinding) {
+    const _tgBound = state.textGenerateBinding;
+    execution.appendChild(el("p", {
+      "data-testid": "wizard-text-generate-bound",
+      style: "font-size:10px;color:#4ade80;margin:0 0 8px;",
+      text: `Bound: ${_tgBound.nodeTitle || _tgBound.nodeType || "Node"} (${_tgBound.nodeType || "unknown type"}) — node ${_tgBound.nodeId}`,
+    }));
+  } else if (!textTargets.length) {
+    execution.appendChild(el("p", {
+      "data-testid": "wizard-text-generate-empty",
+      style: "font-size:10px;color:#888;margin:0 0 8px;",
+      text: "No TextGenerate nodes found in the stored graph or the open canvas — the Playground skip toggle stays hidden until one is bound.",
+    }));
+  }
+  const selector = el("select", {
+    class: "comfymodal-input",
+    "data-testid": "wizard-text-generate-selector",
+    "aria-label": "Text generation — node to bypass",
+    style: "width:100%;margin-bottom:8px;",
+  });
+  selector.appendChild(el("option", { value: "", text: textTargets.length ? "No node selected" : "No text-generation nodes found" }));
+  textTargets.forEach((target) => {
+    const option = el("option", { value: String(target.nodeId), text: `${target.nodeTitle || target.nodeType} (${target.nodeType})` });
+    if (String(target.nodeId) === selectedId) option.selected = true;
+    selector.appendChild(option);
+  });
+  execution.appendChild(selector);
+  const selectedTarget = textTargets.find((target) => String(target.nodeId) === String(selector.value)) || null;
+  const actions = el("div", { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap;" });
+  const useBtn = el("button", {
+    class: "comfymodal-secondary-btn", text: "Use suggestion", "data-testid": "wizard-use-text-generate-suggestion",
+    style: "width:auto;padding:4px 9px;font-size:10px;", disabled: !selectedTarget,
+    onclick: (event) => {
+      event.preventDefault();
+      const target = textTargets.find((candidate) => String(candidate.nodeId) === String(selector.value));
+      if (!target) return;
+      state.textGenerateBinding = { ...target };
+      renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+    },
+  });
+  selector.addEventListener("change", () => { useBtn.disabled = !selector.value; });
+  actions.appendChild(useBtn);
+  // Manual fallback (same as catalog rows): select a node on the canvas,
+  // then bind it here. The scan only finds TextGenerate-class nodes, so a
+  // custom-named generator must be picked this way. Wrong-class picks are
+  // refused — the backend would reject them at save anyway.
+  actions.appendChild(el("button", {
+    class: "comfymodal-secondary-btn", text: "Use selected", "data-testid": "wizard-use-selected-text-generate",
+    title: "Bind the currently selected canvas node",
+    style: "width:auto;padding:4px 9px;font-size:10px;",
+    onclick: (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const selected = getSelectedGraphNodeTarget();
+      if (!selected || selected.nodeId == null) {
+        state.textGenerateNotice = "Select a node on the canvas first, then Use selected.";
+        renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+        return;
+      }
+      const selType = selected.nodeType || "";
+      if (TEXT_GENERATE_NODE_TYPES.indexOf(selType) === -1) {
+        state.textGenerateNotice = `${selected.nodeTitle || selType || "That node"} is not a text-generation node — pick a TextGenerate node.`;
+        renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+        return;
+      }
+      state.textGenerateNotice = null;
+      state.textGenerateBinding = {
+        nodeId: selected.nodeId,
+        nodeType: selType,
+        nodeTitle: selected.nodeTitle || selType,
+      };
+      renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+    },
+  }));
+  if (state.textGenerateNotice) {
+    actions.appendChild(el("span", {
+      "data-testid": "wizard-text-generate-notice",
+      style: "font-size:10px;color:#fbbf24;",
+      text: state.textGenerateNotice,
+    }));
+  }
+  if (selectedTarget) actions.appendChild(renderViewButton(selectedTarget.nodeId, { testid: "wizard-view-text-generate", state }));
+  if (state.textGenerateBinding) {
+    actions.appendChild(el("button", { class: "comfymodal-secondary-btn", text: "Clear", style: "width:auto;padding:4px 9px;font-size:10px;", onclick: () => { state.textGenerateBinding = null; renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state); } }));
+  }
+  execution.appendChild(actions);
+
   // ── Suggest-from-graph ─────────────────────────────────────────────
   // Proposes likely graph targets per catalog role. Suggestions never bind
   // anything by themselves — each one needs an explicit user click on its
@@ -1002,7 +1290,8 @@ function renderBindingsStep(body, state) {
         } else {
           state.graphJson = captureResult.graphJson;
           state.graphCaptured = true;
-          state.suggestedTargets = suggestAllBindings(captureResult.graphJson);
+           state.suggestedTargets = suggestAllBindings(captureResult.graphJson);
+           state.suggestedTextGenerateTargets = _textGenerateNodeTargets(captureResult.graphJson);
           const found = Object.values(state.suggestedTargets).filter((t) => t && t.length).length;
           state.suggestStatus = found
             ? `Found likely targets for ${found} binding${found === 1 ? "" : "s"}. Confirm each one below.`
@@ -1049,14 +1338,38 @@ function renderBindingsStep(body, state) {
     body.appendChild(optDesc);
 
     const optionalList = renderBindingRowList(optionalDefs, state, graphContext, "wizard-optional-bindings");
+    // The bypass picker is not a catalog row, but it lives in the optional
+    // list below sampler and above width so it reads as one of the
+    // exposed-controls rows. Anchor on the row keys; fall back to appending.
+    try {
+      const widthRow = optionalList.querySelector
+        ? optionalList.querySelector('[data-binding-key="width"]') : null;
+      if (widthRow && widthRow.parentNode === optionalList) {
+        optionalList.insertBefore(execution, widthRow);
+      } else {
+        const samplerRow = optionalList.querySelector
+          ? optionalList.querySelector('[data-binding-key="sampler"]') : null;
+        if (samplerRow && samplerRow.parentNode === optionalList && samplerRow.nextSibling) {
+          optionalList.insertBefore(execution, samplerRow.nextSibling);
+        } else {
+          optionalList.appendChild(execution);
+        }
+      }
+    } catch (_e) {
+      optionalList.appendChild(execution);
+    }
     body.appendChild(optionalList);
+  } else {
+    // No optional rows (should not happen with the current catalog): keep
+    // the picker reachable below the required list rather than dropping it.
+    body.appendChild(execution);
   }
 
   // ── Binding summary (T2I save gate) ─────────────────────────────────
   // Save stays blocked until every required role holds a valid concrete
   // binding (exact node widget/field). Non-catalog bindings never count.
   const requiredKeys = collectRequiredBindings(state.selectedFeatures).map((b) => b.key);
-  const boundCount = requiredKeys.filter((k) => isValidConcreteBinding(state.bindings[k])).length;
+  const boundCount = requiredKeys.filter((k) => isValidConcreteBinding(state.bindings[k], k)).length;
   const summary = el("p", {
     "data-testid": "wizard-save-gate",
     style: "font-size:11px;color:#888;margin-top:8px;",
@@ -1682,6 +1995,112 @@ async function rebootManagerAndReport(state) {
 
 // ── Binding row list renderer ────────────────────────────────────────────
 
+/**
+ * Bind the currently selected canvas node to the given role. Shared by the
+ * capture-mode "Use Selected Node" button and the always-visible
+ * "Use selected" row button, so both enforce the same rules: an unambiguous
+ * single candidate is the confirmed field; node outputs can never satisfy an
+ * input row; a pick with no confirmable field is refused with a notice
+ * instead of storing a pseudo-binding the save gate could never count.
+ * Returns true when a binding was stored.
+ */
+function applySelectedNodeBinding(state, bindingDef) {
+  const selected = getSelectedGraphNodeTarget();
+  if (!selected) return false;
+  // Mirror the canvas-click capture auto-select
+  // (studio-graph-binding.js): an unambiguous single candidate is
+  // the confirmed field. Without this a single-candidate manual
+  // capture stores a field-less node-only binding with no dropdown
+  // to fix it, and the save gate can never advance for that row.
+  const selectedCandidates = selected.candidates || [];
+  let selWidgetName = selected.widgetName;
+  let selInputName = selected.inputName;
+  let selOutputIndex = selected.outputIndex;
+  if (selectedCandidates.length === 1) {
+    const c = selectedCandidates[0];
+    if (c.kind === "widget") selWidgetName = c.name;
+    else if (c.kind === "input") selInputName = c.name;
+    else if (c.kind === "output") selOutputIndex = c.index;
+  }
+  // Input rows bind a value INTO a widget/input field: a node output
+  // can never receive a control value (run fails with "no node/input
+  // binding"), so refuse it here with an actionable notice instead
+  // of storing a binding the save gate must then reject.
+  const selResolvesOutput = !selWidgetName && !selInputName && selOutputIndex != null;
+  if (selResolvesOutput && bindingDef.key !== OUTPUT_BINDING.key) {
+    const nodeLabel = selected.nodeTitle || selected.nodeType || ("Node " + selected.nodeId);
+    state.captureNotice = { key: bindingDef.key, message: nodeLabel + " output cannot receive a value — bind the widget or input field that consumes it instead." };
+    cancelGraphBinding();
+    state.bindingCaptureActive = null;
+    renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+    return false;
+  }
+  // Phase 4: extract widgetSchema from the selected candidate
+  const selCandidate = _findSelectedCandidate(
+    selected.candidates,
+    { widgetName: selected.widgetName, inputName: selected.inputName, outputIndex: selected.outputIndex }
+  );
+  const selWidgetSchema = _buildWidgetSchemaFromCandidate(selCandidate);
+  // Refuse captures with no confirmable field: a node-only binding
+  // would look bound while the save gate can never count it. This
+  // covers zero candidates AND the lone node-fallback candidate
+  // (extractNodeCandidates emits kind "node" when a node exposes no
+  // widgets/inputs/outputs) — neither yields a field, and the
+  // dropdown cannot fix it (node options are not offered).
+  const selHasField = selWidgetName || selInputName || selOutputIndex != null;
+  const selPickable = selectedCandidates.some((c) => c && (c.kind === "widget" || c.kind === "input" || c.kind === "output"));
+  if (!selHasField && !selPickable) {
+    const nodeLabel = selected.nodeTitle || selected.nodeType || ("Node " + selected.nodeId);
+    state.captureNotice = { key: bindingDef.key, message: nodeLabel + " exposes no bindable fields — pick a node with widgets or connections." };
+    cancelGraphBinding();
+    state.bindingCaptureActive = null;
+    renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+    return false;
+  }
+  if (state.captureNotice && state.captureNotice.key === bindingDef.key) state.captureNotice = null;
+  state.bindings[bindingDef.key] = {
+    kind: selWidgetName ? "widget" : selInputName ? "input" : selOutputIndex != null ? "output" : "node",
+    nodeId: selected.nodeId,
+    nodeType: selected.nodeType,
+    nodeTitle: selected.nodeTitle,
+    widgetName: selWidgetName,
+    inputName: selInputName,
+    outputIndex: selOutputIndex,
+    label: selected.nodeTitle || selected.nodeType,
+    candidates: selected.candidates || [],
+    widgetSchema: selWidgetSchema,
+  };
+  cancelGraphBinding();
+  state.bindingCaptureActive = null;
+  renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+  return true;
+}
+
+/**
+ * Always-visible row action: bind the currently selected canvas node without
+ * requiring the card-click capture dance. With nothing selected it falls back
+ * to capture mode so the user can then click a node.
+ */
+function renderUseSelectedButton(state, bindingDef) {
+  return el("button", {
+    class: "comfymodal-secondary-btn",
+    "data-testid": "wizard-use-selected",
+    "data-binding-key": bindingDef.key,
+    text: "Use selected",
+    title: "Bind the currently selected canvas node",
+    style: "width:auto;padding:2px 8px;font-size:10px;",
+    onclick: (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (getSelectedGraphNodeTarget()) {
+        applySelectedNodeBinding(state, bindingDef);
+      } else {
+        startBindingCapture(state, bindingDef);
+      }
+    },
+  });
+}
+
 function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
   const listProps = { class: "comfymodal-studio-wizard-binding-list" };
   if (listTestid) listProps["data-testid"] = listTestid;
@@ -1735,61 +2154,7 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
         onclick: (event) => {
           event.preventDefault();
           event.stopPropagation();
-          const selected = getSelectedGraphNodeTarget();
-          if (!selected) return;
-          // Mirror the canvas-click capture auto-select
-          // (studio-graph-binding.js): an unambiguous single candidate is
-          // the confirmed field. Without this a single-candidate manual
-          // capture stores a field-less node-only binding with no dropdown
-          // to fix it, and the save gate can never advance for that row.
-          const selectedCandidates = selected.candidates || [];
-          let selWidgetName = selected.widgetName;
-          let selInputName = selected.inputName;
-          let selOutputIndex = selected.outputIndex;
-          if (selectedCandidates.length === 1) {
-            const c = selectedCandidates[0];
-            if (c.kind === "widget") selWidgetName = c.name;
-            else if (c.kind === "input") selInputName = c.name;
-            else if (c.kind === "output") selOutputIndex = c.index;
-          }
-          // Phase 4: extract widgetSchema from the selected candidate
-          const selCandidate = _findSelectedCandidate(
-            selected.candidates,
-            { widgetName: selected.widgetName, inputName: selected.inputName, outputIndex: selected.outputIndex }
-          );
-          const selWidgetSchema = _buildWidgetSchemaFromCandidate(selCandidate);
-          // Refuse captures with no confirmable field: a node-only binding
-          // would look bound while the save gate can never count it. This
-          // covers zero candidates AND the lone node-fallback candidate
-          // (extractNodeCandidates emits kind "node" when a node exposes no
-          // widgets/inputs/outputs) — neither yields a field, and the
-          // dropdown cannot fix it (node options are not offered).
-          const selHasField = selWidgetName || selInputName || selOutputIndex != null;
-          const selPickable = selectedCandidates.some((c) => c && (c.kind === "widget" || c.kind === "input" || c.kind === "output"));
-          if (!selHasField && !selPickable) {
-            const nodeLabel = selected.nodeTitle || selected.nodeType || ("Node " + selected.nodeId);
-            state.captureNotice = { key: bindingDef.key, message: nodeLabel + " exposes no bindable fields — pick a node with widgets or connections." };
-            cancelGraphBinding();
-            state.bindingCaptureActive = null;
-            renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
-            return;
-          }
-          if (state.captureNotice && state.captureNotice.key === bindingDef.key) state.captureNotice = null;
-          state.bindings[bindingDef.key] = {
-            kind: selWidgetName ? "widget" : selInputName ? "input" : selOutputIndex != null ? "output" : "node",
-            nodeId: selected.nodeId,
-            nodeType: selected.nodeType,
-            nodeTitle: selected.nodeTitle,
-            widgetName: selWidgetName,
-            inputName: selInputName,
-            outputIndex: selOutputIndex,
-            label: selected.nodeTitle || selected.nodeType,
-            candidates: selected.candidates || [],
-            widgetSchema: selWidgetSchema,
-          };
-          cancelGraphBinding();
-          state.bindingCaptureActive = null;
-          renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+          applySelectedNodeBinding(state, bindingDef);
         },
       }));
     } else if (!isGraphAvailable() && !state.graphCaptured) {
@@ -1809,21 +2174,28 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
       row.appendChild(candidateDropdown);
     }
 
-    // Bound rows: a View aid that centers + highlights the node on the
-    // canvas.  Disabled (never hidden) when the node is not on the live
-    // canvas, so the row layout stays stable.
+    // Bound rows: View aid (centers + highlights the node) plus a
+    // Use selected rebind, so a bound row can be re-pointed at the
+    // currently selected canvas node without unbinding first. View is
+    // disabled (never hidden) when the node is not on the live canvas,
+    // so the row layout stays stable.
     if (isBound) {
-      row.appendChild(renderViewButton(bindingValue.nodeId, {
-        testid: "wizard-view-binding",
-        bindingKey: bindingDef.key,
-        state,
-      }));
+      row.appendChild(el("div", { style: "margin-top:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;" }, [
+        renderViewButton(bindingValue.nodeId, {
+          testid: "wizard-view-binding",
+          bindingKey: bindingDef.key,
+          state,
+        }),
+        renderUseSelectedButton(state, bindingDef),
+      ]));
     }
 
     // Unbound rows: show the likely-target hint, plus a one-click
-    // confirmation when the graph scan found a concrete target. The click
-    // below IS the required exact-target confirmation — suggestions are
-    // never applied without it.
+    // confirmation when a concrete target is known. Stored-graph scan hits
+    // and live-canvas fallback hits are the same concept ("Suggested") and
+    // share the same Use suggestion + View confirmation — the click below IS
+    // the required exact-target confirmation, and suggestions are never
+    // applied without it.
     if (!isBound && !isCaptureActive) {
       const scanned = (state.suggestedTargets && state.suggestedTargets[bindingDef.key]) || [];
       if (scanned.length > 0) {
@@ -1858,6 +2230,7 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
             bindingKey: bindingDef.key,
             state,
           }),
+          renderUseSelectedButton(state, bindingDef),
         ]));
       } else {
         const hint = _likelyTargetHint(bindingDef.key);
@@ -1868,8 +2241,8 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
         }
         // Live-canvas fallback: the stored-graph scan found nothing (often
         // custom node types), but a matching node may sit on the canvas.
-        // Each found target gets the same explicit Use + View confirmation
-        // as scanned suggestions — nothing is ever auto-bound.
+        // Each live hit gets the same explicit Use suggestion + View
+        // confirmation as scanned suggestions — nothing is ever auto-bound.
         const found = findCanvasNodeTargets(ROLE_SUGGESTIONS[bindingDef.key], 3);
         found.forEach((target) => {
           const targetLabel = target.widgetName
@@ -1882,13 +2255,13 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
           row.appendChild(el("div", { style: "margin-top:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;" }, [
             el("span", {
               style: "font-size:10px;color:#888;",
-              text: `Found: ${target.nodeTitle || target.nodeType} → ${targetLabel}`,
+              text: `Suggested: ${target.nodeTitle || target.nodeType} → ${targetLabel}`,
             }),
             el("button", {
               class: "comfymodal-secondary-btn",
-              "data-testid": "wizard-use-found",
+              "data-testid": "wizard-use-suggestion",
               "data-binding-key": bindingDef.key,
-              text: "Use found",
+              text: "Use suggestion",
               style: "width:auto;padding:2px 8px;font-size:10px;",
               onclick: (event) => {
                 event.preventDefault();
@@ -1898,34 +2271,40 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
               },
             }),
             renderViewButton(target.nodeId, {
-              testid: "wizard-view-found",
+              testid: "wizard-view-suggestion",
               bindingKey: bindingDef.key,
               state,
             }),
+            renderUseSelectedButton(state, bindingDef),
           ]));
         });
+        // No live target either: no dead disabled buttons — just a hint plus
+        // the always-available Use selected action below.
         if (found.length === 0) {
-          // No live target: both buttons still render so every Likely row
-          // offers the same actions; disabled with the reason until a
-          // matching node is on the canvas.
-          row.appendChild(el("div", { style: "margin-top:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;" }, [
-            el("button", {
-              class: "comfymodal-secondary-btn",
-              "data-testid": "wizard-use-found",
-              "data-binding-key": bindingDef.key,
-              text: "Use found",
-              disabled: true,
-              title: "No matching node on the canvas — load the workflow or capture manually",
-              style: "width:auto;padding:2px 8px;font-size:10px;",
-            }),
-            renderViewButton(null, {
-              testid: "wizard-view-found",
-              bindingKey: bindingDef.key,
-              state,
-            }),
+          row.appendChild(el("div", { style: "margin-top:4px;" }, [
+            el("span", { style: "font-size:10px;color:#888;", text: "No match on the canvas — select a node, then Use selected." }),
           ]));
         }
+        row.appendChild(el("div", { style: "margin-top:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;" }, [
+          renderUseSelectedButton(state, bindingDef),
+        ]));
       }
+    }
+
+    // Bound-but-invalid notice: the row looks filled (green) while the
+    // save gate cannot count it. Say exactly why on the row instead of
+    // leaving the "7 of 8" counter as the only clue. The usual case is the
+    // output row holding a widget/input pick from its dropdown — only the
+    // node's output field satisfies the output binding.
+    if (isBound && !isValidConcreteBinding(bindingValue, bindingDef.key)) {
+      row.appendChild(el("div", { style: "margin-top:4px;" }, [
+        el("span", {
+          style: "font-size:10px;color:#fbbf24;",
+          text: bindingDef.key === OUTPUT_BINDING.key
+            ? "Not counted: bind the node's output field (pick output: … from the dropdown) — inputs/widgets don't satisfy the output."
+            : "Not counted: bind a widget/input field for this row.",
+        }),
+      ]));
     }
 
     // Unbindable-capture notice: the picked node exposed no confirmable
@@ -2039,9 +2418,12 @@ function renderCandidateDropdown(bindingValue, bindingDef, state) {
   }
 
   // Node-fallback candidates are never pickable (the change handler has no
-  // field to store for them), so they are not offered as options.
+  // field to store for them), so they are not offered as options. Output
+  // candidates are only offered on the output row: input rows bind a value
+  // INTO a widget/input field and can never consume a node output.
+  const inputRow = bindingDef.key !== OUTPUT_BINDING.key;
   const pickableCandidates = (bindingValue.candidates || []).filter(
-    (c) => c && (c.kind === "widget" || c.kind === "input" || c.kind === "output")
+    (c) => c && (c.kind === "widget" || c.kind === "input" || (!inputRow && c.kind === "output"))
   );
   pickableCandidates.forEach((c) => {
     let isCurrent = false;
@@ -2075,6 +2457,7 @@ function renderCandidateDropdown(bindingValue, bindingDef, state) {
       bindingValue.widgetName = null;
       bindingValue.outputIndex = null;
     } else if (parsed.kind === "output") {
+      if (bindingDef.key !== OUTPUT_BINDING.key) return; // input rows never consume outputs
       bindingValue.kind = "output";
       bindingValue.outputIndex = parsed.index;
       bindingValue.widgetName = null;
@@ -2111,6 +2494,10 @@ function startBindingCapture(state, bindingDef) {
   const cancelFn = beginGraphBindingCapture({
     bindingKey: bindingDef.key,
     label: bindingDef.label,
+    // Input rows consume a widget/input field; outputs are not selectable
+    // there (the capture layer excludes them, so an output click reports
+    // "no bindable fields" instead of storing a dead binding).
+    allowOutput: bindingDef.key === OUTPUT_BINDING.key,
     onCapture: (result) => {
       // Phase 4: extract widgetSchema from the selected candidate
       const selectedCandidate = _findSelectedCandidate(
@@ -2127,6 +2514,17 @@ function startBindingCapture(state, bindingDef) {
       if (!resHasField && !resPickable) {
         const nodeLabel = result.nodeTitle || result.nodeType || ("Node " + result.nodeId);
         state.captureNotice = { key: result.bindingKey, message: nodeLabel + " exposes no bindable fields — pick a node with widgets or connections." };
+        state.bindingCaptureActive = null;
+        renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+        return;
+      }
+      // Input rows bind a value INTO a widget/input field: a node output can
+      // never receive a control value, so refuse it here (same rule as "Use
+      // Selected Node" and the save gate).
+      const resResolvesOutput = !result.widgetName && !result.inputName && result.outputIndex != null;
+      if (resResolvesOutput && result.bindingKey !== OUTPUT_BINDING.key) {
+        const nodeLabel = result.nodeTitle || result.nodeType || ("Node " + result.nodeId);
+        state.captureNotice = { key: result.bindingKey, message: nodeLabel + " output cannot receive a value — bind the widget or input field that consumes it instead." };
         state.bindingCaptureActive = null;
         renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
         return;
@@ -2269,6 +2667,13 @@ function renderSavedStep(body, state) {
         style: "font-size:11px;color:#888;margin:4px 0;",
       }));
     }
+    if (state.typePersistWarning) {
+      success.appendChild(el("p", {
+        text: state.typePersistWarning,
+        "data-testid": "wizard-type-persist-warning",
+        style: "font-size:11px;color:#fbbf24;margin:4px 0;",
+      }));
+    }
     body.appendChild(success);
     return;
   }
@@ -2325,6 +2730,44 @@ function renderErrorStep(body, state) {
 
 // ── Save orchestration ──────────────────────────────────────────────────
 
+function _selectedWorkflowType(state) {
+  const fid = (state && state.selectedFeatures && state.selectedFeatures[0]) || "txt2img";
+  return normalizeWorkflowType(fid);
+}
+
+function _notifyMappingSaved(state) {
+  // Let live Studio pages drop their cached run-context bundle: the Wizard
+  // saves mappings as new versions (or first mappings on the same version),
+  // and a tab holding the old bundle keeps showing the old shelf fields
+  // until a browser refresh re-fetches them. Best-effort notification only.
+  try {
+    if (typeof document === "undefined" || typeof CustomEvent !== "function") return;
+    document.dispatchEvent(new CustomEvent("comfymodal:mapping-saved", {
+      bubbles: true,
+      detail: {
+        workflowId: state ? state.workflowId : "",
+        workflowVersionId: state ? state.workflowVersionId : "",
+      },
+    }));
+  } catch (_e) { /* notification is best-effort */ }
+}
+
+async function _persistWorkflowType(state, apiBase) {  try {
+    if (!state || !state.isVersionSetup || !state.workflowId) return true;
+    const workflowType = _selectedWorkflowType(state);
+    if (!workflowType) return true;
+    const resp = await updateWorkflow(apiBase, state.workflowId, { workflow_type: workflowType });
+    // apiFetch returns null on transport/JSON failure — that is NOT success.
+    if (!resp || resp.status === "error") throw new Error((resp && (resp.message || resp.error)) || "workflow type save failed");
+    return true;
+  } catch (_e) {
+    // Never fail the mapping save over the type label — but say so loudly
+    // on the saved step instead of pretending the tool was recorded.
+    if (state) state.typePersistWarning = "Mapping saved, but the workflow type could not be recorded — reselect the tool in the Wizard.";
+    return false;
+  }
+}
+
 async function executeSave(state) {
   state.step = "saving";
   const panel = _wizardRoot && _wizardRoot.querySelector(".comfymodal-studio-wizard-panel");
@@ -2344,7 +2787,7 @@ async function executeSave(state) {
         state.errorMessage = "All required bindings must be confirmed before saving.";
         return;
       }
-      const mappingPayload = buildVersionMappingPayload(state);
+  const mappingPayload = buildVersionMappingPayload(state);
       if (!mappingPayload) {
         state.step = "error";
         state.errorMessage = "All required bindings must be confirmed before saving.";
@@ -2355,6 +2798,8 @@ async function executeSave(state) {
         state.mappingResult = mappingResp.mapping;
         state.revisionVersion = null;
         state.step = "saved";
+        await _persistWorkflowType(state, apiBase);
+        _notifyMappingSaved(state);
         return;
       }
       // The version already has an immutable mapping (Edit mapping entry
@@ -2369,6 +2814,8 @@ async function executeSave(state) {
           state.revisionVersion = revisionVersion;
           state.workflowVersionId = revisionVersion.workflow_version_id || state.workflowVersionId;
           state.step = "saved";
+          await _persistWorkflowType(state, apiBase);
+          _notifyMappingSaved(state);
           return;
         }
         state.step = "error";
@@ -2388,7 +2835,7 @@ async function executeSave(state) {
     const nodeBindings = {};
     Object.entries(state.bindings).forEach(([key, val]) => {
       if (key !== OUTPUT_BINDING.key && !BINDABLE_INPUTS[key]) return;
-      if (!isValidConcreteBinding(val)) return;
+      if (!isValidConcreteBinding(val, key)) return;
       nodeBindings[key] = {
         kind: val.kind || "node",
         nodeId: val.nodeId,
@@ -2485,13 +2932,14 @@ async function prefetchVersionSetupGraph(state) {
   if (_wizardState !== state) return;
   try {
     state.suggestedTargets = suggestAllBindings(graph);
+    state.suggestedTextGenerateTargets = _textGenerateNodeTargets(graph);
     const found = Object.values(state.suggestedTargets).filter((t) => t && t.length).length;
     if (found) {
       state.suggestStatus = `Found likely targets for ${found} binding${found === 1 ? "" : "s"} in this version's stored graph. Confirm each one below.`;
     }
   } catch (e) { /* suggestions are best-effort */ }
   const requiredKeys = collectRequiredBindings(state.selectedFeatures).map((binding) => binding.key);
-  const missingRequired = requiredKeys.some((key) => !isValidConcreteBinding(state.bindings && state.bindings[key]));
+  const missingRequired = requiredKeys.some((key) => !isValidConcreteBinding(state.bindings && state.bindings[key], key));
   if (state.step === "bindings" && (!state.bindings || !Object.keys(state.bindings).length || missingRequired)) {
     if (_wizardState !== state) return;
     let mappingResponse = null;
@@ -2501,10 +2949,13 @@ async function prefetchVersionSetupGraph(state) {
       mappingResponse = null;
     }
     if (_wizardState !== state) return;
-    const mappingBindings = _mappingToBindings(mappingResponse);
-    Object.keys(mappingBindings).forEach((key) => {
-      if (state.bindings[key] == null) state.bindings[key] = mappingBindings[key];
-    });
+     const mappingBindings = _mappingToBindings(mappingResponse);
+     Object.keys(mappingBindings).forEach((key) => {
+       if (state.bindings[key] == null) state.bindings[key] = mappingBindings[key];
+     });
+     if (!state.textGenerateBinding) {
+       state.textGenerateBinding = _textGenerateBindingFromMapping(mappingResponse);
+     }
   }
   const panel = _wizardRoot && _wizardRoot.querySelector(".comfymodal-studio-wizard-panel");
   if (panel) renderWizard(panel, state);
@@ -2518,6 +2969,7 @@ function _versionMappingControlKind(key) {
   if (block === "integer") return "integer";
   if (block === "float") return "number";
   if (block === "model-picker") return "file";
+  if (block === "image") return "image";
   if (block === "boolean") return "boolean";
   return "string";
 }
@@ -2541,13 +2993,16 @@ function _isMappingAlreadyExists(resp) {
 function buildVersionMappingPayload(state) {
   const bindings = (state && state.bindings) || {};
   const outputBinding = bindings[OUTPUT_BINDING.key];
-  if (!isValidConcreteBinding(outputBinding)) return null;
+  if (!isValidConcreteBinding(outputBinding, OUTPUT_BINDING.key)) return null;
+  const requiredKeys = new Set(
+    collectRequiredBindings(state && state.selectedFeatures).map((b) => b.key)
+  );
   const entries = {};
   Object.keys(bindings).forEach((key) => {
     if (key === OUTPUT_BINDING.key) return;
     if (!BINDABLE_INPUTS[key]) return;
     const val = bindings[key];
-    if (!isValidConcreteBinding(val)) return;
+    if (!isValidConcreteBinding(val, key)) return;
     entries[key] = {
       semantic_role: key,
       node_id: String(val.nodeId),
@@ -2559,11 +3014,16 @@ function buildVersionMappingPayload(state) {
       data_type: "",
       control_kind: _versionMappingControlKind(key),
       display_name: (BINDABLE_INPUTS[key] && BINDABLE_INPUTS[key].name) || key,
-      required: T2I_SAVE_GATE_KEYS.indexOf(key) !== -1,
+      required: requiredKeys.has(key),
     };
   });
   if (Object.keys(entries).length === 0) return null;
-  return { entries: entries, output_node_id: String(outputBinding.nodeId) };
+  return {
+    entries: entries,
+    output_node_id: String(outputBinding.nodeId),
+    text_generate_node_id: state.textGenerateBinding && state.textGenerateBinding.nodeId != null
+      ? String(state.textGenerateBinding.nodeId) : null,
+  };
 }
 
 // ── Phase 4: Build widget schema from a single candidate ────────────
@@ -2700,7 +3160,7 @@ function collectRequiredAndOptionalBindings(featureIds) {
 function checkAllRequiredBindings(state) {
   if (!state) return false;
   const required = collectRequiredBindings(state.selectedFeatures);
-  return required.every((b) => isValidConcreteBinding(state.bindings && state.bindings[b.key]));
+  return required.every((b) => isValidConcreteBinding(state.bindings && state.bindings[b.key], b.key));
 }
 
 /**
@@ -2711,6 +3171,7 @@ function checkAllRequiredBindings(state) {
 function applySuggestedBinding(state, roleKey, suggestion) {
   if (!state || !roleKey || !suggestion || suggestion.nodeId == null) return false;
   if (!ROLE_SUGGESTIONS[roleKey]) return false; // catalog roles only
+  if (roleKey !== OUTPUT_BINDING.key && suggestion.outputIndex != null) return false; // input rows never consume outputs
   if (state.captureNotice && state.captureNotice.key === roleKey) state.captureNotice = null;
   if (state.viewNotice && state.viewNotice.key === roleKey) state.viewNotice = null;
   state.bindings[roleKey] = {

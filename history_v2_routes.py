@@ -207,6 +207,130 @@ def _model_name(entry: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _model_names(entry: dict[str, Any]) -> list[str]:
+    """All display names for one model_stack entry.
+
+    Besides the ``{name/model/label}`` object form, the writer stores
+    role-keyed dicts (``{"clip": [...], "unet": [...], "vae": [...]}``) —
+    without this fallback every such generation projected zero models.
+    """
+    direct = _model_name(entry)
+    if direct:
+        return [direct]
+    names: list[str] = []
+    for value in entry.values():
+        if isinstance(value, str) and value:
+            names.append(value)
+        elif isinstance(value, (list, tuple)):
+            names.extend(str(v) for v in value if isinstance(v, str) and v)
+    seen: set[str] = set()
+    unique = [n for n in names if not (n in seen or seen.add(n))]
+    return unique
+
+
+def _probe_image_dimensions(managed_path: str) -> tuple[Optional[int], Optional[int]]:
+    """Header-only image dimensions for a local managed file.
+
+    Fallback for assets recorded before dimensions were stored (width/height
+    NULL): ``Image.open`` reads only the header, never a full decode. Remote
+    (``modal://``) or unreadable files return ``(None, None)`` so the viewer
+    omits Resolution instead of guessing.
+    """
+    if not managed_path or str(managed_path).startswith("modal://"):
+        return None, None
+    try:
+        from PIL import Image
+
+        with Image.open(managed_path) as img:
+            width, height = img.size
+        if (
+            isinstance(width, int)
+            and isinstance(height, int)
+            and width > 0
+            and height > 0
+        ):
+            return width, height
+    except Exception:
+        pass
+    return None, None
+
+
+# ComfyUI API-format node types whose inputs carry generation params, and the
+# loader input keys that name model files. Used ONLY on the embedded prompt
+# JSON materialized files carry (PNG tEXt "prompt"), which is ground truth
+# about what produced THAT file — never a guess about the run.
+_EMBEDDED_SAMPLER_TYPES = ("KSampler", "KSamplerAdvanced")
+_EMBEDDED_MODEL_KEYS = ("unet_name", "ckpt_name", "clip_name", "vae_name", "lora_name")
+_EMBEDDED_SAMPLER_KEYS = (
+    ("seed", ("seed", "noise_seed")),
+    ("steps", ("steps",)),
+    ("cfg", ("cfg",)),
+    ("sampler", ("sampler_name", "sampler")),
+    ("scheduler", ("scheduler",)),
+    ("denoise", ("denoise",)),
+)
+
+
+def _recover_embedded_params(managed_path: str) -> tuple[dict[str, Any], list[str]]:
+    """Recover (params, model names) from an image file's embedded prompt JSON.
+
+    Some runs — notably golden-path executions — persist no request snapshot,
+    so the viewer would otherwise show no seed/steps/sampler/models at all.
+    The materialized file itself usually embeds the exact ComfyUI prompt that
+    produced it (KSampler inputs, loader filenames). Header + text-chunk read
+    only; remote, oversized, or unparseable files yield ``({}, [])``.
+    """
+    params: dict[str, Any] = {}
+    models: list[str] = []
+    if not managed_path or str(managed_path).startswith("modal://"):
+        return params, models
+    try:
+        from PIL import Image
+
+        with Image.open(managed_path) as img:
+            info = dict(img.info or {})
+    except Exception:
+        return params, models
+    prompt: Optional[dict[str, Any]] = None
+    for value in info.values():
+        if not isinstance(value, str) or len(value) > 5_000_000:
+            continue
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            continue
+        if (
+            isinstance(parsed, dict)
+            and parsed
+            and all(
+                isinstance(node, dict) and isinstance(node.get("class_type"), str)
+                for node in parsed.values()
+            )
+        ):
+            prompt = parsed
+            break
+    if not prompt:
+        return params, models
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        if node.get("class_type") in _EMBEDDED_SAMPLER_TYPES and not params:
+            for canonical, aliases in _EMBEDDED_SAMPLER_KEYS:
+                for alias in aliases:
+                    value = inputs.get(alias)
+                    if value is not None and not isinstance(value, (dict, list)):
+                        params[canonical] = value
+                        break
+        for key in _EMBEDDED_MODEL_KEYS:
+            value = inputs.get(key)
+            if isinstance(value, str) and value and value not in models:
+                models.append(value)
+    return params, models
+
+
 def _parse_iso_ms(value: str) -> Optional[int]:
     if not value:
         return None
@@ -345,11 +469,28 @@ def _original_projection(
     return None, bool(originals)
 
 
+def _asset_byte_size(asset: Asset) -> Optional[int]:
+    """Local managed-file size in bytes, or None when unknown.
+
+    ``modal://`` (remote) assets and missing files project no size — the
+    viewer omits the File size row rather than showing a fabricated value.
+    """
+    managed_path = str(asset.managed_path or "")
+    if not managed_path or managed_path.startswith("modal://"):
+        return None
+    try:
+        size = Path(managed_path).stat().st_size
+    except OSError:
+        return None
+    return size if isinstance(size, int) and size >= 0 else None
+
+
 def _build_outputs(
     assets: list[Asset],
     gen_thumb_url: str = "",
     attempts: Optional[list[RunAttempt]] = None,
     export_state_of: Optional[Any] = None,
+    include_embedded: bool = False,
 ) -> list[dict[str, Any]]:
     """Group assets by logical output identity and build feed outputs.
 
@@ -364,6 +505,11 @@ def _build_outputs(
     winner objects the URLs point at, so URL + asset id + export state always
     describe one selected Asset.  Without the projector (feed paths) no
     export fields are emitted and nothing is looked up.
+
+    ``include_embedded`` (detail paths only): also probe each output's local
+    file for header-measured dimensions and embedded prompt params/models.
+    Feed pages leave this off — header reads stay off the hot list path and
+    feed cards render no viewer-content fields anyway.
     """
     groups = _logical_output_groups(assets)
 
@@ -376,6 +522,22 @@ def _build_outputs(
         )
         original, original_failed = _original_projection(group, attempts)
         primary = original or preview or thumb or ordered[0]
+        managed_path = str(primary.managed_path or "")
+        width, height = primary.width, primary.height
+        embedded_params: dict[str, Any] = {}
+        embedded_models: list[str] = []
+        if include_embedded:
+            if width is None or height is None:
+                probed_width, probed_height = _probe_image_dimensions(managed_path)
+                if width is None:
+                    width = probed_width
+                if height is None:
+                    height = probed_height
+            embedded_params, embedded_models = _recover_embedded_params(managed_path)
+        output_format = primary.format or None
+        if not output_format:
+            ext = Path(primary.filename or "").suffix.lstrip(".").lower()
+            output_format = ext or None
         output = {
             "index": len(outputs),
             "asset_id": primary.asset_id,
@@ -384,6 +546,23 @@ def _build_outputs(
             "original_url": _asset_url(original.asset_id) if original else "",
             "original_failed": original_failed,
             "status": "success",
+            # Viewer-content fields: resolution (asset-measured W×H, always
+            # available when an image exists — independent of the request
+            # snapshot/params) and file size (local files only; None stays
+            # absent so the viewer omits the row instead of guessing).
+            "width": width,
+            "height": height,
+            "byte_size": _asset_byte_size(primary),
+            # File identity for the viewer's File row (name + open/copy):
+            # the stored filename, container format, and a display path
+            # (local managed path, or the modal:// URI for remote assets).
+            "filename": primary.filename or "",
+            "format": output_format,
+            "path": managed_path,
+            # Embedded-file recovery (detail only): exact sampler params and
+            # loader model names read back from the file's own prompt JSON.
+            "embedded_params": embedded_params,
+            "embedded_models": embedded_models,
         }
         if export_state_of is not None:
             output["preview_asset_id"] = preview.asset_id if preview else None
@@ -443,15 +622,23 @@ def _generation_feed_item(
     attempts: list[RunAttempt],
     snapshot: Optional[RequestSnapshot] = None,
     export_state_of: Optional[Any] = None,
+    include_embedded: bool = False,
 ) -> dict[str, Any]:
     """Build the raw snake_case generation feed item consumed by the UI.
 
     ``export_state_of`` (F9) is passed through to ``_build_outputs`` so
     detail surfaces project per-variant export state; plain feed pages omit
     it (no per-asset export lookups there).
+
+    ``include_embedded`` (detail only) additionally recovers sampler params
+    and model names from each output file's own embedded prompt JSON, and
+    backfills ``models`` from them when the stored model_stack is empty.
     """
     outputs = _build_outputs(
-        assets, attempts=attempts, export_state_of=export_state_of
+        assets,
+        attempts=attempts,
+        export_state_of=export_state_of,
+        include_embedded=include_embedded,
     )
     has_original = any(output["original_url"] for output in outputs)
     has_preview = any(output["preview_url"] for output in outputs)
@@ -477,9 +664,17 @@ def _generation_feed_item(
     for entry in g.get("model_stack") or []:
         if not isinstance(entry, dict):
             continue
-        name = _model_name(entry)
-        if name:
+        for name in _model_names(entry):
             models.append({"name": name})
+    if not models and include_embedded:
+        # Snapshot-less runs store no model_stack; the files themselves name
+        # their loaders, so backfill the viewer-facing list from there.
+        seen_models: set[str] = set()
+        for output in outputs:
+            for name in output.get("embedded_models") or []:
+                if name not in seen_models:
+                    seen_models.add(name)
+                    models.append({"name": name})
 
     featured_index = _featured_output_index(assets, g.get("featured_asset_id"))
 
@@ -1551,6 +1746,7 @@ def register_history_v2_routes(
             detail.generation.to_dict(), detail.assets, detail.attempts,
             snapshot=detail.request_snapshot,
             export_state_of=_export_state_of,
+            include_embedded=True,
         )
         item["attempts"] = [_attempt_dict(a) for a in detail.attempts]
         item["errors"] = [

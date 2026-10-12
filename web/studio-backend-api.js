@@ -619,6 +619,16 @@ function _draftStr(value, max) {
   return s.length > max ? s.slice(0, max) : s;
 }
 
+/** Normalize the optional TextGenerate bypass pick (node-only); null when unusable. */
+function _draftTextGenerateValue(val) {
+  if (!val || typeof val !== "object" || val.nodeId == null) return null;
+  return {
+    nodeId: val.nodeId,
+    nodeType: _draftStr(val.nodeType || "", WIZARD_BINDING_STR_MAX),
+    nodeTitle: _draftStr(val.nodeTitle || "", WIZARD_BINDING_STR_MAX),
+  };
+}
+
 /** Normalize one binding to the bounded draft shape; null when unusable. */
 function _draftBindingValue(val) {
   if (!val || typeof val !== "object" || val.nodeId == null) return null;
@@ -665,6 +675,7 @@ export function buildWizardDraft(state) {
     workflowVersionId: workflowVersionId,
     selectedFeatures: features,
     bindings: bindings,
+    textGenerate: _draftTextGenerateValue(state.textGenerateBinding),
     details: {
       name: _draftStr((state.details && state.details.name) || "", WIZARD_DETAIL_NAME_MAX),
       description: _draftStr((state.details && state.details.description) || "", WIZARD_DETAIL_DESC_MAX),
@@ -709,6 +720,7 @@ export function parseWizardDraft(raw) {
     workflowVersionId: workflowVersionId,
     selectedFeatures: features,
     bindings: bindings,
+    textGenerate: _draftTextGenerateValue(obj.textGenerate),
     details: {
       name: _draftStr(details.name || "", WIZARD_DETAIL_NAME_MAX),
       description: _draftStr(details.description || "", WIZARD_DETAIL_DESC_MAX),
@@ -735,6 +747,9 @@ export function applyWizardDraft(state, draft, validSteps) {
   Object.keys(draft.bindings || {}).forEach((key) => {
     state.bindings[key] = Object.assign({}, draft.bindings[key]);
   });
+  if (draft.textGenerate && state.textGenerateBinding == null) {
+    state.textGenerateBinding = Object.assign({}, draft.textGenerate);
+  }
   if (draft.details) {
     if (draft.details.name) state.details.name = draft.details.name;
     if (draft.details.description) state.details.description = draft.details.description;
@@ -1137,6 +1152,15 @@ export async function triggerGoldenProfileDeploy(apiBase, profile) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ profile }),
+  });
+}
+
+export async function setGoldenProfileRegion(apiBase, profile, region) {
+  if (!profile) return null;
+  return apiFetch(apiBase, "/studio/golden/region", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ profile, region }),
   });
 }
 

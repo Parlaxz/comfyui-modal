@@ -25,6 +25,9 @@ from history_v2_routes import (
     _cell_generation_payload,
     _detail_cell,
     _generation_feed_item,
+    _model_names,
+    _probe_image_dimensions,
+    _recover_embedded_params,
 )
 from history_v2_store import HistoryV2Store
 from history_v2_writer import (
@@ -440,6 +443,228 @@ class LogicalOutputWriterTests(unittest.TestCase):
         assets = repo.get_generation_assets(generation_id)
 
         self.assertEqual([a.logical_output_key for a in assets], [KEY_A])
+
+
+class ViewerContentProjectionTests(unittest.TestCase):
+    """Resolution + file size reach the viewer even without a request snapshot.
+
+    A generation recorded with no snapshot (no params/workflow/model data)
+    must still show resolution: the output projects asset-measured dims and
+    the local managed-file size, and omits both (None) for remote-only
+    assets instead of fabricating values.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _path(self, name: str, size: int = 10) -> str:
+        path = self.root / name
+        path.write_bytes(b"x" * size)
+        return str(path)
+
+    def test_output_projects_dimensions_and_local_file_size(self):
+        asset = Asset(
+            asset_id="preview",
+            generation_id="gen_viewer",
+            type="preview",
+            managed_path=self._path("preview.png", size=1234),
+            filename="preview.png",
+            created_at=T0,
+            run_id="run_p",
+            width=1024,
+            height=768,
+            format="png",
+            logical_output_key=KEY_A,
+        )
+        outputs = _build_outputs([asset], attempts=[_attempt("run_p", "preview")])
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0]["width"], 1024)
+        self.assertEqual(outputs[0]["height"], 768)
+        self.assertEqual(outputs[0]["byte_size"], 1234)
+
+    def test_remote_or_missing_file_projects_no_size_but_keeps_dimensions(self):
+        remote = Asset(
+            asset_id="remote",
+            generation_id="gen_viewer",
+            type="preview",
+            managed_path="modal://workspace/remote.png",
+            filename="remote.png",
+            created_at=T0,
+            run_id="run_p",
+            width=512,
+            height=512,
+            format="png",
+            logical_output_key=KEY_A,
+        )
+        outputs = _build_outputs([remote], attempts=[_attempt("run_p", "preview")])
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0]["width"], 512)
+        self.assertEqual(outputs[0]["height"], 512)
+        self.assertIsNone(outputs[0]["byte_size"])
+
+    def test_missing_recorded_dimensions_are_probed_from_the_image_file(self):
+        from PIL import Image
+
+        image_path = str(self.root / "probed.png")
+        Image.new("RGB", (640, 480)).save(image_path)
+        asset = Asset(
+            asset_id="probed",
+            generation_id="gen_viewer",
+            type="preview",
+            managed_path=image_path,
+            filename="probed.png",
+            created_at=T0,
+            run_id="run_p",
+            width=None,
+            height=None,
+            format="png",
+            logical_output_key=KEY_A,
+        )
+        # Detail-only: feed pages never pay for header probes.
+        outputs = _build_outputs(
+            [asset], attempts=[_attempt("run_p", "preview")], include_embedded=True
+        )
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0]["width"], 640)
+        self.assertEqual(outputs[0]["height"], 480)
+
+    def test_probe_ignores_remote_and_unreadable_files(self):
+        self.assertEqual(_probe_image_dimensions("modal://workspace/x.png"), (None, None))
+        self.assertEqual(_probe_image_dimensions(str(self.root / "absent.png")), (None, None))
+        bad = self.root / "bad.png"
+        bad.write_bytes(b"not an image")
+        self.assertEqual(_probe_image_dimensions(str(bad)), (None, None))
+
+    def test_role_keyed_model_stack_projects_each_model_name(self):
+        self.assertEqual(
+            _model_names({"clip": ["qwen_3_4b.safetensors"], "unet": ["z_image_turbo_bf16.safetensors"], "vae": ["ae.safetensors"]}),
+            ["qwen_3_4b.safetensors", "z_image_turbo_bf16.safetensors", "ae.safetensors"],
+        )
+        self.assertEqual(_model_names({"name": "named.safetensors"}), ["named.safetensors"])
+        self.assertEqual(_model_names({}), [])
+
+        item = _generation_feed_item(
+            {
+                "generation_id": "gen_models",
+                "status": "completed",
+                "created_at": T0,
+                "model_stack": [{"clip": ["qwen_3_4b.safetensors"], "unet": ["z_image_turbo_bf16.safetensors"]}],
+            },
+            [],
+            [],
+        )
+        self.assertEqual(
+            [m["name"] for m in item["models"]],
+            ["qwen_3_4b.safetensors", "z_image_turbo_bf16.safetensors"],
+        )
+
+    def _prompt_png(self, name, prompt):
+        import json as _json
+
+        from PIL import Image
+        from PIL.PngImagePlugin import PngInfo
+
+        path = str(self.root / name)
+        info = PngInfo()
+        info.add_text("prompt", _json.dumps(prompt))
+        Image.new("RGB", (320, 240)).save(path, pnginfo=info)
+        return path
+
+    def test_embedded_prompt_recovers_sampler_params_and_models(self):
+        path = self._prompt_png("embedded.png", {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "u.safetensors"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors"}},
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 23, "steps": 25, "cfg": 1.0, "sampler_name": "euler",
+                "scheduler": "simple", "denoise": 0.8}},
+        })
+        params, models = _recover_embedded_params(path)
+
+        self.assertEqual(params, {
+            "seed": 23, "steps": 25, "cfg": 1.0,
+            "sampler": "euler", "scheduler": "simple", "denoise": 0.8,
+        })
+        self.assertEqual(models, ["u.safetensors", "c.safetensors"])
+
+    def test_embedded_prompt_supports_advanced_sampler_seed_alias(self):
+        path = self._prompt_png("adv.png", {
+            "9": {"class_type": "KSamplerAdvanced", "inputs": {
+                "noise_seed": 7, "steps": 10, "cfg": 3.5,
+                "sampler_name": "dpmpp_2m", "scheduler": "karras"}},
+        })
+        params, models = _recover_embedded_params(path)
+
+        self.assertEqual(params["seed"], 7)
+        self.assertEqual(params["sampler"], "dpmpp_2m")
+        self.assertEqual(models, [])
+
+    def test_embedded_recovery_ignores_remote_missing_and_foreign_chunks(self):
+        params, models = _recover_embedded_params("modal://workspace/x.png")
+        self.assertEqual((params, models), ({}, []))
+        params, models = _recover_embedded_params(str(self.root / "absent.png"))
+        self.assertEqual((params, models), ({}, []))
+
+        from PIL import Image
+
+        foreign = str(self.root / "foreign.png")
+        Image.new("RGB", (8, 8)).save(foreign)
+        params, models = _recover_embedded_params(foreign)
+        self.assertEqual((params, models), ({}, []))
+
+    def test_build_outputs_embeds_recovery_only_on_detail(self):
+        path = self._prompt_png("flag.png", {
+            "3": {"class_type": "KSampler", "inputs": {"seed": 5, "steps": 4}},
+        })
+        asset = Asset(
+            asset_id="flag", generation_id="gen_viewer", type="preview",
+            managed_path=path, filename="flag.png", created_at=T0,
+            run_id="run_p", width=None, height=None, format="png",
+            logical_output_key=KEY_A,
+        )
+        attempts = [_attempt("run_p", "preview")]
+
+        plain = _build_outputs([asset], attempts=attempts)[0]
+        self.assertEqual(plain["embedded_params"], {})
+        self.assertEqual(plain["embedded_models"], [])
+        self.assertIsNone(plain["width"])
+        self.assertEqual(plain["filename"], "flag.png")
+        self.assertEqual(plain["format"], "png")
+
+        rich = _build_outputs([asset], attempts=attempts, include_embedded=True)[0]
+        self.assertEqual(rich["embedded_params"], {"seed": 5, "steps": 4})
+        self.assertEqual(rich["width"], 320)
+        self.assertEqual(rich["height"], 240)
+
+    def test_feed_item_backfills_models_from_embedded_only_when_stack_empty(self):
+        path = self._prompt_png("models.png", {
+            "1": {"class_type": "VAELoader", "inputs": {"vae_name": "v.safetensors"}},
+        })
+        asset = Asset(
+            asset_id="m", generation_id="gen_models", type="preview",
+            managed_path=path, filename="m.png", created_at=T0,
+            run_id="run_p", width=8, height=8, format="png",
+            logical_output_key=KEY_A,
+        )
+        attempts = [_attempt("run_p", "preview")]
+
+        backfilled = _generation_feed_item(
+            {"generation_id": "gen_models", "status": "completed",
+             "created_at": T0, "model_stack": []},
+            [asset], attempts, include_embedded=True,
+        )
+        self.assertEqual(backfilled["models"], [{"name": "v.safetensors"}])
+
+        kept = _generation_feed_item(
+            {"generation_id": "gen_models", "status": "completed",
+             "created_at": T0, "model_stack": [{"name": "stored.safetensors"}]},
+            [asset], attempts, include_embedded=True,
+        )
+        self.assertEqual(kept["models"], [{"name": "stored.safetensors"}])
 
 
 if __name__ == "__main__":

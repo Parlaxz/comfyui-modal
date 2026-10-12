@@ -29,6 +29,10 @@ from .models import (
 
 # Heuristic role mapping: input name → canonical semantic role.
 _INPUT_ROLE_HINTS: dict[str, str] = {
+    # Some custom text nodes expose their positive text widget as ``prompt``
+    # rather than ComfyUI's usual ``text``.  Keep the internal graph role
+    # consistent with the other positive-text candidates.
+    "prompt": "positive_prompt",
     "seed": "seed",
     "steps": "steps",
     "cfg": "cfg",
@@ -944,12 +948,12 @@ def derive_mapping_candidates(
                 if input_name in _TEXT_ROLES:
                     role = input_name
                 elif input_name in (
-                    "text", "string", "positive_prompt", "negative_prompt",
+                    "text", "string", "prompt", "positive_prompt", "negative_prompt",
                 ):
                     role = "negative_prompt" if text_count > 0 else "positive_prompt"
                 else:
                     continue
-            if input_name in ("text", "string") or role in _TEXT_ROLES:
+            if input_name in ("text", "string", "prompt") or role in _TEXT_ROLES:
                 text_count += 1
             if role == "model" and role in entries:
                 continue  # one model role per mapping
@@ -969,9 +973,15 @@ def derive_mapping_candidates(
             entry.node_id = str(node_id)
             entry.input_name = input_name
             entry.display_name = input_name
-            entry.required = any(
-                input_name in defs_dict for defs_dict in defs
-            ) if defs is not None else False
+            # An empty negative prompt is valid input to every text encoder
+            # (upstream tokenizers even substitute a blank for it), so the
+            # negative role is never required even when the node declares
+            # the slot required. The positive prompt keeps the def's flag.
+            entry.required = (
+                role != "negative_prompt"
+                and defs is not None
+                and any(input_name in defs_dict for defs_dict in defs)
+            )
             entries[role] = entry
 
     return entries, output_node_id

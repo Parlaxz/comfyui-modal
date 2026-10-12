@@ -1056,6 +1056,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     sharedShell.render(viewer.record, {
       imageUrl: viewer.imageUrl,
       timing: viewer.timing,
+      variant: viewer.output && viewer.output.label ? viewer.output.label : "",
     });
     _ensureDialogFocus();
   }

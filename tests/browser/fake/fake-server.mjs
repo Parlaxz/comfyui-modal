@@ -98,8 +98,44 @@ async function _readBody(req) {
   });
 }
 
-function _getCookie(req, name) {
-  const header = req.headers.cookie || "";
+function _uploadPart(raw, boundary) {
+  // Return the first multipart section carrying a filename="", as
+  // { filename, bytes }. Buffer-level scan so binary PNG bytes survive.
+  const sep = Buffer.from("--" + boundary);
+  const headerEnd = Buffer.from("\r\n\r\n");
+  let cursor = 0;
+  for (;;) {
+    const start = raw.indexOf(sep, cursor);
+    if (start === -1) return null;
+    const headStart = start + sep.length;
+    if (raw[headStart] === 45 && raw[headStart + 1] === 45) return null; // closing --
+    const headEnd = raw.indexOf(headerEnd, headStart);
+    if (headEnd === -1) return null;
+    const header = raw.slice(headStart, headEnd).toString("latin1");
+    const fileMatch = header.match(/filename="([^"]*)"/);
+    const bodyStart = headEnd + headerEnd.length;
+    const bodyEnd = raw.indexOf(sep, bodyStart);
+    if (bodyEnd === -1) return null;
+    let body = raw.slice(bodyStart, bodyEnd);
+    if (body.length >= 2 && body[body.length - 2] === 13 && body[body.length - 1] === 10) {
+      body = body.slice(0, body.length - 2);
+    }
+    if (fileMatch && fileMatch[1]) return { filename: fileMatch[1], bytes: body };
+    cursor = bodyEnd;
+  }
+}
+
+function _parseUploadFilename(raw, boundary) {
+  const part = _uploadPart(raw, boundary);
+  return part ? part.filename : "";
+}
+
+function _parseUploadBytes(raw, boundary) {
+  const part = _uploadPart(raw, boundary);
+  return part && part.bytes && part.bytes.length ? part.bytes : null;
+}
+
+function _getCookie(req, name) {  const header = req.headers.cookie || "";
   for (const part of header.split(";")) {
     const eq = part.indexOf("=");
     if (eq === -1) continue;
@@ -1178,6 +1214,32 @@ async function handleRequest(req, res) {
       }
       return _error(res, "output not found", 404);
     }
+  }
+
+  // ComfyUI-native image upload (test double). Production exposes this at
+  // the server root; Studio image Tool Inputs POST here. Stored bytes are
+  // served back through /view?filename= like ComfyUI's input directory.
+  if (method === "POST" && pathname === "/upload/image") {
+    const chunks = [];
+    try {
+      await new Promise((resolve, reject) => {
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", resolve);
+        req.on("error", reject);
+      });
+    } catch {
+      return _error(res, "upload read failed", 500);
+    }
+    const raw = Buffer.concat(chunks);
+    const ctype = String(req.headers["content-type"] || "");
+    const boundary = (ctype.match(/boundary=([^;]+)/) || [])[1];
+    if (!boundary) return _error(res, "missing multipart boundary", 400);
+    const name = _parseUploadFilename(raw, boundary) || "upload.png";
+    const bytes = _parseUploadBytes(raw, boundary);
+    if (!bytes) return _error(res, "no image part", 400);
+    const sid = _getCookie(req, "comfymodal_fake_session") || DEFAULT_SESSION;
+    const stored = engine.storeUpload(sid, name, bytes);
+    return _json(res, { name: stored, subfolder: "", type: "input" });
   }
 
   // ComfyUI-Manager root-relative surface. Production exposes these at the

@@ -26,6 +26,19 @@
       "url": "https://civitai.red/api/download/models/2985440?fileId=2865386"
     },
     {
+      "added_at": 1791696881.5110219,
+      "filename": "qwen3vl_8b_int8_convrot.safetensors",
+      "folder": "clip",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1791696881.5110219,
+      "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
+    },
+    {
       "added_at": 1781240874.4127293,
       "filename": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
       "folder": "controlnet",
@@ -220,6 +233,19 @@
       "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors"
     },
     {
+      "added_at": 1791696725.0178478,
+      "filename": "qwen_image_2.1_int8_convrot.safetensors",
+      "folder": "unet",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1791696725.0178478,
+      "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors"
+    },
+    {
       "added_at": 1781240916.1024942,
       "filename": "ae.safetensors",
       "folder": "vae",
@@ -254,6 +280,19 @@
       "source_kind": "huggingface",
       "updated_at": 1781241029.9302888,
       "url": "https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/resolve/main/full_encoder_small_decoder.safetensors"
+    },
+    {
+      "added_at": 1791696720.1606832,
+      "filename": "qwen_image_2.1_vae_bf16.safetensors",
+      "folder": "vae",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1791696720.1606832,
+      "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors"
     },
     {
       "added_at": 1781243369.9858036,

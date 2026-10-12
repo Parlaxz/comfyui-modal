@@ -20,6 +20,10 @@
 //   options — {
 //     apiBase,                 // "/comfymodal" default
 //     mode,                    // "single" (default) | "many"
+//     workflowType,            // optional tool filter ("t2i", "i2i", …,
+//                             // aliases accepted); when set the list shows
+//                             // only workflows of that type
+//     workflowTypes,           // optional array alternative to workflowType
 //     selectedIds,             // initially selected workflow ids
 //     requiredRoles,           // optional role keys, labelled via the catalog
 //     confirmLabel,            // confirm button text (default per mode)
@@ -32,7 +36,7 @@
 
 import { el } from "./studio-ui.js";
 import { listWorkflows, listWorkflowFolders } from "./studio-backend-api.js";
-import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
+import { BINDABLE_INPUTS, normalizeWorkflowType } from "./studio-bindable-inputs.js";
 
 // Empty-list requests are shared by the library, picker, and run flow.  Keep
 // the cache deliberately short-lived: it removes duplicate navigation fetches
@@ -114,6 +118,24 @@ export function renderWorkflowPicker(options) {
   const actions = Array.isArray(opts.actions) ? opts.actions : [];
   const confirmLabel = opts.confirmLabel
     || (mode === "many" ? "Use selected workflows" : "Use workflow");
+
+  // Optional tool scoping (e.g. the Text-to-Image tool passes "t2i" so the
+  // dialog never offers image-edit/inpaint workflows). Absent/empty means
+  // all types, preserving existing callers (library dialog, compare).
+  const _wantedTypes = (function () {
+    const raw = opts.workflowTypes !== undefined ? opts.workflowTypes : opts.workflowType;
+    const list = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+    const set = new Set();
+    list.forEach((t) => {
+      const n = normalizeWorkflowType(t);
+      if (n) set.add(n);
+    });
+    return set;
+  })();
+
+  function _rowType(w) {
+    return normalizeWorkflowType((w && (w.workflow_type || w.workflowType || w.type)) || "t2i");
+  }
 
   const root = el("div", {
     class: "comfymodal-studio-workflow-picker",
@@ -228,11 +250,13 @@ export function renderWorkflowPicker(options) {
 
   // Local narrowing over the cached full list: folder uses the same
   // exact-or-subfolder semantics as the backend/library; search matches
-  // name + description + tags like the library's client-side filter.
+  // name + description + tags like the library's client-side filter; an
+  // optional workflowType scopes the dialog to one tool's workflows.
   function applyFilter() {
     const q = (searchInput.value || "").trim().toLowerCase();
     const folder = folderSelect.value || "";
     const rows = allWorkflows.filter((w) => {
+      if (_wantedTypes.size && !_wantedTypes.has(_rowType(w))) return false;
       if (folder) {
         const wf = String((w && w.folder) || "");
         if (!(wf === folder || wf.indexOf(folder + "/") === 0)) return false;
@@ -279,6 +303,15 @@ export function renderWorkflowPicker(options) {
   root.appendChild(el("div", {
     class: "comfymodal-studio-workflows-toolbar",
   }, [searchInput, folderSelect]));
+  if (_wantedTypes.size) {
+    const _typeLabels = { t2i: "Text to Image", i2i: "Image Edit", inpaint: "Inpaint", sketch: "Sketch", outpaint: "Outpaint" };
+    const _names = Array.from(_wantedTypes).map((t) => _typeLabels[t] || t).join(", ");
+    root.appendChild(el("p", {
+      class: "comfymodal-studio-dialog-note",
+      "data-testid": "workflow-picker-type-note",
+      text: "Showing only " + _names + " workflows.",
+    }));
+  }
   root.appendChild(listEl);
   root.appendChild(el("div", {
     class: "comfymodal-studio-dialog-actions",

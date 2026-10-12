@@ -110,6 +110,18 @@ async function shelfValue(page, role) {
   return page.locator(`[data-testid="shelf-input-${role}"]`).inputValue();
 }
 
+async function dragShelfCard(page, role, targetLocator, position = "center") {
+  const grip = await page.locator(`[data-testid="shelf-drag-${role}"]`).boundingBox();
+  const target = await targetLocator.boundingBox();
+  expect(grip).toBeTruthy();
+  expect(target).toBeTruthy();
+  const y = position === "top" ? target.y + 3 : position === "bottom" ? target.y + target.height - 3 : target.y + target.height / 2;
+  await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(target.x + target.width / 2, y, { steps: 8 });
+  await page.mouse.up();
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 test.describe("Studio Shelf Playground", () => {
@@ -207,26 +219,24 @@ test.describe("Studio Shelf Playground", () => {
 
     await selectPortraitV1(page, wfMock);
 
-    // Deterministic synthetic HTML5 drag-and-drop: seed before steps.
-    await page.evaluate(() => {
-      const grip = document.querySelector('[data-testid="shelf-drag-seed"]');
-      const target = document.querySelector('[data-testid="shelf-field-steps"]');
-      if (!grip || !target) throw new Error("shelf drag fixtures missing");
-      const dt = new DataTransfer();
-      dt.setData("text/shelf-role", "seed");
-      grip.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
-      target.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: dt }));
-      target.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }));
-      grip.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: dt }));
-    });
+    // Layout actions are drag-only: the old per-card Same row/Advanced
+    // buttons are intentionally no longer rendered.
+    expect(await page.locator('[data-testid^="shelf-field-"] button', { hasText: "Same row" }).count()).toBe(0);
+    expect(await page.locator('[data-testid^="shelf-field-"] button', { hasText: "Advanced" }).count()).toBe(0);
+
+    // Reorder seed before steps by dropping near the target's top edge.
+    await dragShelfCard(page, "seed", page.locator('[data-testid="shelf-field-steps"]'), "top");
     await page.waitForTimeout(300);
 
-    // Advanced placement: cfg moves into the Advanced section.
-    await page.locator('[data-testid="shelf-advanced-cfg"]').click();
-    await expect(page.locator('[data-testid="shelf-advanced-section"] [data-testid="shelf-field-cfg"]')).toBeVisible({ timeout: 5000 });
+    // Advanced placement: seed moves into the open Advanced section.
+    await page.locator('[data-testid="shelf-advanced-toggle"]').click();
+    const advancedTarget = page.locator('[data-testid="shelf-advanced-section"] [data-testid^="shelf-field-"]').first();
+    await dragShelfCard(page, "seed", advancedTarget);
+    await page.locator('[data-testid="shelf-advanced-toggle"]').click();
+    await expect(page.locator('[data-testid="shelf-advanced-section"] [data-testid="shelf-field-seed"]')).toBeVisible({ timeout: 5000 });
 
     // Same-row grouping: height joins width's row.
-    await page.locator('[data-testid="shelf-group-height"]').click();
+    await dragShelfCard(page, "height", page.locator('[data-testid="shelf-field-width"]'));
     const sharedRow = page.locator('[data-testid^="shelf-row-"]', { has: page.locator('[data-testid="shelf-field-width"]') });
     await expect(sharedRow.locator('[data-testid="shelf-field-height"]')).toBeVisible({ timeout: 5000 });
 
@@ -237,10 +247,10 @@ test.describe("Studio Shelf Playground", () => {
     const t2i = layout.t2i;
     expect(t2i).toBeTruthy();
     expect(t2i.order.indexOf("seed")).toBeLessThan(t2i.order.indexOf("steps"));
-    expect(t2i.advanced).toContain("cfg");
+    expect(t2i.advanced).toContain("seed");
     expect(t2i.rows.height).toBe(t2i.rows.width);
 
-    // Reload: layout restored (seed still before steps, cfg still Advanced).
+    // Reload: layout restored (seed still before steps, seed still Advanced).
     await page.reload();
     await openStudio(page, COMFYUI_URL);
     await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 20000 });
@@ -249,7 +259,7 @@ test.describe("Studio Shelf Playground", () => {
     );
     expect(order.indexOf("shelf-field-seed")).toBeLessThan(order.indexOf("shelf-field-steps"));
     await page.locator('[data-testid="shelf-advanced-toggle"]').click();
-    await expect(page.locator('[data-testid="shelf-advanced-section"] [data-testid="shelf-field-cfg"]')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('[data-testid="shelf-advanced-section"] [data-testid="shelf-field-seed"]')).toBeVisible({ timeout: 5000 });
 
     api.assertNoUnhandledCalls();
     wfMock.assertNoUnhandledWorkflowCalls();

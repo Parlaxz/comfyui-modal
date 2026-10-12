@@ -5,6 +5,7 @@ import { ensureStudioStyles } from "./studio-styles.js";
 import { mountStudioShell } from "./studio-shell.js";
 import { parseStudioHash } from "./studio-routing.js";
 import { el, registerLayerHandler } from "./studio-ui.js";
+import { managerRebootAndWait } from "./studio-backend-api.js";
 
 // Backward-compat flag preserved for external scripts/custom nodes that may
 // still read it. Hidden legacy sidebar registrations were removed (H10);
@@ -193,6 +194,35 @@ export function comfyModalTestingDiagnostics() {
   return { ..._diag };
 }
 
+// Topnav restart: same explicit-reboot contract as the wizard dependencies
+// section (rebootManagerAndReport → managerRebootAndWait). Fires only on
+// click; the reboot POST's connection drop is expected and success is
+// decided by the bounded reconnect probes, never by the POST response.
+async function handleTopnavRestart(btn) {
+  if (!btn || btn.disabled) return;
+  const originalTitle = btn.title;
+  btn.disabled = true;
+  // aria-busy drives the spinning ring via CSS (::after); the ↻ glyph
+  // stays in the DOM, hidden by color:transparent, so no content swap.
+  btn.setAttribute("aria-busy", "true");
+  btn.title = "Restarting ComfyUI — waiting for it to reconnect…";
+  let res = null;
+  try {
+    res = await managerRebootAndWait({
+      onPhase: (phase) => {
+        btn.title = phase === "manager"
+          ? "ComfyUI reconnected — waiting for ComfyUI-Manager…"
+          : "Restarting ComfyUI — waiting for it to reconnect…";
+      },
+    });
+  } catch (e) {
+    res = null;
+  }
+  btn.removeAttribute("aria-busy");
+  btn.disabled = false;
+  btn.title = (res && res.message) || originalTitle;
+}
+
 function buildShell() {
   const overlay = el("div", { class: "comfymodal-testing-overlay" });
   const modal = el("div", {
@@ -207,6 +237,15 @@ function buildShell() {
     class: "comfymodal-studio-topnav-heading",
   });
   const topnavActions = el("div", { class: "comfymodal-studio-topnav-actions" }, [
+    el("button", {
+      class: "comfymodal-studio-restart",
+      type: "button",
+      "data-testid": "topnav-restart-comfy",
+      "aria-label": "Restart ComfyUI",
+      title: "Restart ComfyUI",
+      text: "↻",
+      onclick: (e) => handleTopnavRestart(e.currentTarget),
+    }),
     el("button", {
       class: "comfymodal-studio-help",
       "aria-label": "Open documentation",

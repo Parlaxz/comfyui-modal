@@ -110,8 +110,8 @@ test.describe("Studio UI overhaul", () => {
       const count = await cards.count();
       expect(count).toBeGreaterThanOrEqual(2);
       const before = await cards.evaluateAll((els) => els.slice(0, 2).map((el) => el.getAttribute("data-role")));
-      await page.locator(`[data-testid="shelf-group-${before[1]}"]`).click();
-      await expect(page.locator(".comfymodal-studio-shelf-row").first().locator('[data-testid^="shelf-field-"]')).toHaveCount(2);
+      expect(await page.locator(`[data-testid="shelf-group-${before[1]}"]`).count()).toBe(0);
+      expect(await page.locator(`[data-testid="shelf-advanced-${before[1]}"]`).count()).toBe(0);
       const gripBox = await page.locator(`[data-testid="shelf-drag-${before[1]}"]`).boundingBox();
       const targetBox = await page.locator(`[data-testid="shelf-field-${before[0]}"]`).boundingBox();
       expect(gripBox).toBeTruthy();
@@ -119,9 +119,9 @@ test.describe("Studio UI overhaul", () => {
       await page.mouse.move(gripBox.x + gripBox.width / 2, gripBox.y + gripBox.height / 2);
       await page.mouse.down();
       await page.mouse.move(targetBox.x + 3, targetBox.y + targetBox.height / 2, { steps: 8 });
-      await expect(page.locator(`[data-testid="shelf-field-${before[0]}"]`)).toHaveClass(/is-drop-before/);
+      await expect(page.locator('[data-testid^="shelf-row-"]').first()).toHaveClass(/is-drop-target/);
       await page.mouse.move(targetBox.x + targetBox.width - 3, targetBox.y + targetBox.height / 2, { steps: 8 });
-      await expect(page.locator(`[data-testid="shelf-field-${before[0]}"]`)).toHaveClass(/is-drop-after/);
+      await expect(page.locator('[data-testid^="shelf-row-"]').first()).toHaveClass(/is-drop-target/);
       await page.mouse.up();
       await expect.poll(async () => page.locator(".comfymodal-studio-shelf-row").first().locator('[data-testid^="shelf-field-"]').evaluateAll((els) => els.map((el) => el.getAttribute("data-role")))).toEqual([before[0], before[1]]);
 

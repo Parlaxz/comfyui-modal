@@ -7996,13 +7996,13 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
     print(f"[comfyapp] build_order:")
     print(f"  1. base CUDA image (nvidia/cuda:13.0.0-devel-ubuntu24.04)")
     print(f"  2. install comfy-cli build utility")
-    print(f"  3. fetch/checkout pinned ComfyUI v0.34.2")
+    print(f"  3. fetch/checkout pinned ComfyUI v0.39.0 (7f7fd918)")
     print(f"  4. install pinned ComfyUI requirements")
     print(f"  5. PyTorch CUDA reinstall (cu130)")
     print(f"  6. triton install")
     print(f"  7. add .custom_node_requirements (as local_dir)")
     print(f"  8. run custom-node prereq pip loop")
-    print(f"  9. install/verify comfy-kitchen==0.2.31")
+    print(f"  9. install/verify comfy-kitchen==0.2.37")
     print(f"  10. install/verify fastsafetensors and SageAttention")
     print(f"  11. apply late runtime env vars")
     if CUSTOM_NODE_DELIVERY == "volume":
@@ -8273,12 +8273,14 @@ GPU_PROFILES = {
 }
 
 # Authoritative ComfyUI core for Step-3 host<->image parity: the upstream
-# v0.34.2 tag commit the image checkout is pinned to
-# (Comfy-Org/ComfyUI, lightweight tag v0.34.2).  comfy-cli 1.3.7's default
+# master commit the image checkout is pinned to (Comfy-Org/ComfyUI @
+# 7f7fd918, v0.39.0, 2026-10-10 — first pinned core shipping the native
+# TextEncodeQwenImage21 Qwen Image 2.1 encoder; keep the host checkout and
+# this pin on the same commit for parity).  comfy-cli 1.3.7's default
 # "nightly" install clones master WITHOUT a tag checkout, so the image must
 # be re-pinned explicitly; the string change also busts the image layer hash
 # so a new pin always triggers a rebuild of the affected layers.
-_COMFYUI_PINNED_COMMIT = "169fcf35a2fc163fec31338b816503ddac0d3fcf"
+_COMFYUI_PINNED_COMMIT = "7f7fd918ed0815c5d5ef2ccfe44bfc8e72cfd217"
 
 SAGEATTENTION_SITE_PACKAGES = "/usr/local/lib/python3.11/site-packages"
 
@@ -8976,12 +8978,12 @@ def _build_canonical_accelerator_images(base: Any) -> tuple[Any, Any]:
     # to add these packages.
     third_party = base.run_commands(
         "python -m pip install --disable-pip-version-check --no-input "
-        "--upgrade --force-reinstall --no-deps 'comfy-kitchen==0.2.31'",
+        "--upgrade --force-reinstall --no-deps 'comfy-kitchen==0.2.37'",
         gpu="a10g",
     ).run_commands(
         "python -X utf8 -c \"import importlib, importlib.metadata; "
         "version = importlib.metadata.version('comfy-kitchen'); "
-        "assert version == '0.2.31', f'expected comfy-kitchen==0.2.31, got {version}'; "
+        "assert version == '0.2.37', f'expected comfy-kitchen==0.2.37, got {version}'; "
         "kitchen = importlib.import_module('comfy_kitchen'); "
         "assert callable(getattr(kitchen, 'int8_attention', None)), "
         "'comfy_kitchen.int8_attention is unavailable'; "
@@ -18629,9 +18631,68 @@ class _ComfyAPIMixin:
         event_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(event_loop)
 
+        def _dummy_asset_manager():
+            """AssetManager for the port-less in-process server.
+
+            Newer cores require an asset manager at PromptServer
+            construction. The dummy serves no HTTP, uploads nothing, and
+            scans nothing, so the correct collaborator is core's disabled
+            manager. A local no-op stands in only when the assets subsystem
+            itself (or its database dependencies) is not importable, so
+            backend startup can never fail on asset plumbing.
+            """
+            try:
+                from app.assets.manager import NoAssets
+                from app.database.db import dependencies_available
+                if not dependencies_available():
+                    raise ImportError("asset database dependencies unavailable")
+                import argparse
+                return NoAssets(argparse.Namespace(enable_assets=False,
+                                                   enable_asset_hashing=False))
+            except Exception:
+                pass
+
+            class _DisabledAssets:
+                enabled = False
+
+                def startup(self):
+                    pass
+
+                def shutdown(self):
+                    pass
+
+                def register_routes(self, app, user_manager):
+                    pass
+
+                def ensure_scan_started(self):
+                    pass
+
+                def pause_background_scan(self):
+                    pass
+
+                def queue_output_scan(self):
+                    pass
+
+                def resume_background_scan(self):
+                    pass
+
+                def register_upload(self, *args, **kwargs):
+                    return None
+
+                def register_executed_output(self, *args, **kwargs):
+                    return None
+
+                def register_cached_output(self, *args, **kwargs):
+                    return None
+
+                def set_event_sink(self, sink):
+                    pass
+
+            return _DisabledAssets()
+
         class _DummyServer(comfy_server.PromptServer):
             def __init__(self, loop):
-                super().__init__(loop)
+                super().__init__(loop, _dummy_asset_manager())
                 comfy_server.PromptServer.instance = self
                 q = execution.PromptQueue(comfy_server.PromptServer.instance)
                 self.client_id = "in-process"

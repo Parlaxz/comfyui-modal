@@ -271,33 +271,64 @@ def read_deployment_receipt(path: Path) -> DeploymentReceipt:
     return DeploymentReceipt.from_dict(raw)
 
 
+def _receipt_order(path: Path) -> tuple[int, str]:
+    # Receipt filenames are receipt_<seq>_<digest>.json. Sorting on the raw
+    # filename orders lexically, which puts receipt_9_* ahead of receipt_11_*
+    # and makes the scan read stale receipts before current ones. Order on
+    # the numeric sequence instead, then the digest for a stable tiebreak.
+    name = path.name
+    try:
+        seq = int(name[len(RECEIPT_PREFIX):].split("_", 1)[0])
+    except (ValueError, IndexError):
+        seq = -1
+    return (seq, name)
+
+
+def preload_receipt_metadata(
+    repo_root: Path,
+) -> list[tuple[Path, Mapping[str, Any]]]:
+    """Read raw receipt metadata once for a multi-profile matching pass.
+
+    A catalog pass matches every profile against the same receipts directory;
+    re-reading and re-parsing every file per profile dominated cold catalog
+    scans.  Corrupt records fail closed here exactly as the per-profile scan
+    did: catalog matching always filters by profile, so every record here is
+    load-bearing for the pass that consumes it.
+    """
+    directory = Path(repo_root) / ".v2ctl" / "deployments"
+    if not directory.is_dir():
+        return []
+    ordered = sorted(
+        directory.glob(f"{RECEIPT_PREFIX}*.json"), key=_receipt_order, reverse=True
+    )
+    result: list[tuple[Path, Mapping[str, Any]]] = []
+    for path in ordered:
+        try:
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise GateError(f"deployment receipt is missing or corrupt: {path}") from exc
+        if not isinstance(metadata, Mapping):
+            raise GateError(f"deployment receipt is malformed: {path}")
+        result.append((path, metadata))
+    return result
+
+
 def latest_deployment_receipt(
     repo_root: Path,
     *,
     profile: str | None = None,
     target: Mapping[str, str] | None = None,
     workspace_id: str | None = None,
+    metadata: list[tuple[Path, Mapping[str, Any]]] | None = None,
 ) -> tuple[Path, DeploymentReceipt] | None:
     directory = Path(repo_root) / ".v2ctl" / "deployments"
-    if not directory.is_dir():
-        return None
+    if metadata is None:
+        if not directory.is_dir():
+            return None
+        metadata = preload_receipt_metadata(repo_root)
     matches: list[tuple[Path, DeploymentReceipt]] = []
 
-    def _receipt_order(path: Path) -> tuple[int, str]:
-        # Receipt filenames are receipt_<seq>_<digest>.json. Sorting on the raw
-        # filename orders lexically, which puts receipt_9_* ahead of receipt_11_*
-        # and makes the scan read stale receipts before current ones. Order on
-        # the numeric sequence instead, then the digest for a stable tiebreak.
-        name = path.name
-        try:
-            seq = int(name[len(RECEIPT_PREFIX):].split("_", 1)[0])
-        except (ValueError, IndexError):
-            seq = -1
-        return (seq, name)
-
-    for path in sorted(
-        directory.glob(f"{RECEIPT_PREFIX}*.json"), key=_receipt_order, reverse=True
-    ):
+    for path, record in metadata:
         # Older receipts from another app may predate the immutable digest
         # field.  When the caller has already identified the profile/target,
         # filter those unrelated records before strict receipt parsing.  A
@@ -305,22 +336,16 @@ def latest_deployment_receipt(
         # and fails closed below; this is only a compatibility boundary for
         # unrelated historical authorities.
         if profile is not None or target is not None:
-            try:
-                metadata = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise GateError(f"deployment receipt is missing or corrupt: {path}") from exc
-            if not isinstance(metadata, Mapping):
-                raise GateError(f"deployment receipt is malformed: {path}")
-            if profile is not None and metadata.get("profile") != profile:
+            metadata_target = record.get("target")
+            if profile is not None and record.get("profile") != profile:
                 continue
-            metadata_target = metadata.get("target")
             if target is not None and (
                 not isinstance(metadata_target, Mapping)
                 or any(metadata_target.get(k) != str(v) for k, v in target.items())
             ):
                 continue
             if workspace_id is not None:
-                metadata_destination = metadata.get("modal_destination")
+                metadata_destination = record.get("modal_destination")
                 if isinstance(metadata_destination, Mapping):
                     registered_workspace_id = metadata_destination.get("workspace_id")
                 else:
@@ -333,7 +358,7 @@ def latest_deployment_receipt(
             # validated and are not corruption; they are simply older records.
             # Skip them here so a legacy receipt does not abort the scan before
             # a current, deploy_id-bearing receipt is considered.
-            if not metadata.get("deploy_id"):
+            if not record.get("deploy_id"):
                 continue
         try:
             receipt = read_deployment_receipt(path)
