@@ -135,7 +135,19 @@ function requireRunId(opts) {
 const MODAL_STATUS_PHASE_MAP = {
   dispatch: "submitting",
   entry: "submitting",
+  awaiting_remote: "starting",
+  scheduling: "scheduling",
+  scheduled: "scheduling",
+  queue: "scheduling",
   restore: "restoring",
+  restoring: "restoring",
+  restore_begin: "restoring",
+  snapshot_capturing: "persisting",
+  snapshot: "persisting",
+  snapshotting: "persisting",
+  snapshot_committed: "persisting",
+  teardown: "persisting",
+  finalizing: "persisting",
   custom_nodes: "starting",
   gpu: "starting",
   warmup: "starting",
@@ -143,6 +155,7 @@ const MODAL_STATUS_PHASE_MAP = {
   backend_ready: "starting",
   auto_save: "starting",
   startup: "starting",
+  plan_received: "starting",
   execution: "executing",
 };
 

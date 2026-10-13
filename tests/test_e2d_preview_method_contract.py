@@ -65,7 +65,7 @@ class PreviewFreezeContractTests(unittest.TestCase):
             "preview_codec": "webp",
             "production": {"enabled": False},
         })
-        self.assertEqual(options.output_mode, "preview")
+        self.assertEqual(options.output_mode, "data_saver")
         conversion = options.output_conversion_options
         self.assertEqual(conversion["format"], "webp_lossy")
         self.assertEqual(conversion["quality"], 70)

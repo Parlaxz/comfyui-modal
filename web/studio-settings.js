@@ -77,6 +77,9 @@ const MODERN_SETTINGS_KEYS = [
   "comfymodal_preview_default",
   "comfymodal_preview_codec",
   "comfymodal_preview_quality",
+  "comfymodal_data_saver_default",
+  "comfymodal_data_saver_codec",
+  "comfymodal_data_saver_quality",
   "comfymodal-studio-history-columns",
   "comfymodal_heavy_tracing",
   "comfymodal.studio.golden.profile.v1",
@@ -136,12 +139,15 @@ function el(tag, props = {}, children = []) {
 // ΓöÇΓöÇ Preview preference helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 function getPreviewPrefs() {
+  const saverDefault = localStorage.getItem("comfymodal_data_saver_default") ?? localStorage.getItem("comfymodal_preview_default");
+  const saverCodec = localStorage.getItem("comfymodal_data_saver_codec") ?? localStorage.getItem("comfymodal_preview_codec");
+  const saverQualityRaw = localStorage.getItem("comfymodal_data_saver_quality") ?? localStorage.getItem("comfymodal_preview_quality");
   return {
-    preview_default: localStorage.getItem("comfymodal_preview_default") === "on"
+    preview_default: saverDefault === "on"
       ? "on" : PREVIEW_DEFAULTS.preview_default,
-    preview_codec: localStorage.getItem("comfymodal_preview_codec") === "webp"
+    preview_codec: saverCodec === "webp"
       ? "webp" : PREVIEW_DEFAULTS.preview_codec,
-    preview_quality: parseInt(localStorage.getItem("comfymodal_preview_quality"), 10) || PREVIEW_DEFAULTS.preview_quality,
+    preview_quality: parseInt(saverQualityRaw, 10) || PREVIEW_DEFAULTS.preview_quality,
   };
 }
 
@@ -423,13 +429,16 @@ export function renderSettings(state, context) {
 
   const resets = {
     generation: async () => {
-      removeKeys(["comfymodal_gpu", "comfymodal_preview_default", "comfymodal_preview_codec", "comfymodal_preview_quality"]);
+      removeKeys(["comfymodal_gpu", "comfymodal_preview_default", "comfymodal_preview_codec", "comfymodal_preview_quality", "comfymodal_data_saver_default", "comfymodal_data_saver_codec", "comfymodal_data_saver_quality"]);
       try {
         const m = await loadOutputPrefsModule();
         await m.setOutputPreferences({
           preview_default: PREVIEW_DEFAULTS.preview_default,
           preview_codec: PREVIEW_DEFAULTS.preview_codec,
           preview_quality: PREVIEW_DEFAULTS.preview_quality,
+          data_saver_default: PREVIEW_DEFAULTS.preview_default,
+          data_saver_codec: PREVIEW_DEFAULTS.preview_codec,
+          data_saver_quality: PREVIEW_DEFAULTS.preview_quality,
         });
       } catch (_) {}
       try {
@@ -582,6 +591,9 @@ export function renderSettings(state, context) {
 
     // GPU (server-backed; localStorage comfymodal_gpu is a display cache only)
     const gpuSelect = el("select", { class: "comfymodal-input", "data-testid": "settings-gpu" });
+    // Placeholder until refreshGpuConfig replaces the options: an empty
+    // select renders as a blank dropdown and reads as missing state.
+    gpuSelect.appendChild(el("option", { value: "", text: "Loading GPUs…", disabled: true, selected: true }));
     gpuSelect.style.cssText = "width:100%;font-size:11px;padding:3px 6px;";
     section.appendChild(controlRow("GPU", gpuSelect, "You only pay while generating.", "gpu graphics card"));
     section.appendChild(el("div", {
@@ -590,7 +602,7 @@ export function renderSettings(state, context) {
       style: "display:none;",
     }));
 
-    // Preview default (global, server-backed)
+    // Data Saver default (global, server-backed; testids keep legacy preview names)
     const previewDefault = selectWithOptions([["off", "Off"], ["on", "On"]], "settings-preview-default");
     previewDefault.value = getPreviewPrefs().preview_default;
     previewDefault.addEventListener("change", () => {
@@ -599,7 +611,7 @@ export function renderSettings(state, context) {
         previewDefault.value = previous;
       });
     });
-    section.appendChild(controlRow("Preview default", previewDefault, "Global default for result previews. Applies to new submissions only.", "preview default"));
+    section.appendChild(controlRow("Data Saver default", previewDefault, "Global default for Data Saver results. Original is always stored; Data Saver serves the small file. Applies to new submissions only.", "data saver default preview default"));
 
     const previewCodec = selectWithOptions([["webp", "WebP"]], "settings-preview-codec");
     previewCodec.value = getPreviewPrefs().preview_codec;
@@ -607,16 +619,16 @@ export function renderSettings(state, context) {
       const previous = previewCodec.value === "webp" ? "webp" : PREVIEW_DEFAULTS.preview_codec;
       setPreviewPrefs({ preview_codec: previewCodec.value }).catch(() => { previewCodec.value = previous; });
     });
-    section.appendChild(controlRow("Preview codec", previewCodec, "Codec used for preview thumbnails.", "preview codec"));
+    section.appendChild(controlRow("Data Saver codec", previewCodec, "Codec used for Data Saver files.", "data saver codec preview codec"));
 
-    const previewQuality = el("input", { type: "range", min: "1", max: "100", step: "1", value: String(getPreviewPrefs().preview_quality), class: "comfymodal-settings-range", "data-testid": "settings-preview-quality", "aria-label": "Preview quality" });
+    const previewQuality = el("input", { type: "range", min: "1", max: "100", step: "1", value: String(getPreviewPrefs().preview_quality), class: "comfymodal-settings-range", "data-testid": "settings-preview-quality", "aria-label": "Data Saver quality" });
     const previewQualityVal = el("span", { class: "comfymodal-settings-range-value", "data-testid": "settings-preview-quality-value", text: previewQuality.value });
     previewQuality.addEventListener("input", () => { previewQualityVal.textContent = previewQuality.value; });
     previewQuality.addEventListener("change", () => {
       const previous = previewQuality.value;
       setPreviewPrefs({ preview_quality: parseInt(previewQuality.value, 10) || PREVIEW_DEFAULTS.preview_quality }).catch(() => { previewQuality.value = previous; previewQualityVal.textContent = previous; });
     });
-    section.appendChild(controlRow("Preview quality", el("div", { class: "comfymodal-settings-range-wrap" }, [previewQuality, previewQualityVal]), "Compression quality for preview thumbnails (1-100).", "preview quality"));
+    section.appendChild(controlRow("Data Saver quality", el("div", { class: "comfymodal-settings-range-wrap" }, [previewQuality, previewQualityVal]), "Compression quality for Data Saver files (1-100).", "data saver quality preview quality"));
 
     const goldenProfileWrap = el("div", { class: "comfymodal-settings-control", "data-search": "golden profile owner method deployed undeployed runtime" });
     goldenProfileWrap.appendChild(settingsRow("Golden profile", el("div", { "data-testid": "settings-golden-profile-host", style: "width:100%;" })));
@@ -895,7 +907,15 @@ export function renderSettings(state, context) {
           }
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        // Keep a truthful, usable value when the catalog is unreachable
+        // instead of stranding the "Loading…" placeholder.
+        if (!gpuSelect.options.length || (gpuSelect.options.length === 1 && !gpuSelect.value)) {
+          while (gpuSelect.firstChild) gpuSelect.removeChild(gpuSelect.firstChild);
+          gpuSelect.appendChild(el("option", { value: "rtx-pro-6000", text: "rtx-pro-6000 (default)" }));
+          gpuSelect.value = "rtx-pro-6000";
+        }
+      });
 
     gpuSelect.addEventListener("change", async () => {
       const gpu = gpuSelect.value;

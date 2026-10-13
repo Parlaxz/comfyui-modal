@@ -22,6 +22,7 @@ import {
   selectPreset,
   submitSingleRun,
   enableExperimentMode,
+  openExperimentManager,
 } from "./helpers.mjs";
 
 const SEEDED_PRESET_ID = "preset_default";
@@ -234,6 +235,7 @@ test.describe("Phase I8 playground polish", () => {
       await page.locator(WF_SELECTOR).selectOption("wf_text2img");
       await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 10000 });
       await enableExperimentMode(page);
+      const modal = await openExperimentManager(page);
 
       // No axes/backends chosen yet → generic empty-state hint.
       const matrixEmpty = page.locator('[data-testid="experiment-matrix-empty"]');
@@ -241,14 +243,14 @@ test.describe("Phase I8 playground polish", () => {
       expect(await matrixEmpty.evaluate((el) => el.classList.contains("cm-empty-state"))).toBe(true);
 
       // Submission goes through the modern V2 creator only.
-      const btn = page.locator(SUBMIT_BTN);
+      const btn = modal.locator(SUBMIT_BTN);
       await expect(btn).toBeEnabled({ timeout: 10000 });
       await btn.click();
       await expect.poll(() => tracker.v2CreatePosts.length, { timeout: 10000 }).toBe(1);
       expect(tracker.legacyCreatorPosts).toEqual([]);
 
       // Cell status chips adopt the shared base with a truthful tone.
-      const cellChip = page
+      const cellChip = modal
         .locator('[data-testid="experiment-v2-grid"] [data-cell-id]')
         .first()
         .locator(".comfymodal-studio-history-v2-chip");

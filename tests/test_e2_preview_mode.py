@@ -33,11 +33,11 @@ class PreviewModeContractTests(unittest.TestCase):
             "preview_quality": 70,
             "production": {"enabled": False},
         })
-        self.assertEqual(options.output_mode, "preview")
+        self.assertEqual(options.output_mode, "data_saver")
         self.assertEqual(options.output_conversion_options["format"], "webp_lossy")
         self.assertEqual(options.output_conversion_options["quality"], 70)
         legacy = options.to_legacy_dict()
-        self.assertEqual(legacy["output_mode"], "preview")
+        self.assertEqual(legacy["output_mode"], "data_saver")
         self.assertEqual(legacy["output_format"], "webp_lossy")
         self.assertEqual(legacy["quality"], 70)
 
@@ -75,12 +75,12 @@ class PreviewModeContractTests(unittest.TestCase):
         )
         self.assertIsNone(error)
         self.assertIsInstance(plan, ExecutionPlan)
-        self.assertEqual(plan.execution_options.output_mode, "preview")
+        self.assertEqual(plan.execution_options.output_mode, "data_saver")
         self.assertEqual(plan.execution_options.output_conversion_options["quality"], 70)
-        self.assertEqual(plan.request_metadata["output_mode"], "preview")
+        self.assertEqual(plan.request_metadata["output_mode"], "data_saver")
         accepted["preview_quality"] = 99
         self.assertEqual(plan.execution_options.output_conversion_options["quality"], 70)
-        self.assertEqual(plan.to_dict()["execution_options"]["output_mode"], "preview")
+        self.assertEqual(plan.to_dict()["execution_options"]["output_mode"], "data_saver")
 
     def test_experiment_cells_share_frozen_preview_mode(self):
         resolution = experiment_plan.WorkflowResolution(
@@ -130,18 +130,18 @@ class PreviewModeContractTests(unittest.TestCase):
         ):
             plan = experiment_plan.build_cell_plan(definition, str(ROOT))
 
-        self.assertEqual(plan.modal_options["output_mode"], "preview")
+        self.assertEqual(plan.modal_options["output_mode"], "data_saver")
         self.assertEqual(
             len(calls), 2,
             [cell.error for cell in plan.cells],
         )
-        self.assertTrue(all(call["output_mode"] == "preview" for call in calls))
-        self.assertTrue(all(cell.output_mode == "preview" for cell in plan.cells))
+        self.assertTrue(all(call["output_mode"] == "data_saver" for call in calls))
+        self.assertTrue(all(cell.output_mode == "data_saver" for cell in plan.cells))
         for cell in plan.cells:
             self.assertIsNotNone(cell.execution_plan_dict)
             cell_plan_dict = dict(cell.execution_plan_dict or {})
             self.assertEqual(
-                cell_plan_dict["execution_options"]["output_mode"], "preview"
+                cell_plan_dict["execution_options"]["output_mode"], "data_saver"
             )
         accepted["preview_quality"] = 12
         first_plan_dict = dict(plan.cells[0].execution_plan_dict or {})
@@ -178,8 +178,8 @@ class PreviewModeContractTests(unittest.TestCase):
             attempt, output_mode="preview", variant="preview"
         )
         descriptor = result["asset_descriptors"][0]
-        self.assertEqual(result["output_mode"], "preview")
-        self.assertEqual(descriptor["variant"], "preview")
+        self.assertEqual(result["output_mode"], "data_saver")
+        self.assertEqual(descriptor["variant"], "data_saver")
         self.assertEqual(descriptor["logical_output_key"], "node:6:slot:images:item:2")
         self.assertEqual(
             descriptor["logical_output_key"],

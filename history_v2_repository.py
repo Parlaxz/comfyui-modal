@@ -564,7 +564,7 @@ class HistoryV2Repository:
         generation_id: str,
         *,
         run_id: Optional[str] = None,
-        mode: str = "preview",
+        mode: str = "data_saver",
         experiment_id: Optional[str] = None,
         cell_id: Optional[str] = None,
         started_at: Optional[str] = None,
@@ -572,7 +572,13 @@ class HistoryV2Repository:
         run_id = run_id if run_id is not None else new_id("run_")
         now = utc_now_iso()
         started = started_at or now
-        mode_value = RunMode(mode).value
+        raw_mode = str(mode or "data_saver").strip().lower()
+        # RunMode predates the canonical name; retain preview in the existing
+        # attempt rows while accepting all data_saver aliases at the boundary.
+        if raw_mode in {"preview", "data_saver", "data-saver", "datasaver"}:
+            mode_value = RunMode.PREVIEW.value
+        else:
+            mode_value = RunMode(raw_mode).value
         with self._store.transaction() as conn:
             conn.execute(
                 """INSERT INTO run_attempts (
@@ -1162,6 +1168,208 @@ class HistoryV2Repository:
                 (note, utc_now_iso(), generation_id),
             )
             return cur.rowcount > 0
+
+    @staticmethod
+    def _validate_delete_id(value: str) -> None:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("ids must be non-empty strings")
+
+    @classmethod
+    def _unique_delete_ids(cls, values: Sequence[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            cls._validate_delete_id(value)
+            if value not in seen:
+                seen.add(value)
+                result.append(value)
+        return result
+
+    def _delete_generation_rows(
+        self, conn: sqlite3.Connection, generation_ids: Sequence[str]
+    ) -> tuple[list[str], list[str]]:
+        """Delete generation rows while *conn* owns the transaction.
+
+        Returns ``(deleted_ids, managed_paths)``.  Deletion is intentionally
+        allowed for pending/running generations: this is an administrative
+        history operation, and the existing schema already cascades attempts,
+        assets, and export records from the generation row.
+        """
+        deleted: list[str] = []
+        managed_paths: list[str] = []
+        now = utc_now_iso()
+        for generation_id in generation_ids:
+            row = conn.execute(
+                "SELECT generation_id FROM generations WHERE generation_id = ?",
+                (generation_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            managed_paths.extend(
+                str(asset_row["managed_path"])
+                for asset_row in conn.execute(
+                    "SELECT managed_path FROM assets WHERE generation_id = ?",
+                    (generation_id,),
+                ).fetchall()
+            )
+            # experiment_cells.generation_id predates the delete API and has
+            # no ON DELETE action. Detach the cell before the generation row
+            # is removed; the cell itself remains part of its experiment.
+            conn.execute(
+                """UPDATE experiment_cells
+                   SET generation_id = NULL, attempt_ids_json = '[]',
+                       status = 'pending', error = NULL, updated_at = ?
+                   WHERE generation_id = ?""",
+                (now, generation_id),
+            )
+            conn.execute(
+                "DELETE FROM request_snapshots WHERE generation_id = ?",
+                (generation_id,),
+            )
+            conn.execute(
+                "DELETE FROM legacy_mapping WHERE generation_id = ?",
+                (generation_id,),
+            )
+            conn.execute(
+                "DELETE FROM generations WHERE generation_id = ?",
+                (generation_id,),
+            )
+            deleted.append(generation_id)
+        return deleted, managed_paths
+
+    def delete_generation(self, generation_id: str) -> bool:
+        """Delete one generation, returning False when it is missing.
+
+        The database commit happens before best-effort managed-file cleanup;
+        referenced source files outside the managed asset root are untouched.
+        """
+        self._validate_delete_id(generation_id)
+        result = self.bulk_delete(generation_ids=[generation_id])
+        return generation_id in result["deleted_generations"]
+
+    def _delete_experiment_rows(
+        self, conn: sqlite3.Connection, experiment_ids: Sequence[str]
+    ) -> tuple[list[str], list[str]]:
+        """Delete experiments and their generation-owned records in one tx."""
+        deleted: list[str] = []
+        managed_paths: list[str] = []
+        for experiment_id in experiment_ids:
+            row = conn.execute(
+                "SELECT experiment_id FROM experiments WHERE experiment_id = ?",
+                (experiment_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            generation_ids = [
+                str(generation_row["generation_id"])
+                for generation_row in conn.execute(
+                    "SELECT generation_id FROM generations WHERE experiment_id = ?",
+                    (experiment_id,),
+                ).fetchall()
+            ]
+            generation_ids.extend(
+                str(generation_row["generation_id"])
+                for generation_row in conn.execute(
+                    """SELECT DISTINCT g.generation_id
+                       FROM experiment_cells c
+                       JOIN generations g ON g.generation_id = c.generation_id
+                       WHERE c.experiment_id = ?""",
+                    (experiment_id,),
+                ).fetchall()
+                if generation_row["generation_id"] not in generation_ids
+            )
+            _, paths = self._delete_generation_rows(conn, generation_ids)
+            managed_paths.extend(paths)
+            # Any malformed/orphan attempt that points at this experiment is
+            # still removed before the experiment's cells cascade.
+            conn.execute(
+                "DELETE FROM run_attempts WHERE experiment_id = ?", (experiment_id,)
+            )
+            cur = conn.execute(
+                "DELETE FROM experiments WHERE experiment_id = ?", (experiment_id,)
+            )
+            if cur.rowcount:
+                deleted.append(experiment_id)
+        return deleted, managed_paths
+
+    def delete_experiment(self, experiment_id: str) -> bool:
+        """Delete one experiment, returning False when it is missing."""
+        self._validate_delete_id(experiment_id)
+        result = self.bulk_delete(experiment_ids=[experiment_id])
+        return experiment_id in result["deleted_experiments"]
+
+    def bulk_delete(
+        self,
+        *,
+        generation_ids: Sequence[str] = (),
+        experiment_ids: Sequence[str] = (),
+    ) -> dict[str, list[str]]:
+        """Delete requested generations and experiments atomically.
+
+        IDs are de-duplicated while preserving request order.  File cleanup is
+        best-effort and happens after the SQLite transaction commits.
+        """
+        generations = self._unique_delete_ids(generation_ids)
+        experiments = self._unique_delete_ids(experiment_ids)
+        if len(generations) + len(experiments) == 0:
+            raise ValueError("at least one generation or experiment id is required")
+        if len(generations) + len(experiments) > 100:
+            raise ValueError("at most 100 ids may be deleted at once")
+
+        with self._store.transaction() as conn:
+            deleted_generations, paths = self._delete_generation_rows(conn, generations)
+            deleted_experiments, experiment_paths = self._delete_experiment_rows(
+                conn, experiments
+            )
+            paths.extend(experiment_paths)
+        self._remove_owned_asset_files(paths)
+        return {
+            "deleted_generations": deleted_generations,
+            "deleted_experiments": deleted_experiments,
+            "missing_generations": [
+                generation_id
+                for generation_id in generations
+                if generation_id not in deleted_generations
+            ],
+            "missing_experiments": [
+                experiment_id
+                for experiment_id in experiments
+                if experiment_id not in deleted_experiments
+            ],
+        }
+
+    def _remove_owned_asset_files(self, managed_paths: Sequence[str]) -> int:
+        """Unlink managed files strictly inside the store's asset root.
+
+        Returns the count removed. Anything outside the root (referenced
+        sources, ``modal://`` URIs, missing files) is skipped, never raised.
+        An emptied per-generation directory is removed best-effort too.
+        """
+        try:
+            root = self._store.assets_root().resolve()
+        except Exception:
+            return 0
+        removed = 0
+        for managed in managed_paths:
+            if not managed or str(managed).startswith("modal://"):
+                continue
+            try:
+                path = Path(managed).resolve()
+                if root not in path.parents:
+                    continue
+                if not path.is_file():
+                    continue
+                path.unlink()
+                removed += 1
+                try:
+                    parent = path.parent
+                    if parent != root and not any(parent.iterdir()):
+                        parent.rmdir()
+                except OSError:
+                    pass
+            except OSError:
+                continue
+        return removed
 
     def get_generation_assets(
         self, generation_id: str, *, asset_type: Optional[str] = None
@@ -2090,7 +2298,7 @@ class HistoryV2Repository:
         has_output = bool(
             detail is not None
             and any(
-                asset.type in {"thumbnail", "preview", "original"}
+                asset.type in {"thumbnail", "preview", "data_saver", "original"}
                 for asset in detail.assets
             )
         )
@@ -2792,7 +3000,7 @@ class HistoryV2Repository:
         if has_preview:
             where.append(
                 "EXISTS (SELECT 1 FROM assets a WHERE a.generation_id = g.generation_id "
-                "AND a.type = 'preview')"
+                "AND a.type IN ('preview', 'data_saver'))"
             )
         if has_original:
             where.append(
@@ -2802,7 +3010,7 @@ class HistoryV2Repository:
         if preview_only:
             where.append(
                 "EXISTS (SELECT 1 FROM assets a WHERE a.generation_id = g.generation_id "
-                "AND a.type = 'preview') AND NOT EXISTS (SELECT 1 FROM assets a "
+                "AND a.type IN ('preview', 'data_saver')) AND NOT EXISTS (SELECT 1 FROM assets a "
                 "WHERE a.generation_id = g.generation_id AND a.type = 'original')"
             )
         if interrupted:
@@ -2824,7 +3032,7 @@ class HistoryV2Repository:
         if has_image:
             where.append(
                 "EXISTS (SELECT 1 FROM assets a WHERE a.generation_id = g.generation_id "
-                "AND a.type IN ('thumbnail','preview','original'))"
+                "AND a.type IN ('thumbnail','preview','data_saver','original'))"
             )
 
         where_clause = " AND ".join(where) if where else "1=1"

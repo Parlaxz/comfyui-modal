@@ -712,6 +712,9 @@ const ROUTES = [
   ["GET", "/comfymodal/civitai-token", async (res) => _json(res, { status: "ok", token: "" })],
   ["POST", "/comfymodal/civitai-token", async (res) => _json(res, { status: "ok" })],
   ["GET", "/comfymodal/health", async (res) => _json(res, { status: "ok", message: "Fake runtime ready" })],
+  // Shell dep-sync poll (studio-shell.js, mount + 15s): idle shape keeps the
+  // notice hidden, matching the UI's own empty fallback.
+  ["GET", "/comfymodal/sync/status", async (res) => _json(res, { dependency: null, custom_nodes: { pending: [] } })],
   ["GET", "/comfymodal/profile/level", async (res) => _json(res, engine.getProfileLevel(res._sid))],
   ["POST", "/comfymodal/profile/level", async (res, body) => {
     const r = engine.setProfileLevel(res._sid, body);

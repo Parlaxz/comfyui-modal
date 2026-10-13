@@ -55,6 +55,7 @@ except Exception:  # pragma: no cover - diagnostics must never break imports
 try:
     from .prompt_signature_cache import (
         apply_memo_hit as _psc_apply_memo_hit,
+        apply_memo_partial as _psc_apply_memo_partial,
         build_node_memo_entry as _psc_build_node_memo_entry,
         canonical_inputs_hash as _psc_canonical_inputs_hash,
         get_store as _psc_get_store,
@@ -64,6 +65,8 @@ try:
         memo_path as _psc_memo_path,
         persist_store as _psc_persist_store,
         set_store as _psc_set_store,
+        static_identity as _psc_static_identity,
+        structure_fingerprint as _psc_structure_fingerprint,
         topo_lazy_get as _psc_topo_lazy_get,
         topo_lazy_pending_count as _psc_topo_lazy_pending_count,
         topo_lazy_persist as _psc_topo_lazy_persist,
@@ -71,6 +74,7 @@ try:
     )
 except Exception:  # pragma: no cover - memoization must never break the runtime
     _psc_apply_memo_hit = None  # type: ignore[assignment]
+    _psc_apply_memo_partial = None  # type: ignore[assignment]
     _psc_build_node_memo_entry = None  # type: ignore[assignment]
     _psc_canonical_inputs_hash = None  # type: ignore[assignment]
     _psc_get_store = None  # type: ignore[assignment]
@@ -80,6 +84,8 @@ except Exception:  # pragma: no cover - memoization must never break the runtime
     _psc_memo_path = None  # type: ignore[assignment]
     _psc_persist_store = None  # type: ignore[assignment]
     _psc_set_store = None  # type: ignore[assignment]
+    _psc_static_identity = None  # type: ignore[assignment]
+    _psc_structure_fingerprint = None  # type: ignore[assignment]
     _psc_topo_lazy_get = None  # type: ignore[assignment]
     _psc_topo_lazy_pending_count = None  # type: ignore[assignment]
     _psc_topo_lazy_persist = None  # type: ignore[assignment]
@@ -2391,6 +2397,7 @@ def build_prompt_executor_breakdown_line(
         ("gap_wui_handler_ms", _gap_wui),
         ("c2f_cached_to_first_node_ms", _c2f_parent),
         ("c2f_topo_walk_ms", _topo),
+        ("c2f_topo_walk_max_ms", _num(state.get("opt_exec_topo_walk_max_ms"))),
         ("c2f_topo_input_info_ms", _topo_input_info),
         ("c2f_topo_other_ms", _topo_other),
         ("c2f_stage_ms", _stage),
@@ -2403,7 +2410,10 @@ def build_prompt_executor_breakdown_line(
         ("signature_cache_hit", state.get("opt_exec_signature_memo_hit")),
         ("signature_cache_source", state.get("opt_exec_signature_memo_source")),
         ("signature_cache_key_hash", state.get("opt_exec_signature_memo_key_hash")),
+        ("signature_cache_key_kind", state.get("opt_exec_signature_memo_key_kind")),
         ("signature_cache_fallback", state.get("opt_exec_signature_memo_fallback")),
+        ("signature_cache_partial", state.get("opt_exec_signature_memo_partial")),
+        ("signature_cache_reused", state.get("opt_exec_signature_memo_reused")),
         ("signature_reuse_ms", _num(state.get("opt_exec_signature_reuse_ms"))),
         # Topo-lazy deterministic fast path (cached→first-node fix) —
         # additive evidence; absent when the per-request state lacks it.
@@ -2483,18 +2493,76 @@ def _memo_plan_from_state(state: dict[str, Any]) -> str | None:
     return _ident["identity_hash"]
 
 
-async def _memo_write_back(self, node_ids, identity_hash, state):
+def _static_store_key(state, get_node, has_node, node_ids):
+    """Value-independent static store key for this request, or None.
+
+    Combines the deployment-side identity already stashed on ``state`` with
+    a structural fingerprint of the requested nodes read live from the
+    dynamic prompt (node classes + link topology + value types — never
+    values).  A prompt/size/seed edit leaves the key intact; a wizard
+    structural edit changes it (explicit total miss); any error or
+    incomplete component returns None and the caller stays on the legacy
+    full-hash key.  Never raises; reads node objects transiently and
+    retains nothing.
+    """
+    try:
+        if _psc_structure_fingerprint is None or _psc_static_identity is None:
+            return None
+        _identity = state.get("opt_exec_signature_memo_identity")
+        if not isinstance(_identity, dict) or not _identity:
+            return None
+        if get_node is None or has_node is None:
+            return None
+        _nodes: dict[str, Any] = {}
+        for _nid in node_ids or ():
+            try:
+                if not has_node(_nid):
+                    continue
+                _node = get_node(_nid)
+            except Exception:
+                continue
+            if not isinstance(_node, dict):
+                continue
+            _nodes[str(_nid)] = _node
+        _structure = _psc_structure_fingerprint(_nodes)
+        if not _structure:
+            return None
+        _static = _psc_static_identity(
+            structure_hash=_structure,
+            deployment_combined_hash=_identity.get("deployment_combined_hash", ""),
+            custom_node_generation=_identity.get("custom_node_generation", ""),
+            registry_proof=_identity.get("registry_proof"),
+        )
+        if not _static.get("complete"):
+            return None
+        return _static["static_hash"]
+    except Exception:
+        return None
+
+
+async def _memo_write_back(self, node_ids, identity_hash, state, skip=None):
     """Build per-node memo entries from a completed ORIGINAL add_keys pass.
 
     Runs only on the compute-miss request (bounded: one atomic file write of
     ~10-100KB; fsync ~10-50ms is acceptable on the compute-miss request).
-    Every failure is swallowed — the memo simply stays unpopulated.
+    ``skip`` holds str node ids already populated by partial reuse — their
+    stored entries are current, so they are not rewritten, and when every
+    requested node was reused nothing persists at all (no fsync tax on the
+    reuse path).  Every failure is swallowed — the memo simply stays
+    unpopulated.
     """
     _t0 = time.perf_counter_ns()
     try:
+        _skip = set()
+        try:
+            _skip = {str(_s) for _s in (skip or ())}
+        except Exception:
+            _skip = set()
         _changed = False
         for _nid in node_ids:
             if _nid not in self.keys:
+                continue
+            if str(_nid) in _skip:
                 continue
             try:
                 _node = self.dynprompt.get_node(_nid)
@@ -3322,6 +3390,15 @@ def install_pre_sampler_hooks() -> None:
                             state["opt_exec_topo_nodes"] = (
                                 state.get("opt_exec_topo_nodes", 0) + 1
                             )
+                            # Union probe: add_node fans out per link through
+                            # nested add_node calls, all accumulated above,
+                            # so the sum is an upper bound that double-counts
+                            # shared subgraphs across output walks.  The max
+                            # single-call wall next to it separates real walk
+                            # cost from nesting.  Telemetry only.
+                            _prev_max = state.get("opt_exec_topo_walk_max_ms")
+                            if _prev_max is None or _elapsed > _prev_max:
+                                state["opt_exec_topo_walk_max_ms"] = _elapsed
                             # ── Topo-lazy persistence (once per request) ──
                             # The top-level walk (defaults include_lazy=False,
                             # subgraph_nodes=None — the FIRST add_node the
@@ -3501,35 +3578,95 @@ def install_pre_sampler_hooks() -> None:
                         _memo_plan = None
                         if state is not None:
                             _memo_plan = _memo_plan_from_state(state)
+                        # Static (frozen-graph) store key: value-independent
+                        # structure + the same deployment-side identity.  A
+                        # prompt/size/seed edit leaves it intact (partial
+                        # reuse below); a wizard structural edit changes it
+                        # (explicit total miss).  None → legacy behavior.
+                        _static_key = None
                         if _memo_plan is not None:
+                            _static_key = _static_store_key(
+                                state,
+                                self.dynprompt.get_node,
+                                self.dynprompt.has_node,
+                                node_ids,
+                            )
+                        _store_key = _static_key or _memo_plan
+                        if _static_key is not None:
+                            # Co-locate the topo-lazy section (persisted
+                            # later via state["...key_hash"]) with the static
+                            # nodes section.
+                            state["opt_exec_signature_memo_key_hash"] = _static_key
+                            state["opt_exec_signature_memo_key_kind"] = "static"
+                        elif _memo_plan is not None:
+                            state["opt_exec_signature_memo_key_kind"] = "legacy"
+                        _reused: set = set()
+                        if _store_key is not None:
                             _memo_t0 = time.perf_counter_ns()
-                            _hit, _reason = await _psc_apply_memo_hit(
+                            _hit_all, _reason, _reused = await _psc_apply_memo_partial(
                                 keys=self.keys,
                                 subcache_keys=self.subcache_keys,
                                 node_ids=node_ids,
                                 get_node=self.dynprompt.get_node,
                                 has_node=self.dynprompt.has_node,
                                 get_is_changed=self.is_changed_cache.get,
-                                identity_hash=_memo_plan,
+                                identity_hash=_store_key,
                             )
-                            if _hit:
-                                # Full memo hit: skip the original computation
-                                # entirely; the memo reconstructed the exact
-                                # keys the original would have produced.
+                            if _hit_all:
+                                # Full reuse: every requested key now holds
+                                # the exact value the original computation
+                                # would have produced (verified clean,
+                                # ancestors included) — skip it entirely.
                                 state["opt_exec_signature_memo_hit"] = True
-                                state["opt_exec_signature_memo_source"] = _psc_memo_entry_source(_memo_plan)
+                                state["opt_exec_signature_memo_source"] = _psc_memo_entry_source(_store_key)
                                 state["opt_exec_signature_memo_fallback"] = ""
+                                state["opt_exec_signature_memo_partial"] = bool(_reused)
+                                state["opt_exec_signature_memo_reused"] = len(_reused)
                                 state["opt_exec_signature_reuse_ms"] = (
                                     state.get("opt_exec_signature_reuse_ms", 0.0)
                                     + _ns_ms(_memo_t0)
                                 )
                                 return None
+                            # Legacy fallback: a static miss on a
+                            # never-migrated identical prompt may still be a
+                            # full hit under the old full-hash key (one
+                            # migration pass, then write-back stores static).
+                            if (
+                                _reason == "no_entry"
+                                and _static_key is not None
+                                and _memo_plan is not None
+                                and _memo_plan != _static_key
+                            ):
+                                _leg_hit, _leg_reason = await _psc_apply_memo_hit(
+                                    keys=self.keys,
+                                    subcache_keys=self.subcache_keys,
+                                    node_ids=node_ids,
+                                    get_node=self.dynprompt.get_node,
+                                    has_node=self.dynprompt.has_node,
+                                    get_is_changed=self.is_changed_cache.get,
+                                    identity_hash=_memo_plan,
+                                )
+                                if _leg_hit:
+                                    state["opt_exec_signature_memo_hit"] = True
+                                    state["opt_exec_signature_memo_source"] = _psc_memo_entry_source(_memo_plan)
+                                    state["opt_exec_signature_memo_fallback"] = ""
+                                    state["opt_exec_signature_memo_key_kind"] = "legacy"
+                                    state["opt_exec_signature_memo_partial"] = bool(_reused)
+                                    state["opt_exec_signature_memo_reused"] = len(_reused)
+                                    state["opt_exec_signature_reuse_ms"] = (
+                                        state.get("opt_exec_signature_reuse_ms", 0.0)
+                                        + _ns_ms(_memo_t0)
+                                    )
+                                    return None
+                                _reason = _leg_reason or _reason
                             state["opt_exec_signature_memo_hit"] = False
-                            state["opt_exec_signature_memo_source"] = _psc_memo_entry_source(_memo_plan)
+                            state["opt_exec_signature_memo_source"] = _psc_memo_entry_source(_store_key)
                             state["opt_exec_signature_memo_fallback"] = _reason or "no_entry"
+                            state["opt_exec_signature_memo_partial"] = bool(_reused)
+                            state["opt_exec_signature_memo_reused"] = len(_reused)
                         _result = await _orig_sig_add_keys(self, node_ids)
-                        if _memo_plan is not None and state is not None:
-                            await _memo_write_back(self, node_ids, _memo_plan, state)
+                        if _store_key is not None and state is not None:
+                            await _memo_write_back(self, node_ids, _store_key, state, skip=_reused)
                         return _result
                     finally:
                         _elapsed = _ns_ms(_t0)

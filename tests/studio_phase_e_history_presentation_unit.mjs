@@ -52,19 +52,19 @@ function generation(overrides = {}) {
   }, overrides);
 }
 
-// 1-4. Feed policy: thumbnail, Preview fallback, then deliberate state.
+// 1-4. Feed policy: Data Saver first, then thumbnail, then deliberate state.
 {
   assert.deepEqual(selectFeedAsset(output({ thumbUrl: "/thumb" })), {
     kind: "thumbnail", url: "/thumb", label: "Thumbnail",
   });
   assert.equal(selectGenerationFeedAsset({ featuredOutput: output({ thumbUrl: "/thumb" }) }).kind, "thumbnail");
-  section("1. Feed uses Thumbnail first");
+  section("1. Feed uses Thumbnail when no Data Saver");
 
   assert.deepEqual(selectFeedAsset(output({ previewUrl: "/preview" })), {
-    kind: "preview", url: "/preview", label: "Preview",
+    kind: "data_saver", url: "/preview", label: "Data Saver",
   });
-  assert.equal(selectGenerationFeedAsset({ featuredOutput: output({ previewUrl: "/preview" }) }).kind, "preview");
-  section("2. Feed falls back to Preview");
+  assert.equal(selectGenerationFeedAsset({ featuredOutput: output({ previewUrl: "/preview" }) }).kind, "data_saver");
+  section("2. Feed prefers Data Saver");
 
   const originalOnly = selectFeedAsset(output({ originalUrl: "/original" }));
   assert.equal(originalOnly.url, "", "feed never selects Original bytes");
@@ -89,9 +89,9 @@ function generation(overrides = {}) {
   assert.equal(experimentSource.includes("selectExperimentCellAsset(cell)"), true);
   section("5. Experiment cell uses Thumbnail");
 
-  assert.equal(selectExperimentCellAsset(output({ previewUrl: "/cell-preview" })).kind, "preview");
+  assert.equal(selectExperimentCellAsset(output({ previewUrl: "/cell-preview" })).kind, "data_saver");
   assert.equal(experimentSource.includes('src: asset.url'), true);
-  section("6. Experiment cell falls back to Preview");
+  section("6. Experiment cell falls back to Data Saver");
 
   const cellOriginal = selectExperimentCellAsset(output({ originalUrl: "/cell-original" }));
   assert.equal(cellOriginal.url, "");
@@ -100,13 +100,13 @@ function generation(overrides = {}) {
   section("7. Experiment Original-only cell uses a placeholder");
 }
 
-// 8-10. Detail prefers Preview, then Thumbnail, and only loads Original on click.
+// 8-10. Detail prefers Data Saver, then Thumbnail, and only loads Original on click.
 {
   assert.deepEqual(selectDetailAsset(output({ previewUrl: "/preview", thumbUrl: "/thumb" })), {
-    kind: "preview", url: "/preview", label: "Preview",
+    kind: "data_saver", url: "/preview", label: "Data Saver",
   });
-  assert.equal(selectGenerationDetailAsset({ featuredOutput: output({ previewUrl: "/preview" }) }).kind, "preview");
-  section("8. Detail automatically displays Preview");
+  assert.equal(selectGenerationDetailAsset({ featuredOutput: output({ previewUrl: "/preview" }) }).kind, "data_saver");
+  section("8. Detail automatically displays Data Saver");
 
   assert.equal(selectGenerationDetailAsset({ featuredOutput: output({ originalUrl: "/original" }) }).url, "");
   assert.equal(detailSource.includes("src: feat.originalUrl"), true, "Original loader remains available in the click handler");
@@ -122,11 +122,11 @@ function generation(overrides = {}) {
 
 // 11-14. Badge and failure/attempt purpose semantics.
 {
-  assert.equal(selectFeedAsset(output({ previewUrl: "/preview" })).kind, "preview");
-  assert.equal(selectFeedAsset(output({ thumbUrl: "/thumb", previewUrl: "/preview" })).kind, "thumbnail");
-  assert.equal(feedSource.includes('asset.kind === "preview"'), true);
-  assert.equal(detailSource.includes('displayed.kind === "preview"'), true);
-  assert.equal(experimentSource.includes('asset.kind === "preview"'), true);
+  assert.equal(selectFeedAsset(output({ previewUrl: "/preview" })).kind, "data_saver");
+  assert.equal(selectFeedAsset(output({ thumbUrl: "/thumb", previewUrl: "/preview" })).kind, "data_saver");
+  assert.equal(feedSource.includes('kind === "data_saver"'), true);
+  assert.equal(detailSource.includes('isDataSaverKind(displayed.kind)'), true);
+  assert.equal(experimentSource.includes('asset.kind === "data_saver"'), true);
   assert.equal(feedSource.includes(".webp"), false);
   assert.equal(detailSource.includes(".webp"), false);
   section("11. Preview badge follows asset purpose, never file extension");
@@ -137,7 +137,7 @@ function generation(overrides = {}) {
   }));
   assert.equal(failed.featuredOutput.previewUrl, "/preview");
   assert.equal(failed.featuredOutput.originalFailed, true);
-  assert.equal(selectDetailAsset(failed.featuredOutput).kind, "preview");
+  assert.equal(selectDetailAsset(failed.featuredOutput).kind, "data_saver");
   // The failed-Original failure state lives in the generate/retry note (the
   // one viewer composition in studio-ui.js also badges the zoom stage).
   assert.equal(detailSource.includes("Original failed \\u2014 Preview retained."), true);
@@ -157,9 +157,11 @@ function generation(overrides = {}) {
   assert.equal(attempts[1].status, "failed");
   section("13. Retained Original stays available after failed retry");
 
-  assert.equal(generationAttemptPurposeLabel("preview"), "Preview");
+  assert.equal(generationAttemptPurposeLabel("preview"), "Data Saver");
+  assert.equal(generationAttemptPurposeLabel("data_saver"), "Data Saver");
   assert.equal(generationAttemptPurposeLabel("original"), "Original");
-  assert.equal(cellAttemptPurposeLabel("preview"), "Preview");
+  assert.equal(cellAttemptPurposeLabel("preview"), "Data Saver");
+  assert.equal(cellAttemptPurposeLabel("data_saver"), "Data Saver");
   assert.equal(cellAttemptPurposeLabel("original"), "Original");
   assert.equal(detailSource.includes("historyAttemptPurposeLabel(a.mode || a.purpose)"), true);
   assert.equal(experimentSource.includes("historyAttemptPurposeLabel(a && (a.mode || a.purpose))"), true);

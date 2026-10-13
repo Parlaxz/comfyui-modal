@@ -335,6 +335,7 @@ async def compose_generic_clip_load_stage(
     request_id: str,
     path_resolver: Callable[[str, str], str | None] | None = None,
     volume: Any = None,
+    clip_ticket: Any = None,
 ) -> dict[str, Any]:
     """Load CLIP via the SHARED ``golden_clip_load`` stage with the shared
     model transport (same selection as canonical runs: the session carries
@@ -344,7 +345,10 @@ async def compose_generic_clip_load_stage(
     Same shared construction/adoption/proof as canonical runs; only the
     source-read arm differs (session-local policy, no environment toggle).
     Mixed-dtype files take the stage's observable proof-downgrade path
-    instead of failing outright.  Returns ``{"ok": True, "clip": ...,
+    instead of failing outright.  An early-load ticket (started at
+    dispatch install while executor setup ran) is attached to the session
+    when it names this same single resolved file; the stage joins it
+    instead of starting a second read.  Returns ``{"ok": True, "clip": ...,
     "session": ..., "owners": [...], "source_arm": "golden_clip", ...}``
     or ``{"ok": False, "reason": ...}``.  Never raises.
     """
@@ -385,6 +389,14 @@ async def compose_generic_clip_load_stage(
                     "source_arm": "golden_clip"}
         # The stage reads full paths from the session (same as canonical).
         session.clip_paths = list(resolved)
+        try:
+            if (
+                len(session.clip_paths) == 1
+                and _match_clip_ticket(clip_ticket, session.clip_paths[0])
+            ):
+                session._generic_clip_ticket = clip_ticket
+        except Exception:
+            pass
         # QD publication must produce ordinary mutable tensors: the executor
         # runs under inference mode, and the legacy transport plus the
         # assign=True adoption perform in-place updates that inference
@@ -801,12 +813,17 @@ async def compose_generic_vae_load(
     request_id: str,
     path_resolver: Callable[[str, str], str | None] | None = None,
     volume: Any = None,
+    vae_ticket: Any = None,
 ) -> dict[str, Any]:
     """Load VAE via the SHARED ``golden_vae_load`` stage (imported).
 
     Same outcome shape as :func:`compose_generic_unet_load` with
-    ``source_arm="golden_vae"``; the native tuple is ``(vae,)``.  Never
-    raises.
+    ``source_arm="golden_vae"``; the native tuple is ``(vae,)``.  An
+    early-load ticket (started at sampler dispatch while sampling ran) is
+    joined here via the stage's ``preloaded_transport`` contract — the
+    awaited object carries the identical ``LoadedSafetensors`` shape the
+    stage's own read would produce — instead of starting a second read.
+    Never raises.
     """
     started_ns = time.monotonic_ns()
     resolve = path_resolver or _default_path_resolver
@@ -839,12 +856,73 @@ async def compose_generic_vae_load(
                     "reason": f"dynamic_vram_unavailable:{vram_detail}",
                     "elapsed_ms": elapsed_ms,
                     "source_arm": "golden_vae"}
+        # Early-VAE ticket join: the transport read ran while sampling
+        # ran.  Await it and hand the result to the stage through its
+        # preloaded-transport contract (same shape the stage's own read
+        # would produce: sd/owner/stats/header_metadata).  Joined ONLY
+        # when the stage would take its shared-transport (m2) branch —
+        # evaluated here with the stage's own predicate on this same
+        # session, so branch agreement is deterministic.  A path
+        # mismatch, missing/failed task, disabled transport, or malformed
+        # result falls through to the normal stage read below.
+        # Never raises.
+        _preloaded = None
+        try:
+            try:
+                from .golden_serial import (
+                    _golden_model_transport_enabled as _m2_enabled,
+                    _session_source_policy as _src_policy,
+                )
+                _m2_ok = bool(_m2_enabled()) and _src_policy(session) != "legacy_qd"
+            except Exception:
+                _m2_ok = False
+            if _m2_ok and _match_vae_ticket(vae_ticket, path):
+                _task = vae_ticket.get("task")
+                try:
+                    vae_ticket["consumed"] = True
+                except Exception:
+                    pass
+                _loaded = await _task
+                _layout = getattr(_loaded, "layout", None)
+                _header = (getattr(_layout, "header", None)
+                           if _layout is not None else None)
+                if (
+                    _loaded is not None
+                    and isinstance(getattr(_loaded, "views", None), dict)
+                    and getattr(_loaded, "owner", None) is not None
+                    and isinstance(getattr(_loaded, "stats", None), dict)
+                    and isinstance(_header, dict)
+                ):
+                    _preloaded = {
+                        "sd": _loaded.views,
+                        "owner": _loaded.owner,
+                        "stats": dict(_loaded.stats),
+                        "header_metadata": _header.get("__metadata__"),
+                    }
+                    try:
+                        print(
+                            "[v2.overlap] vae_ticket_join consumed "
+                            f"path={str(path).split('/')[-1]}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+        except Exception as exc:  # noqa: BLE001 - join failure falls through
+            try:
+                print(
+                    "[v2.overlap] vae_ticket_join fallback "
+                    f"reason={type(exc).__name__}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            _preloaded = None
         # Same inference-mode guard as the CLIP stage path: ordinary mutable
         # tensors for transport publication and assign=True adoption.
         import torch as _torch_vae
 
         with _torch_vae.inference_mode(False):
-            vae = await golden_vae_load(session)
+            vae = await golden_vae_load(session, preloaded_transport=_preloaded)
         owners = [
             o for o in [getattr(session, "vae_owner", None)]
             if o is not None
@@ -2445,6 +2523,7 @@ def _select_substitution(
 async def _substitute_unet_vae_loader(
     *, role: str, inputs: Any, request_id: str,
     unet_ticket: Any = None,
+    vae_ticket: Any = None,
 ) -> dict[str, Any]:
     """Shared UNET/VAE tail for dispatch substitution (imported stages).
 
@@ -2453,7 +2532,9 @@ async def _substitute_unet_vae_loader(
     unsupported files (scaled-FP8 UNET, non-uniform dtypes) with clean
     reasons; the caller falls back to native.  An early UNET load ticket
     (from the overlap launcher) is handed to the stage, which joins it
-    instead of starting a second read.  Never raises.
+    instead of starting a second read; an early VAE ticket (launched at
+    sampler dispatch) is handed to the VAE compose step the same way.
+    Never raises.
     """
     try:
         given = inputs if isinstance(inputs, dict) else {}
@@ -2513,6 +2594,7 @@ async def _substitute_unet_vae_loader(
                 vae_filenames=[vae_name],
                 folder="vae",
                 request_id=request_id,
+                vae_ticket=vae_ticket,
             )
         else:
             return {"ok": False, "reason": f"{role}_deferred"}
@@ -2571,6 +2653,14 @@ def _is_sampler_node(obj: Any, input_data_all: Any) -> bool:
         return False
 
 
+def _publish_studio_node_span(active: Mapping[str, Any], name: str, start_ns: int, end_ns: int | None = None) -> None:
+    trace = getattr(active.get("trace_emit"), "__self__", None)
+    if trace is None or not getattr(trace, "_metadata", {}).get("studio_progress"):
+        return
+    from .gantt_telemetry import publish_studio_span
+    publish_studio_span(trace, name, start_ns, end_ns)
+
+
 async def _run_native_with_kitchen_option(
     active: Mapping[str, Any],
     prompt_id: Any,
@@ -2620,6 +2710,7 @@ async def _run_native_with_kitchen_option(
                 try:
                     import time as _node_time
                     _node_start_ns = int(_node_time.monotonic_ns())
+                    _publish_studio_node_span(active, f"{_cls_name} (node {node_id})", _node_start_ns)
                 except Exception:
                     _node_time = None  # type: ignore[assignment]
                     _node_start_ns = 0
@@ -2633,6 +2724,7 @@ async def _run_native_with_kitchen_option(
                     try:
                         if _node_time is not None and _node_start_ns:
                             _node_end_ns = int(_node_time.monotonic_ns())
+                            _publish_studio_node_span(active, f"{_cls_name} (node {node_id})", _node_start_ns, _node_end_ns)
                             if _node_end_ns >= _node_start_ns:
                                 from .gantt_telemetry import (
                                     register_gantt_span as _node_register_span,
@@ -2672,6 +2764,7 @@ async def _run_native_with_kitchen_option(
     try:
         import time as _samp_time
         _samp_start_ns = int(_samp_time.monotonic_ns())
+        _publish_studio_node_span(active, "sampling", _samp_start_ns)
     except Exception:
         _samp_time = None  # type: ignore[assignment]
         _samp_start_ns = 0
@@ -2681,6 +2774,7 @@ async def _run_native_with_kitchen_option(
             if _samp_time is None or not _samp_start_ns:
                 return
             _samp_end_ns = int(_samp_time.monotonic_ns())
+            _publish_studio_node_span(active, "sampling", _samp_start_ns, _samp_end_ns)
             if _samp_end_ns < _samp_start_ns:
                 return
             from .gantt_telemetry import register_gantt_span as _samp_register_span
@@ -2796,15 +2890,45 @@ async def _run_substituted_loader(
                     _ticket = _candidate
             except Exception:
                 _ticket = None
+            _vae_ticket = None
+            try:
+                if str(role or "") == "vae":
+                    _vae_candidate = (ctx.get("vae_ticket")
+                                      if isinstance(ctx, Mapping) else None)
+                    _vae_raw = str(given.get("vae_name") or "").strip()
+                    _vae_resolved = (_default_path_resolver(
+                        "vae", _vae_raw)
+                        if _vae_raw else None)
+                    if _vae_resolved and _match_vae_ticket(
+                            _vae_candidate, _vae_resolved):
+                        _vae_ticket = _vae_candidate
+            except Exception:
+                _vae_ticket = None
             return await _substitute_unet_vae_loader(
                 role=role, inputs=given, request_id=request_id,
-                unet_ticket=_ticket)
+                unet_ticket=_ticket, vae_ticket=_vae_ticket)
         classification = classify_loader_node(
             "CLIPLoader", inputs if isinstance(inputs, dict) else {}
         )
         if not classification.get("supported"):
             return {"ok": False,
                     "reason": str(classification.get("reason") or "unsupported")}
+        # Early-CLIP ticket join: the transport read ran while executor
+        # setup ran.  The ticket serves this load only for the identical
+        # resolved checkpoint path; anything else falls through to the
+        # normal synchronous read below.  Never raises.
+        _clip_ticket = None
+        try:
+            _candidate = ctx.get("clip_ticket") if isinstance(ctx, Mapping) else None
+            _clip_name = str(classification.get("clip_name") or "").strip()
+            _clip_path = (
+                _default_path_resolver("text_encoders", _clip_name)
+                if _clip_name else None
+            )
+            if _clip_path and _match_clip_ticket(_candidate, _clip_path):
+                _clip_ticket = _candidate
+        except Exception:
+            _clip_ticket = None
         # Shared-stage-first routing: the stage owns FP8 sources end to
         # end since the quant-marker and real-device fixes (proven live).
         # QD4 second.  Keep both attempt walls so a slow invocation cannot
@@ -2816,6 +2940,7 @@ async def _run_substituted_loader(
                 clip_type=str(classification.get("clip_type") or "stable_diffusion"),
                 folder="text_encoders",
                 request_id=request_id,
+                clip_ticket=_clip_ticket,
             )
         except Exception as exc:  # noqa: BLE001 - fallback contract
             stage_outcome = {"ok": False,
@@ -3072,6 +3197,44 @@ def _match_unet_ticket(ticket: Any, path: Any) -> bool:
         return False
 
 
+def _match_clip_ticket(ticket: Any, path: Any) -> bool:
+    """Whether a prepared early-CLIP ticket may serve this load (pure logic).
+
+    Requires a mapping ticket for the identical resolved path with a
+    task handle present.  A finished task is explicitly ACCEPTED: joining
+    a completed read is free (the early read winning its race is the
+    normal case — the ticket ran while executor setup ran), and a failed
+    one raises into the stage's existing fallback handling.  Never raises.
+    """
+    try:
+        if not isinstance(ticket, dict):
+            return False
+        if str(ticket.get("path") or "") != str(path or ""):
+            return False
+        return ticket.get("task") is not None
+    except Exception:
+        return False
+
+
+def _match_vae_ticket(ticket: Any, path: Any) -> bool:
+    """Whether a prepared early-VAE ticket may serve this load (pure logic).
+
+    Requires a mapping ticket for the identical resolved path with a
+    task handle present.  A finished task is explicitly ACCEPTED: joining
+    a completed read is free (the read winning the sampling race is the
+    normal case), and a failed one raises into the stage's existing
+    fallback handling.  Never raises.
+    """
+    try:
+        if not isinstance(ticket, dict):
+            return False
+        if str(ticket.get("path") or "") != str(path or ""):
+            return False
+        return ticket.get("task") is not None
+    except Exception:
+        return False
+
+
 def _overlap_launch_unet_load(active: Any) -> dict[str, Any]:
     """Start the shared-transport UNET load early (async ticket).
 
@@ -3143,6 +3306,235 @@ def _overlap_launch_unet_load(active: Any) -> dict[str, Any]:
         return {"started": False, "reason": type(exc).__name__}
 
 
+def _overlap_launch_clip_load(active: Any) -> dict[str, Any]:
+    """Start the shared-transport CLIP load early (async ticket).
+
+    Called once at dispatch-substitution install (pregraph, before the
+    PromptExecutor cache/topo/setup window) so the ~1.2-1.5s CLIP source
+    read overlaps executor setup instead of serializing after it.  Uses
+    the exact shared-transport call the stage itself would make
+    (``transport.load(path, role="clip")`` — the same async vehicle as
+    the UNET ticket; the sync body is identical, only the loop handoff
+    differs).  The CLIP stage joins this future at CLIP dispatch instead
+    of starting its own read.
+
+    Gates (fail-closed, all recorded as reasons): eligible overlap plan
+    with a resolvable CLIP node, no existing ticket, a non-empty
+    ``clip_name`` in the clip spec, a resolvable checkpoint path, a
+    COMPLETE deployment identity (combined hash + node generation — the
+    version gate: same filename under a redeployed volume must not reuse
+    a stale read), a running loop, and an available transport.
+    Request-scoped (stored on the active context), cancelled at teardown
+    when never consumed.  The UNET ticket still launches after CLIP
+    dispatch, so the two transport generations never run concurrently.
+    Never raises.
+    """
+    try:
+        if not isinstance(active, Mapping):
+            return {"started": False, "reason": "no_active_context"}
+        plan = active.get("overlap_plan") or {}
+        if not plan.get("eligible") or not plan.get("clip_node_id"):
+            return {"started": False, "reason": "overlap_not_eligible"}
+        if isinstance(active.get("clip_ticket"), dict):
+            return {"started": False, "reason": "ticket_already_exists"}
+        spec = active.get("overlap_clip_spec") or {}
+        filename = spec.get("clip_name")
+        if not isinstance(filename, str) or not filename.strip():
+            return {"started": False, "reason": "clip_filename_unresolved"}
+        deployment = active.get("deployment_identity") or {}
+        if not (
+            isinstance(deployment, Mapping)
+            and str(deployment.get("deployment_combined_hash") or "").strip()
+            and str(deployment.get("custom_nodes_generation") or "").strip()
+        ):
+            return {"started": False, "reason": "deployment_identity_incomplete"}
+        path = _default_path_resolver("text_encoders", filename)
+        if not path:
+            return {"started": False, "reason": "clip_path_unresolvable"}
+        try:
+            import asyncio as _asyncio_launch
+            loop = _asyncio_launch.get_running_loop()
+        except Exception:
+            return {"started": False, "reason": "no_running_loop"}
+        try:
+            from .golden_model_transport import (
+                get_golden_model_transport as _get_transport,
+            )
+            transport = _get_transport()
+        except Exception:
+            return {"started": False, "reason": "transport_unavailable"}
+        if transport is None:
+            return {"started": False, "reason": "transport_unavailable"}
+        try:
+            task = loop.create_task(transport.load(path, role="clip"))
+        except Exception as exc:  # noqa: BLE001 - launch is best-effort
+            return {"started": False,
+                    "reason": f"task_create_failed:{type(exc).__name__}"}
+        try:
+            active["clip_ticket"] = {
+                "path": path,
+                "task": task,
+                "started_ns": time.monotonic_ns(),
+                "consumed": False,
+            }
+            try:
+                print(
+                    f"[v2.overlap] clip_ticket_launched "
+                    f"path={str(path).split('/')[-1]} "
+                    f"mono_ns={active['clip_ticket']['started_ns']}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+        except Exception:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+            return {"started": False, "reason": "ticket_store_failed"}
+        return {"started": True, "reason": "", "path": path}
+    except Exception as exc:  # noqa: BLE001 - launch contract: never raise
+        return {"started": False, "reason": type(exc).__name__}
+
+
+def _overlap_maybe_launch_vae_on_dispatch(
+    active: Any, obj: Any, input_data_all: Any,
+) -> dict[str, Any] | None:
+    """Launch the early-VAE ticket when a sampler starts dispatching.
+
+    Testable seam for the dispatch wrapper: returns the launch outcome
+    dict on sampler nodes, None otherwise (including any error — the
+    wrapper treats None as "no ticket", exactly as before).  Launching at
+    sampler START (not earlier) bounds speculation to requests that will
+    actually produce latents.  A launch chained on CLIP completion is
+    deliberately NOT done here: the UNET ticket's transport generation is
+    still running at that point, and the shared transport serves a single
+    generation at a time (staging singletons, generation counter), so an
+    overlapping VAE generation could corrupt both reads.  If the VAE node
+    already dispatched (early-VAE workflows), no ticket is launched —
+    launching after consumption point would only burn a read that
+    teardown cancels.
+    """
+    try:
+        if not _is_sampler_node(obj, input_data_all):
+            return None
+        try:
+            _spec = active.get("overlap_vae_spec") if isinstance(active, Mapping) else None
+            _vae_nid = str((_spec or {}).get("node_id") or "")
+            _dispatched = active.get("dispatched_nodes") if isinstance(active, Mapping) else None
+            if _vae_nid and isinstance(_dispatched, set) and _vae_nid in _dispatched:
+                return {"started": False, "reason": "vae_already_dispatched"}
+        except Exception:
+            pass
+        return _overlap_launch_vae_load(active)
+    except Exception:
+        return None
+
+
+def _overlap_launch_vae_load(active: Any) -> dict[str, Any]:
+    """Start the shared-transport VAE load early (async ticket).
+
+    Called when a sampler starts dispatching so the ~0.3-0.5s VAE source
+    read overlaps sampling instead of serializing after it (the overlap
+    Golden Parallel already assumes).  Uses the exact shared-transport
+    call the stage itself would make — ``transport.load(path)`` with NO
+    role override, identical to ``golden_vae_load``'s own call — so a
+    joined result is telemetry-indistinguishable from a synchronous
+    stage read.  The VAE dispatch joins this future via the stage's
+    ``preloaded_transport`` contract instead of starting its own read.
+
+    Gates (fail-closed, all recorded as reasons): eligible overlap plan,
+    a resolvable VAE spec (node + non-empty ``vae_name`` — resolved LIVE
+    here, so dynamic filenames are never speculated), a COMPLETE
+    deployment identity, a resolvable checkpoint path, no existing ticket,
+    a running loop, and an available transport.  Request-scoped (stored
+    on the active context), cancelled at teardown when never consumed.
+    Never raises.
+    """
+    try:
+        if not isinstance(active, Mapping):
+            return {"started": False, "reason": "no_active_context"}
+        plan = active.get("overlap_plan") or {}
+        if not plan.get("eligible"):
+            return {"started": False, "reason": "overlap_not_eligible"}
+        if isinstance(active.get("vae_ticket"), dict):
+            return {"started": False, "reason": "ticket_already_exists"}
+        try:
+            _unet_ticket = active.get("unet_ticket")
+            _unet_task = (
+                _unet_ticket.get("task")
+                if isinstance(_unet_ticket, dict) else None
+            )
+            if _unet_task is not None and not bool(
+                    getattr(_unet_task, "done", lambda: True)()):
+                # The shared transport serves a single generation at a
+                # time: launching while the UNET read is still running
+                # would interleave staging/scheduler state and corrupt
+                # both reads.  Fail closed; the VAE stage reads
+                # synchronously as before.
+                return {"started": False, "reason": "transport_busy_unet_inflight"}
+        except Exception:
+            pass
+        spec = active.get("overlap_vae_spec") or {}
+        filename = spec.get("vae_name")
+        if not isinstance(filename, str) or not filename.strip():
+            return {"started": False, "reason": "vae_filename_unresolved"}
+        deployment = active.get("deployment_identity") or {}
+        if not (
+            isinstance(deployment, Mapping)
+            and str(deployment.get("deployment_combined_hash") or "").strip()
+            and str(deployment.get("custom_nodes_generation") or "").strip()
+        ):
+            return {"started": False, "reason": "deployment_identity_incomplete"}
+        path = _default_path_resolver("vae", filename)
+        if not path:
+            return {"started": False, "reason": "vae_path_unresolvable"}
+        try:
+            import asyncio as _asyncio_launch
+            loop = _asyncio_launch.get_running_loop()
+        except Exception:
+            return {"started": False, "reason": "no_running_loop"}
+        try:
+            from .golden_model_transport import (
+                get_golden_model_transport as _get_transport,
+            )
+            transport = _get_transport()
+        except Exception:
+            return {"started": False, "reason": "transport_unavailable"}
+        if transport is None:
+            return {"started": False, "reason": "transport_unavailable"}
+        try:
+            task = loop.create_task(transport.load(path))
+        except Exception as exc:  # noqa: BLE001 - launch is best-effort
+            return {"started": False,
+                    "reason": f"task_create_failed:{type(exc).__name__}"}
+        try:
+            active["vae_ticket"] = {
+                "path": path,
+                "task": task,
+                "started_ns": time.monotonic_ns(),
+                "consumed": False,
+            }
+            try:
+                print(
+                    f"[v2.overlap] vae_ticket_launched "
+                    f"path={str(path).split('/')[-1]} "
+                    f"mono_ns={active['vae_ticket']['started_ns']}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+        except Exception:
+            try:
+                task.cancel()
+            except Exception:
+                pass
+            return {"started": False, "reason": "ticket_store_failed"}
+        return {"started": True, "reason": "", "path": path}
+    except Exception as exc:  # noqa: BLE001 - launch contract: never raise
+        return {"started": False, "reason": type(exc).__name__}
+
+
 def install_execution_dispatch_substitution(
     *,
     role_bindings: Any,
@@ -3150,6 +3542,7 @@ def install_execution_dispatch_substitution(
     trace_emit: Callable[..., Any] | None,
     request_id: str,
     workflow: Any = None,
+    deployment_identity: Any = None,
 ) -> Callable[[], None] | None:
     """Wrap upstream ``execution.get_output_data`` with role substitution.
 
@@ -3159,6 +3552,13 @@ def install_execution_dispatch_substitution(
     when already installed, or when installation fails — native behavior
     is always the fallback.  Only loader roles substitute; every other
     node passes through untouched.
+
+    ``deployment_identity`` (plan deployment identity mapping, optional)
+    gates the early-CLIP ticket: the ticket pre-reads the CLIP checkpoint
+    while executor setup runs, so it may only launch when the deployment
+    combined hash + node generation are proven (same filename under a
+    redeployed volume must never serve a stale read).  Absent/incomplete
+    → no ticket; dispatch behaves exactly as before.
     """
     global _ACTIVE_DISPATCH_CTX
     try:
@@ -3223,6 +3623,20 @@ def install_execution_dispatch_substitution(
                         reason=str(overlap_plan.get("reason") or ""))
         ctx["overlap_plan"] = overlap_plan
         ctx["overlap_pick_restore"] = None
+        try:
+            _dep_map: dict[str, Any] = {}
+            if isinstance(deployment_identity, Mapping):
+                _dep_map = dict(deployment_identity)
+            elif deployment_identity is not None:
+                _dep_get = getattr(deployment_identity, "get", None)
+                if callable(_dep_get):
+                    _dep_map = {
+                        "deployment_combined_hash": _dep_get("deployment_combined_hash", ""),
+                        "custom_nodes_generation": _dep_get("custom_nodes_generation", ""),
+                    }
+            ctx["deployment_identity"] = _dep_map
+        except Exception:
+            ctx["deployment_identity"] = {}
         if overlap_plan.get("eligible"):
             # Warm both model files while setup runs: content-agnostic
             # page-cache hints, harmless when unused or invalidated.
@@ -3283,6 +3697,53 @@ def install_execution_dispatch_substitution(
                 active_spec = {"node_id": None, "unet_name": None}
             ctx["overlap_unet_spec"] = active_spec
             try:
+                _clip_spec_name: Any = None
+                _wf_clip_spec = workflow if isinstance(workflow, Mapping) else {}
+                _clip_spec_node = _wf_clip_spec.get(
+                    str(overlap_plan.get("clip_node_id") or ""))
+                if isinstance(_clip_spec_node, Mapping):
+                    _clip_spec_inputs = _clip_spec_node.get("inputs")
+                    if isinstance(_clip_spec_inputs, Mapping):
+                        _clip_spec_name = _clip_spec_inputs.get("clip_name")
+                ctx["overlap_clip_spec"] = {
+                    "node_id": str(overlap_plan.get("clip_node_id") or ""),
+                    "clip_name": (
+                        str(_clip_spec_name)
+                        if isinstance(_clip_spec_name, str) and _clip_spec_name.strip()
+                        else None
+                    ),
+                }
+            except Exception:
+                ctx["overlap_clip_spec"] = {"node_id": None, "clip_name": None}
+            try:
+                _vae_spec_name: Any = None
+                _vae_spec_nid: Any = None
+                try:
+                    _node_roles = node_roles if isinstance(node_roles, dict) else {}
+                    _vae_spec_nid = next(
+                        (str(_nid) for _nid, _role in _node_roles.items()
+                         if str(_role or "") == "vae"),
+                        "",
+                    )
+                except Exception:
+                    _vae_spec_nid = ""
+                _wf_vae_spec = workflow if isinstance(workflow, Mapping) else {}
+                _vae_spec_node = _wf_vae_spec.get(str(_vae_spec_nid or ""))
+                if isinstance(_vae_spec_node, Mapping):
+                    _vae_spec_inputs = _vae_spec_node.get("inputs")
+                    if isinstance(_vae_spec_inputs, Mapping):
+                        _vae_spec_name = _vae_spec_inputs.get("vae_name")
+                ctx["overlap_vae_spec"] = {
+                    "node_id": str(_vae_spec_nid or ""),
+                    "vae_name": (
+                        str(_vae_spec_name)
+                        if isinstance(_vae_spec_name, str) and _vae_spec_name.strip()
+                        else None
+                    ),
+                }
+            except Exception:
+                ctx["overlap_vae_spec"] = {"node_id": None, "vae_name": None}
+            try:
                 ctx["overlap_pick_restore"] = _install_overlap_pick_policy(
                     trace_emit=trace_emit,
                     request_id=str(request_id or ""),
@@ -3290,6 +3751,20 @@ def install_execution_dispatch_substitution(
             except Exception:
                 ctx["overlap_pick_restore"] = None
         _ACTIVE_DISPATCH_CTX = ctx
+        # Early-CLIP ticket: the CLIP source read runs while PromptExecutor
+        # cache/topo/setup runs (the install point is pregraph, before
+        # executor invoke).  Best-effort with recorded reasons; any gate
+        # failure leaves dispatch exactly as before (synchronous CLIP
+        # read at CLIP dispatch).  Kill switch: the existing overlap
+        # switch (ineligible plan → no ticket, same as UNET overlap).
+        try:
+            _clip_launch = _overlap_launch_clip_load(ctx)
+            _emit_trace(trace_emit, "generic_overlap_clip_launch",
+                        request_id=str(request_id or ""),
+                        started=bool(_clip_launch.get("started")),
+                        reason=str(_clip_launch.get("reason") or ""))
+        except Exception:
+            pass
 
         async def _substituting_get_output_data(
             prompt_id: Any,
@@ -3319,6 +3794,20 @@ def install_execution_dispatch_substitution(
                 pass
             decision = _select_substitution(active, unique_id, obj, input_data_all)
             if decision is None:
+                # Sampler start: launch the early-VAE ticket so the VAE
+                # source read overlaps sampling.  Best-effort with a
+                # recorded trace; any gate failure leaves the request
+                # exactly as before (synchronous VAE read at VAE dispatch).
+                try:
+                    _vae_launch = _overlap_maybe_launch_vae_on_dispatch(
+                        active, obj, input_data_all)
+                    if _vae_launch is not None:
+                        _emit_trace(trace_emit, "generic_overlap_vae_launch",
+                                    request_id=str(active.get("request_id") or ""),
+                                    started=bool(_vae_launch.get("started")),
+                                    reason=str(_vae_launch.get("reason") or ""))
+                except Exception:
+                    pass
                 return await _run_native_with_kitchen_option(
                     active, prompt_id, unique_id, obj, input_data_all,
                     original,
@@ -3328,6 +3817,8 @@ def install_execution_dispatch_substitution(
             try:
                 import time as _time
                 _sub_start_ns = int(_time.monotonic_ns())
+                _role_label = {"clip": "CLIP load", "unet": "UNET load", "model_unet": "UNET load", "vae": "VAE load"}.get(str(decision["role"]).lower(), str(decision["role"]))
+                _publish_studio_node_span(active, _role_label, _sub_start_ns)
             except Exception:
                 _time = None  # type: ignore[assignment]
                 _sub_start_ns = 0
@@ -3338,6 +3829,7 @@ def install_execution_dispatch_substitution(
             try:
                 if _time is not None and _sub_start_ns:
                     _sub_end_ns = int(_time.monotonic_ns())
+                    _publish_studio_node_span(active, _role_label, _sub_start_ns, _sub_end_ns)
                     _role_norm = str(decision["role"]).strip().lower()
                     if _role_norm in ("clip",):
                         _span_name, _span_lane = "CLIP load", "STORAGE"
@@ -3423,15 +3915,16 @@ def install_execution_dispatch_substitution(
         def _restore_dispatch() -> None:
             global _ACTIVE_DISPATCH_CTX
             try:
-                _ticket = ctx.get("unet_ticket")
-                _task = (_ticket or {}).get("task") if isinstance(
-                    _ticket, dict) else None
-                if _task is not None and not bool(
-                        getattr(_task, "done", lambda: True)()):
-                    try:
-                        _task.cancel()
-                    except Exception:
-                        pass
+                for _ticket_key in ("unet_ticket", "clip_ticket", "vae_ticket"):
+                    _ticket = ctx.get(_ticket_key)
+                    _task = (_ticket or {}).get("task") if isinstance(
+                        _ticket, dict) else None
+                    if _task is not None and not bool(
+                            getattr(_task, "done", lambda: True)()):
+                        try:
+                            _task.cancel()
+                        except Exception:
+                            pass
             except Exception:
                 pass
             try:

@@ -492,6 +492,325 @@ def topo_lazy_pending_count(identity_hash: str) -> int:
         return 0
 
 
+# ── Static structure identity + partial reuse (frozen-graph rule) ──────────
+# Saved workflows are frozen node graphs: only input VALUES change per
+# request (prompt text, sizes, seeds) while node types/links/topology are
+# fixed by the wizard version.  The legacy memo key binds the FULL request
+# workflow_hash (values included), so every prompt edit is a total miss.
+# The static key binds STRUCTURE instead (node classes + link topology +
+# value *types*); per-node ``inputs_hash`` guards values.  A changed node
+# (and its descendants — signatures embed the full ancestor chain, see
+# ``CacheKeySetInputSignature.get_node_signature``) is recomputed via the
+# ORIGINAL add_keys path, which skips keys already populated here.
+# Advisory and fail-closed throughout: any error → full recompute.
+
+
+def is_link_value(value: Any) -> bool:
+    """Mirror ``comfymodal_runtime``-external ``graph_utils.is_link``.
+
+    A link is a 2-list ``[node_id: str, socket: int|float]``.  Kept local so
+    this module stays stdlib-only and import-safe without ComfyUI.
+    """
+    if not isinstance(value, list):
+        return False
+    if len(value) != 2:
+        return False
+    if not isinstance(value[0], str):
+        return False
+    if not isinstance(value[1], int) and not isinstance(value[1], float):
+        return False
+    return True
+
+
+def _structure_slot(value: Any) -> Any:
+    """Normalize one input into a value-independent structural descriptor.
+
+    Links keep their target (topology); literal values collapse to their
+    type name (a changed literal still flips ``canonical_inputs_hash``, so
+    value changes are detected — just at per-node granularity, not by
+    destroying the whole memo entry).
+    """
+    if is_link_value(value):
+        _sock = value[1]
+        if isinstance(_sock, float) and _sock.is_integer():
+            _sock = int(_sock)
+        return ["link", str(value[0]), _sock]
+    if value is None:
+        return ["value", "none"]
+    if isinstance(value, bool):
+        return ["value", "bool"]
+    if isinstance(value, int):
+        return ["value", "int"]
+    if isinstance(value, float):
+        return ["value", "float"]
+    if isinstance(value, str):
+        return ["value", "str"]
+    if isinstance(value, bytes):
+        return ["value", "bytes"]
+    if isinstance(value, (list, tuple)):
+        return ["value", "list"]
+    if isinstance(value, Mapping):
+        return ["value", "dict"]
+    return ["value", "other"]
+
+
+def structure_fingerprint(node_map: Any) -> str:
+    """Value-independent structural hash of a node map.
+
+    ``node_map`` is ``{node_id: {"class_type", "inputs"}}``.  Returns the
+    stable hex digest, or ``""`` when the map is empty/malformed (caller
+    treats that as static-incomplete and takes the legacy path).
+    """
+    try:
+        if not isinstance(node_map, Mapping) or not node_map:
+            return ""
+        shaped: dict[str, Any] = {}
+        for _nid, _node in node_map.items():
+            if not isinstance(_node, Mapping):
+                return ""
+            _inputs = _node.get("inputs")
+            if _inputs is None:
+                _inputs = {}
+            if not isinstance(_inputs, Mapping):
+                return ""
+            shaped[str(_nid)] = [
+                str(_node.get("class_type", "")),
+                [
+                    [str(_k), _structure_slot(_v)]
+                    for _k, _v in sorted(_inputs.items(), key=lambda _kv: str(_kv[0]))
+                ],
+            ]
+        return stable_hash(shaped)
+    except Exception:
+        return ""
+
+
+def static_identity(
+    *,
+    structure_hash: str = "",
+    deployment_combined_hash: str = "",
+    custom_node_generation: str = "",
+    registry_proof: Any = None,
+    schema_version: int = SCHEMA_VERSION,
+) -> dict[str, Any]:
+    """Build the value-independent static identity for memoization.
+
+    Same deployment/registry/schema gating as :func:`memo_identity`, but
+    keyed on the graph STRUCTURE instead of the full request workflow_hash.
+    A wizard structural edit changes the structure hash → explicit total
+    miss; a prompt/size/seed edit leaves it intact → partial reuse.
+    """
+    identity = {
+        "structure_hash": str(structure_hash or ""),
+        "deployment_combined_hash": str(deployment_combined_hash or ""),
+        "custom_node_generation": str(custom_node_generation or ""),
+        "registry_proof_hash": stable_hash(registry_proof or {}),
+        "schema_version": int(schema_version or SCHEMA_VERSION),
+    }
+    complete = bool(
+        identity["structure_hash"]
+        and identity["deployment_combined_hash"]
+        and identity["custom_node_generation"]
+    )
+    return {
+        "identity": identity,
+        "static_hash": stable_hash(identity),
+        "complete": complete,
+    }
+
+
+async def apply_memo_partial(
+    *,
+    keys: dict[str, Any],
+    subcache_keys: dict[str, Any],
+    node_ids: Any,
+    get_node: Any,
+    has_node: Any,
+    get_is_changed: Any,
+    identity_hash: str,
+) -> tuple[bool, str, set]:
+    """Populate the reusable subset of ``node_ids`` from the memo store.
+
+    Per-node checks are verbatim those of :func:`apply_memo_hit` (class
+    match, ``inputs_hash`` match, ``is_changed`` re-evaluation unless the
+    stored value is ``False``, reconstructed signature must be a
+    frozenset).  Additionally, a candidate is reusable only when its full
+    transitive ancestor chain is trustworthy: an ancestor counts as clean
+    when its key was already computed this request (present in ``keys``),
+    when it passes the same own-checks, or — for ancestors outside the
+    requested set — when a stored entry matches class+inputs with a stored
+    ``is_changed`` of ``False`` (the same trust the full-hit path extends;
+    anything else is dirty without evaluating foreign ``is_changed``).
+
+    Verified-clean nodes are populated into ``keys``/``subcache_keys``
+    exactly as the full-hit path would; the caller ALWAYS falls through to
+    the original ``add_keys``, which skips populated keys (upstream
+    ``caching.py`` ``if node_id in self.keys: continue``) and computes the
+    rest from the current prompt — so descendant invalidation stays owned
+    by the original computation.
+
+    Returns ``(reused_all, reason, reused)`` where ``reused`` holds the RAW
+    node ids populated here (for write-back skip) and ``reused_all`` is
+    True only when every requested node is now in ``keys``.  ``reason`` is
+    ``""`` on full reuse, else the first dirty reason in request order
+    (``"no_entry"``/``"malformed_entry"`` when the store has nothing).
+    Never raises.
+    """
+    reused: set = set()
+    try:
+        entry = get_store(identity_hash)
+        if entry is None:
+            return False, "no_entry", reused
+        nodes_entry = entry.get("nodes") if isinstance(entry, dict) else None
+        if not isinstance(nodes_entry, dict):
+            return False, "malformed_entry", reused
+
+        try:
+            _keys_str = {str(_k) for _k in keys}
+        except Exception:
+            _keys_str = set()
+
+        # Pass 1: own-checks for requested nodes (verbatim full-hit checks).
+        _candidate: dict[str, tuple[Any, str, Any]] = {}
+        _dirty_reason: dict[str, str] = {}
+        _requested: list[tuple[Any, str]] = []
+        for _nid in node_ids:
+            if _nid in keys:
+                continue
+            _snid = str(_nid)
+            _requested.append((_nid, _snid))
+            try:
+                if not has_node(_nid):
+                    _dirty_reason[_snid] = "unknown_node"
+                    continue
+                _node = get_node(_nid)
+            except Exception:
+                _dirty_reason[_snid] = "dynprompt_error"
+                continue
+            _node_entry = nodes_entry.get(_snid)
+            if not isinstance(_node_entry, dict):
+                _dirty_reason[_snid] = f"missing_node_entry:{_nid}"
+                continue
+            if str(_node_entry.get("class_type", "")) != str(_node.get("class_type", "")):
+                _dirty_reason[_snid] = f"class_type_mismatch:{_nid}"
+                continue
+            if str(_node_entry.get("inputs_hash", "")) != canonical_inputs_hash(
+                _node.get("inputs") or {}
+            ):
+                _dirty_reason[_snid] = f"inputs_hash_mismatch:{_nid}"
+                continue
+            _stored_isc = _node_entry.get("is_changed")
+            if _stored_isc is not False:
+                try:
+                    _current_isc = await get_is_changed(_nid)
+                except Exception:
+                    _dirty_reason[_snid] = f"is_changed_error:{_nid}"
+                    continue
+                if _stored_isc != encode_is_changed(_current_isc):
+                    _dirty_reason[_snid] = f"is_changed_mismatch:{_nid}"
+                    continue
+            _signature = reconstruct_signature(_node_entry)
+            if not isinstance(_signature, frozenset):
+                _dirty_reason[_snid] = f"malformed_signature:{_nid}"
+                continue
+            _candidate[_snid] = (_nid, str(_node.get("class_type", "")), _signature)
+
+        # Ancestor walk helper: link targets of one node (fail-closed).
+        def _link_targets(_node: Any) -> list[str] | None:
+            try:
+                _inputs = _node.get("inputs") if isinstance(_node, Mapping) else None
+                if not isinstance(_inputs, Mapping):
+                    return None
+                _targets: list[str] = []
+                for _v in _inputs.values():
+                    if is_link_value(_v):
+                        _targets.append(str(_v[0]))
+                return _targets
+            except Exception:
+                return None
+
+        # Pass 2: ancestor-closure cleanliness with memoization.
+        _clean_memo: dict[str, bool] = {}
+
+        def _ancestor_clean(_snid: str, _stack: frozenset) -> bool:
+            if _snid in _keys_str:
+                return True
+            if _snid in _clean_memo:
+                return _clean_memo[_snid]
+            if _snid in _stack:
+                _clean_memo[_snid] = False
+                return False
+            if _snid in _dirty_reason:
+                _clean_memo[_snid] = False
+                return False
+            if _snid not in _candidate:
+                # Outside the requested set: trust only computed-now keys
+                # or a stored entry with static (False) is_changed — never
+                # evaluate foreign is_changed here (bounded cost).
+                try:
+                    _stored = nodes_entry.get(_snid)
+                except Exception:
+                    _stored = None
+                if not isinstance(_stored, dict):
+                    _clean_memo[_snid] = False
+                    return False
+                if _stored.get("is_changed") is not False:
+                    _clean_memo[_snid] = False
+                    return False
+                try:
+                    if not has_node(_snid):
+                        _clean_memo[_snid] = False
+                        return False
+                    _live = get_node(_snid)
+                except Exception:
+                    _clean_memo[_snid] = False
+                    return False
+                if not isinstance(_live, Mapping) or str(_stored.get("class_type", "")) != str(
+                    _live.get("class_type", "")
+                ):
+                    _clean_memo[_snid] = False
+                    return False
+                if str(_stored.get("inputs_hash", "")) != canonical_inputs_hash(
+                    _live.get("inputs") or {}
+                ):
+                    _clean_memo[_snid] = False
+                    return False
+                _node_for_walk: Any = _live
+            else:
+                try:
+                    _node_for_walk = get_node(_candidate[_snid][0])
+                except Exception:
+                    _clean_memo[_snid] = False
+                    return False
+            _targets = _link_targets(_node_for_walk)
+            if _targets is None:
+                _clean_memo[_snid] = False
+                return False
+            _next = _stack | {_snid}
+            for _t in _targets:
+                if not _ancestor_clean(_t, _next):
+                    _clean_memo[_snid] = False
+                    return False
+            _clean_memo[_snid] = True
+            return True
+
+        _first_reason = ""
+        for _nid, _snid in _requested:
+            if _nid in keys:
+                continue
+            if _snid in _candidate and _ancestor_clean(_snid, frozenset()):
+                _raw, _ct, _sig = _candidate[_snid]
+                keys[_raw] = _sig
+                subcache_keys[_raw] = (_raw, _ct)
+                reused.add(_raw)
+            elif not _first_reason:
+                _first_reason = _dirty_reason.get(_snid, f"ancestor_dirty:{_nid}")
+        _reused_all = all((_nid in keys) for _nid in node_ids)
+        return _reused_all, ("" if _reused_all else _first_reason), reused
+    except Exception:
+        return False, "memo_partial_exception", reused
+
+
 # ── Memo-hit application (the executor patch consults this) ──────────────
 
 

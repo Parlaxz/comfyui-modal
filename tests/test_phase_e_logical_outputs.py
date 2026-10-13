@@ -25,9 +25,12 @@ from history_v2_routes import (
     _cell_generation_payload,
     _detail_cell,
     _generation_feed_item,
+    _launch_local_path,
     _model_names,
     _probe_image_dimensions,
+    _probe_image_format,
     _recover_embedded_params,
+    _resolve_local_asset_file,
 )
 from history_v2_store import HistoryV2Store
 from history_v2_writer import (
@@ -540,6 +543,55 @@ class ViewerContentProjectionTests(unittest.TestCase):
         bad.write_bytes(b"not an image")
         self.assertEqual(_probe_image_dimensions(str(bad)), (None, None))
 
+    def test_probe_image_format_reads_bytes_not_names(self):
+        from PIL import Image
+
+        png_path = str(self.root / "real.png")
+        Image.new("RGB", (8, 8)).save(png_path)
+        self.assertEqual(_probe_image_format(png_path), "png")
+        webp_path = str(self.root / "real.webp")
+        Image.new("RGB", (8, 8)).save(webp_path, format="WEBP")
+        self.assertEqual(_probe_image_format(webp_path), "webp")
+        # WebP bytes under a .png name (golden materialization before
+        # extension sniffing) still probe as webp.
+        misnamed = str(self.root / "misnamed.png")
+        Image.new("RGB", (8, 8)).save(misnamed, format="WEBP")
+        self.assertEqual(_probe_image_format(misnamed), "webp")
+        self.assertIsNone(_probe_image_format("modal://workspace/x.png"))
+        self.assertIsNone(_probe_image_format(str(self.root / "absent.png")))
+        bad = self.root / "bad.bin"
+        bad.write_bytes(b"not an image at all!!!!!")
+        self.assertIsNone(_probe_image_format(str(bad)))
+
+    def test_detail_format_prefers_byte_truth_over_stored(self):
+        from PIL import Image
+
+        # Mirrors the field case: webp bytes, .png name, stored format png.
+        misnamed = str(self.root / "truth.webp")
+        Image.new("RGB", (16, 16)).save(misnamed, format="WEBP")
+        asset = Asset(
+            asset_id="truthy",
+            generation_id="gen_viewer",
+            type="original",
+            managed_path=misnamed,
+            filename="truth.png",
+            created_at=T0,
+            run_id="run_o",
+            width=None,
+            height=None,
+            format="png",
+            logical_output_key=KEY_A,
+        )
+        attempts = [_attempt("run_o", "original")]
+        rich = _build_outputs([asset], attempts=attempts, include_embedded=True)[0]
+        self.assertEqual(rich["format"], "webp")
+        self.assertEqual(rich["original_format"], "webp")
+        self.assertEqual(rich["width"], 16)
+        self.assertEqual(rich["height"], 16)
+        # Feed path never opens files: stored value stands.
+        plain = _build_outputs([asset], attempts=attempts)[0]
+        self.assertEqual(plain["format"], "png")
+
     def test_role_keyed_model_stack_projects_each_model_name(self):
         self.assertEqual(
             _model_names({"clip": ["qwen_3_4b.safetensors"], "unet": ["z_image_turbo_bf16.safetensors"], "vae": ["ae.safetensors"]}),
@@ -665,6 +717,185 @@ class ViewerContentProjectionTests(unittest.TestCase):
             [asset], attempts, include_embedded=True,
         )
         self.assertEqual(kept["models"], [{"name": "stored.safetensors"}])
+
+    def test_resolve_local_asset_file(self):
+        from types import SimpleNamespace
+
+        missing_repo = SimpleNamespace(get_asset=lambda asset_id: None)
+        path, error = _resolve_local_asset_file(missing_repo, "ast_nope")
+        self.assertIsNone(path)
+        self.assertTrue(error and error[0] == "asset_not_found" and error[2] == 404)
+
+        remote = SimpleNamespace(get_asset=lambda asset_id: SimpleNamespace(
+            managed_path="modal://ws|gpu|/remote.png"))
+        path, error = _resolve_local_asset_file(remote, "ast_remote")
+        self.assertIsNone(path)
+        self.assertTrue(error and error[0] == "remote_asset")
+
+        gone = SimpleNamespace(get_asset=lambda asset_id: SimpleNamespace(
+            managed_path=str(self.root / "gone.png")))
+        path, error = _resolve_local_asset_file(gone, "ast_gone")
+        self.assertIsNone(path)
+        self.assertTrue(error and error[0] == "file_missing")
+
+        real = self._path("local.png")
+        found_repo = SimpleNamespace(get_asset=lambda asset_id: SimpleNamespace(
+            managed_path=real))
+        path, error = _resolve_local_asset_file(found_repo, "ast_local")
+        self.assertIsNone(error)
+        self.assertEqual(str(path), real)
+
+    def test_launch_local_path_reveal_selects_file(self):
+        from unittest import mock
+
+        import history_v2_routes as routes
+
+        target = Path(self.root / "local.png")
+        target.write_bytes(b"x")
+        with mock.patch.object(routes.subprocess, "Popen") as popen, \
+            mock.patch.object(routes.os, "name", "nt"):
+            _launch_local_path(target, reveal=True)
+        popen.assert_called_once_with(["explorer", "/select,", str(target)])
+
+    def test_launch_local_path_open_uses_default_app(self):
+        from unittest import mock
+
+        import history_v2_routes as routes
+
+        target = Path(self.root / "local.png")
+        target.write_bytes(b"x")
+        with mock.patch.object(routes.os, "name", "nt"), \
+            mock.patch("os.startfile", create=True) as startfile:
+            _launch_local_path(target, reveal=False)
+        startfile.assert_called_once_with(str(target))
+
+
+class DeleteGenerationTests(unittest.TestCase):
+    """Generation deletion beyond the HTTP contract: referenced sources are
+    never touched, snapshots/mappings go with the record, experiment cells
+    detach (the experiment survives), and missing ids report False.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.store = HistoryV2Store(self.root / ".studio_history_v2" / "history_v2.db")
+        self.store.initialize()
+        self.repo = HistoryV2Repository(self.store)
+
+    def _gen(self, gen_id, experiment_id=None):
+        with self.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO generations (generation_id, created_at, experiment_id,"
+                " favorite, note, status, updated_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (gen_id, T0, experiment_id, 0, "", "completed", T0),
+            )
+
+    def _attempt(self, run_id, gen_id, mode="preview"):
+        with self.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO run_attempts (run_id, generation_id, mode, status,"
+                " created_at) VALUES (?,?,?,?,?)",
+                (run_id, gen_id, mode, "completed", T0),
+            )
+
+    def _asset(self, asset_id, gen_id, managed_path, asset_type="preview"):
+        with self.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO assets (asset_id, generation_id, type, managed_path,"
+                " filename, created_at) VALUES (?,?,?,?,?,?)",
+                (asset_id, gen_id, asset_type, managed_path, Path(managed_path).name, T0),
+            )
+
+    def _snapshot(self, gen_id):
+        with self.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO request_snapshots (snapshot_id, generation_id,"
+                " workflow_json, created_at) VALUES (?,?,?,?)",
+                ("snap_" + gen_id, gen_id, "{}", T0),
+            )
+
+    def _mapping(self, run_id, gen_id):
+        with self.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO legacy_mapping (legacy_run_id, generation_id, source,"
+                " migrated_at) VALUES (?,?,?,?)",
+                (run_id, gen_id, "test", T0),
+            )
+
+    def _count(self, table, gen_id):
+        rows = self.store.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE generation_id = ?", (gen_id,)
+        )
+        return rows[0]["n"]
+
+    def test_delete_clears_snapshots_mapping_and_spares_referenced_files(self):
+        gen_id = "gen_del_full"
+        self._gen(gen_id)
+        self._attempt("run_del", gen_id)
+        owned_dir = self.store.assets_root() / gen_id
+        owned_dir.mkdir(parents=True)
+        owned = owned_dir / "ast_owned.png"
+        owned.write_bytes(b"owned")
+        self._asset("ast_owned", gen_id, str(owned))
+        referenced = self.root / "keep_me.png"
+        referenced.write_bytes(b"source-of-truth")
+        self._asset("ast_ref", gen_id, str(referenced), asset_type="original")
+        self._snapshot(gen_id)
+        self._mapping("run_del", gen_id)
+
+        self.assertTrue(self.repo.delete_generation(gen_id))
+
+        self.assertEqual(self._count("generations", gen_id), 0)
+        self.assertEqual(self._count("run_attempts", gen_id), 0)
+        self.assertEqual(self._count("assets", gen_id), 0)
+        self.assertEqual(self._count("request_snapshots", gen_id), 0)
+        self.assertEqual(self._count("legacy_mapping", gen_id), 0)
+        self.assertFalse(owned.exists(), "store-owned file removed")
+        self.assertTrue(referenced.exists(), "referenced source file untouched")
+        self.assertFalse(owned_dir.exists(), "emptied generation dir removed")
+        self.assertIsNone(self.repo.get_generation(gen_id))
+
+    def test_missing_generation_returns_false(self):
+        self.assertFalse(self.repo.delete_generation("gen_absent"))
+
+    def test_experiment_member_detaches_cell_and_keeps_experiment(self):
+        gen_id = "gen_del_cell"
+        with self.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO experiments (experiment_id, status, created_at,"
+                " updated_at) VALUES (?,?,?,?)",
+                ("exp_1", "running", T0, T0),
+            )
+        self._gen(gen_id, experiment_id="exp_1")
+        with self.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO experiment_cells (cell_id, experiment_id, position,"
+                " generation_id, status, updated_at) VALUES (?,?,?,?,?,?)",
+                ("cell_1", "exp_1", 0, gen_id, "completed", T0),
+            )
+
+        self.assertTrue(self.repo.delete_generation(gen_id))
+
+        self.assertEqual(self._count("generations", gen_id), 0)
+        cell = self.store.execute(
+            "SELECT generation_id, status FROM experiment_cells WHERE cell_id = ?",
+            ("cell_1",),
+        )[0]
+        self.assertIsNone(cell["generation_id"], "cell detached, not deleted")
+        self.assertIsNotNone(
+            self.repo.get_experiment("exp_1"), "experiment survives its cell's deletion")
+
+    def test_missing_owned_file_is_tolerated(self):
+        gen_id = "gen_del_nofile"
+        self._gen(gen_id)
+        ghost = self.store.assets_root() / gen_id / "ast_ghost.png"
+        self._asset("ast_ghost", gen_id, str(ghost))
+
+        self.assertTrue(self.repo.delete_generation(gen_id))
+        self.assertEqual(self._count("generations", gen_id), 0)
 
 
 if __name__ == "__main__":

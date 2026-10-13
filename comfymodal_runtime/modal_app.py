@@ -67,6 +67,49 @@ _STUDIO_MODEL_LOADER_INPUTS = {
 }
 
 
+def _golden_batch_cancel_dict() -> Any:
+    """Shared Dict for cooperative batch cancellation, or None.
+
+    Written by the ComfyUI-host ``/studio/batch_cancel`` route, read by the
+    batch generator between variants.  Best-effort: any failure degrades to
+    cancel-unsupported, never to a batch abort.
+    """
+    try:
+        return _modal.Dict.from_name(
+            "comfymodal-studio-batch-cancel", create_if_missing=True
+        )
+    except Exception:
+        return None
+
+
+def _golden_batch_cancel_requested(cancel_dict: Any, cancel_key: str) -> bool:
+    if cancel_dict is None:
+        return False
+    try:
+        return bool(cancel_dict.get(cancel_key))
+    except Exception:
+        return False
+
+
+def _golden_batch_variant_skipped(cancel_dict: Any, skip_key: str) -> bool:
+    if cancel_dict is None:
+        return False
+    try:
+        return bool(cancel_dict.get(skip_key))
+    except Exception:
+        return False
+
+
+def _golden_batch_cancel_cleanup(cancel_dict: Any, keys: list) -> None:
+    if cancel_dict is None:
+        return
+    for key in keys:
+        try:
+            cancel_dict.delete(key)
+        except Exception:
+            pass
+
+
 def _normalize_studio_golden_prompt(prompt: Any) -> Any:
     """Flatten model-library subfolder names at the remote execution boundary."""
     if not isinstance(prompt, Mapping):
@@ -6866,14 +6909,16 @@ def _persist_v2_dependency_manifest(
     generation record), and delegates to
     ``legacy_module._build_and_persist_dependency_manifest(... commit=True)``.
 
-    In production modes (``off``, ``fail_fast``), fails closed with
-    ``RuntimeError`` if the baked hash, deployment hash, generation, runtime
-    volume, or resulting manifest identity is missing.  Does **not** run full
+    In production modes (``off``, ``fail_fast``), missing components raise
+    ``RuntimeError`` with a precise message.  The startup call site catches
+    it, logs a loud warning, and continues boot (warn-and-continue: detection
+    stays, nothing aborts).  Does **not** run full
     dependency fingerprint validation or pip install — bootstrap already did
     preparation.
 
-    Returns the manifest dict.  Never returns an empty/missing identity in
-    production modes (raises instead).  Emits a concise startup diagnostic.
+    Returns the manifest dict.  Raises instead of returning an empty/missing
+    identity in production modes; the startup call site catches that,
+    warns, and continues boot.  Emits a concise startup diagnostic.
     """
     _t0 = time.time()
 
@@ -6926,6 +6971,9 @@ def _persist_v2_dependency_manifest(
                 f"(repair_mode={_repair_mode})"
             )
         if not _cn_gen:
+            # Read-only: the generation record is written exclusively by the
+            # custom-nodes publisher on real sync.  The startup call site
+            # catches this, warns, and continues boot.
             raise RuntimeError(
                 "V2 startup manifest persistence failed: "
                 "custom_node_generation is empty "
@@ -11190,6 +11238,15 @@ class ModalRuntimeEntrypoint:
                         state,
                         self._legacy_module,
                         self._legacy_api,
+                    )
+                except Exception as _dep_mft_exc:
+                    # No fail-fast: a manifest problem warns but never aborts
+                    # startup.  Request-time detection still reports it and
+                    # Studio shows cause + solution + sync button.
+                    print(
+                        "[v2.dep_manifest] WARNING (startup continues): "
+                        f"{_dep_mft_exc!r}",
+                        flush=True,
                     )
                 finally:
                     _v2_startup_stage(
@@ -17028,6 +17085,7 @@ class ModalRuntimeEntrypoint:
                     trace_emit=trace.emit,
                     request_id=str(getattr(context, "request_id", "") or ""),
                     workflow=workflow,
+                    deployment_identity=getattr(plan, "deployment_identity", None),
                 )
             except Exception:
                 _generic_loader_holder = None
@@ -22377,6 +22435,7 @@ class ModalRuntimeEntrypoint:
             None,
         )
         context.trace.set_metadata(**trace_identity_metadata)
+        context.trace.set_metadata(studio_progress=bool(plan.request_metadata.get("studio_progress")))
         context.trace.set_metadata(**context_snapshot_age)
         validate_torch_thread_policy(
             stage="request_entry",
@@ -23653,6 +23712,164 @@ class ModalRuntimeEntrypoint:
         ):
             yield event
 
+    async def run_golden_studio_batch_stream(
+        self,
+        request: Mapping[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Studio-only sequential batch: N variants, ONE container.
+
+        The ordinary v2ctl methods never enter this method.  Each variant is
+        a complete single-request dict (the same shape
+        ``run_golden_studio_stream`` accepts) executed SEQUENTIALLY through
+        the shared impl in this same container/process — one container start
+        for the whole batch instead of one per variant.  There is deliberately
+        no cross-variant parallelism: one ComfyUI server executes one prompt
+        at a time, and concurrent mutation of GPU/prompt state is refused by
+        design.  A variant failure is collected, never a batch abort.
+
+        Cooperative cancellation (best-effort): a ``/studio/batch_cancel``
+        call records flags in a shared Dict which this loop checks BEFORE
+        each variant — never mid-variant.  ``{batch_id}:cancel`` stops the
+        batch after the current variant; ``{batch_id}:skip:{variant_id}``
+        skips one pending variant (reported as ``variant_skipped`` so the
+        caller can requeue it).  Dict access failures degrade to
+        cancel-unsupported, never to a batch abort.
+        """
+        if not isinstance(request, Mapping):
+            yield {
+                "type": "error",
+                "request_id": "",
+                "message": "golden_batch_request_must_be_mapping",
+            }
+            return
+        batch_id_raw = request.get("request_id")
+        batch_id = batch_id_raw if isinstance(batch_id_raw, str) else ""
+        if not batch_id.strip():
+            yield {
+                "type": "error",
+                "request_id": "",
+                "message": "golden_batch_request_id_required_nonempty_string",
+            }
+            return
+        variants = request.get("variants")
+        if not isinstance(variants, list) or not variants:
+            yield {
+                "type": "error",
+                "request_id": batch_id,
+                "message": "golden_batch_variants_nonempty_list_required",
+            }
+            return
+        seen_variant_ids: set[str] = set()
+        for variant in variants:
+            if not isinstance(variant, Mapping):
+                yield {
+                    "type": "error",
+                    "request_id": batch_id,
+                    "message": "golden_batch_variant_must_be_mapping",
+                }
+                return
+            variant_id = variant.get("request_id")
+            if (
+                not isinstance(variant_id, str)
+                or not variant_id.strip()
+                or variant_id in seen_variant_ids
+            ):
+                yield {
+                    "type": "error",
+                    "request_id": batch_id,
+                    "message": "golden_batch_variant_request_id_invalid_or_duplicate",
+                }
+                return
+            seen_variant_ids.add(variant_id)
+            if not isinstance(variant.get("prompt"), Mapping) or not variant.get("prompt"):
+                yield {
+                    "type": "error",
+                    "request_id": batch_id,
+                    "message": "golden_batch_variant_prompt_mapping_required",
+                }
+                return
+        yield {
+            "type": "batch_start",
+            "request_id": batch_id,
+            "variant_count": len(variants),
+        }
+        cancel_dict = _golden_batch_cancel_dict()
+        cancel_key = "batch:" + batch_id + ":cancel"
+        seen_skip_keys: list[str] = []
+        summaries: list[dict[str, Any]] = []
+        cancelled = False
+        for index, variant in enumerate(variants):
+            variant_id = str(variant.get("request_id"))
+            if _golden_batch_cancel_requested(cancel_dict, cancel_key):
+                cancelled = True
+                break
+            skip_key = "batch:" + batch_id + ":skip:" + variant_id
+            if _golden_batch_variant_skipped(cancel_dict, skip_key):
+                seen_skip_keys.append(skip_key)
+                summaries.append({"variant_request_id": variant_id, "status": "skipped"})
+                yield {
+                    "type": "variant_skipped",
+                    "request_id": batch_id,
+                    "variant_request_id": variant_id,
+                    "variant_index": index,
+                }
+                continue
+            yield {
+                "type": "variant_start",
+                "request_id": batch_id,
+                "variant_request_id": variant_id,
+                "variant_index": index,
+                "variant_count": len(variants),
+            }
+            terminal_data: Any = None
+            variant_error: str | None = None
+            try:
+                # Ordinary (non-stage-streamed) path per variant: the shared
+                # impl validates and executes exactly like a single v2ctl
+                # request.  Sequential awaits keep one prompt on the GPU.
+                async for event in self._run_golden_stream_impl(dict(variant)):
+                    if not isinstance(event, Mapping):
+                        continue
+                    event_type = str(event.get("type", "")).lower()
+                    if event_type == "result":
+                        terminal_data = event.get("data")
+                    elif event_type == "error":
+                        variant_error = str(
+                            event.get("message") or "golden variant execution failed"
+                        )
+            except BaseException as exc:
+                variant_error = f"{type(exc).__name__}: {exc}"[:2000]
+            if variant_error is not None or terminal_data is None:
+                message = variant_error or "golden variant ended without a terminal event"
+                summaries.append(
+                    {"variant_request_id": variant_id, "status": "error", "message": message}
+                )
+                yield {
+                    "type": "variant_error",
+                    "request_id": batch_id,
+                    "variant_request_id": variant_id,
+                    "variant_index": index,
+                    "message": message,
+                }
+                continue
+            summaries.append({"variant_request_id": variant_id, "status": "ok"})
+            yield {
+                "type": "variant_result",
+                "request_id": batch_id,
+                "variant_request_id": variant_id,
+                "variant_index": index,
+                "data": terminal_data,
+            }
+        if cancelled:
+            yield {
+                "type": "batch_cancelled",
+                "request_id": batch_id,
+                "results": summaries,
+            }
+        else:
+            yield {"type": "batch_result", "request_id": batch_id, "results": summaries}
+        _golden_batch_cancel_cleanup(cancel_dict, [cancel_key] + seen_skip_keys)
+
     async def _run_golden_stream_impl(
         self,
         request: Mapping[str, Any],
@@ -23970,6 +24187,17 @@ class ModalRuntimeEntrypoint:
                 raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
             if cpu_prefetch_raw and request.get("instant_tensor"):
                 raise ValueError("golden_cpu_qd2_prefetch_instant_tensor_conflict")
+            # Result image wire representation: request-scoped, validated here
+            # and re-validated by GoldenRequest.  ``bytes`` (default) yields raw
+            # PNG bytes; ``base64`` keeps the legacy images[0].data envelope.
+            result_transport_raw = request.get("result_transport", "bytes")
+            if not isinstance(result_transport_raw, str):
+                raise ValueError("golden_result_transport_must_be_string")
+            result_transport = result_transport_raw.strip().lower()
+            if result_transport not in {"bytes", "base64"}:
+                raise ValueError(
+                    f"golden_result_transport_invalid:{result_transport_raw!r}"
+                )
 
             def _golden_snapshot_proof_supplier() -> dict[str, list[Any]]:
                 """Passive snapshot-proof supplier built ONLY from real,
@@ -24106,6 +24334,7 @@ class ModalRuntimeEntrypoint:
                 cpu_qd2_prefetch=cpu_prefetch_raw,
                 deep_trace=_full_trace_request_requested,
                 studio_advisory=studio_entrypoint,
+                result_transport=result_transport,
             )
             # ── Golden DynamicVRAM activation seam (official-equivalent) ──
             # Exactly one call per request; the callee is idempotent per
@@ -24418,35 +24647,66 @@ class ModalRuntimeEntrypoint:
         # in-memory bytes through the existing legacy ``images[].data``
         # transport.  The metadata stays explicit and distinguishes ready from
         # durable; strict results retain their historical path descriptor.
+        # Effective wire representation actually used below.  Strict mode
+        # keeps its historical path descriptor and never enters the branch.
+        effective_transport = "descriptor"
         if (
             result_data.get("output_durability_mode") == "off"
-            and result_data.get("image_data")
+            and (result_data.get("image_data") or result_data.get("image_raw"))
         ):
             image_sha = str(result_data.get("image_sha256", ""))
             image_filename = str(result_data.get("filename") or f"{image_sha}.png")
-            image_entry = {
-                "filename": image_filename,
-                "node_id": result_data.get("output_node_id", ""),
-                "output_key": "images",
-                "mime_type": result_data.get("mime_type", "image/png"),
-                "file_ext": ".png",
-                "width": result_data.get("width", 0),
-                "height": result_data.get("height", 0),
-                "byte_count": result_data.get("byte_count", 0),
-                "asset_id": image_sha,
-                "identity": f"sha256:{image_sha}" if image_sha else "",
-                "data": result_data["image_data"],
-                "output_durability_mode": "off",
-                "durability_requested": False,
-                "result_durable": False,
-            }
+            image_raw = result_data.get("image_raw")
+            if isinstance(image_raw, (bytes, bytearray)) and image_raw:
+                # Bytes transport (default): raw PNG rides images[0].raw_bytes
+                # with no base64 expansion.  data stays present-but-empty so
+                # legacy consumers see a known shape, never a duplicate copy.
+                effective_transport = "bytes"
+                image_entry = {
+                    "filename": image_filename,
+                    "node_id": result_data.get("output_node_id", ""),
+                    "output_key": "images",
+                    "mime_type": result_data.get("mime_type", "image/png"),
+                    "file_ext": ".png",
+                    "width": result_data.get("width", 0),
+                    "height": result_data.get("height", 0),
+                    "byte_count": result_data.get("byte_count", 0),
+                    "asset_id": image_sha,
+                    "identity": f"sha256:{image_sha}" if image_sha else "",
+                    "data": "",
+                    "raw_bytes": bytes(image_raw),
+                    "output_durability_mode": "off",
+                    "durability_requested": False,
+                    "result_durable": False,
+                }
+                result_data["include_base64"] = False
+            else:
+                # Base64 transport (diagnosis/compatibility): the historical
+                # images[0].data envelope, unchanged.
+                effective_transport = "base64"
+                image_entry = {
+                    "filename": image_filename,
+                    "node_id": result_data.get("output_node_id", ""),
+                    "output_key": "images",
+                    "mime_type": result_data.get("mime_type", "image/png"),
+                    "file_ext": ".png",
+                    "width": result_data.get("width", 0),
+                    "height": result_data.get("height", 0),
+                    "byte_count": result_data.get("byte_count", 0),
+                    "asset_id": image_sha,
+                    "identity": f"sha256:{image_sha}" if image_sha else "",
+                    "data": result_data["image_data"],
+                    "output_durability_mode": "off",
+                    "durability_requested": False,
+                    "result_durable": False,
+                }
+                result_data["include_base64"] = True
             result_data["images"] = [image_entry]
-            result_data["include_base64"] = True
-            # The PNG now lives in images[0].data.  Leaving the flat
-            # image_data key in place duplicated the full 3 MB payload, which
-            # base64-encodes to ~4 MB and is serialized onto the Modal wire
-            # between yield and method return.
+            result_data["result_transport"] = effective_transport
+            # Neither representation may duplicate the payload: the flat keys
+            # are transport-only and never cross the wire twice.
             result_data.pop("image_data", None)
+            result_data.pop("image_raw", None)
         # The adapter result is the authoritative request-scoped Golden
         # identity surface.  Keep a named copy as well as the conventional
         # result identity key so host projection can consume either terminal
@@ -24498,6 +24758,7 @@ class ModalRuntimeEntrypoint:
             "core_model_patcher_is_dynamic": bool(
                 activation_evidence.get("is_dynamic_alias")
             ),
+            "COMFYMODAL_GOLDEN_RESULT_TRANSPORT": effective_transport,
         }
         # Evidence, never fabrication: attach the telemetry document Golden
         # actually persisted at the known local path.  Host artifacts retain
@@ -24750,6 +25011,7 @@ def _build_decorated_v2_class() -> type:
         "run_golden_serial_stream",
         "run_golden_parallel_stream",
         "run_golden_studio_stream",
+        "run_golden_studio_batch_stream",
         "read_output_asset", "run_checkpoint_stream",
         "publish_restore_plan", "run_rehoming_experiment",
         "run_numa_experiment",
@@ -24777,6 +25039,7 @@ def _build_decorated_v2_class() -> type:
         "run_golden_serial_stream",
         "run_golden_parallel_stream",
         "run_golden_studio_stream",
+        "run_golden_studio_batch_stream",
         "run_env_probe", "run_entry_probe",
         "run_numa_experiment", "run_rehoming_experiment",
         "publish_restore_plan",
@@ -24954,6 +25217,12 @@ def _build_decorated_v2_class() -> type:
         cls,
         "run_golden_studio_stream",
         _modal.method(is_generator=True)(cls.run_golden_studio_stream),
+    )
+    # Studio-only sequential batch adapter: N variants, one container.
+    setattr(
+        cls,
+        "run_golden_studio_batch_stream",
+        _modal.method(is_generator=True)(cls.run_golden_studio_batch_stream),
     )
     setattr(
         cls,

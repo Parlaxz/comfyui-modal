@@ -860,7 +860,7 @@ class TestPreflightIntegration:
     @patch("comfyapp.assert_valid_api_prompt_structure")
     @patch("comfyapp._load_dependency_manifest")
     @patch("comfyapp._check_dependency_manifest_identity")
-    def test_missing_manifest_fail_closed(
+    def test_missing_manifest_warns_and_continues(
         self,
         mock_check_identity,
         mock_load_mft,
@@ -872,7 +872,7 @@ class TestPreflightIntegration:
         mock_run_val,
         _patch_globals,
     ):
-        """Missing manifest: fail-closed (runs validation, raises on failure)."""
+        """Missing manifest: warn-and-continue (runs validation, records status on failure)."""
         mock_combined.return_value = "combined_hash_val"
         mock_baked.return_value = {"overall_dependency_hash": "fp"}
         mock_cn_gen.return_value = {"generation": "gen"}
@@ -903,8 +903,13 @@ class TestPreflightIntegration:
         }
 
         app = FakeComfyApp()
-        with pytest.raises(RuntimeError, match="not prepared"):
-            _get_preflight_unbound()(app, {"some": "workflow"})
+        result = _get_preflight_unbound()(app, {"some": "workflow"})
+
+        assert result["dependency_prepared"] is False
+        _status = result.get("dependency_status") or {}
+        assert _status.get("prepared") is False
+        assert _status.get("cause")
+        assert _status.get("solution")
 
         mock_run_val.assert_called_once()
         mock_build_persist.assert_not_called()

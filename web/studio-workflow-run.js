@@ -560,11 +560,17 @@ export function resolveRunnable(store) {
 
 /**
  * Keep the client gate aligned with the backend's authoritative bundle
- * resolver. A remote Golden target can ignore host-only inventory checks, but
- * it cannot make an incomplete workflow version executable.
+ * resolver (studio_workflow_run.resolve_workflow_run_bundle with
+ * remote_model_readiness=True). A remote Golden target resolves models in the
+ * deployed Modal volume, so host-local "missing model ..." reasons must not
+ * block it; every other reason stays fail-closed.
  */
 export function resolveExecutionRunnable(gated, remoteSelected) {
-  return gated;
+  if (!gated || gated.runnable || !remoteSelected) return gated;
+  const reasons = Array.isArray(gated.reasons) ? gated.reasons : [];
+  const kept = reasons.filter((r) => !String(r).startsWith("missing model "));
+  if (kept.length === reasons.length) return gated;
+  return { runnable: kept.length === 0, reasons: kept };
 }
 
 // ΓöÇΓöÇ Run payload ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ

@@ -529,6 +529,110 @@ class HistoryV2ApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(resp.status, 400)
 
+    async def test_delete_generation_and_experiment_contracts(self):
+        generation = self._gen()
+        asset = self.repo.attach_asset(
+            generation.generation_id,
+            asset_type="preview",
+            data=_png_bytes(),
+            filename="delete-me.png",
+            fmt="png",
+        )
+        asset_path = Path(asset.managed_path)
+        self.assertTrue(asset_path.is_file())
+
+        response = await self.client.delete(
+            f"/comfymodal/history-v2/generations/{generation.generation_id}"
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            await response.json(),
+            {"status": "ok", "deleted": generation.generation_id},
+        )
+        self.assertIsNone(self.repo.get_generation(generation.generation_id))
+        self.assertFalse(asset_path.exists())
+
+        missing = await self.client.delete(
+            "/comfymodal/history-v2/generations/generation-missing"
+        )
+        self.assertEqual(missing.status, 404)
+
+        experiment = self._exp(cells=[{}])
+        experiment_id = experiment.experiment.experiment_id
+        experiment_generation = self.repo.create_generation(
+            experiment_id=experiment_id
+        )
+        cell = experiment.cells[0]
+        attempt = self.repo.add_attempt(
+            experiment_generation.generation_id,
+            experiment_id=experiment_id,
+            cell_id=cell.cell_id,
+        )
+        self.repo.update_experiment_cell(
+            cell.cell_id, generation_id=experiment_generation.generation_id
+        )
+        experiment_asset = self.repo.attach_asset(
+            experiment_generation.generation_id,
+            run_id=attempt.run_id,
+            asset_type="original",
+            data=_png_bytes(),
+            filename="experiment-delete-me.png",
+            fmt="png",
+        )
+        experiment_asset_path = Path(experiment_asset.managed_path)
+
+        response = await self.client.delete(
+            f"/comfymodal/history-v2/experiments/{experiment_id}"
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            await response.json(), {"status": "ok", "deleted": experiment_id}
+        )
+        self.assertIsNone(self.repo.get_experiment(experiment_id))
+        self.assertIsNone(self.repo.get_generation(experiment_generation.generation_id))
+        self.assertFalse(experiment_asset_path.exists())
+
+        missing = await self.client.delete(
+            "/comfymodal/history-v2/experiments/experiment-missing"
+        )
+        self.assertEqual(missing.status, 404)
+
+    async def test_bulk_delete_mixed_aliases_missing_and_cap(self):
+        generation = self._gen()
+        experiment = self._exp()
+        experiment_id = experiment.experiment.experiment_id
+        response = await self.client.post(
+            "/comfymodal/history-v2/bulk-delete",
+            json={
+                "generations": [generation.generation_id, "missing-generation"],
+                "experiment_ids": [experiment_id, "missing-experiment"],
+            },
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            await response.json(),
+            {
+                "status": "ok",
+                "deleted_generations": [generation.generation_id],
+                "deleted_experiments": [experiment_id],
+                "missing_generations": ["missing-generation"],
+                "missing_experiments": ["missing-experiment"],
+            },
+        )
+
+        empty = await self.client.post(
+            "/comfymodal/history-v2/bulk-delete", json={}
+        )
+        self.assertEqual(empty.status, 400)
+        self.assertIn("at least one", (await empty.json())["message"])
+
+        capped = await self.client.post(
+            "/comfymodal/history-v2/bulk-delete",
+            json={"generation_ids": [f"gen-{i}" for i in range(101)]},
+        )
+        self.assertEqual(capped.status, 400)
+        self.assertIn("100", (await capped.json())["message"])
+
     # ── Assets ───────────────────────────────────────────────────────────
 
     async def test_managed_asset_serves_correct_file(self):

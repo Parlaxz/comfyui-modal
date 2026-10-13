@@ -4529,6 +4529,133 @@ def build_current_custom_node_dependency_manifest() -> dict:
     )
 
 
+def describe_dependency_mismatch(
+    reason: str,
+    *,
+    changed_nodes=(),
+    missing_in_volume=(),
+) -> dict:
+    """Cause + solution strings for a dependency mismatch. Never raises.
+
+    Single owner for the mismatch message shown in logs, run results, and
+    Studio.  Wording stays grounded: what differs and which button fixes it.
+    """
+    try:
+        _changed = sorted({str(x).strip() for x in (changed_nodes or []) if str(x).strip()})
+        _missing = sorted({str(x).strip() for x in (missing_in_volume or []) if str(x).strip()})
+        _reason = str(reason or "unknown")
+        if _reason == "custom_node_set_mismatch" and _missing and not _changed:
+            _cause = (
+                "The deployed image was built with custom nodes that are "
+                f"not on the custom-nodes volume (missing: {', '.join(_missing)})."
+            )
+            _solution = (
+                "In Studio, press 'Sync deps / custom nodes' to publish the "
+                "local custom-node tree to the volume, then redeploy the image "
+                "so baked and volume agree."
+            )
+        elif _reason == "custom_node_set_mismatch" and _changed:
+            _cause = (
+                "The custom-nodes volume has nodes the deployed image was not "
+                f"built with (extra: {', '.join(_changed)})."
+            )
+            _solution = (
+                "Rebuild and redeploy the image from the current custom-node "
+                "tree so the baked manifest includes them."
+            )
+        elif _reason == "dependency_hash_mismatch":
+            _names = _changed or _missing
+            _name_suffix = " (" + ", ".join(_names) + ")" if _names else ""
+            _cause = (
+                "Custom-node requirements on the volume differ from what the "
+                "deployed image was built with" + _name_suffix + "."
+            )
+            _solution = (
+                "In Studio, press 'Sync deps / custom nodes' to publish the "
+                "current tree, then redeploy the image."
+            )
+        elif _reason == "baked_manifest_missing":
+            _cause = "The deployed image has no baked custom-node dependency manifest."
+            _solution = "Redeploy the image so the baked manifest is generated."
+        else:
+            _cause = f"Custom-node dependency check failed (reason={_reason})."
+            _solution = (
+                "In Studio, press 'Sync deps / custom nodes', then redeploy "
+                "the image if the warning persists."
+            )
+        return {"cause": _cause, "solution": _solution}
+    except Exception:
+        return {"cause": "Custom-node dependency check failed.", "solution": "Sync custom nodes in Studio, then redeploy."}
+
+
+def _record_dependency_status(
+    *,
+    prepared: bool,
+    reason: str,
+    repair_mode: str,
+    baked_hash: str = "",
+    current_hash: str = "",
+    changed_nodes=(),
+    missing_in_volume=(),
+) -> dict:
+    """Log a loud mismatch warning and return the status dict. Never raises.
+
+    Warn-and-continue contract: detection always runs and is always visible,
+    but nothing raises.  Callers keep going with ``prepared=False`` and carry
+    this dict in their result for Studio.
+    """
+    try:
+        _explained = describe_dependency_mismatch(
+            reason, changed_nodes=changed_nodes, missing_in_volume=missing_in_volume
+        )
+        _status = {
+            "prepared": bool(prepared),
+            "reason": str(reason or ""),
+            "cause": _explained["cause"],
+            "solution": _explained["solution"],
+            "baked_hash": str(baked_hash or ""),
+            "current_hash": str(current_hash or ""),
+            "changed_nodes": [str(x) for x in (changed_nodes or [])],
+            "missing_in_volume": [str(x) for x in (missing_in_volume or [])],
+            "repair_mode": str(repair_mode or ""),
+            "checked_at_unix": time.time(),
+        }
+        if not _status["prepared"]:
+            print(
+                "\n".join([
+                    "[comfyapp] === DEPENDENCY MISMATCH - run continues ===",
+                    f"[comfyapp] cause: {_status['cause']}",
+                    f"[comfyapp] solution: {_status['solution']}",
+                    f"[comfyapp] reason={_status['reason']} repair_mode={_status['repair_mode']} "
+                    f"baked={(_status['baked_hash'][:12] or '?')} "
+                    f"current={(_status['current_hash'][:12] or '?')}",
+                    "[comfyapp] ==========================================",
+                ]),
+                flush=True,
+            )
+        return _status
+    except Exception:
+        return {
+            "prepared": bool(prepared), "reason": str(reason or ""),
+            "cause": "Custom-node dependency check failed.",
+            "solution": "Sync custom nodes in Studio, then redeploy.",
+            "baked_hash": "", "current_hash": "",
+            "changed_nodes": [], "missing_in_volume": [],
+            "repair_mode": str(repair_mode or ""), "checked_at_unix": time.time(),
+        }
+
+
+def _dependency_manifest_node_names(manifest: dict) -> set[str]:
+    explicit = (manifest or {}).get("dependency_nodes")
+    if explicit is not None:
+        return set(explicit or [])
+    return {
+        name
+        for name, data in ((manifest or {}).get("nodes", {}) or {}).items()
+        if isinstance(data, dict) and data.get("dependency_files")
+    }
+
+
 def validate_custom_node_dependencies_prepared() -> dict:
     """Compare the baked image manifest against the current custom-node volume.
 
@@ -4561,18 +4688,8 @@ def validate_custom_node_dependencies_prepared() -> dict:
     baked_hash = baked.get("overall_dependency_hash", "")
     current_hash = current.get("overall_dependency_hash", "")
 
-    def _dependency_node_names(manifest: dict) -> set[str]:
-        explicit = manifest.get("dependency_nodes")
-        if explicit is not None:
-            return set(explicit or [])
-        return {
-            name
-            for name, data in (manifest.get("nodes", {}) or {}).items()
-            if isinstance(data, dict) and data.get("dependency_files")
-        }
-
-    baked_node_names = _dependency_node_names(baked)
-    current_node_names = _dependency_node_names(current)
+    baked_node_names = _dependency_manifest_node_names(baked)
+    current_node_names = _dependency_manifest_node_names(current)
 
     # Node set mismatch detection: if baked manifest has no nodes but current does
     if current_node_names and not baked_node_names:
@@ -4610,6 +4727,7 @@ def validate_custom_node_dependencies_prepared() -> dict:
             "baked_hash": baked_hash,
             "current_hash": current_hash,
             "changed_nodes": missing_in_baked,
+            "missing_in_volume": extra_in_baked,
         }
 
     if baked_hash == current_hash:
@@ -8523,7 +8641,12 @@ def _prepare_custom_node_archive(source_root: str) -> tuple[str, str]:
     files = collect_semantic_files(source_root)
     identity = build_source_identity(source_root, semantic_files=files)
     archive_key = archive_content_digest(files)
-    cache_root = Path(tempfile.gettempdir()) / "comfymodal-custom-node-archives"
+    configured_cache_root = os.environ.get("COMFYMODAL_CUSTOM_NODE_ARCHIVE_DIR")
+    cache_root = Path(
+        configured_cache_root
+        if configured_cache_root
+        else Path(tempfile.gettempdir()) / "comfymodal-custom-node-archives"
+    )
     cache_root.mkdir(parents=True, exist_ok=True)
     archive_path = cache_root / f"custom_nodes-{archive_key}.tar.gz"
     if not archive_path.is_file():
@@ -8531,6 +8654,42 @@ def _prepare_custom_node_archive(source_root: str) -> tuple[str, str]:
         temporary = archive_path.with_name(f".{archive_path.name}.{os.getpid()}.tmp")
         temporary.write_bytes(archive_data)
         os.replace(temporary, archive_path)
+
+    try:
+        try:
+            keep = max(
+                1,
+                int(os.environ.get("COMFYMODAL_CUSTOM_NODE_ARCHIVE_KEEP", "2")),
+            )
+        except (TypeError, ValueError):
+            keep = 2
+
+        archives = sorted(
+            cache_root.glob("custom_nodes-*.tar.gz"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        kept_archives = {archive_path}
+        kept_archives.update(
+            path for path in archives if len(kept_archives) < keep
+        )
+        pruned = 0
+        for path in archives:
+            if path not in kept_archives:
+                path.unlink()
+                pruned += 1
+
+        orphan_cutoff = time.time() - 3600
+        for path in cache_root.glob(".custom_nodes-*.tmp"):
+            if path.stat().st_mtime < orphan_cutoff:
+                path.unlink()
+
+        print(
+            f"[comfyapp] custom_node_archive_cache: kept={len(kept_archives)} "
+            f"pruned={pruned} root={cache_root}"
+        )
+    except Exception:
+        pass
     return str(archive_path), identity.content_generation
 
 # Custom-node requirements are copied and installed one node at a time.  The
@@ -11666,6 +11825,9 @@ class _ComfyAPIMixin:
             _cn_fp_pre = _baked_mft_pre if _baked_mft_pre else None
             _cn_gen_rec_pre = _read_custom_nodes_generation_record()
             _cn_gen_pre = _cn_gen_rec_pre.get("content_generation", "") if _cn_gen_rec_pre else ""
+            # Read-only: the generation record is written exclusively by the
+            # custom-nodes publisher on real sync.  A missing record simply
+            # misses the fast path below; detection still reports it.
             _manifest_snapshot = _load_dependency_manifest()
             _manifest_load_ms = round((time.time() - _dep_t0) * 1000, 2)
             _chk_t0 = time.time()
@@ -11718,16 +11880,13 @@ class _ComfyAPIMixin:
                     )
                     if _new_mft.get("identity"):
                         _refresh_performed = True
-                    elif mode in ("off", "fail_fast"):
-                        error_msg = (
-                            "Immutable dependency manifest refresh failed: "
-                            "write or commit did not produce a valid identity. "
-                            f"repair_mode={mode}"
+                    else:
+                        print(
+                            "[comfyapp] WARNING (run continues): manifest refresh "
+                            "did not produce a valid identity "
+                            f"(repair_mode={mode}).",
+                            flush=True,
                         )
-                        if stream:
-                            raise RuntimeError(error_msg)
-                        else:
-                            raise RuntimeError(error_msg)
                 _emit_dependency_validation_v2(
                     source="request_rebuild",
                     identity_match=False,
@@ -11747,20 +11906,19 @@ class _ComfyAPIMixin:
                     baked_hash = dep_check.get("baked_hash", "?") or "?"
                     current_hash = dep_check.get("current_hash", "?") or "?"
                     changed_nodes = dep_check.get("changed_nodes", [])
-                    error_msg = (
-                        "Custom node dependencies are not prepared for this image. "
-                        f"Runtime pip install is disabled in {mode} mode. "
-                        "Rebuild/deploy the Modal image after syncing "
-                        "custom-node requirements. "
-                        f"reason={dep_reason} "
-                        f"baked_hash={baked_hash} "
-                        f"current_hash={current_hash} "
-                        f"changed_nodes={changed_nodes}"
+                    _missing_in_vol = dep_check.get("missing_in_volume", [])
+                    _dep_status = _record_dependency_status(
+                        prepared=False,
+                        reason=dep_reason,
+                        repair_mode=mode,
+                        baked_hash=baked_hash,
+                        current_hash=current_hash,
+                        changed_nodes=changed_nodes,
+                        missing_in_volume=_missing_in_vol,
                     )
-                    if stream:
-                        raise RuntimeError(error_msg)
-                    else:
-                        raise RuntimeError(error_msg)
+                    dep_check["dependency_status"] = _dep_status
+                    # Warn-and-continue: the run proceeds with the mismatch
+                    # recorded.  Studio shows cause + solution + sync button.
 
         # 5. Dev mode: runtime repair is allowed
         if mode == "dev":
@@ -11805,7 +11963,7 @@ class _ComfyAPIMixin:
             "dependency_source_root_resolve_ms", "dependency_fingerprint_ms",
             "dependency_cache_key_ms", "dependency_memory_lookup_ms",
             "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
-            "dependency_sentinel_write_ms",
+            "dependency_sentinel_write_ms", "dependency_status",
         ):
             if _dep_field in dep_check:
                 result[_dep_field] = dep_check[_dep_field]
@@ -11849,6 +12007,7 @@ class _ComfyAPIMixin:
         #    2b. Fall back to existing validation + manifest refresh
         dep_prepared = True
         dep_reason = ""
+        dep_check: dict = {}
         if _repair_mode in ("off", "fail_fast"):
             _dep_t0 = time.time()
 
@@ -11868,6 +12027,10 @@ class _ComfyAPIMixin:
             _custom_node_generation_read_ms = round((time.time() - _cngr_t0) * 1000, 2)
 
             _cn_gen_pre = _cn_gen_rec_pre.get("content_generation", "") if _cn_gen_rec_pre else ""
+
+            # Read-only: the generation record is written exclusively by the
+            # custom-nodes publisher on real sync.  A missing record simply
+            # misses the fast path below; detection still reports it.
 
             # 2a. Load persisted manifest (timed)
             _ml_t0 = time.time()
@@ -11947,11 +12110,12 @@ class _ComfyAPIMixin:
                     )
                     if _new_mft.get("identity"):
                         _refresh_performed = True
-                    elif _repair_mode in ("off", "fail_fast"):
-                        raise RuntimeError(
-                            "Immutable dependency manifest refresh failed: "
-                            "write or commit did not produce a valid identity. "
-                            f"repair_mode={_repair_mode}"
+                    else:
+                        print(
+                            "[comfyapp] WARNING (run continues): manifest refresh "
+                            "did not produce a valid identity "
+                            f"(repair_mode={_repair_mode}).",
+                            flush=True,
                         )
                 # preflight_total_ms calculated immediately before emission after refresh work
                 _preflight_total_ms = round((time.time() - _preflight_t0) * 1000, 2)
@@ -11987,31 +12151,31 @@ class _ComfyAPIMixin:
                     baked_hash = dep_check.get("baked_hash", "?") or "?"
                     current_hash = dep_check.get("current_hash", "?") or "?"
                     changed_nodes = dep_check.get("changed_nodes", [])
+                    _missing_in_vol2 = dep_check.get("missing_in_volume", [])
+                    _dep_status2 = _record_dependency_status(
+                        prepared=False,
+                        reason=dep_reason,
+                        repair_mode=_repair_mode,
+                        baked_hash=baked_hash,
+                        current_hash=current_hash,
+                        changed_nodes=changed_nodes,
+                        missing_in_volume=_missing_in_vol2,
+                    )
+                    dep_check["dependency_status"] = _dep_status2
                     summary = FailureSummary(phase="dependency_preflight")
-                    summary.fatal_error = "custom node dependencies not prepared"
+                    summary.fatal_error = "custom node dependencies not prepared (warn-and-continue)"
                     summary.modal_invoked = True
-                    summary.recommendation = (
-                        "Rebuild/deploy Modal image after syncing "
-                        "custom-node requirements."
-                    )
+                    summary.recommendation = _dep_status2["solution"]
                     print(f"[comfyapp] FAILURE SUMMARY: {summary}")
-                    raise RuntimeError(
-                        "Custom node dependencies are not prepared for this image. "
-                        "Runtime pip install is disabled in "
-                        f"{_repair_mode} mode. "
-                        f"Rebuild/deploy the Modal image after syncing "
-                        f"custom-node requirements. "
-                        f"reason={dep_reason} "
-                        f"baked_hash={baked_hash} "
-                        f"current_hash={current_hash} "
-                        f"changed_nodes={changed_nodes}"
-                    )
+                    # Warn-and-continue: the run proceeds with the mismatch
+                    # recorded.  Studio shows cause + solution + sync button.
 
         result = {
             "valid_prompt": valid_prompt,
             "dependency_prepared": dep_prepared,
             "repair_mode": _repair_mode,
             "dependency_reason": dep_reason,
+            "dependency_status": dep_check.get("dependency_status"),
         }
         print(f"[comfyapp] preflight result: {result}")
         return result
@@ -15567,8 +15731,9 @@ class _ComfyAPIMixin:
         Respects ``COMFYMODAL_REQUIREMENTS_REPAIR_MODE``:
 
         * ``off`` GÃ‡Ã¶ Never pip install.  Validate baked manifest.  Return.
-        * ``fail_fast`` GÃ‡Ã¶ Never pip install.  Validate baked manifest.
-          Raise RuntimeError if not prepared.
+        * ``fail_fast`` — Never pip install, never raise.  Validate baked
+          manifest, record a loud mismatch warning for Studio, and return
+          ``prepared=False`` so the run continues.
         * ``dev`` GÃ‡Ã¶ Runtime pip install allowed.  ``force=True`` works only
           in dev mode.
 
@@ -15594,19 +15759,24 @@ class _ComfyAPIMixin:
         if mode == "fail_fast":
             dep_check = _run_dependency_validation_with_cache(repair_mode=mode)
             if not dep_check.get("prepared", False):
-                baked_hash = dep_check.get("baked_hash", "?") or "?"
-                current_hash = dep_check.get("current_hash", "?") or "?"
-                changed_nodes = dep_check.get("changed_nodes", [])
-                raise RuntimeError(
-                    "Custom node dependencies are not prepared for this image. "
-                    "Runtime pip install is disabled in fail_fast mode. "
-                    "Rebuild/deploy the Modal image after syncing "
-                    "custom-node requirements. "
-                    f"reason={dep_check.get('dependency_validation_reason', dep_check.get('reason', ''))} "
-                    f"baked_hash={baked_hash} "
-                    f"current_hash={current_hash} "
-                    f"changed_nodes={changed_nodes}"
+                _dep_reason3 = dep_check.get('dependency_validation_reason', dep_check.get('reason', ''))
+                _dep_status3 = _record_dependency_status(
+                    prepared=False,
+                    reason=_dep_reason3,
+                    repair_mode=mode,
+                    baked_hash=dep_check.get("baked_hash", "") or "",
+                    current_hash=dep_check.get("current_hash", "") or "",
+                    changed_nodes=dep_check.get("changed_nodes", []),
+                    missing_in_volume=dep_check.get("missing_in_volume", []),
                 )
+                # Warn-and-continue: never pip install, never raise.  The
+                # mismatch is recorded for Studio; the caller proceeds.
+                return {
+                    "installed": [], "skipped": [], "failed": [],
+                    "mode": "fail_fast", "prepared": False,
+                    "dependency_reason": _dep_reason3,
+                    "dependency_status": _dep_status3,
+                }
             skipped = []
             for node_dir in _iter_syncable_custom_node_dirs(CUSTOM_NODES_PATH):
                 src = os.path.join(CUSTOM_NODES_PATH, node_dir)
@@ -19156,24 +19326,24 @@ class _ComfyAPIMixin:
         try:
             install_summary = self._install_custom_node_requirements()
         except RuntimeError as _req_err:
-            # In fail_fast mode, abort startup if requirements are missing.
-            # This prevents a container from booting in a broken state.
-            print(f"[comfyapp] FATAL: {_req_err}")
-            raise
+            # No fail-fast: a requirements error warns but never aborts
+            # startup.  The mismatch is recorded for Studio; boot continues.
+            print(f"[comfyapp] WARNING (startup continues): {_req_err}", flush=True)
+            install_summary = {"prepared": False, "mode": "", "dependency_reason": str(_req_err)[:200]}
         self._log_profile("requirements_install", duration_ms=self._profile_ms(stage_started), installed=len(install_summary.get("installed", [])), skipped=len(install_summary.get("skipped", [])))
 
-        # ── Fail closed in production modes when requirements not prepared ──
-        # _install_custom_node_requirements raises in fail_fast but returns
-        # prepared=False silently in off mode.  Catch that here before
-        # persisting any manifest.
+        # ── Warn-and-continue when requirements are not prepared ──
+        # Startup never aborts on dependency mismatch.  The mismatch is
+        # recorded for Studio; boot and later runs continue.
         if not install_summary.get("prepared"):
             _off_mode = (install_summary.get("mode") or REQUIREMENTS_REPAIR_MODE or "").strip().lower()
-            if _off_mode in ("off", "fail_fast"):
-                raise RuntimeError(
-                    "Cannot build immutable dependency manifest: "
-                    "custom node requirements are not prepared "
-                    f"(repair_mode={_off_mode})."
-                )
+            print(
+                "[comfyapp] WARNING (startup continues): custom node requirements "
+                f"are not prepared (repair_mode={_off_mode}). "
+                f"reason={install_summary.get('dependency_reason', '')} "
+                "See Studio for cause, solution, and the sync button.",
+                flush=True,
+            )
 
         stage_started = time.time()
         self._record_runtime_state()
@@ -19181,48 +19351,26 @@ class _ComfyAPIMixin:
 
         # ── Build and persist immutable dependency manifest ───────────
         # The manifest is created during every valid startup.  If identity
-        # components (baked hash, custom-nodes generation) are unavailable
-        # in production mode, we fail closed — no silent skip.
+        # components (baked hash, custom-nodes generation) are unavailable,
+        # warn loudly and continue — never abort startup.
         _mft_t0 = time.time()
         _repair_mode_s = REQUIREMENTS_REPAIR_MODE.strip().lower()
         _baked_mft_su = load_baked_custom_node_dependency_manifest()
         _baked_mft_ok = bool(_baked_mft_su and _baked_mft_su.get("overall_dependency_hash"))
 
-        # Ensure generation record exists for the synced tree.
+        # Generation record is read-only here: it is written exclusively by
+        # the custom-nodes publisher on real sync.  A missing record simply
+        # flows through as empty; detection still reports it.
         _cn_gen_rec_su = _read_custom_nodes_generation_record()
-        if _cn_gen_rec_su is None:
-            # Deterministic content-derived generation so the persisted
-            # record converges on the image-baked production generation when
-            # the synced tree matches baked content — snapshot_exact_skip
-            # identity depends on this (a UUID here would never match).
-            _cn_init_generation = ""
-            try:
-                _cn_init_generation = custom_node_source_generation(CUSTOM_NODES_PATH)
-            except Exception as _cn_init_gen_exc:
-                print(f"[dep_manifest] generation compute failed during init: {_cn_init_gen_exc!r}")
-            _cn_gen_rec_su = _write_custom_nodes_generation_record_no_commit(
-                reason="startup_init_generation_record",
-                content_generation=_cn_init_generation or None,
-            )
-            # Commit the generation record so the manifest persists it atomically.
-            # The manifest write below will be in a separate commit cycle.
-            custom_nodes_vol.commit()
-            print(
-                f"[dep_manifest] initialized generation="
-                f"{_cn_gen_rec_su['content_generation'][:12]} reason=startup_init_generation_record"
-            )
-        _cn_gen_str_su = _cn_gen_rec_su.get("content_generation", "")
+        _cn_gen_str_su = _cn_gen_rec_su.get("content_generation", "") if _cn_gen_rec_su else ""
 
-        # In production modes, missing baked hash must fail closed.
+        # In production modes, a missing baked hash warns but never aborts
+        # startup.  Detection stays visible; Studio shows cause + solution.
         if not _baked_mft_ok and _repair_mode_s in ("off", "fail_fast"):
             print(
-                "[dep_manifest] FATAL: baked dependency manifest missing "
-                f"repair_mode={_repair_mode_s}",
+                "[dep_manifest] WARNING (startup continues): baked dependency "
+                f"manifest missing repair_mode={_repair_mode_s}",
                 flush=True,
-            )
-            raise RuntimeError(
-                "Cannot build immutable dependency manifest: baked manifest "
-                f"is missing or incomplete (repair_mode={_repair_mode_s})."
             )
 
         # Build the combined hash using available identity components.
@@ -19246,18 +19394,14 @@ class _ComfyAPIMixin:
         _mft_identity = _manifest_su.get("identity", "")
         _mft_ident_match = bool(_mft_identity)
 
-        # In production modes, absent identity must fail closed.
+        # Absent identity warns but never aborts startup (volume commit
+        # failure or missing identity components).  Detection stays visible.
         if not _mft_ident_match and _repair_mode_s in ("off", "fail_fast"):
             print(
-                "[dep_manifest] FATAL: startup manifest has no identity — "
-                "volume commit likely failed or identity components unavailable",
+                "[dep_manifest] WARNING (startup continues): startup manifest "
+                "has no identity — volume commit likely failed or identity "
+                "components unavailable",
                 flush=True,
-            )
-            raise RuntimeError(
-                "Immutable dependency manifest creation failed: "
-                "no valid identity (volume commit failure or "
-                "missing identity components). "
-                f"repair_mode={_repair_mode_s}"
             )
 
         # Emit the startup diagnostic with source=snapshot_manifest.
@@ -23286,6 +23430,7 @@ class _ComfyAPIMixin:
                 "dependency_cache_key_ms", "dependency_memory_lookup_ms",
                 "dependency_sentinel_lookup_ms", "dependency_full_validation_ms",
                 "dependency_sentinel_write_ms",
+                "dependency_prepared", "dependency_reason", "dependency_status",
             ):
                 _pv = _policy.get(_dep_policy_field)
                 if _pv is not None:

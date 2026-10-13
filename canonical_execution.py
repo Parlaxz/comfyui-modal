@@ -1180,6 +1180,30 @@ def _collect_plan_validation_proof(prompt_id: str, workflow: dict) -> dict:
         raise RuntimeError(f"plan validation failed (exception): {_exc}") from _exc
     if not _valid:
         _err_text = str(_error or {})[:300]
+        # The rollup error is often content-free (e.g. ComfyUI reports every
+        # output invalid with no attached reasons when one upstream node
+        # fails). Append the per-node causes so a failure names the actual
+        # node + reason instead of surfacing empty details.
+        _node_bits: list[str] = []
+        try:
+            for _nid, _info in (dict(_node_errors or {})).items():
+                _info_map = _info if isinstance(_info, dict) else {}
+                for _nerr in (_info_map.get("errors") or [])[:2]:
+                    _nerr_map = _nerr if isinstance(_nerr, dict) else {}
+                    _node_bits.append(
+                        (
+                            f"node {_nid} ({_info_map.get('class_type', '?')}): "
+                            f"{_nerr_map.get('type', '?')}: "
+                            f"{_nerr_map.get('message', '')} "
+                            f"{_nerr_map.get('details', '')}"
+                        ).strip()
+                    )
+                if len(_node_bits) >= 4:
+                    break
+        except Exception:
+            _node_bits = []
+        if _node_bits:
+            _err_text = (_err_text + " | " + " ; ".join(_node_bits))[:600]
         raise RuntimeError(f"plan validation failed (invalid workflow): {_err_text}")
     return {
         "schema_version": VALIDATION_PROOF_SCHEMA_VERSION,

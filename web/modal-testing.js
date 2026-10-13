@@ -5,7 +5,12 @@ import { ensureStudioStyles } from "./studio-styles.js";
 import { mountStudioShell } from "./studio-shell.js";
 import { parseStudioHash } from "./studio-routing.js";
 import { el, registerLayerHandler } from "./studio-ui.js";
-import { managerRebootAndWait } from "./studio-backend-api.js";
+import {
+  managerRebootAndWait,
+  triggerGoldenProfileDeploy,
+  getGoldenProfileDeployStatus,
+} from "./studio-backend-api.js";
+import { loadGoldenProfileSelection } from "./studio-playground-state.js";
 
 // Backward-compat flag preserved for external scripts/custom nodes that may
 // still read it. Hidden legacy sidebar registrations were removed (H10);
@@ -198,18 +203,22 @@ export function comfyModalTestingDiagnostics() {
 // section (rebootManagerAndReport → managerRebootAndWait). Fires only on
 // click; the reboot POST's connection drop is expected and success is
 // decided by the bounded reconnect probes, never by the POST response.
-async function handleTopnavRestart(btn) {
-  if (!btn || btn.disabled) return;
-  const originalTitle = btn.title;
-  btn.disabled = true;
-  // aria-busy drives the spinning ring via CSS (::after); the ↻ glyph
-  // stays in the DOM, hidden by color:transparent, so no content swap.
-  btn.setAttribute("aria-busy", "true");
-  btn.title = "Restarting ComfyUI — waiting for it to reconnect…";
+let _topnavBusy = false;
+
+function setTopnavBusy(btn, busy) {
+  _topnavBusy = busy;
+  if (!btn) return;
+  btn.disabled = busy;
+  if (busy) btn.setAttribute("aria-busy", "true");
+  else btn.removeAttribute("aria-busy");
+}
+
+async function runTopnavRestartStep(btn) {
   let res = null;
   try {
     res = await managerRebootAndWait({
       onPhase: (phase) => {
+        if (!btn) return;
         btn.title = phase === "manager"
           ? "ComfyUI reconnected — waiting for ComfyUI-Manager…"
           : "Restarting ComfyUI — waiting for it to reconnect…";
@@ -218,9 +227,113 @@ async function handleTopnavRestart(btn) {
   } catch (e) {
     res = null;
   }
-  btn.removeAttribute("aria-busy");
-  btn.disabled = false;
+  return res;
+}
+
+async function handleTopnavRestart(btn) {
+  if (!btn || btn.disabled || _topnavBusy) return;
+  const originalTitle = btn.title;
+  setTopnavBusy(btn, true);
+  btn.title = "Restarting ComfyUI — waiting for it to reconnect…";
+  const res = await runTopnavRestartStep(btn);
+  setTopnavBusy(btn, false);
   btn.title = (res && res.message) || originalTitle;
+}
+
+// Topnav redeploy: same POST /studio/golden/deploy contract as the Settings
+// Golden-profile Deploy control, but page-agnostic (no Settings host/owner).
+// Uses the persisted profile selection; bounded poll mirrors Settings.
+async function runTopnavRedeployStep(btn) {
+  const profile = loadGoldenProfileSelection();
+  if (!profile) {
+    if (btn) btn.title = "Select a Golden profile in Settings first";
+    return { ok: false, message: "Select a Golden profile in Settings first" };
+  }
+  if (btn) btn.title = "Deploying " + profile + "…";
+  let started = null;
+  try {
+    started = await triggerGoldenProfileDeploy(MODAL_PREFIX, profile);
+  } catch (e) {
+    started = null;
+  }
+  if (!started || started.status === "error") {
+    const message = "Deploy request failed" + (started && started.message ? ": " + started.message : ".");
+    if (btn) btn.title = message;
+    return { ok: false, message };
+  }
+  for (let attempt = 0; attempt < 900; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    let payload = null;
+    try {
+      payload = await getGoldenProfileDeployStatus(MODAL_PREFIX, profile);
+    } catch (e) {
+      payload = null;
+    }
+    if (payload && payload.state === "done") {
+      if (btn) btn.title = "Deploy finished.";
+      return { ok: true, message: "Deploy finished." };
+    }
+    if (payload && payload.state === "failed") {
+      const tail = String(payload.output || payload.message || "").trim().split("\n").pop();
+      const message = "Deploy failed: " + (tail || "see v2ctl output");
+      if (btn) btn.title = message;
+      return { ok: false, message };
+    }
+  }
+  if (btn) btn.title = "Deploy still running. Reopen Settings to check its status.";
+  return { ok: false, message: "Deploy still running. Reopen Settings to check its status." };
+}
+
+async function handleTopnavRedeploy(btn) {
+  if (!btn || btn.disabled || _topnavBusy) return;
+  const originalTitle = btn.title;
+  setTopnavBusy(btn, true);
+  const res = await runTopnavRedeployStep(btn);
+  setTopnavBusy(btn, false);
+  if (res && res.ok) {
+    btn.title = res.message || originalTitle;
+  }
+  // On failure runTopnavRedeployStep already set a descriptive title.
+}
+
+function handleTopnavHardReload() {
+  location.reload();
+}
+
+// "All of the above": strictly sequential — redeploy completes, then
+// ComfyUI restart completes, and only then the page reloads.
+async function handleTopnavAll(btn) {
+  if (!btn || btn.disabled || _topnavBusy) return;
+  setTopnavBusy(btn, true);
+  try {
+    await runTopnavRedeployStep(btn);
+    btn.title = "Restarting ComfyUI — waiting for it to reconnect…";
+    await runTopnavRestartStep(btn);
+  } finally {
+    btn.title = "Reloading…";
+    location.reload();
+  }
+}
+
+function closeRestartMenu(shell) {
+  if (!shell || !shell.restartMenu || !shell.restartBtn) return;
+  shell.restartMenu.style.display = "none";
+  shell.restartBtn.setAttribute("aria-expanded", "false");
+  if (shell.nav) shell.nav.style.overflow = "";
+}
+
+function toggleRestartMenu(shell) {
+  if (!shell || !shell.restartMenu || !shell.restartBtn) return;
+  const open = shell.restartMenu.style.display !== "none";
+  if (open) {
+    closeRestartMenu(shell);
+  } else {
+    shell.restartMenu.style.display = "block";
+    shell.restartBtn.setAttribute("aria-expanded", "true");
+    // The topnav scrolls horizontally (overflow-x:auto), which would clip
+    // the dropdown. While the menu is open, lift clipping; restored on close.
+    if (shell.nav) shell.nav.style.overflow = "visible";
+  }
 }
 
 function buildShell() {
@@ -236,16 +349,87 @@ function buildShell() {
     text: "Modal GPU",
     class: "comfymodal-studio-topnav-heading",
   });
-  const topnavActions = el("div", { class: "comfymodal-studio-topnav-actions" }, [
+  const restartBtn = el("button", {
+    class: "comfymodal-studio-restart",
+    type: "button",
+    "data-testid": "topnav-restart-comfy",
+    "aria-label": "Restart options",
+    title: "Restart options",
+    text: "↻",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+  });
+  const restartMenu = el("div", {
+    class: "comfymodal-studio-restart-menu",
+    "data-testid": "topnav-restart-menu",
+    role: "menu",
+    style: "display:none;",
+  }, [
     el("button", {
-      class: "comfymodal-studio-restart",
       type: "button",
-      "data-testid": "topnav-restart-comfy",
-      "aria-label": "Restart ComfyUI",
-      title: "Restart ComfyUI",
-      text: "↻",
-      onclick: (e) => handleTopnavRestart(e.currentTarget),
+      class: "comfymodal-studio-restart-menu-item",
+      "data-testid": "topnav-restart-comfyui",
+      role: "menuitem",
+      text: "Restart ComfyUI",
+      onclick: (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeRestartMenu(_shellCache);
+        handleTopnavRestart(_shellCache ? _shellCache.restartBtn : restartBtn);
+      },
+      onkeydown: (e) => e.stopPropagation(),
     }),
+    el("button", {
+      type: "button",
+      class: "comfymodal-studio-restart-menu-item",
+      "data-testid": "topnav-redeploy-golden",
+      role: "menuitem",
+      text: "Redeploy",
+      onclick: (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeRestartMenu(_shellCache);
+        handleTopnavRedeploy(_shellCache ? _shellCache.restartBtn : restartBtn);
+      },
+      onkeydown: (e) => e.stopPropagation(),
+    }),
+    el("button", {
+      type: "button",
+      class: "comfymodal-studio-restart-menu-item",
+      "data-testid": "topnav-hard-reload",
+      role: "menuitem",
+      text: "Hard reload page",
+      onclick: (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeRestartMenu(_shellCache);
+        handleTopnavHardReload();
+      },
+      onkeydown: (e) => e.stopPropagation(),
+    }),
+    el("button", {
+      type: "button",
+      class: "comfymodal-studio-restart-menu-item",
+      "data-testid": "topnav-restart-all",
+      role: "menuitem",
+      text: "All of the above",
+      onclick: (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeRestartMenu(_shellCache);
+        handleTopnavAll(_shellCache ? _shellCache.restartBtn : restartBtn);
+      },
+      onkeydown: (e) => e.stopPropagation(),
+    }),
+  ]);
+  restartBtn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    toggleRestartMenu(_shellCache);
+  });
+  const restartWrap = el("div", { class: "comfymodal-studio-restart-wrap" }, [restartBtn, restartMenu]);
+  const topnavActions = el("div", { class: "comfymodal-studio-topnav-actions" }, [
+    restartWrap,
     el("button", {
       class: "comfymodal-studio-help",
       "aria-label": "Open documentation",
@@ -261,7 +445,21 @@ function buildShell() {
   const body = el("div", { class: "comfymodal-studio-body", "data-testid": "body" });
   modal.appendChild(body);
   overlay.appendChild(modal);
-  return { overlay, modal, heading, topnavActions, body };
+  const shell = { overlay, modal, heading, topnavActions, body, restartBtn, restartMenu, restartWrap };
+  document.addEventListener("click", (e) => {
+    if (!_shellCache || _shellCache !== shell) return;
+    if (shell.restartMenu.style.display === "none") return;
+    if (shell.restartWrap.contains(e.target)) return;
+    closeRestartMenu(shell);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (!_shellCache || _shellCache !== shell) return;
+    if (e.key !== "Escape") return;
+    if (shell.restartMenu.style.display === "none") return;
+    closeRestartMenu(shell);
+    e.stopPropagation();
+  });
+  return shell;
 }
 
 let _hostEl = null;
@@ -365,6 +563,11 @@ export function open_testing_modal(tabName) {
         _shellCache._escHandler = registerLayerHandler(2, {
           escape: function () {
             if (_shellCache && _shellCache._destroyed) return false;
+            if (_shellCache && _shellCache.restartMenu
+              && _shellCache.restartMenu.style.display !== "none") {
+              closeRestartMenu(_shellCache);
+              return true;
+            }
             close_testing_modal();
             return true;
           },
@@ -415,6 +618,10 @@ export function open_testing_modal(tabName) {
   shell._escHandler = registerLayerHandler(2, {
     escape: function () {
       if (shell._destroyed) return false;
+      if (shell.restartMenu && shell.restartMenu.style.display !== "none") {
+        closeRestartMenu(shell);
+        return true;
+      }
       close_testing_modal();
       return true;
     },

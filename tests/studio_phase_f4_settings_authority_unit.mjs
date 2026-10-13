@@ -110,6 +110,27 @@ const SETTINGS_KEY_CONTRACT = {
       [settingsSource, 'localStorage.getItem("comfymodal_preview_quality"'],
     ],
   },
+  "comfymodal_data_saver_default": {
+    classification: "value-setting",
+    evidence: [
+      [outputPrefsSource, 'DATA_SAVER_DEFAULT: "comfymodal_data_saver_default"'],
+      [settingsSource, 'localStorage.getItem("comfymodal_data_saver_default"'],
+    ],
+  },
+  "comfymodal_data_saver_codec": {
+    classification: "value-setting",
+    evidence: [
+      [outputPrefsSource, 'DATA_SAVER_CODEC: "comfymodal_data_saver_codec"'],
+      [settingsSource, 'localStorage.getItem("comfymodal_data_saver_codec"'],
+    ],
+  },
+  "comfymodal_data_saver_quality": {
+    classification: "value-setting",
+    evidence: [
+      [outputPrefsSource, 'DATA_SAVER_QUALITY: "comfymodal_data_saver_quality"'],
+      [settingsSource, 'localStorage.getItem("comfymodal_data_saver_quality"'],
+    ],
+  },
   "comfymodal-studio-history-columns": {
     // F4C: consumed by the mounted History V2 feed grid (normalized 2–8,
     // default 6, applied as an inline CSS custom property on the page root).

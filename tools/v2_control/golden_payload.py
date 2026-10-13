@@ -100,6 +100,7 @@ def _golden_p1_request_payload(
     source_launch_gap_ns: int | str | None = None,
     microscope_mode: str | None = None,
     qd_mode: str | None = None,
+    result_transport: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(cpu_qd2_prefetch, bool):
         raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
@@ -217,4 +218,13 @@ def _golden_p1_request_payload(
         payload["request_origin_info"]["c0_source_threads"] = True
     if invocation_id:
         payload["request_origin_info"]["v2ctl_invocation_id"] = str(invocation_id)
+    transport = str(
+        result_transport
+        if result_transport is not None
+        else (os.environ.get("COMFYMODAL_GOLDEN_RESULT_TRANSPORT") or "bytes")
+    ).strip().lower()
+    if transport not in {"bytes", "base64"}:
+        raise ValueError("golden_result_transport_invalid")
+    payload["result_transport"] = transport
+    payload["request_origin_info"]["golden_result_transport"] = transport
     return payload

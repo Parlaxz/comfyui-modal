@@ -24,6 +24,9 @@ export const STORAGE_KEYS = {
   PREVIEW_DEFAULT: "comfymodal_preview_default",
   PREVIEW_CODEC: "comfymodal_preview_codec",
   PREVIEW_QUALITY: "comfymodal_preview_quality",
+  DATA_SAVER_DEFAULT: "comfymodal_data_saver_default",
+  DATA_SAVER_CODEC: "comfymodal_data_saver_codec",
+  DATA_SAVER_QUALITY: "comfymodal_data_saver_quality",
 };
 
 export const DEFAULT_OUTPUT_SAVEFOLDER = "output/modal";
@@ -42,13 +45,22 @@ function _previewQuality(value) {
 }
 
 function _readPreviewPreferences() {
-  var previewDefault = localStorage.getItem(STORAGE_KEYS.PREVIEW_DEFAULT);
-  var previewCodec = localStorage.getItem(STORAGE_KEYS.PREVIEW_CODEC);
-  return {
-    preview_default: previewDefault === "on" ? "on" : PREVIEW_DEFAULTS.preview_default,
-    preview_codec: previewCodec === "webp" ? previewCodec : PREVIEW_DEFAULTS.preview_codec,
-    preview_quality: _previewQuality(localStorage.getItem(STORAGE_KEYS.PREVIEW_QUALITY)),
+  // Data Saver is canonical; preview_* keys are legacy aliases.
+  var saverDefault = localStorage.getItem(STORAGE_KEYS.DATA_SAVER_DEFAULT);
+  if (saverDefault === null) saverDefault = localStorage.getItem(STORAGE_KEYS.PREVIEW_DEFAULT);
+  var saverCodec = localStorage.getItem(STORAGE_KEYS.DATA_SAVER_CODEC);
+  if (saverCodec === null) saverCodec = localStorage.getItem(STORAGE_KEYS.PREVIEW_CODEC);
+  var saverQualityRaw = localStorage.getItem(STORAGE_KEYS.DATA_SAVER_QUALITY);
+  if (saverQualityRaw === null) saverQualityRaw = localStorage.getItem(STORAGE_KEYS.PREVIEW_QUALITY);
+  var resolved = {
+    preview_default: saverDefault === "on" ? "on" : PREVIEW_DEFAULTS.preview_default,
+    preview_codec: saverCodec === "webp" ? saverCodec : PREVIEW_DEFAULTS.preview_codec,
+    preview_quality: _previewQuality(saverQualityRaw),
   };
+  resolved.data_saver_default = resolved.preview_default;
+  resolved.data_saver_codec = resolved.preview_codec;
+  resolved.data_saver_quality = resolved.preview_quality;
+  return resolved;
 }
 
 export function normalizePreviewPreferences(prefs) {
@@ -137,6 +149,9 @@ export async function setOutputPreferences(prefs, syncToServer) {
   merged.preview_default = normalizedPreview.preview_default;
   merged.preview_codec = normalizedPreview.preview_codec;
   merged.preview_quality = normalizedPreview.preview_quality;
+  merged.data_saver_default = merged.preview_default;
+  merged.data_saver_codec = merged.preview_codec;
+  merged.data_saver_quality = merged.preview_quality;
 
   // Sync to server
   if (syncToServer) {
@@ -154,6 +169,9 @@ export async function setOutputPreferences(prefs, syncToServer) {
           preview_default: merged.preview_default,
           preview_codec: merged.preview_codec,
           preview_quality: merged.preview_quality,
+          data_saver_default: merged.data_saver_default,
+          data_saver_codec: merged.data_saver_codec,
+          data_saver_quality: merged.data_saver_quality,
         }),
       });
       if (!response.ok) throw new Error("Output preferences were rejected");
@@ -175,6 +193,9 @@ export async function setOutputPreferences(prefs, syncToServer) {
     localStorage.setItem(STORAGE_KEYS.PREVIEW_DEFAULT, merged.preview_default);
     localStorage.setItem(STORAGE_KEYS.PREVIEW_CODEC, merged.preview_codec);
     localStorage.setItem(STORAGE_KEYS.PREVIEW_QUALITY, String(merged.preview_quality));
+    localStorage.setItem(STORAGE_KEYS.DATA_SAVER_DEFAULT, merged.data_saver_default);
+    localStorage.setItem(STORAGE_KEYS.DATA_SAVER_CODEC, merged.data_saver_codec);
+    localStorage.setItem(STORAGE_KEYS.DATA_SAVER_QUALITY, String(merged.data_saver_quality));
   } catch (e) {
     // localStorage unavailable — runtime can still use the returned value
   }
@@ -228,14 +249,26 @@ export async function syncOutputConfigFromServer() {
     if (cfg.save_metadata_sidecar !== undefined) {
       updates.save_metadata_sidecar = cfg.save_metadata_sidecar !== false;
     }
-    if (cfg.preview_default !== undefined) {
+    if (cfg.data_saver_default !== undefined) {
+      updates.preview_default = cfg.data_saver_default;
+      updates.data_saver_default = cfg.data_saver_default;
+    } else if (cfg.preview_default !== undefined) {
       updates.preview_default = cfg.preview_default;
+      updates.data_saver_default = cfg.preview_default;
     }
-    if (cfg.preview_codec !== undefined) {
+    if (cfg.data_saver_codec !== undefined) {
+      updates.preview_codec = cfg.data_saver_codec;
+      updates.data_saver_codec = cfg.data_saver_codec;
+    } else if (cfg.preview_codec !== undefined) {
       updates.preview_codec = cfg.preview_codec;
+      updates.data_saver_codec = cfg.preview_codec;
     }
-    if (cfg.preview_quality !== undefined) {
+    if (cfg.data_saver_quality !== undefined) {
+      updates.preview_quality = cfg.data_saver_quality;
+      updates.data_saver_quality = cfg.data_saver_quality;
+    } else if (cfg.preview_quality !== undefined) {
       updates.preview_quality = cfg.preview_quality;
+      updates.data_saver_quality = cfg.preview_quality;
     }
 
     if (Object.keys(updates).length > 0) {

@@ -98,6 +98,122 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
   // class-name collision with page-level containers
   const pageContainer = el("div", { class: "comfymodal-studio-pagecontainer", "data-testid": "studio-page" });
 
+  // Dependency health belongs to the shell: a volume mismatch can affect
+  // every Studio page, not just Settings or Backend.
+  const syncNotice = el("div", { class: "comfymodal-studio-sync-notice-host", hidden: true });
+  let syncPollTimer = null;
+  let syncInFlight = false;
+  let lastSyncResult = "";
+  let lastSyncData = null;
+
+  function shortHash(value) {
+    return typeof value === "string" && value ? value.slice(0, 8) : "—";
+  }
+
+  function syncResultText(data, fallback) {
+    if (data && data.status === "ok") return data.message || "Dependencies and custom nodes synced.";
+    const error = data && (data.error || data.message || data.reason);
+    if (typeof error === "string") return error;
+    if (error && typeof error === "object") return error.detail || error.message || error.code || fallback;
+    return fallback;
+  }
+
+  function renderSyncNotice(status) {
+    const dependency = status && status.dependency;
+    const pending = Array.isArray(status && status.custom_nodes && status.custom_nodes.pending)
+      ? status.custom_nodes.pending : [];
+    const mismatch = dependency && dependency.prepared === false;
+    const hasResult = Boolean(lastSyncResult);
+    while (syncNotice.firstChild) syncNotice.removeChild(syncNotice.firstChild);
+    if (!mismatch && !pending.length && !hasResult) {
+      syncNotice.hidden = true;
+      return;
+    }
+    syncNotice.hidden = false;
+    const banner = el("section", {
+      class: `comfymodal-studio-sync-notice ${mismatch ? "mismatch" : pending.length ? "pending" : "result"}`,
+      ...(mismatch ? { "data-testid": "dep-mismatch-banner", role: "alert", "aria-live": "polite" } : {}),
+    });
+    if (mismatch) {
+      banner.appendChild(el("div", { class: "comfymodal-studio-sync-title", text: "Studio dependencies need syncing" }));
+      banner.appendChild(el("div", { class: "comfymodal-studio-sync-copy", text: dependency.cause || "Dependency mismatch detected." }));
+      banner.appendChild(el("div", { class: "comfymodal-studio-sync-copy", text: dependency.solution || "Sync dependencies and custom nodes to repair the volume." }));
+      const names = [...(Array.isArray(dependency.changed_nodes) ? dependency.changed_nodes : []), ...(Array.isArray(dependency.missing_in_volume) ? dependency.missing_in_volume : [])]
+        .filter((name, index, values) => name && values.indexOf(name) === index).slice(0, 5);
+      const details = [dependency.reason, `baked ${shortHash(dependency.baked_hash)} / current ${shortHash(dependency.current_hash)}`, names.length ? names.join(", ") : "no affected nodes listed"]
+        .filter(Boolean).join(" · ");
+      banner.appendChild(el("div", { class: "comfymodal-studio-sync-detail", text: details }));
+    } else if (pending.length) {
+      banner.appendChild(el("div", { class: "comfymodal-studio-sync-copy", text: `${pending.length} custom node(s) not yet published to the volume` }));
+    }
+    const actions = el("div", { class: "comfymodal-studio-sync-actions" });
+    actions.appendChild(el("button", {
+      type: "button", class: "comfymodal-primary-btn",
+      text: syncInFlight ? "Syncing…" : "Sync deps / custom nodes",
+      "data-testid": "dep-sync-button", disabled: syncInFlight,
+      onclick: function () { syncCustomNodes(); },
+    }));
+    banner.appendChild(actions);
+    if (hasResult) banner.appendChild(el("div", { class: "comfymodal-studio-sync-result", "data-testid": "dep-sync-result", text: lastSyncResult, role: "status" }));
+    const destructive = lastSyncData && lastSyncData.publication && lastSyncData.publication.reason === "destructive_custom_node_publication_blocked"
+      ? (lastSyncData.publication.destructive || null) : null;
+    const blockedPackages = destructive && Array.isArray(destructive.packages) ? destructive.packages : [];
+    if (blockedPackages.length) {
+      const lines = blockedPackages.slice(0, 5).map(function (pkg) {
+        const name = pkg && pkg.package ? String(pkg.package) : "unknown package";
+        const count = pkg && pkg.missing_count != null ? pkg.missing_count : "?";
+        const paths = pkg && Array.isArray(pkg.missing_paths) ? pkg.missing_paths.slice(0, 3).join(", ") : "";
+        return `${name}: ${count} file(s) only on the volume${paths ? ` (${paths}${pkg.missing_paths.length > 3 ? ", …" : ""})` : ""}`;
+      });
+      banner.appendChild(el("div", { class: "comfymodal-studio-sync-detail", "data-testid": "dep-blocked-detail", text: lines.join(" · ") }));
+      const confirmActions = el("div", { class: "comfymodal-studio-sync-actions" });
+      confirmActions.appendChild(el("button", {
+        type: "button", class: "comfymodal-primary-btn",
+        text: syncInFlight ? "Syncing…" : "Replace volume contents",
+        title: "Publish the local tree, deleting volume files the local tree lacks",
+        "data-testid": "dep-sync-confirm-button", disabled: syncInFlight,
+        onclick: function () { syncCustomNodes({ allow_destructive: true }); },
+      }));
+      banner.appendChild(confirmActions);
+    }
+    syncNotice.appendChild(banner);
+  }
+
+  async function fetchSyncStatus() {
+    try {
+      const response = await fetch(`${context.apiBase}/sync/status`);
+      const data = await response.json();
+      if (response.ok) renderSyncNotice(data);
+    } catch {
+      // Keep the last known warning visible through transient poll failures.
+    }
+  }
+
+  async function syncCustomNodes(requestBody) {
+    if (syncInFlight) return;
+    syncInFlight = true;
+    lastSyncResult = "Syncing dependencies and custom nodes…";
+    lastSyncData = null;
+    renderSyncNotice({ dependency: null, custom_nodes: { pending: [] } });
+    try {
+      const request = requestBody
+        ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) }
+        : { method: "POST" };
+      const response = await fetch(`${context.apiBase}/sync/custom-nodes`, request);
+      let data = null;
+      try { data = await response.json(); } catch { /* show a result even for an empty response */ }
+      lastSyncData = data;
+      lastSyncResult = syncResultText(data, response.ok ? "Sync finished." : `Sync failed (HTTP ${response.status}).`);
+    } catch {
+      lastSyncData = null;
+      lastSyncResult = "Sync failed: unable to reach the Studio sync service.";
+    } finally {
+      syncInFlight = false;
+      await fetchSyncStatus();
+      if (!syncNotice.firstChild) renderSyncNotice({ dependency: null, custom_nodes: { pending: [] } });
+    }
+  }
+
   // Deferred scroll restoration state — handles rapid successive re-renders
   // (e.g. rapid experiment checkbox toggles) by coalescing into one callback
   // that always uses the latest captured scroll values.
@@ -123,7 +239,21 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
 
     const pageDef = PAGES[state.activePage];
     if (!pageDef) {
-      pageContainer.textContent = `Unknown page: ${state.activePage}`;
+      // Never leave the body empty (an empty dialog reads as a black
+      // hang): render a truthful notice with a recovery action.
+      const notice = el("div", {
+        class: "comfymodal-studio-placeholder-notice",
+        role: "alert",
+      });
+      notice.appendChild(el("p", { text: `Unknown page: ${state.activePage}` }));
+      const backBtn = el("button", {
+        type: "button",
+        class: "comfymodal-secondary-btn",
+        text: "Back to Playground",
+        onclick: () => setPage("playground"),
+      });
+      notice.appendChild(backBtn);
+      pageContainer.appendChild(notice);
       return;
     }
 
@@ -372,6 +502,7 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
 
   // Assemble shell
   rootEl.appendChild(nav);
+  rootEl.appendChild(syncNotice);
   rootEl.appendChild(pageContainer);
 
   // Initial render — honor the resolved initial route (explicit opener
@@ -386,10 +517,16 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
   if (initialRoute.focus && initialRoute.page === "settings") {
     _scheduleSettingsSectionFocus(initialRoute.focus);
   }
+  fetchSyncStatus();
+  syncPollTimer = setInterval(fetchSyncStatus, 15000);
 
   const shellApi = {
     nav,
     destroy() {
+      if (syncPollTimer) {
+        clearInterval(syncPollTimer);
+        syncPollTimer = null;
+      }
       if (typeof window !== "undefined") {
         window.removeEventListener("hashchange", _handleHashChange);
       }

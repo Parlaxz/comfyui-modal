@@ -348,11 +348,14 @@ test.describe("Studio Shelf Experiment", () => {
       expect(definition.axes.seed.values.map((v) => Number(v)).sort((a, b) => a - b)).toEqual([42, 222]);
       expect(postedBody.experiment_id).toBeTruthy();
 
-      // Results render in the EXISTING experiment-v2 grid (no second system).
-      const grid = page.locator('[data-testid="experiment-v2-grid"]');
+      // Results render in the experiment manager's grid (no second system).
+      await page.locator('[data-testid="experiment-manager-open"]').click();
+      const expModal = page.locator('[data-testid="experiment-manager"]');
+      await expect(expModal).toBeVisible({ timeout: 10000 });
+      const grid = expModal.locator('[data-testid="experiment-v2-grid"]');
       await expect(grid.locator('[data-testid="experiment-v2-cell-cell_0"]')).toBeVisible({ timeout: 15000 });
       expect(await grid.locator('[data-testid^="experiment-v2-cell-cell_"]').count()).toBe(4);
-      await expect(page.locator('[data-testid="experiment-v2-progress"]')).toContainText("4/4 complete", { timeout: 15000 });
+      await expect(expModal.locator('[data-testid="experiment-v2-progress"]')).toContainText("4/4 complete", { timeout: 15000 });
 
       guard.assertNoErrors();
       api.assertNoUnhandledCalls();

@@ -223,18 +223,21 @@ _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
 
 # Asset types that count as visible "output" imagery (mirrors the route
 # contract in history_v2_routes).
-_OUTPUT_ASSET_TYPES = frozenset({"thumbnail", "preview", "original"})
+_OUTPUT_ASSET_TYPES = frozenset({"thumbnail", "preview", "data_saver", "original"})
 
 _THUMBNAIL_MAX = 256
 
 # Asset types that count as REQUIRED workflow results (never derivatives).
 # A Thumbnail alone must never satisfy the required-output association gate.
-_REQUIRED_ASSET_TYPES = frozenset({"preview", "original"})
+_REQUIRED_ASSET_TYPES = frozenset({"preview", "data_saver", "original"})
 
 # Semantic variant values that map a producer/result record onto a History
 # Asset type.  Unknown variants stay backward-compatible Originals.
 _VARIANT_ASSET_TYPES = {
     "preview": "preview",
+    "data_saver": "preview",  # Canonical mode keeps legacy preview asset rows readable.
+    "data-saver": "preview",
+    "datasaver": "preview",
     "original": "original",
     "main": "original",
     "thumbnail": "thumbnail",
@@ -245,7 +248,7 @@ def semantic_output_mode(meta: Any) -> str:
     """Explicit immutable output mode from E2B request/result metadata.
 
     Reads ``output_mode`` (then ``variant``) from *meta* and returns exactly
-    ``"preview"`` or ``"original"``.  Preview is NEVER inferred from codec,
+    ``"data_saver"`` or ``"original"``.  Data saver is NEVER inferred from codec,
     quality, extension, filename, or MIME type; a legacy call without the
     semantic field safely defaults to ``"original"``.
     """
@@ -255,7 +258,9 @@ def semantic_output_mode(meta: Any) -> str:
         value = meta.get(key)
         if isinstance(value, str):
             normalized = value.strip().lower()
-            if normalized in ("preview", "original"):
+            if normalized in ("preview", "data_saver", "data-saver", "datasaver"):
+                return "data_saver"
+            if normalized == "original":
                 return normalized
     return "original"
 
@@ -1030,7 +1035,9 @@ class HistoryV2ProductionWriter:
         }
         attached: list[Asset] = []
         studio_outputs: Optional[Path] = None
-        primary_type = semantic_output_mode(meta)
+        # Keep the established DB value: canonical data_saver is the preview
+        # asset variant, so old preview rows remain readable without migration.
+        primary_type = "preview" if semantic_output_mode(meta) == "data_saver" else "original"
 
         for index, candidate in enumerate(candidates):
             candidate_path = Path(candidate)
@@ -1545,7 +1552,7 @@ class HistoryV2ProductionWriter:
                             output_paths, meta=None) -> list[Asset]:
         """Attach experiment-cell output files (semantic primaries + thumbs)."""
         metadata = meta if isinstance(meta, dict) else {}
-        primary_type = semantic_output_mode(metadata)
+        primary_type = "preview" if semantic_output_mode(metadata) == "data_saver" else "original"
         existing = self._repo.get_generation_assets(generation_id)
         existing_names = {(a.run_id, a.filename) for a in existing}
         attached: list[Asset] = []

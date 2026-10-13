@@ -178,6 +178,11 @@ export function saveRunResult(presetId, featureId, runData) {
       experimentId: runData.experimentId || null,
       generationId: runData.generationId || null,
       imageUrl: runData.imageUrl || null,
+      // Persisted alongside imageUrl so a reloaded canvas can resolve the
+      // same full-size variant (see _canvasUrlForRun); absent on older
+      // entries, which fall back to imageUrl exactly as before.
+      featuredOutput: runData.featuredOutput && typeof runData.featuredOutput === "object"
+        ? runData.featuredOutput : null,
       outputPath: runData.outputPath || null,
       prompt: runData.prompt || null,
       negativePrompt: runData.negativePrompt || null,
@@ -815,4 +820,29 @@ export function takeWorkflowHandoff() {
   } catch (e) {
     return null;
   }
+}
+
+// One-shot "use as base" parameter payload (a past run's prompt + sampler
+// controls) for the Playground shelf. Deliberately IN-MEMORY, not
+// localStorage: it is consumed by the next shelf build in this session,
+// and a stale base must never resurrect after a reload.
+let _pendingPlaygroundBase = null;
+
+/**
+ * Stash a base payload for the next Playground shelf build.
+ * @param {object|null|undefined} payload shelf-role keyed values
+ */
+export function setPendingPlaygroundBase(payload) {
+  _pendingPlaygroundBase = payload && typeof payload === "object" ? payload : null;
+}
+
+/**
+ * Take the stashed base payload, clearing the slot. Exactly-once: a second
+ * call returns null until stashed again.
+ * @returns {object|null}
+ */
+export function takePendingPlaygroundBase() {
+  const pending = _pendingPlaygroundBase;
+  _pendingPlaygroundBase = null;
+  return pending;
 }

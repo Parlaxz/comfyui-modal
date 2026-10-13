@@ -1114,7 +1114,14 @@ def _hydrate_missing_required_widget_defaults(
     *,
     node_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Fill omitted API-prompt widgets from the live node schema defaults."""
+    """Fill omitted API-prompt widgets from the live node schema defaults.
+
+    Covers required inputs and optional inputs that declare an explicit
+    default (e.g. TextGenerate ``mtp``): a stored ``None`` fails ComfyUI's
+    value-in-list validation exactly like a missing key, while filling the
+    schema's own default is semantically identical to leaving it unconnected.
+    Optional inputs without a declared default are left untouched.
+    """
     hydrated: list[dict[str, str]] = []
     try:
         import nodes
@@ -1137,7 +1144,13 @@ def _hydrate_missing_required_widget_defaults(
         inputs = node.setdefault("inputs", {})
         if not isinstance(inputs, dict):
             continue
-        for name, spec in (schema.get("required") or {}).items():
+        candidates: list[tuple[str, Any]] = []
+        if isinstance(schema, dict):
+            for section_key in ("required", "optional"):
+                section = schema.get(section_key)
+                if isinstance(section, dict):
+                    candidates.extend(section.items())
+        for name, spec in candidates:
             if (
                 not isinstance(spec, (tuple, list))
                 or not spec

@@ -111,13 +111,16 @@ async function shelfValue(page, role) {
 }
 
 async function dragShelfCard(page, role, targetLocator, position = "center") {
-  const grip = await page.locator(`[data-testid="shelf-drag-${role}"]`).boundingBox();
-  const target = await targetLocator.boundingBox();
+  const gripLocator = page.locator(`[data-testid="shelf-drag-${role}"]`);
+  await gripLocator.scrollIntoViewIfNeeded();
+  const grip = await gripLocator.boundingBox();
   expect(grip).toBeTruthy();
-  expect(target).toBeTruthy();
-  const y = position === "top" ? target.y + 3 : position === "bottom" ? target.y + target.height - 3 : target.y + target.height / 2;
   await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2);
   await page.mouse.down();
+  await targetLocator.scrollIntoViewIfNeeded();
+  const target = await targetLocator.boundingBox();
+  expect(target).toBeTruthy();
+  const y = position === "top" ? target.y + 3 : position === "bottom" ? target.y + target.height - 3 : target.y + target.height / 2;
   await page.mouse.move(target.x + target.width / 2, y, { steps: 8 });
   await page.mouse.up();
 }
@@ -228,11 +231,10 @@ test.describe("Studio Shelf Playground", () => {
     await dragShelfCard(page, "seed", page.locator('[data-testid="shelf-field-steps"]'), "top");
     await page.waitForTimeout(300);
 
-    // Advanced placement: seed moves into the open Advanced section.
-    await page.locator('[data-testid="shelf-advanced-toggle"]').click();
-    const advancedTarget = page.locator('[data-testid="shelf-advanced-section"] [data-testid^="shelf-field-"]').first();
+    // Advanced placement: seed moves onto the collapsed full-row accordion
+    // header, which opens after the drop.
+    const advancedTarget = page.locator('[data-testid="shelf-advanced-toggle"]');
     await dragShelfCard(page, "seed", advancedTarget);
-    await page.locator('[data-testid="shelf-advanced-toggle"]').click();
     await expect(page.locator('[data-testid="shelf-advanced-section"] [data-testid="shelf-field-seed"]')).toBeVisible({ timeout: 5000 });
 
     // Same-row grouping: height joins width's row.
@@ -257,7 +259,7 @@ test.describe("Studio Shelf Playground", () => {
     const order = await page.locator('[data-testid="shelf-fields"] [data-testid^="shelf-field-"]').evaluateAll((els) =>
       els.map((node) => node.getAttribute("data-testid"))
     );
-    expect(order.indexOf("shelf-field-seed")).toBeLessThan(order.indexOf("shelf-field-steps"));
+    expect(order).not.toContain("shelf-field-seed");
     await page.locator('[data-testid="shelf-advanced-toggle"]').click();
     await expect(page.locator('[data-testid="shelf-advanced-section"] [data-testid="shelf-field-seed"]')).toBeVisible({ timeout: 5000 });
 

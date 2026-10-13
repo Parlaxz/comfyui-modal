@@ -1091,6 +1091,25 @@ export function renderModernCellTile(cell, index, state, actions, context) {
     img.src = cell.thumbUrl;
     img.alt = "Cell " + cellId;
     img.loading = "lazy";
+    // Cells open in the shared studio viewer (same shell as History and
+    // the queue manager). Dynamic import: playground owns the opener and
+    // already statically imports this module.
+    img.style.cursor = "zoom-in";
+    img.setAttribute("role", "button");
+    img.setAttribute("tabindex", "0");
+    img.setAttribute("aria-label", "Open cell " + cellId + " in viewer");
+    img.setAttribute("data-testid", "experiment-v2-cell-open-" + cellId);
+    var openCell = function () {
+      import("./studio-playground.js").then(function (pg) {
+        if (pg && typeof pg.openRunImagePreview === "function") {
+          pg.openRunImagePreview(state, ctx, { id: cellId, runId: cellId }, cell.thumbUrl);
+        }
+      }).catch(function () {});
+    };
+    img.addEventListener("click", openCell);
+    img.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openCell(); }
+    });
     tile.appendChild(img);
   } else {
     var empty = document.createElement("div");
@@ -1246,6 +1265,30 @@ function _syncExperimentMount(mount, state) {
     resumeBtn.textContent = "Resume";
   }
   if (actionNote) actionNote.textContent = "";
+
+  // Manager-modal summary + progress bar (same counts as the grid).
+  var mgr = mount.closest ? mount.closest('[data-testid="experiment-manager"]') : null;
+  if (mgr) {
+    var cells = (st && Array.isArray(st.cells)) ? st.cells : [];
+    var n = cells.length || (st && st.total) || 0;
+    var nDone = cells.filter(function (c) { return c && c.status === "completed"; }).length;
+    var nFail = cells.filter(function (c) { return c && c.status === "failed"; }).length;
+    var sumEl = mgr.querySelector('[data-testid="experiment-manager-summary"]');
+    if (sumEl) {
+      sumEl.textContent = hasActive && st
+        ? (formatExperimentProgress(st.counts, st.total)
+          + (nFail ? " · " + nFail + " failed" : "")
+          + (st.status && st.status !== "completed" ? " · " + experimentStatusLabel(st.status) : ""))
+        : "No active experiment.";
+    }
+    var barEl = mgr.querySelector('[data-testid="experiment-manager-progress"]');
+    var fillEl = mgr.querySelector('[data-testid="experiment-manager-progress-fill"]');
+    if (barEl) {
+      barEl.setAttribute("aria-valuemax", String(n));
+      barEl.setAttribute("aria-valuenow", String(nDone));
+    }
+    if (fillEl) fillEl.style.width = n ? Math.round((nDone / n) * 100) + "%" : "0%";
+  }
 }
 
 export function renderModernExperimentSection(state, actions, context) {
@@ -1392,9 +1435,113 @@ let _experimentSurfaceHost = null;
  * signature.
  */
 function _mountExperimentRunSurface(host, state, actions, context) {
-  host._experimentSurface = "modern";
+  // The run surface (submit/progress/cell grid) lives in the Experiment
+  // Manager popup, not the control panel. The panel host keeps a compact
+  // launcher; the 1.2s watcher re-renders it only when its signature moves.
+  var pg = state && state.playground;
+  var controller = pg && pg._experimentController;
+  var st = controller ? controller.getState() : null;
+  var experimentId = pg && pg._activeExperimentId ? pg._activeExperimentId : "";
+  var sig = [
+    "launcher", experimentId, st ? st.status || "" : "",
+    st ? JSON.stringify(st.counts || {}) : "", st ? st.total || 0 : 0,
+  ].join("~");
+  if (host._launcherSignature === sig) return;
+  host._launcherSignature = sig;
+  host._experimentSurface = "launcher";
   while (host.firstChild) host.removeChild(host.firstChild);
-  host.appendChild(renderModernExperimentSection(state, actions, context || {}));
+  var wrap = document.createElement("div");
+  wrap.className = "comfymodal-studio-experiment-launcher";
+  var status = document.createElement("p");
+  status.className = "comfymodal-studio-experiment-launcher-status";
+  status.setAttribute("data-testid", "experiment-launcher-status");
+  status.textContent = experimentId && st
+    ? ("Experiment " + experimentId + " · " + formatExperimentProgress(st.counts, st.total))
+    : "No active experiment.";
+  wrap.appendChild(status);
+  var openBtn = document.createElement("button");
+  openBtn.className = "comfymodal-secondary-btn";
+  openBtn.setAttribute("data-testid", "experiment-manager-open");
+  openBtn.textContent = "Open experiment manager";
+  openBtn.addEventListener("click", function () {
+    openExperimentManager(state, actions, context || {});
+  });
+  wrap.appendChild(openBtn);
+  host.appendChild(wrap);
+}
+
+// ── Experiment Manager popup ───────────────────────────────────────
+// Body-level modal hosting the run surface (submit/progress/cell grid).
+// The mounted section self-registers for live sync while connected.
+
+var _experimentManagerEl = null;
+
+function _experimentManagerKeydown(e) {
+  if (e && e.key === "Escape") closeExperimentManager();
+}
+
+export function closeExperimentManager() {
+  if (_experimentManagerEl && _experimentManagerEl.isConnected) _experimentManagerEl.remove();
+  _experimentManagerEl = null;
+  document.removeEventListener("keydown", _experimentManagerKeydown);
+}
+
+export function openExperimentManager(state, actions, context) {
+  var ctx = context || _modernContext;
+  if (context) _modernContext = context;
+  closeExperimentManager();
+  var overlay = document.createElement("div");
+  overlay.className = "comfymodal-studio-experiment-manager-overlay";
+  overlay.setAttribute("data-testid", "experiment-manager");
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-label", "Experiment manager");
+  overlay.addEventListener("click", function (e) {
+    if (e.target === overlay) closeExperimentManager();
+  });
+  var panel = document.createElement("div");
+  panel.className = "comfymodal-studio-experiment-manager";
+  var head = document.createElement("div");
+  head.className = "comfymodal-studio-experiment-manager-head";
+  var title = document.createElement("h3");
+  title.className = "comfymodal-studio-experiment-manager-heading";
+  title.textContent = "Experiment Manager";
+  head.appendChild(title);
+  var summary = document.createElement("span");
+  summary.className = "comfymodal-studio-experiment-manager-summary";
+  summary.setAttribute("data-testid", "experiment-manager-summary");
+  head.appendChild(summary);
+  var closeBtn = document.createElement("button");
+  closeBtn.className = "comfymodal-secondary-btn";
+  closeBtn.setAttribute("data-testid", "experiment-manager-close");
+  closeBtn.textContent = "Close";
+  closeBtn.addEventListener("click", closeExperimentManager);
+  head.appendChild(closeBtn);
+  panel.appendChild(head);
+  var bar = document.createElement("div");
+  bar.className = "comfymodal-studio-experiment-manager-progress";
+  bar.setAttribute("data-testid", "experiment-manager-progress");
+  bar.setAttribute("role", "progressbar");
+  bar.setAttribute("aria-valuemin", "0");
+  var fill = document.createElement("div");
+  fill.className = "comfymodal-studio-experiment-manager-progress-fill";
+  fill.setAttribute("data-testid", "experiment-manager-progress-fill");
+  bar.appendChild(fill);
+  panel.appendChild(bar);
+  var host = document.createElement("div");
+  host.setAttribute("data-testid", "experiment-manager-surface");
+  host.appendChild(renderModernExperimentSection(state, actions, ctx));
+  panel.appendChild(host);
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  _experimentManagerEl = overlay;
+  // The section synced during construction, while still detached from the
+  // overlay — its modal summary/progress lookup found nothing. Re-sync now
+  // that the mount is connected.
+  var section = host.querySelector('[data-testid="experiment-v2-section"]');
+  if (section) delete section._experimentSignature;
+  _updateExperimentSectionMounts(state);
+  closeBtn.focus();
+  document.addEventListener("keydown", _experimentManagerKeydown);
 }
 
 export function renderExperimentMode(state, actions, context) {

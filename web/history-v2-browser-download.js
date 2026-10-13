@@ -22,7 +22,8 @@
 // ── Variant vocabulary ───────────────────────────────────────────────────
 
 const VARIANT_LABELS = {
-  preview: "Download Preview",
+  preview: "Download Data Saver",
+  data_saver: "Download Data Saver",
   original: "Download Original",
   thumbnail: "Download Thumbnail",
 };
@@ -134,7 +135,8 @@ function _makeButton(attrs) {
 export function buildManagedAssetDownloadButton(opts) {
   const o = opts || {};
   if (!o.url) return null;
-  const variant = o.variant === "original" || o.variant === "thumbnail" ? o.variant : "preview";
+  const rawVariant = String(o.variant || "").toLowerCase();
+  const variant = rawVariant === "original" || rawVariant === "thumbnail" ? rawVariant : "data_saver";
   const label = o.label || VARIANT_LABELS[variant];
   let inFlight = false;
 

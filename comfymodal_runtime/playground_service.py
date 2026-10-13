@@ -37,9 +37,10 @@ try:
         ExecutionOptions,
         ExecutionPlan,
         normalize_output_intent_options,
+        normalize_output_mode,
     )
 except ImportError:
-    from contracts import ExecutionOptions, ExecutionPlan, normalize_output_intent_options  # noqa: F401
+    from contracts import ExecutionOptions, ExecutionPlan, normalize_output_intent_options, normalize_output_mode  # noqa: F401
 
 _log = logging.getLogger(__name__)
 
@@ -212,7 +213,7 @@ def _default_build_execution_plan(
     from workflow_metadata import extract_model_stack, prompt_sha256
 
     effective_modal_options = normalize_output_intent_options(modal_options)
-    output_mode = str(effective_modal_options.get("output_mode", "original"))
+    output_mode = normalize_output_mode(effective_modal_options.get("output_mode", "original"))
 
     # ── 0. Validate controls against snapshot schemas ──
     schemas = derive_control_schemas_from_snapshot(snapshot)
@@ -615,8 +616,23 @@ def _sync_materialize(
         result["_local_primary_output"] = primary
     descriptors = result.get("asset_descriptors", []) if isinstance(result, dict) else []
     workspace_id = str((workspace or {}).get("id", ""))
-    result_mode = str((result or {}).get("output_mode", "original") or "original")
-    result_variant = str((result or {}).get("variant", result_mode) or result_mode)
+    result_mode = normalize_output_mode(
+        (result or {}).get("output_mode", "original") or "original"
+    )
+    raw_result_variant = str(
+        (result or {}).get("variant", result_mode) or result_mode
+    ).strip().lower()
+    result_variant = (
+        "thumbnail"
+        if raw_result_variant == "thumbnail"
+        else normalize_output_mode(raw_result_variant)
+    )
+    if isinstance(result, dict):
+        result["output_mode"] = result_mode
+        result["variant"] = result_variant
+        result["served_variant"] = (
+            result_variant if result_variant != "thumbnail" else result_mode
+        )
     derivative_asset_ids: list[str] = []
     if isinstance(descriptors, list) and workspace_id:
         try:
@@ -629,10 +645,15 @@ def _sync_materialize(
                 backend_path = str(descriptor.get("backend_path") or descriptor.get("path") or "")
                 if not asset_id or not backend_path:
                     continue
-                descriptor_variant = str(
+                raw_descriptor_variant = str(
                     descriptor.get("variant")
                     or descriptor.get("output_mode")
                     or result_variant
+                )
+                descriptor_variant = (
+                    "thumbnail"
+                    if raw_descriptor_variant.strip().lower() == "thumbnail"
+                    else normalize_output_mode(raw_descriptor_variant)
                 )
                 leases.register_asset(
                     asset_id=asset_id,
@@ -1007,6 +1028,9 @@ class PlaygroundService:
             "output_paths": output_paths,
             "output_path": output_paths[0] if output_paths else "",
             "primary_asset_id": meta.get("primary_asset_id", ""),
+            "output_mode": result.get("output_mode", "original") if isinstance(result, dict) else "original",
+            "variant": result.get("variant", "original") if isinstance(result, dict) else "original",
+            "served_variant": result.get("served_variant", "original") if isinstance(result, dict) else "original",
             "timings": timings,
             "trace": copy.deepcopy(result.get("trace", {})) if isinstance(result, dict) else {},
             "meta": meta,

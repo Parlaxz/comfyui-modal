@@ -18,6 +18,7 @@ function syncKindForMutation(path, method) {
   if (method === "GET" || method === "HEAD") return null;
   if (
     path === "/studio/run" ||
+    path === "/studio/run_batch" ||
     path === "/studio/experiment-v2" ||
     /^\/(?:history-v2|run-history|experiments)(?:\/|$)/.test(path)
   ) return "history";
@@ -68,6 +69,75 @@ export async function runStudioWorkflow(apiBase, payload) {
 
 export async function getStudioRunStatus(apiBase, id) {
   return apiFetch(apiBase, `/experiments/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Submit a Studio queue batch and stream per-variant completions.
+ * The route answers with NDJSON (one JSON object per line): prep-failure
+ * entries, batch_start, one single-shaped ok/error entry per variant AS EACH
+ * IMAGE LANDS, then a final batch_result summary.  onEvent is awaited per
+ * line so the caller can apply results incrementally.  Returns a transport
+ * summary ({ok: true} or {ok: false, message}).
+ */
+export async function runStudioBatchStream(apiBase, payload, onEvent) {
+  let res;
+  try {
+    res = await fetch(`${apiBase}/studio/run_batch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    return { ok: false, message: (err && err.message) || "Batch request failed." };
+  }
+  if (!res.ok || !res.body) {
+    let message = "Batch run failed.";
+    try {
+      const data = await res.json();
+      if (data && data.message) message = data.message;
+    } catch {}
+    return { ok: false, status: res.status, message };
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        let event = null;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (event && onEvent) await onEvent(event);
+      }
+    }
+  } catch (err) {
+    return { ok: false, message: (err && err.message) || "Batch stream interrupted." };
+  }
+  return { ok: true };
+}
+
+/**
+ * Cooperative batch cancellation. Without variantRequestId the batch stops
+ * after its current variant; with one, that pending variant is skipped (the
+ * caller should requeue it). A running variant always finishes.
+ */
+export async function cancelStudioBatch(apiBase, payload) {
+  const data = await apiFetch(apiBase, "/studio/batch_cancel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return data;
 }
 
 /**

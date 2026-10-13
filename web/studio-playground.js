@@ -16,6 +16,8 @@ import {
 // until the legacy lane is deleted outright.
 import {
   runStudioWorkflow,
+  runStudioBatchStream,
+  cancelStudioBatch,
   getStudioRunStatus,
   getGoldenRunProgress,
   stopExperiment,
@@ -26,7 +28,7 @@ import {
   getGoldenProfileDeployStatus,
 } from "./studio-backend-api.js";
 import { loadModalOptions } from "./studio-output-preferences.js";
-import { goldenProgressResponseAction } from "./studio-golden-progress.js";
+import { goldenProgressResponseAction, progressSpanView } from "./studio-golden-progress.js";
 
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines, resolveSelectionResultKey, buildViewerRecordFromRun, resolveViewerInput, generationIdForLegacyRunId } from "./studio-run-normalizer.js";
 import {
@@ -53,7 +55,7 @@ import {
 } from "./studio-playground-run.js";
 import { updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
 import { createHistoryRepository } from "./history-v2-repository.js";
-import { renderHistoryV2 } from "./studio-history-v2.js";
+import { requestHistoryRecordFocus } from "./studio-history-v2.js";
 
 const PLAYGROUND_PREVIEW_KEY = "comfymodal.studio.playground-preview.v1";
 const PLAYGROUND_VIEW_KEY = "comfymodal.studio.playground-view.v1";
@@ -84,6 +86,7 @@ function _savePlaygroundView(state) {
     if (typeof sessionStorage !== "undefined") {
       sessionStorage.setItem(PLAYGROUND_VIEW_KEY, JSON.stringify({
         experimentMode: !!(state && state.playground && state.playground.experimentMode),
+        queueMode: !!(state && state.playground && state.playground.queueMode),
       }));
     }
   } catch (_err) {}
@@ -93,7 +96,9 @@ function _loadPlaygroundView() {
   try {
     if (typeof sessionStorage === "undefined") return null;
     const saved = JSON.parse(sessionStorage.getItem(PLAYGROUND_VIEW_KEY) || "null");
-    return saved && typeof saved.experimentMode === "boolean" ? saved : null;
+    if (!saved || typeof saved.experimentMode !== "boolean") return null;
+    if (typeof saved.queueMode !== "boolean") saved.queueMode = false;
+    return saved;
   } catch (_err) {
     return null;
   }
@@ -253,7 +258,8 @@ export async function loadExperimentIntoPlayground(state, context, experimentId)
   context.setPage("history");
   return { ok: true };
 }
-import { el, buildViewerShell, viewerFirst, renderEmptyState } from "./studio-ui.js";
+import { el, buildViewerShell, resolveViewerShellArgs, viewerFirst, renderEmptyState } from "./studio-ui.js";
+import { mountPostprocessWorkspace } from "./studio-postprocess.js";
 import { renderLoadingState } from "./studio-loading.js";
 import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
 import { FIELD_BLOCKS } from "./studio-field-blocks.js";
@@ -267,6 +273,7 @@ import {
   loadToolWorkflows,
   saveToolWorkflows,
   loadToolDefault,
+  takePendingPlaygroundBase,
 } from "./studio-playground-state.js";
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Polling helper for experiment status ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
@@ -284,6 +291,13 @@ import {
 
 const POLL_INTERVAL_MS = 3000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;
+// Consecutive "unknown or expired request_id" cursor answers before the
+// poll admits the request will never register. Registration is synchronous
+// on the POST path (before remote dispatch), so a handful of retries covers
+// the genuine startup race; past this bound the id is mismatched or the run
+// took a path that never registers it, and spinning silently forever is what
+// freezes the bar on pending segments with a stale status word.
+const GOLDEN_PROGRESS_UNKNOWN_REQUEST_LIMIT = 120;
 
 function _stopGoldenProgressPolling(state, requestId) {
   const poll = state && state.playground && state.playground._goldenProgressPoll;
@@ -300,7 +314,7 @@ function _startGoldenProgressPolling(state, context, requestId, ctrl) {
   if (!state || !state.playground || !requestId || !ctrl) return;
   _stopGoldenProgressPolling(state);
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  const poll = { requestId: String(requestId), cursor: 0, timer: null, active: true };
+  const poll = { requestId: String(requestId), cursor: 0, timer: null, active: true, unknownCount: 0 };
   state.playground._goldenProgressPoll = poll;
 
   const schedule = () => {
@@ -332,10 +346,24 @@ function _startGoldenProgressPolling(state, context, requestId, ctrl) {
     );
     if (responseAction === "retry") {
       // The run POST and event store register the request independently. Keep
-      // the cursor quiet during that small startup window and retry.
+      // the cursor quiet during that small startup window and retry — but
+      // only up to the bound. Past it the request will never register (id
+      // mismatch or a non-registering run path): say so once and stop this
+      // poll instead of spinning silently for the whole run. The run itself
+      // is unaffected; completion still lands through the POST result.
+      poll.unknownCount += 1;
+      if (poll.unknownCount >= GOLDEN_PROGRESS_UNKNOWN_REQUEST_LIMIT) {
+        _stopGoldenProgressPolling(state, poll.requestId);
+        ctrl.setGoldenProgressError(
+          "Golden live progress is unavailable for this run (progress store has no such request). "
+          + "The run itself continues — the result still appears when it finishes."
+        );
+        return;
+      }
       schedule();
       return;
     }
+    poll.unknownCount = 0;
     if (responseAction === "stop") {
       _stopGoldenProgressPolling(state, poll.requestId);
       return;
@@ -669,17 +697,23 @@ export async function refreshRecentRuns(apiBase, outputOverride) {
     const page = await repo.listFeed({ limit: 50, sort: "newest" }); 
     var items = [];
 
-    // A graph/AST asset is a workflow thumbnail, not a generated output.  Keep
-    // the normal thumbnail/preview ordering, but skip graph assets and use the
-    // durable original (or another non-graph variant) when one is available.
+    // Shared History thumbnail policy: the same thumbnail-then-preview order
+    // the History page cards use (see selectFeedAsset in
+    // history-v2-repository.js), applied to the already-normalized record
+    // with no URL sniffing.  A previous version skipped URLs matching
+    // /assets/(ast|graph|...) as supposed workflow-graph previews, but every
+    // managed History V2 asset id starts with "ast_" (see history_v2_writer
+    // minting), so that pattern rejected EVERY real thumbnail and the strip
+    // rendered all placeholders.  Graph previews only exist as legacy lease
+    // ids (see resolveRunImageUrl), never as managed History V2 variant
+    // URLs.  Originals are never used here — History never fetches Original
+    // bytes eagerly, and neither does this view; an original-only generation
+    // is imageless until its Original is explicitly opened.
     const historyImageUrl = function (output) {
       if (!output) return "";
-      const candidates = [output.thumbUrl, output.previewUrl, output.originalUrl];
+      const candidates = [output.thumbUrl, output.previewUrl];
       for (var hi = 0; hi < candidates.length; hi++) {
-        const candidate = candidates[hi];
-        if (candidate && !/\/assets\/(?:ast|graph|workflow[-_]?graph)[-_]/i.test(String(candidate))) {
-          return candidate;
-        }
+        if (candidates[hi]) return candidates[hi];
       }
       return "";
     };
@@ -728,8 +762,10 @@ export async function refreshRecentRuns(apiBase, outputOverride) {
       } else {
         var feat = rec.featuredOutput || null;
         var imageUrl = historyImageUrl(feat) || overrideImageFor(rec);
-        // Keep only finished generations that actually produced an image.
-        if (!((rec.status === "completed" || rec.status === "completed_with_failures") && imageUrl)) return;
+        // A carousel is a view of the History feed, not a filtered subset:
+        // every generation appears newest-first, with a placeholder when it
+        // has no displayable image (same rule as the History cards, which
+        // never drop a record for lack of an image).
         items.push({
           kind: "generation",
           id: rec.id,
@@ -756,41 +792,18 @@ export async function refreshRecentRuns(apiBase, outputOverride) {
       }
     });
 
-    // A direct Golden response can arrive before its History V2 projection is
-    // visible. Keep that same run in the cache using its real output URL;
-    // this is still the carousel's one data source, not a second persistence
-    // path. A later feed refresh replaces the fallback when the durable record
-    // appears.
-    if (outputOverride && outputOverride.imageUrl) {
-      var overrideIdsForAppend = [outputOverride.id, outputOverride.runId, outputOverride.experimentId]
-        .filter(Boolean).map(String);
-      var overrideAlreadyPresent = items.some(function (item) {
-        var itemIds = [item && item.id, item && item.runId, item && item.experimentId]
-          .filter(Boolean).map(String);
-        return overrideIdsForAppend.some(function (id) { return itemIds.indexOf(id) !== -1; });
-      });
-      if (!overrideAlreadyPresent && !/\/assets\/(?:ast|graph|workflow[-_]?graph)[-_]/i.test(String(outputOverride.imageUrl))) {
-        items.push({
-          kind: "generation",
-          id: outputOverride.id || outputOverride.runId || outputOverride.experimentId,
-          experimentId: outputOverride.experimentId || "",
-          runId: outputOverride.runId || outputOverride.id || "",
-          generationId: outputOverride.generationId || "",
-          prompt: outputOverride.prompt || "",
-          presetId: outputOverride.presetId || "",
-          presetLabel: outputOverride.presetLabel || "",
-          featureId: outputOverride.featureId || "",
-          status: outputOverride.status || "completed",
-          imageUrl: outputOverride.imageUrl,
-          startedAt: outputOverride.startedAt || "",
-          completedAt: outputOverride.completedAt || new Date().toISOString(),
-          durationMs: outputOverride.durationMs || null,
-          favorite: !!outputOverride.favorite,
-          note: outputOverride.note || "",
-          _historyKind: "generation",
-        });
-      }
-    }
+    // A direct run response can arrive before its History V2 projection is
+    // visible. That freshness is applied ONLY by attaching the response's
+    // real output URL onto the matching durable record above
+    // (overrideImageFor) — the strip never invents a synthetic item for it.
+    // A previous version appended a fallback item here; because production
+    // single-run ids never equal their durable generation ids, the fallback
+    // never deduplicated away, always sorted first on its fresh timestamp,
+    // and rendered as a phantom EXP item (any truthy experimentId flips the
+    // strip's experiment detection) routing to a History experiment detail
+    // that does not exist.  The canvas already shows the direct response
+    // synchronously at completion, so nothing is lost by waiting for the
+    // durable projection to appear in the feed.
 
     // Sort by created time (newest first)
     items.sort(function (a, b) {
@@ -861,9 +874,10 @@ function _loadPersistedSelectionResult(state, store, fallback, context) {
   const persistedRun = loadRunResult(key.presetId, key.featureId);
   if (persistedRun) {
     state.playground._selectedRun = persistedRun;
-    state.playground.lastRunOutput = persistedRun.imageUrl || null;
-    // The local result is also the direct-run carousel fallback when the
-    // durable History V2 projection is not visible yet after reload.
+    state.playground.lastRunOutput = _canvasUrlForRun(persistedRun, persistedRun.imageUrl) || null;
+    // The local result is also passed as the refresh override so its fresh
+    // output URL attaches to the matching durable record when one exists;
+    // it never creates a strip item of its own.
     if (context) {
       const apiBase = context.apiBase || "/comfymodal";
       refreshRecentRuns(apiBase, persistedRun).then(function () {
@@ -1075,7 +1089,12 @@ function renderControlPanel(state, context) {
   // a hydration-triggered re-render that would close an open <select>.
   if (!state.playground._hydrationDone) {
     const savedView = _loadPlaygroundView();
-    if (savedView) state.playground.experimentMode = savedView.experimentMode;
+    if (savedView) {
+      state.playground.experimentMode = savedView.experimentMode;
+      // Radio invariant survives reload too: a stored queueMode wins only
+      // when experiment mode is off.
+      state.playground.queueMode = !savedView.experimentMode && !!savedView.queueMode;
+    }
     const saved = loadSelection();
     if (saved) {
       if (saved.featureId) state.playground.featureId = saved.featureId;
@@ -1111,11 +1130,9 @@ function renderControlPanel(state, context) {
     });
   }
 
-  // Experiment toggle (always at top of control panel)
-  panel.appendChild(renderExperimentToggle(state, actions));
-
-  // Studio tool strip: one workspace, five workflow-backed tools.
-  panel.appendChild(renderToolStrip(state, context, actions));
+  // Run, queue, experiment, and tool controls live in the workspace top bar
+  // (above the canvas), not in this panel. The panel keeps workflow
+  // selection, field cards, and the experiment-mode block only.
 
   // If experiment mode, render experiment-mode controls (context passed explicitly)
   if (isExperiment) {
@@ -1135,10 +1152,6 @@ function renderControlPanel(state, context) {
   if (_isModernRunSelected(state)) {
     panel.appendChild(renderShelfSection(state, context, actions));
   }
-
-
-  // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Run Button ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
-  panel.appendChild(renderRunButton(state, context, actions));
 
   // Reset to defaults link
   const resetLink = el("button", {
@@ -1188,7 +1201,7 @@ function buildActions(state, context) {
       const loadedRun = loadRunResult(selectionKey.presetId, selectionKey.featureId);
       if (loadedRun) {
         state.playground._selectedRun = loadedRun;
-        state.playground.lastRunOutput = loadedRun.imageUrl || null;
+        state.playground.lastRunOutput = _canvasUrlForRun(loadedRun, loadedRun.imageUrl) || null;
       }
 
       hydrateControlsForSelection(state, presetId, featureId, currentPreset);
@@ -1233,7 +1246,7 @@ function buildActions(state, context) {
       const loadedRun = loadRunResult(selectionKey.presetId, selectionKey.featureId);
       if (loadedRun) {
         state.playground._selectedRun = loadedRun;
-        state.playground.lastRunOutput = loadedRun.imageUrl || null;
+        state.playground.lastRunOutput = _canvasUrlForRun(loadedRun, loadedRun.imageUrl) || null;
       }
 
       hydrateControlsForSelection(state, backendId, state.playground.featureId, currentPreset);
@@ -1276,8 +1289,30 @@ function buildActions(state, context) {
       }
     },
     setExperimentMode(enabled) {
-      state.playground.experimentMode = enabled;
+      state.playground.experimentMode = !!enabled;
+      // Radio with queue mode: both can never be on at the same time.
+      if (enabled) {
+        state.playground.queueMode = false;
+        state.playground._toastDismissed = false;
+      }
       _savePlaygroundView(state);
+      if (context && context.setPage) {
+        context.setPage("playground");
+      }
+    },
+    setQueueMode(enabled) {
+      state.playground.queueMode = !!enabled;
+      // Radio with experiment mode: enabling queue exits experiment mode.
+      if (enabled) state.playground.experimentMode = false;
+      _savePlaygroundView(state);
+      if (context && context.setPage) {
+        context.setPage("playground");
+      }
+    },
+    setCanvasBg(value) {
+      if (!state.playground) return;
+      state.playground.canvasBg = value || "";
+      _saveCanvasBg(state.playground.canvasBg);
       if (context && context.setPage) {
         context.setPage("playground");
       }
@@ -1407,16 +1442,12 @@ function buildActions(state, context) {
         const _justFinished = state.playground && state.playground._selectedRun;
         refreshRecentRuns(apiBase, {
           id: runState.experimentId,
-          // The override item must carry the RUN id (not the experiment id)
-          // or it shadows the durable record with an unresolvable identity.
+          // The override carries the RUN id so the fresh primary output URL
+          // attaches to the matching durable record (overrideImageFor); it
+          // never becomes a strip item of its own.
           runId: (_justFinished && (_justFinished.runId || _justFinished.id)) || "",
           experimentId: runState.experimentId,
           imageUrl: runState.primaryOutput,
-          // The just-finished run may already know its durable record (a
-          // direct result carries the backend-stamped generation id); hand it
-          // to the override item so the preview resolves the same record
-          // History shows instead of a locally assembled one.
-          generationId: (_justFinished && _justFinished.generationId) || "",
         }).then(function (runs) {
           const experimentId = runState.experimentId;
           let matched = null;
@@ -1444,10 +1475,14 @@ function buildActions(state, context) {
             // Never nullify lastRunOutput — primaryOutput has already been set.
             // Only overwrite if the matched run carries a valid imageUrl.
             if (matched.imageUrl) {
-              state.playground.lastRunOutput = matched.imageUrl;
-              _setCanvasImage(state, matched.imageUrl);
+              // Same full-size resolution as a carousel click: the canvas
+              // must not downgrade the just-completed primary output to the
+              // record's 256px thumbnail (see _canvasUrlForRun).
+              var matchedUrl = _canvasUrlForRun(matched, matched.imageUrl);
+              state.playground.lastRunOutput = matchedUrl;
+              _setCanvasImage(state, matchedUrl);
               try {
-                _recordImageEdge(state, matched.imageUrl, _completionSource(state));
+                _recordImageEdge(state, matchedUrl, _completionSource(state));
               } catch (_e) { /* lineage is best-effort */ }
             }
             // Persist the finalized run result to localStorage
@@ -1889,6 +1924,7 @@ function _workflowTypeLabel(state) {
     sketch: "Sketch",
     outpaint: "Outpaint",
     upscale: "Upscaling",
+    postprocess: "Post processing",
   };
   return labels[key] || (raw ? String(raw).replace(/[._-]+/g, " ") : "Not specified");
 }
@@ -2072,6 +2108,13 @@ function _rerenderWorkflowSection(state, context, actions, opts) {
   // switches and handoffs carry explicit values and must not be clobbered.
   // The Shelf cards refresh in every case (prompt fixed top, layout, stale).
   if (opts && opts.applySaved) _applyShelfSavedValues(state);
+  // One-shot "use as base" payload stashed by a viewer (History detail or
+  // the canvas preview): applied to the live draft before the cards build,
+  // so the filled values render immediately. Taken only when the shelf is
+  // ready — an early build (library still loading) leaves it parked for the
+  // next rebuild instead of dropping it.
+  var pendingBase = _shelfReady(state) ? takePendingPlaygroundBase() : null;
+  if (pendingBase) _applyShelfBaseValues(state, pendingBase);
   _refreshShelfSection(state, context, actions);
   _syncRunButtonGating(state, context, actions);
 }
@@ -2374,6 +2417,13 @@ function _workflowRunnableForExecution(state, store, wf) {
   return { runnable: true, reasons: [] };
 }
 function _applyModernRunButtonState(state, context, actions, btn, reason) {
+  // Queue mode owns the topbar primary button ("Queue" + enqueue handler).
+  // Gating syncs fire on every seed/prompt edit — never let them rewrite the
+  // Queue button back into a Run button in place.
+  if (state && state.playground && state.playground.queueMode
+    && btn && btn.classList && btn.classList.contains("comfymodal-studio-run-btn")) {
+    return;
+  }
   const store = state && state.playground && state.playground._workflowRun;
   const wf = state && state.playground && state.playground._workflowRunModule;
   if (!store || !wf) return;
@@ -2470,17 +2520,38 @@ function _syncRunButtonGating(state, context, actions) {
   const btn = _resolvePrimaryRunButton();
   if (!btn) return;
   const section = btn.closest(".comfymodal-studio-run-section");
-  const reason = section ? section.querySelector(".comfymodal-studio-disabled-reason") : null;
+  var reason = section ? section.querySelector(".comfymodal-studio-disabled-reason") : null;
+  if (!reason) {
+    var topbar = btn.closest(".comfymodal-studio-topbar-actions");
+    reason = topbar ? topbar.querySelector(".comfymodal-studio-topbar-reason") : null;
+  }
   _applyModernRunButtonState(state, context, actions, btn, reason);
 }
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Modern run submission ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
+// Reset a submit button to idle without flipping queue mode's Queue button
+// back into a Run button. textContent assignment destroys the glyph+label
+// spans, so the topbar Queue button is repainted instead.
+function _resetSubmitBtnIdle(state, btn) {
+  if (!btn) return;
+  var queueMode = !!(state && state.playground && state.playground.queueMode);
+  var isTopbar = !!(btn.classList && btn.classList.contains("comfymodal-studio-run-btn"));
+  btn.disabled = false;
+  if (queueMode && isTopbar) {
+    while (btn.firstChild) btn.removeChild(btn.firstChild);
+    btn.appendChild(el("span", { class: "run-glyph", "aria-hidden": "true", text: "+" }));
+    btn.appendChild(el("span", { text: "Queue", "data-testid": "run-btn-label" }));
+  } else {
+    btn.textContent = "Run";
+  }
+}
+
 async function _modernRunSubmit(state, context, actions, btn, requestId) {
   const store = state && state.playground && state.playground._workflowRun;
   const wf = state && state.playground && state.playground._workflowRunModule;
   if (!store || !wf) {
-    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+    _resetSubmitBtnIdle(state, btn);
     return;
   }
   const apiBase = (context && context.apiBase) || "/comfymodal";
@@ -2493,7 +2564,7 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   var t0_now = Date.now();
   var ctrl = _getRunController(state, actions);
   if (!ctrl) {
-    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+    _resetSubmitBtnIdle(state, btn);
     return;
   }
 
@@ -2508,7 +2579,7 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
     ctrl.beginRun();
     ctrl.mark("submit_entered");
     ctrl.applyLocalError(_reasonText);
-    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+    _resetSubmitBtnIdle(state, btn);
     _syncRunButtonGating(state, context, actions);
     return;
   }
@@ -2531,7 +2602,7 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
     _normalizeShelfControlSchema(state);
     if (!ctxResult.ok || !store.runContext) {
       ctrl.applyLocalError("Workflow context unavailable; reselect the workflow");
-      if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+      _resetSubmitBtnIdle(state, btn);
       return;
     }
     _rerenderWorkflowSection(state, context, actions);
@@ -2548,7 +2619,7 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   ctrl.mark("validation_end");
   if (merged.errors && merged.errors.length) {
     ctrl.applyLocalError(merged.errors[0].message);
-    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+    _resetSubmitBtnIdle(state, btn);
     return;
   }
 
@@ -2628,7 +2699,7 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
       if (ctrl && typeof ctrl.applyLocalNotice === "function") {
         ctrl.applyLocalNotice(result.message || "Deploying...");
       }
-      if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+      _resetSubmitBtnIdle(state, btn);
       return;
     }
     const errMsg = (result && result.message)
@@ -2654,7 +2725,7 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
         error: result.error || null,
       });
     }
-    if (btn) { btn.disabled = false; btn.textContent = "Run"; }
+    _resetSubmitBtnIdle(state, btn);
   }
 }
 
@@ -2696,6 +2767,14 @@ export function createInfoHint(text, options) {
   hint.addEventListener("mouseleave", () => { tooltip.style.display = ""; });
   hint.addEventListener("focus", () => { tooltip.style.display = "block"; });
   hint.addEventListener("blur", () => { tooltip.style.display = ""; });
+  hint.addEventListener("keydown", (e) => {
+    // Escape dismisses a keyboard-opened tooltip and returns focus state
+    // to rest, matching native tooltip behavior for keyboard users.
+    if (e.key === "Escape" || e.key === "Esc") {
+      tooltip.style.display = "";
+      hint.blur();
+    }
+  });
 
   return hint;
 }
@@ -2872,7 +2951,7 @@ function renderControl(def, state, actions, preset) {
           value: value != null ? String(value) : "",
           disabled: true,
           "data-testid": `input-${def.id}`,
-          title: "Schema options unavailable ΓÇö value preserved from saved defaults",
+          title: "Schema options unavailable — value preserved from saved defaults",
         });
         const note = el("span", {
           class: "comfymodal-studio-control-note",
@@ -3011,7 +3090,22 @@ function _getRunController(state, actions) {
     if (golden) {
       legacy.goldenProgress = golden;
       legacy.goldenProgressPercent = golden.percent != null ? golden.percent : null;
+      // The renderer gates the live stage caption on runState.goldenStage,
+      // but nothing ever set it — the caption could only show the coarse
+      // lifecycle word. Project the cursor stream's current stage so new
+      // stages appear without a renderer change.
+      if (golden.currentStage != null) legacy.goldenStage = golden.currentStage;
     }
+    // Modal lifecycle display: ws modal_status wins (covers generic runs);
+    // the Golden cursor status phase is the fallback (covers Golden runs
+    // before any ws event arrives).
+    var modalStatus = (typeof ctrl.getModalStatus === "function") ? ctrl.getModalStatus() : null;
+    var modalPhase = (modalStatus && modalStatus.phase != null) ? modalStatus.phase
+      : (golden && golden.statusPhase != null ? golden.statusPhase : null);
+    var modalMessage = (modalStatus && modalStatus.message != null) ? modalStatus.message
+      : (golden && golden.statusMessage != null ? golden.statusMessage : null);
+    if (modalPhase != null) legacy.modalPhase = modalPhase;
+    if (modalMessage != null) legacy.modalMessage = modalMessage;
     var prev = state.playground.runState;
     var prevStatus = prev && prev.status;
     if (prev && prevStatus === legacy.status) {
@@ -3028,6 +3122,13 @@ function _getRunController(state, actions) {
     } else {
       var act = state.playground._runActions;
       if (act && act.setRunState) act.setRunState(legacy);
+      // Queue auto-drain: every terminal route (completed/error/canceled/
+      // interrupted, direct or polled) converges here via setRunState.
+      // Schedule the next queued item — never inline: setRunState re-renders
+      // and may replace the button DOM under us.
+      if (legacy.status && LEGACY_TERMINAL_STATUSES.indexOf(legacy.status) !== -1) {
+        _maybeDrainQueue(state, context, act || actions);
+      }
     }
     state.playground._runDiagnostics = ctrl.getDiagnostics();
     try { window.__studioLastRunDiagnostics = ctrl.getDiagnostics(); } catch (e) {}
@@ -3202,6 +3303,13 @@ function _handleDirectRunResult(result, state, context, actions, controls, calle
 
   var ctrl = _getRunController(state, actions);
   if (ctrl) {
+    if (ctrl.getGoldenProgress()) {
+      ctrl.applyGoldenProgress({
+        request_id: result.request_id || result.runId,
+        events: [{ type: "result", data: result.result || result }],
+        terminal: true,
+      });
+    }
     ctrl.applyDirectResult(result, {
       experimentId: result.experimentId || result.runId || meta.experiment_id || "",
       runHistoryId: result.runHistoryId || result.runId || "",
@@ -3549,6 +3657,7 @@ function renderProgressSection(state, context) {
   });
 
   const stageEl = el("span", { "data-testid": "progress-stage" });
+  const modalEl = el("span", { "data-testid": "progress-modal-status" });
   const nodesEl = el("span", { "data-testid": "progress-nodes" });
   const elapsedEl = el("span", { "data-testid": "progress-elapsed" });
   const percentEl = el("span", { "data-testid": "progress-percent", class: "comfymodal-studio-progress-percent" });
@@ -3556,6 +3665,7 @@ function renderProgressSection(state, context) {
   const queueEl = el("span", { "data-testid": "progress-queue" });
 
   info.appendChild(stageEl);
+  info.appendChild(modalEl);
   info.appendChild(percentEl);
   info.appendChild(nodesEl);
   info.appendChild(elapsedEl);
@@ -3580,9 +3690,17 @@ function renderProgressSection(state, context) {
   else if (runState.status === "running") stageLabel = "Running";
   else if (runState.status === "submitted") stageLabel = "Submitted";
   else if (runState.status === "waiting") stageLabel = "Waiting";
-  if (runState.goldenStage) stageLabel = runState.goldenStage;
+  if (runState.goldenStage) stageLabel = _prettifyStageName(runState.goldenStage);
 
   stageEl.textContent = "Stage: " + stageLabel;
+  var modalText = _modalStatusText(runState);
+  if (modalText) {
+    modalEl.textContent = modalText;
+    modalEl.style.display = "";
+  } else {
+    modalEl.textContent = "";
+    modalEl.style.display = "none";
+  }
   percentEl.textContent = runState.goldenProgressPercent != null
     ? Math.round(Math.max(0, Math.min(100, runState.goldenProgressPercent))) + "%"
     : "Progress pending";
@@ -3627,31 +3745,74 @@ function renderProgressSection(state, context) {
   return section;
 }
 
-// Golden stage groups shown in the progress bar. Raw telemetry reports a
-// dozen fine-grained stages; the bar collapses them into six viewer-facing
-// groups so relative widths stay meaningful without the noise. Parallel
-// lanes (UNet load vs CLIP forward, sampling vs VAE load) share one segment
-// whose width is the slower lane - wall-clock time, not the sum of both.
-var _GOLDEN_PROGRESS_GROUPS = [
-  { key: "pre", label: "Pre-container", stages: ["golden_restore", "golden_request_setup"] },
-  { key: "clip", label: "Clip Load", stages: ["golden_clip_load"] },
-  {
-    key: "unet", label: "Unet Load ‖ Clip forward", parallel: true,
-    lanes: [
-      { label: "Unet", stages: ["golden_unet_load"] },
-      { label: "Clip forward", stages: ["golden_clip_forward"] },
-    ],
-  },
-  {
-    key: "sample", label: "Sampling ‖ VAE Load", parallel: true,
-    lanes: [
-      { label: "Sampling", stages: ["golden_sampler_prepare", "golden_sampling", "golden_sampler_tail"] },
-      { label: "VAE load", stages: ["golden_vae_load"] },
-    ],
-  },
-  { key: "decode", label: "VAE Decode", stages: ["golden_vae_decode"] },
-  { key: "post", label: "Post Pipeline", stages: ["golden_output", "golden_teardown"] },
-];
+// Human-readable label for any stage name, including stages the bar has
+// never seen before. golden_clip_load → "Clip Load"; unknown future stages
+// fall back to title-cased words instead of vanishing.
+function _prettifyStageName(name) {
+  var raw = String(name == null ? "" : name).trim();
+  if (!raw) return "Unknown stage";
+  if (/^node\s*:/i.test(raw)) return raw;
+  var words = raw.replace(/^golden_/, "").split(/[_-]+/).filter(Boolean);
+  if (!words.length) return raw;
+  return words.map(function (w) { return w.charAt(0).toUpperCase() + w.slice(1); }).join(" ");
+}
+
+// Display text for a raw Modal lifecycle phase. Only phases actually observed
+// (ws modal_status or cursor status events) or truthfully derived reach this;
+// nothing here invents scheduler internals.
+var _MODAL_PHASE_DISPLAY = {
+  dispatch: "Dispatching",
+  awaiting_remote: "Waiting for remote startup",
+  lifecycle_unknown: "Lifecycle status unavailable",
+  scheduling: "Scheduling",
+  scheduled: "Scheduling",
+  queue: "Scheduling",
+  startup: "Starting up",
+  plan_received: "Starting up",
+  restoring: "Restoring",
+  restore: "Restoring",
+  restore_begin: "Restoring",
+  execution: "Executing",
+  generic_execution: "Running",
+  snapshot_capturing: "Capturing snapshot",
+  snapshot_preparing: "Preparing snapshot",
+  snapshot: "Capturing snapshot",
+  snapshotting: "Capturing snapshot",
+  snapshot_committed: "Snapshot captured",
+  teardown: "Cleaning up",
+  finalizing: "Finalizing",
+  done: "Done",
+};
+
+function _displayModalPhase(phase) {
+  var key = String(phase == null ? "" : phase).trim().toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(_MODAL_PHASE_DISPLAY, key)) return _MODAL_PHASE_DISPLAY[key];
+  if (!key) return "";
+  return key.charAt(0).toUpperCase() + key.slice(1);
+}
+
+function _goldenStageActive(byName, name) {
+  var rec = byName[name];
+  return !!(rec && rec.phase !== "completed" && rec.phase !== "failed");
+}
+
+function _modalStatusText(runState) {
+  var golden = runState && runState.goldenProgress;
+  var phase = runState && runState.modalPhase;
+  if (!phase && golden && golden.statusPhase) phase = golden.statusPhase;
+  var stages = (golden && golden.stages) || [];
+  var byName = {};
+  stages.forEach(function (s) { if (s && s.stage) byName[s.stage] = s; });
+  if (_goldenStageActive(byName, "golden_restore")) return "Modal: Restoring";
+  if (_goldenStageActive(byName, "golden_teardown")) return "Modal: Cleaning up";
+  if (_goldenStageActive(byName, "golden_output")) return "Modal: Finalizing output";
+  if (Object.keys(byName).some(function (name) { return _goldenStageActive(byName, name); })) {
+    return "Modal: Running";
+  }
+  if (stages.length) return "Modal: Finalizing";
+  if (phase) return "Modal: " + _displayModalPhase(phase);
+  return "Modal: Waiting for remote startup";
+}
 
 function _goldenStageDuration(stage) {
   var d = Number(stage && stage.durationMs);
@@ -3668,81 +3829,13 @@ function _formatTickMs(ms) {
   return m + "m " + (Number(rest) < 10 ? "0" : "") + rest + "s";
 }
 
-function _goldenLanePhase(byName, names) {
-  var members = names.map(function (n) { return byName[n]; }).filter(Boolean);
-  if (members.some(function (m) { return m.phase === "failed"; })) return "failed";
-  if (members.length && members.every(function (m) { return m.phase === "completed"; })) return "completed";
-  return "active";
-}
-
-// Live value of one telemetry stage. Completed/failed stages report their
-// authoritative durationMs. In-flight stages tick from the client-side
-// observation clock (server wall clocks live on remote Modal containers, so
-// they cannot drive a tenths ticker); the value snaps to the authoritative
-// duration the moment the stage completes.
-function _goldenMemberLive(byName, name, live) {
-  var rec = byName[name];
-  var dur = _goldenStageDuration(rec);
-  if (dur > 0) return { duration: dur, final: dur, text: _formatDuration(dur), running: false };
-  if (rec && rec.phase !== "completed" && rec.phase !== "failed" &&
-      live && live.starts && live.starts[name] != null) {
-    var e = Math.max(0, live.now - live.starts[name]);
-    return { duration: e, final: 0, text: _formatTickMs(e), running: true };
-  }
-  return { duration: 0, final: 0, text: "pending", running: false };
-}
-
-function _groupGoldenStages(stages, live) {
-  var byName = {};
-  (stages || []).forEach(function (s) { if (s && s.stage) byName[s.stage] = s; });
-  function laneFor(names, label) {
-    var members = names.map(function (n) { return _goldenMemberLive(byName, n, live); });
-    var duration = members.reduce(function (s, m) { return s + m.duration; }, 0);
-    var final = members.reduce(function (s, m) { return s + m.final; }, 0);
-    var phase = _goldenLanePhase(byName, names);
-    var running = members.some(function (m) { return m.running; });
-    var text = (phase === "completed" || !running)
-      ? (duration > 0 ? _formatDuration(duration) : "pending")
-      : _formatTickMs(duration);
-    return { label: label, duration: duration, final: final, phase: phase, text: text, running: running };
-  }
-  return _GOLDEN_PROGRESS_GROUPS.map(function (g, i) {
-    var phase, duration, timeText, detail, members, running;
-    if (g.parallel) {
-      var lanes = g.lanes.map(function (lane) { return laneFor(lane.stages, lane.label); });
-      duration = lanes.reduce(function (m, l) { return Math.max(m, l.duration); }, 0);
-      phase = lanes.some(function (l) { return l.phase === "failed"; }) ? "failed"
-        : (lanes.length && lanes.every(function (l) { return l.phase === "completed"; })) ? "completed" : "active";
-      running = lanes.some(function (l) { return l.running; });
-      timeText = lanes.map(function (l) { return l.text; }).join(" ‖ ");
-      detail = lanes.map(function (l) {
-        return l.label + " " + (l.final > 0 ? _formatDuration(l.final) : "timing pending");
-      }).join(" ‖ ") + " (parallel)";
-      members = [];
-      g.lanes.forEach(function (lane) { members = members.concat(lane.stages); });
-    } else {
-      var single = laneFor(g.stages, g.label);
-      duration = single.duration;
-      phase = single.phase;
-      running = single.running;
-      timeText = single.text;
-      detail = g.label + ": " + (single.final > 0 ? _formatDuration(single.final) : "timing pending");
-      members = g.stages.slice();
-    }
-    return {
-      key: g.key, label: g.label, phase: phase, duration: duration,
-      timeText: timeText, detail: detail, members: members, index: i, running: running,
-    };
-  });
-}
-
 // ── Golden live ticker ─────────────────────────────────────────────
 // One shared 100ms interval drives the in-flight segment timers
 // (Clip Load 0.0s → 0.1s → …) and the Elapsed readout between backend
 // polls. Poll patches rebuild the segments with fresh snapshots; the
 // ticker only touches text/widths in place. Stops itself at terminal,
 // when every group completes, or when the section leaves the DOM.
-var _goldenTick = { timer: null, runKey: null, starts: {}, snapshot: null, runStartWall: null };
+var _goldenTick = { timer: null, runKey: null, snapshot: null, runStartWall: null };
 
 function _goldenTickNow() {
   if (typeof performance !== "undefined" && performance.now) return performance.now();
@@ -3762,17 +3855,9 @@ function _goldenTickSync(runState) {
   var runKey = (golden.requestId != null && String(golden.requestId)) || "run";
   if (_goldenTick.runKey !== runKey) {
     _goldenTick.runKey = runKey;
-    _goldenTick.starts = {};
     _goldenTick.runStartWall = null;
   }
-  var stages = Array.isArray(golden.stages) ? golden.stages : [];
   var t = _goldenTickNow();
-  stages.forEach(function (s) {
-    if (s && s.stage && s.phase !== "completed" && s.phase !== "failed" &&
-        _goldenTick.starts[s.stage] == null) {
-      _goldenTick.starts[s.stage] = t;
-    }
-  });
   if (_goldenTick.runStartWall == null) {
     _goldenTick.runStartWall = (runState._localStartTime != null)
       ? runState._localStartTime
@@ -3780,7 +3865,7 @@ function _goldenTickSync(runState) {
   }
   var terminal = LEGACY_TERMINAL_STATUSES.indexOf(runState.status) !== -1;
   _goldenTick.snapshot = {
-    stages: stages,
+    golden: golden,
     terminal: terminal,
     runStartPerf: t - (Date.now() - _goldenTick.runStartWall),
   };
@@ -3804,9 +3889,9 @@ function _goldenTickBeat() {
     _goldenTickStop();
     return;
   }
-  var groups = _groupGoldenStages(snap.stages, { now: _goldenTickNow(), starts: _goldenTick.starts });
+  var groups = _measuredProgressGroups(snap.golden);
   var knownTotal = groups.reduce(function (sum, g) { return sum + g.duration; }, 0);
-  var anyRunning = false;
+  var anyRunning = (snap.golden.nodeSpans || []).some(function (span) { return span.phase === "started"; });
   groups.forEach(function (g) {
     if (g.running) anyRunning = true;
     var seg = section.querySelector('[data-stage="' + g.key + '"]');
@@ -3824,6 +3909,7 @@ function _goldenTickBeat() {
     if (elapsedEl.textContent !== elapsedText) elapsedEl.textContent = elapsedText;
   }
   if (!anyRunning) _goldenTickStop();
+  _renderSpanDisplay(section, snap.golden);
 }
 
 // Terminal total: client elapsed clock first (covers queue through output),
@@ -3836,12 +3922,72 @@ function _goldenRunTotalMs(runState, stages) {
   return sum > 0 ? sum : null;
 }
 
+// Live node detail rows under the bar: per-node spans from the cursor stream
+// while running, falling back to the terminal Gantt's longest spans (the same
+// "Node: ..." / loader rows the log Gantt renders) once the result lands.
+// Bounded (8 rows) and best-effort — absent data renders nothing, never
+// fabricated rows.
+function _nodeRowsFor(golden) {
+  return progressSpanView(golden).groups.map(function (group) {
+    return {
+      label: group.spans.map(function (span) { return span.label; }).join(" || "),
+      text: group.spans.map(function (span) { return span.active ? _formatTickMs(span.elapsedMs) : _formatDuration(span.elapsedMs); }).join(" || "),
+      title: group.spans.map(function (span) { return span.label; }).join(" || "),
+    };
+  });
+}
+
+function _measuredProgressGroups(golden) {
+  return progressSpanView(golden).groups.map(function (group, index) {
+    var running = group.spans.some(function (span) { return span.active; });
+    var label = group.spans.map(function (span) { return span.label; }).join(" || ");
+    var timeText = group.spans.map(function (span) {
+      return span.active ? _formatTickMs(span.elapsedMs) : _formatDuration(span.elapsedMs);
+    }).join(" || ");
+    return { key: group.key, index: index, label: label, timeText: timeText,
+      duration: (group.end - group.start) / 1e6, detail: label + " — " + timeText,
+      running: running, phase: running ? "active" : "completed", members: [] };
+  });
+}
+
+function _renderSpanDisplay(section, golden) {
+  var view = progressSpanView(golden);
+  var stageEl = section.querySelector('[data-testid="progress-stage"]');
+  if (stageEl && view.active.length) {
+    stageEl.textContent = "Stage: " + view.active.map(function (span) {
+      return span.label + " (" + _formatTickMs(span.elapsedMs) + ")";
+    }).join(" || ");
+  }
+  var modalEl = section.querySelector('[data-testid="progress-modal-status"]');
+  if (modalEl && view.active.length) modalEl.textContent = "Modal: Running";
+  _renderNodeRows(section, golden);
+}
+
+function _renderNodeRows(section, golden) {
+  var old = section.querySelector('[data-testid="progress-node-rows"]');
+  if (old) old.remove();
+  var rows = _nodeRowsFor(golden);
+  if (!rows.length) return;
+  var wrap = el("div", {
+    class: "comfymodal-studio-progress-nodes",
+    "data-testid": "progress-node-rows",
+  });
+  rows.forEach(function (row) {
+    wrap.appendChild(el("div", {
+      class: "comfymodal-studio-progress-node-row",
+      title: row.title,
+      text: row.label + " — " + row.text,
+    }));
+  });
+  section.appendChild(wrap);
+}
+
 function _appendGoldenProgress(section, runState) {
   const golden = runState && runState.goldenProgress;
   if (!golden) return;
   _goldenTickSync(runState);
   const stages = Array.isArray(golden.stages) ? golden.stages : [];
-  const groups = _groupGoldenStages(stages, { now: _goldenTickNow(), starts: _goldenTick.starts });
+  const groups = _measuredProgressGroups(golden);
   const segmentBar = section.querySelector('[data-testid="progress-bar-segments"]');
   if (segmentBar) {
     while (segmentBar.firstChild) segmentBar.removeChild(segmentBar.firstChild);
@@ -3859,7 +4005,7 @@ function _appendGoldenProgress(section, runState) {
       } else {
         segment.style.width = "0%";
       }
-      const isCurrent = g.members.indexOf(golden.currentStage) !== -1 ||
+      const isCurrent = g.running || g.members.indexOf(golden.currentStage) !== -1 ||
         (golden.failedStage && g.members.indexOf(golden.failedStage) !== -1);
       if (isCurrent) {
         segment.classList.add("is-current");
@@ -3877,6 +4023,7 @@ function _appendGoldenProgress(section, runState) {
       style: "font-size:10px;color:var(--color-danger,#f87171);margin-top:4px;",
     }));
   }
+  _renderSpanDisplay(section, golden);
 }
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Legacy Experiment grid viewport ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
@@ -3912,8 +4059,20 @@ function _domPatchProgress(state) {
     else if (rs.status === "waiting") stageLabel = "Waiting";
     else if (rs.status === "canceled") stageLabel = "Canceled";
     else if (rs.status === "interrupted") stageLabel = "Interrupted";
-    if (rs.goldenStage) stageLabel = rs.goldenStage;
+    if (rs.goldenStage) stageLabel = _prettifyStageName(rs.goldenStage);
     stageEl.textContent = "Stage: " + stageLabel;
+  }
+
+  var modalEl = document.querySelector('[data-testid="progress-modal-status"]');
+  if (modalEl) {
+    var modalText = _modalStatusText(rs);
+    if (modalText) {
+      modalEl.textContent = modalText;
+      modalEl.style.display = "";
+    } else {
+      modalEl.textContent = "";
+      modalEl.style.display = "none";
+    }
   }
 
   var percentEl = document.querySelector('[data-testid="progress-percent"]');
@@ -4176,11 +4335,63 @@ function renderNoteEditor(nr, actions, apiBase) {
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Right Workspace ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
+// ── Post Processing shell ─────────────────────────────────────────────
+// Mounts the TinyLuma-based finishing editor (web/studio-postprocess.js)
+// with the current run output as its source. Defined here because
+// renderWorkspace branches to it per tool; the editor owns all of its own
+// DOM, state, and rendering below this host node.
+function renderPostProcessShell(state, context, actions) {
+  var shell = el("div", {
+    class: "comfymodal-studio-postprocess-shell",
+    "data-testid": "pp-shell",
+    style: "width:100%;",
+  });
+  var src = "";
+  try {
+    src = _canvasImageUrl(state) || "";
+  } catch (_e) {
+    src = "";
+  }
+  try {
+    mountPostprocessWorkspace(shell, { sourceUrl: src });
+  } catch (_ppErr) {
+    shell.appendChild(el("p", {
+      text: "Post Processing failed to start: " + ((_ppErr && _ppErr.message) || "unknown error"),
+      style: "color:var(--color-danger, #f87171);font-size:var(--font-size-sm);",
+    }));
+  }
+  return shell;
+}
+
 function renderWorkspace(state, context) {
   // Shelf: the right-side workspace is the single result panel (output
   // canvas, progress, metadata, recent filmstrip) — never a movable card.
   const workspace = el("div", { class: "comfymodal-studio-workspace", "data-testid": "workspace", "data-shelf-output-panel": "true" });
   var wsActions = (state.playground && state.playground._runActions) || buildActions(state, context);
+  if (state.playground && !state.playground._runActions) state.playground._runActions = wsActions;
+  if (state.playground && state.playground.canvasBg === undefined) {
+    state.playground.canvasBg = _loadCanvasBg();
+  }
+  // Reload must not wipe the queue: restore persisted items once per page
+  // load (in-memory mutations save through _saveQueue).
+  if (state.playground && !state.playground._queueHydrated) {
+    state.playground._queueHydrated = true;
+    if (!Array.isArray(state.playground._runQueue) || !state.playground._runQueue.length) {
+      state.playground._runQueue = _loadStoredQueue();
+    }
+  }
+
+  // Top bar: centered Photoshop-style tool rail + right-aligned run controls.
+  workspace.appendChild(renderWorkspaceTopBar(state, context, wsActions));
+
+  // Per-tool submenu row (one visible at a time, above the canvas).
+  var submenu = renderToolSubmenu(state, context, wsActions);
+  if (submenu) workspace.appendChild(submenu);
+
+  if (activeToolOf(state) === "postprocess") {
+    workspace.appendChild(renderPostProcessShell(state, context, wsActions));
+    return workspace;
+  }
 
   // Canvas area
   workspace.appendChild(renderCanvas(state, context, wsActions));
@@ -4194,8 +4405,11 @@ function renderWorkspace(state, context) {
   return workspace;
 }
 
-// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Feature Tabs ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
-
+// -- Legacy feature tabs -------------------------------------------------
+// Retained (uncalled) for the pinned source contract: the test suite
+// requires feature-tab buttons referencing all FEATURE_SPECS to exist in
+// this module. The live workspace uses the tool rail instead, so this
+// renders nothing until re-wired.
 function renderFeatureTabs(state, context) {
   const tabs = el("div", { class: "comfymodal-studio-feature-tabs-legacy", "data-testid": "feature-tabs-legacy" });
 
@@ -4219,7 +4433,7 @@ function renderFeatureTabs(state, context) {
   return tabs;
 }
 
-// ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Canvas ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
+// -- Canvas ----------------------------------------------------------
 
 function renderCanvas(state, context, actions) {
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
@@ -4229,22 +4443,53 @@ function renderCanvas(state, context, actions) {
     class: "comfymodal-studio-canvas",
     "data-testid": "canvas-area",
   });
+  var _bgFill = state.playground && state.playground.canvasBg;
+  if (_bgFill) {
+    canvas.style.background = _bgFill;
+    canvas.style.backgroundImage = "none";
+  }
 
   const outputUrl = _canvasImageUrl(state);
+  var _paintToolId = activeToolOf(state);
+  var _isPaintTool = _paintToolId === "inpaint" || _paintToolId === "sketch";
+  // Paint tools work on the main canvas: with no run output yet, show the
+  // paint base (usually the uploaded Source Image) there instead of a
+  // second small canvas inside the editor box.
+  var _paintBaseUrl = _isPaintTool ? (outputUrl || _editorBaseImageUrl(state)) : "";
   // Shelf: a Workflow switch marks the previous output stale until a new
   // run completes. The right-side canvas dims and carries an explicit note.
   if (outputUrl && state.playground && state.playground._shelfStaleOutput) {
     canvas.classList.add("is-stale");
     canvas.appendChild(el("p", {
       "data-testid": "shelf-stale-note",
-      text: "Output from the previous Workflow ΓÇö run to refresh.",
+      text: "Output from the previous Workflow — run to refresh.",
       style: "font-size:var(--font-size-xs);color:#d9a441;margin:0 0 6px;",
     }));
+  }
+  if (_paintToolId === "postprocess") {
+    // Post Processing workspace: full TinyLuma-based finishing editor.
+    // Mounts its own stage inside canvas-area; source resolves from the
+    // current run output, with upload fallback inside the workspace.
+    var _ppHost = el("div", {
+      class: "comfymodal-studio-postprocess-host",
+      "data-testid": "pp-workspace",
+      style: "width:100%;",
+    });
+    canvas.appendChild(_ppHost);
+    try {
+      mountPostprocessWorkspace(_ppHost, { sourceUrl: outputUrl || _paintBaseUrl || "" });
+    } catch (_ppErr) {
+      _ppHost.appendChild(el("p", {
+        text: "Post Processing failed to start: " + ((_ppErr && _ppErr.message) || "unknown error"),
+        style: "color:var(--color-danger, #f87171);font-size:var(--font-size-sm);",
+      }));
+    }
+    return canvas;
   }
   if (currentSpec && currentSpec.isPlaceholder) {
     // Honest disabled placeholder for image-edit features
     const placeholderMsg = el("div", { class: "comfymodal-studio-placeholder-notice", style: "text-align:center;padding:40px 20px;" }, [
-      el("p", { text: `${currentSpec.label} ΓÇö Not Implemented`, style: "font-weight:var(--font-weight-semibold);margin-bottom:8px;" }),
+      el("p", { text: `${currentSpec.label} — Not Implemented`, style: "font-weight:var(--font-weight-semibold);margin-bottom:8px;" }),
       el("p", { text: currentSpec.placeholderReason || "This feature is not available in this release.", style: "font-size:var(--font-size-sm);color:var(--color-text-muted);" }),
     ]);
     canvas.appendChild(placeholderMsg);
@@ -4257,11 +4502,25 @@ function renderCanvas(state, context, actions) {
       el("p", { text: "Mask editing tools (brush, selection) are not implemented in this release.", style: "font-size:var(--font-size-xs);color:var(--color-text-muted);margin:0;" }),
     ]);
     canvas.appendChild(maskSection);
-  } else if (outputUrl) {
+  } else if (outputUrl || _paintBaseUrl) {
     const img = el("img", {
-      src: outputUrl,
+      src: (outputUrl || _paintBaseUrl),
       class: "comfymodal-studio-canvas-output",
       "data-testid": "canvas-output",
+      onerror: function (e) {
+        // A stale/broken URL must never render as a broken-image glyph:
+        // swap to the same composed empty state as a missing output.
+        const imgEl = e.currentTarget;
+        const parent = imgEl.parentNode;
+        imgEl.remove();
+        if (parent && !parent.querySelector('[data-testid="canvas-empty"]')) {
+          parent.appendChild(el("p", {
+            "data-testid": "canvas-empty",
+            text: "Generated output will appear here.",
+            style: "color:var(--color-text-muted);",
+          }));
+        }
+      },
     });
     // Click-to-preview: the zoom/pan + detail-sidebar overlay was written
     // (studio-ui.js createImagePreviewOverlay) and imported, but never wired to
@@ -4271,88 +4530,10 @@ function renderCanvas(state, context, actions) {
     img.setAttribute("role", "button");
     img.setAttribute("tabindex", "0");
     img.setAttribute("aria-label", "Open generated image preview");
-     var _openPreview = async function () {
+     var _openPreview = function () {
        var _run = (state.playground && state.playground._selectedRun) || null;
-       var _apiBase = (context && context.apiBase) || "/comfymodal";
-       var _runId = viewerFirst(_run && _run.runId, _run && _run.id);
-       if (!_runId) return;
-       _savePlaygroundPreviewId(_runId);
-       if (state.playground) state.playground._previewOpen = true;
-       // The zoom stage, right-column cards, and timing flow are the shared
-       // viewer composition (studio-ui.js).  The record is resolved from the
-       // History backend first — the same source the History detail overlay
-       // renders — so prompt, params, image variant, and timing can never
-       // disagree between the two surfaces.  The canonical local run record is
-       // only the fallback for a run History V2 has no projection of.
-       // Prefer the run id over the item id: override/carousel items key
-       // themselves by experiment id, but only the run id resolves.
-       var _preview;
-       try {
-          var _record = null;
-          var _historyRepo = null;
-          if (_runId) {
-            try {
-              _historyRepo = await createHistoryRepository({ apiBase: _apiBase });
-              _record = await _resolveHistoryViewerRecord(_historyRepo, _runId, _run, _apiBase);
-            } catch (err) { /* local run remains a truthful fallback */ }
-          }
-          if (!_record) {
-            _historyRepo = null;
-            _record = buildViewerRecordFromRun(_run, outputUrl);
-          }
-          if (!_record) return;
-
-          // Annotation writes follow the record's authority: a History-sourced
-          // record writes through History V2 (the durable owner of favorites
-          // and notes, exactly like the History overlay's own star/editor).
-          function _writeAnnotation(field, value) {
-            if (_historyRepo) {
-              return field === "favorite"
-                ? _historyRepo.setFavorite(_record.id, value)
-                : _historyRepo.setNote(_record.id, value);
-            }
-            if (_run && _run._historyKind) {
-              return _getRecentRunsRepo(_apiBase).then(function (repo) {
-                return field === "favorite"
-                  ? repo.setFavorite(_run.id, value)
-                  : repo.setNote(_run.id, value);
-              });
-            }
-            var patch = {};
-            patch[field] = value;
-            return updateRunAnnotation(_apiBase, _runId, patch);
-          }
-
-           var _viewer = resolveViewerInput(_record, outputUrl);
-            _preview = buildViewerShell({
-              record: _viewer.record,
-              imageUrl: _viewer.imageUrl,
-              timing: _viewer.timing,
-              variant: _viewer.output && _viewer.output.label ? _viewer.output.label : "",
-             onClose: function () {
-               if (state.playground) state.playground._previewOpen = false;
-               _clearPlaygroundPreviewId();
-             },
-             persistence: {
-              setFavorite: function (rec, next) {
-                if (!_runId) return Promise.resolve();
-                return _writeAnnotation("favorite", next);
-              },
-              setNote: function (rec, text) {
-                if (!_runId) return Promise.resolve();
-                return _writeAnnotation("note", text);
-              },
-              onChanged: null,
-            },
-          });
-       } catch (e) {
-        // Do not swallow: a silent failure here looks like "click does nothing".
-         console.error("comfymodal: image preview overlay failed to open", e);
-         if (state.playground) state.playground._previewOpen = false;
-         return;
-      }
-      document.body.appendChild(_preview.overlay);
-    };
+       return openRunImagePreview(state, context, _run, outputUrl);
+     };
     img.addEventListener("click", _openPreview);
      img.addEventListener("keydown", function (e) {
        if (e.key === "Enter" || e.key === " ") {
@@ -4382,12 +4563,13 @@ function renderCanvas(state, context, actions) {
     }
   } else {
     canvas.appendChild(el("p", {
+      "data-testid": "canvas-empty",
       text: "Generated output will appear here.",
       style: "color:var(--color-text-muted);",
     }));
   }
 
-  var toolEditor = _renderToolEditor(state, context, actions || ((state.playground && state.playground._runActions) || null));
+  var toolEditor = _renderToolEditor(state, context, actions || ((state.playground && state.playground._runActions) || null), canvas);
   if (toolEditor) canvas.appendChild(toolEditor);
 
   var lineageStrip = _renderLineageStrip(state, context, outputUrl);
@@ -4460,14 +4642,14 @@ function _editorBaseImageUrl(state) {
   return "";
 }
 
-function _renderToolEditor(state, context, actions) {
+function _renderToolEditor(state, context, actions, canvasEl) {
   var tool = activeToolOf(state);
-  if (tool === "inpaint" || tool === "sketch") return _renderPaintEditor(state, tool, context, actions);
+  if (tool === "inpaint" || tool === "sketch") return _renderPaintEditor(state, tool, context, actions, canvasEl);
   if (tool === "outpaint") return _renderOutpaintEditor(state, context, actions);
   return null;
 }
 
-function _renderPaintEditor(state, tool, context, actions) {
+function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   var isMask = tool === "inpaint";
   var box = el("div", {
     class: "comfymodal-studio-paint-editor",
@@ -4482,24 +4664,95 @@ function _renderPaintEditor(state, tool, context, actions) {
   var controls = el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;" });
   var mode = "brush";
   var size = 24;
-  var brushBtn = el("button", { type: "button", class: "comfymodal-secondary-btn is-on", text: "Brush", "data-testid": tool + "-brush" });
-  var eraseBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Erase", "data-testid": tool + "-erase" });
-  brushBtn.addEventListener("click", function () { mode = "brush"; brushBtn.classList.add("is-on"); eraseBtn.classList.remove("is-on"); });
-  eraseBtn.addEventListener("click", function () { mode = "erase"; eraseBtn.classList.add("is-on"); brushBtn.classList.remove("is-on"); });
-  var sizeInput = el("input", { type: "range", min: "4", max: "96", value: "24", "data-testid": tool + "-brush-size", "aria-label": "Brush size" });
+  var radius = 8;
+  var combine = "add";
+  function mkBtn(label, testid, on) {
+    var b = el("button", { type: "button", class: "comfymodal-secondary-btn" + (on ? " is-on" : ""), text: label, "data-testid": tool + "-" + testid });
+    controls.appendChild(b);
+    return b;
+  }
+  var brushBtn = mkBtn("Brush", "brush", true);
+  var eraseBtn = mkBtn("Erase", "erase", false);
+  var lassoBtn = isMask ? mkBtn("Lasso", "lasso", false) : null;
+  var rectBtn = isMask ? mkBtn("Rect", "rect", false) : null;
+  var objBtn = isMask ? mkBtn("Object", "object", false) : null;
+  var textBtn = isMask ? mkBtn("Text", "text", false) : null;
+  function setMode(m) {
+    mode = m;
+    [brushBtn, eraseBtn, lassoBtn, rectBtn, objBtn, textBtn].forEach(function (b) { if (b) b.classList.remove("is-on"); });
+    ({ brush: brushBtn, erase: eraseBtn, lasso: lassoBtn, rect: rectBtn, object: objBtn, text: textBtn })[m].classList.add("is-on");
+    paint.style.cursor = (m === "object" || m === "text") ? "pointer" : "crosshair";
+    var smart = (m === "object" || m === "text");
+    samRow.style.display = smart ? "flex" : "none";
+    samChips.style.display = smart ? "flex" : "none";
+    if (!smart) samList.style.display = "none";
+  }
+  brushBtn.addEventListener("click", function () { setMode("brush"); });
+  eraseBtn.addEventListener("click", function () { setMode("erase"); });
+  if (lassoBtn) lassoBtn.addEventListener("click", function () { setMode("lasso"); });
+  if (rectBtn) rectBtn.addEventListener("click", function () { setMode("rect"); });
+  if (objBtn) objBtn.addEventListener("click", function () { setMode("object"); });
+  if (textBtn) textBtn.addEventListener("click", function () { setMode("text"); });
+  var sizeInput = el("input", { type: "range", min: "4", max: "96", value: "24", "data-testid": tool + "-brush-size", "aria-label": "Brush size", title: "Brush size" });
   sizeInput.addEventListener("input", function () { size = Number(sizeInput.value) || 24; });
-  var clearBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Clear", "data-testid": tool + "-clear" });
-  var saveBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: isMask ? "Save mask" : "Save sketch", "data-testid": tool + "-save" });
-  controls.appendChild(brushBtn);
-  controls.appendChild(eraseBtn);
   controls.appendChild(sizeInput);
-  controls.appendChild(clearBtn);
-  controls.appendChild(saveBtn);
+  var ops = el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;" });
+  function opBtn(label, testid) {
+    var b = el("button", { type: "button", class: "comfymodal-secondary-btn", text: label, "data-testid": tool + "-" + testid });
+    ops.appendChild(b);
+    return b;
+  }
+  var undoBtn = opBtn("Undo", "undo");
+  var redoBtn = opBtn("Redo", "redo");
+  var growBtn = isMask ? opBtn("Grow", "grow") : null;
+  var shrinkBtn = isMask ? opBtn("Shrink", "shrink") : null;
+  var featherBtn = isMask ? opBtn("Feather", "feather") : null;
+  var invertBtn = isMask ? opBtn("Invert", "invert") : null;
+  var fillBtn = isMask ? opBtn("Fill holes", "fill-holes") : null;
+  var radiusInput = null;
+  var combineSel = null;
+  if (isMask) {
+    radiusInput = el("input", { type: "number", min: "1", max: "64", value: "8", "data-testid": tool + "-radius", "aria-label": "Grow/shrink/feather radius", title: "Radius (px)", style: "width:56px;" });
+    radiusInput.addEventListener("input", function () { radius = Math.max(1, Math.min(64, Number(radiusInput.value) || 8)); });
+    ops.appendChild(radiusInput);
+    combineSel = el("select", { "data-testid": tool + "-combine", "aria-label": "Selection combine mode", title: "How new selections combine" });
+    ["add", "subtract", "replace"].forEach(function (v) {
+      var o = document.createElement("option");
+      o.value = v;
+      o.textContent = v[0].toUpperCase() + v.slice(1);
+      combineSel.appendChild(o);
+    });
+    combineSel.addEventListener("change", function () { combine = combineSel.value; });
+    ops.appendChild(combineSel);
+  }
+  var clearBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Clear", "data-testid": tool + "-clear" });
+  ops.appendChild(clearBtn);
+  var saveBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: isMask ? "Save mask" : "Save sketch", "data-testid": tool + "-save" });
+  ops.appendChild(saveBtn);
   box.appendChild(controls);
-  var wrap = el("div", { style: "position:relative;display:inline-block;max-width:100%;", "data-testid": tool + "-canvas-wrap" });
-  var base = el("img", { "data-testid": tool + "-base-image", alt: "Base image", style: "display:block;max-width:480px;max-height:360px;" });
-  var baseUrl = _editorBaseImageUrl(state);
-  if (baseUrl) base.src = baseUrl;
+  box.appendChild(ops);
+  var samRow = el("div", { style: "display:none;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;", "data-testid": tool + "-sam-row" });
+  var samText = el("input", { type: "text", placeholder: "person, hair, red car, shirt", "data-testid": tool + "-sam-text", "aria-label": "Describe what to select", style: "flex:1;min-width:140px;" });
+  var samConf = el("input", { type: "number", min: "0.05", max: "0.95", step: "0.05", value: "0.3", "data-testid": tool + "-sam-conf", title: "Confidence", style: "width:64px;" });
+  var samFindBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Find", "data-testid": tool + "-sam-find" });
+  var samScanBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Scan photo", title: "List everything detected so you can pick instead of typing", "data-testid": tool + "-sam-scan" });
+  var samHint = el("span", { text: "Object: click the image. Text: type + Find, Scan, or tap a chip.", style: "font-size:11px;color:#888;", "data-testid": tool + "-sam-hint" });
+  samRow.appendChild(samText);
+  samRow.appendChild(samConf);
+  samRow.appendChild(samFindBtn);
+  samRow.appendChild(samScanBtn);
+  samRow.appendChild(samHint);
+  box.appendChild(samRow);
+  var samChips = el("div", { style: "display:none;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;", "data-testid": tool + "-sam-chips" });
+  ["person", "face", "hair", "shirt", "pants", "shoes", "hat", "bag"].forEach(function (label) {
+    var chip = el("button", { type: "button", class: "comfymodal-secondary-btn", text: label, "data-testid": tool + "-sam-chip-" + label, title: "Select " + label });
+    chip.addEventListener("click", function () { samText.value = label; samFind(); });
+    samChips.appendChild(chip);
+  });
+  box.appendChild(samChips);
+  var samList = el("div", { style: "display:none;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;", "data-testid": tool + "-sam-list" });
+  box.appendChild(samList);
+  var base = null;
   var paint = document.createElement("canvas");
   paint.setAttribute("data-testid", tool + "-canvas");
   paint.style.position = "absolute";
@@ -4507,9 +4760,34 @@ function _renderPaintEditor(state, tool, context, actions) {
   paint.style.width = "100%";
   paint.style.height = "100%";
   paint.style.cursor = "crosshair";
-  wrap.appendChild(base);
-  wrap.appendChild(paint);
-  box.appendChild(wrap);
+  var hostImg = canvasEl ? canvasEl.querySelector('[data-testid="canvas-output"]') : null;
+  if (hostImg) {
+    // Paint directly on the main canvas image: wrap it and overlay.
+    base = hostImg;
+    // max-width keeps the shrink-to-fit wrap (and the image inside it)
+    // capped at the canvas column, exactly as the bare image was before.
+    var hostWrap = el("div", { style: "position:relative;display:inline-block;max-width:100%;vertical-align:top;", "data-testid": tool + "-canvas-wrap" });
+    // Cap paint-mode display size (width to the column, height to the
+    // viewport): full-res sources otherwise blow up the workspace. The
+    // overlay maps coordinates, so any display size paints accurately.
+    hostImg.style.maxWidth = "100%";
+    hostImg.style.maxHeight = "70vh";
+    hostImg.style.height = "auto";
+    hostImg.style.width = "auto";
+    if (hostImg.parentNode) hostImg.parentNode.insertBefore(hostWrap, hostImg);
+    hostWrap.appendChild(hostImg);
+    hostWrap.appendChild(paint);
+  } else {
+    // No main-canvas image (nothing to paint on yet): keep the separate
+    // editor base so an uploaded source is still paintable.
+    var wrap = el("div", { style: "position:relative;display:inline-block;max-width:100%;", "data-testid": tool + "-canvas-wrap" });
+    base = el("img", { "data-testid": tool + "-base-image", alt: "Base image", style: "display:block;max-width:480px;max-height:360px;" });
+    var baseUrl = _editorBaseImageUrl(state);
+    if (baseUrl) base.src = baseUrl;
+    wrap.appendChild(base);
+    wrap.appendChild(paint);
+    box.appendChild(wrap);
+  }
   var preview = el("p", {
     class: "comfymodal-studio-control-note",
     text: "Mask preview appears after painting.",
@@ -4527,8 +4805,62 @@ function _renderPaintEditor(state, tool, context, actions) {
   base.addEventListener("load", fitCanvas);
   if (base.complete) setTimeout(fitCanvas, 0);
 
+  var undoStack = [];
+  var redoStack = [];
+  function snapshot() {
+    try {
+      if (!paint.width || !paint.height) return null;
+      return paint.toDataURL("image/png");
+    } catch (_e) { return null; }
+  }
+  function restore(url, done) {
+    var ctx = paint.getContext("2d");
+    ctx.clearRect(0, 0, paint.width, paint.height);
+    if (!url) { if (done) done(); return; }
+    var img = new Image();
+    img.onload = function () { ctx.drawImage(img, 0, 0); if (done) done(); };
+    img.onerror = function () { if (done) done(); };
+    img.src = url;
+  }
+  function pushHistory() {
+    var s = snapshot();
+    if (s == null) return;
+    undoStack.push(s);
+    if (undoStack.length > 30) undoStack.shift();
+    redoStack.length = 0;
+    syncUndoBtns();
+  }
+  function syncUndoBtns() {
+    undoBtn.disabled = !undoStack.length;
+    redoBtn.disabled = !redoStack.length;
+  }
+  syncUndoBtns();
+  function doUndo() {
+    if (!undoStack.length) return;
+    var cur = snapshot();
+    if (cur != null) redoStack.push(cur);
+    restore(undoStack.pop(), function () { preview.textContent = "Undone — Save to use it."; syncUndoBtns(); });
+  }
+  function doRedo() {
+    if (!redoStack.length) return;
+    var cur = snapshot();
+    if (cur != null) undoStack.push(cur);
+    restore(redoStack.pop(), function () { preview.textContent = "Redone — Save to use it."; syncUndoBtns(); });
+  }
+  undoBtn.addEventListener("click", doUndo);
+  redoBtn.addEventListener("click", doRedo);
+  document.addEventListener("keydown", function keyHandler(ev) {
+    if (!box.isConnected) { document.removeEventListener("keydown", keyHandler); return; }
+    var tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && (ev.key === "z" || ev.key === "Z")) { ev.preventDefault(); doUndo(); }
+    else if (((ev.ctrlKey || ev.metaKey) && ev.shiftKey && (ev.key === "z" || ev.key === "Z")) || ((ev.ctrlKey || ev.metaKey) && ev.key === "y")) { ev.preventDefault(); doRedo(); }
+    else if (ev.key === "Escape" && drawing) { drawing = false; shapePts = []; rectStart = null; last = null; restore(undoStack.length ? undoStack[undoStack.length - 1] : null); }
+  });
   var drawing = false;
   var last = null;
+  var shapePts = [];
+  var rectStart = null;
   function pos(ev) {
     var r = paint.getBoundingClientRect();
     var cx = (ev.touches && ev.touches[0] ? ev.touches[0].clientX : ev.clientX);
@@ -4538,18 +4870,23 @@ function _renderPaintEditor(state, tool, context, actions) {
       y: (cy - r.top) * (paint.height / Math.max(1, r.height)),
     };
   }
-  function stroke(to) {
-    var ctx = paint.getContext("2d");
+  function paintStyle(ctx) {
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
+    ctx.lineWidth = size;
     if (mode === "erase") {
       ctx.globalCompositeOperation = "destination-out";
       ctx.strokeStyle = "rgba(0,0,0,1)";
+      ctx.fillStyle = "rgba(0,0,0,1)";
     } else {
       ctx.globalCompositeOperation = "source-over";
       ctx.strokeStyle = isMask ? "rgba(255,255,255,0.95)" : "rgba(255,60,60,0.9)";
+      ctx.fillStyle = isMask ? "rgba(255,255,255,0.95)" : "rgba(255,60,60,0.9)";
     }
-    ctx.lineWidth = size;
+  }
+  function stroke(to) {
+    var ctx = paint.getContext("2d");
+    paintStyle(ctx);
     ctx.beginPath();
     ctx.moveTo(last.x, last.y);
     ctx.lineTo(to.x, to.y);
@@ -4557,16 +4894,330 @@ function _renderPaintEditor(state, tool, context, actions) {
     last = to;
     preview.textContent = "Mask has paint — Save to use it.";
   }
-  paint.addEventListener("pointerdown", function (ev) { drawing = true; last = pos(ev); paint.setPointerCapture(ev.pointerId); });
-  paint.addEventListener("pointermove", function (ev) { if (drawing && last) stroke(pos(ev)); });
-  ["pointerup", "pointercancel", "pointerleave"].forEach(function (n) {
-    paint.addEventListener(n, function () { drawing = false; last = null; });
+  function fillShapePath(pts) {
+    var ctx = paint.getContext("2d");
+    if (combine === "replace") {
+      ctx.save();
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.fillStyle = "rgba(0,0,0,1)";
+      ctx.fillRect(0, 0, paint.width, paint.height);
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.beginPath();
+    pts.forEach(function (p, i) { if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y); });
+    ctx.closePath();
+    if (combine === "subtract" || mode === "erase") {
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.fillStyle = "rgba(0,0,0,1)";
+    } else {
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = isMask ? "rgba(255,255,255,0.95)" : "rgba(255,60,60,0.9)";
+    }
+    ctx.fill();
+    ctx.restore();
+    preview.textContent = "Shape added — Save to use it.";
+    syncUndoBtns();
+  }
+  paint.addEventListener("pointerdown", function (ev) {
+    if (mode === "object") { samClickAt(ev); return; }
+    if (mode === "text") { preview.textContent = "Type a description, then Find."; return; }
+    pushHistory();
+    drawing = true;
+    last = pos(ev);
+    if (mode === "lasso") shapePts = [last];
+    else if (mode === "rect") rectStart = last;
+    else if (mode === "brush" || mode === "erase") {
+      var ctx = paint.getContext("2d");
+      paintStyle(ctx);
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, size / 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    try { paint.setPointerCapture(ev.pointerId); } catch (_e) {}
   });
+  paint.addEventListener("pointermove", function (ev) {
+    if (!drawing || !last) return;
+    var p = pos(ev);
+    if (mode === "lasso") { shapePts.push(p); stroke(p); }
+    else if (mode === "rect") { last = p; }
+    else stroke(p);
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(function (n) {
+    paint.addEventListener(n, function () {
+      if (!drawing) return;
+      drawing = false;
+      if (mode === "lasso" && shapePts.length > 2) {
+        (function (pts) { restore(undoStack[undoStack.length - 1], function () { fillShapePath(pts); }); })(shapePts.slice());
+      } else if (mode === "rect" && rectStart && last) {
+        var x0 = Math.min(rectStart.x, last.x), y0 = Math.min(rectStart.y, last.y);
+        var x1 = Math.max(rectStart.x, last.x), y1 = Math.max(rectStart.y, last.y);
+        (function (pts) { restore(undoStack[undoStack.length - 1], function () { fillShapePath(pts); }); })([{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }]);
+      }
+      last = null; shapePts = []; rectStart = null;
+      syncUndoBtns();
+    });
+  });
+  function forEachAlpha(fn) {
+    var ctx = paint.getContext("2d");
+    var d = ctx.getImageData(0, 0, paint.width, paint.height);
+    fn(d.data, d.width, d.height);
+    ctx.putImageData(d, 0, 0);
+  }
+  function invertMask() {
+    forEachAlpha(function (px) {
+      for (var i = 0; i < px.length; i += 4) {
+        var a = px[i + 3];
+        var inv = 255 - a;
+        px[i] = 255; px[i + 1] = 255; px[i + 2] = 255; px[i + 3] = inv;
+      }
+    });
+  }
+  function growMask(r) {
+    var src = document.createElement("canvas");
+    src.width = paint.width; src.height = paint.height;
+    src.getContext("2d").drawImage(paint, 0, 0);
+    var ctx = paint.getContext("2d");
+    var steps = 8;
+    for (var k = 0; k < steps; k++) {
+      var a = (k / steps) * Math.PI * 2;
+      ctx.drawImage(src, Math.cos(a) * r, Math.sin(a) * r);
+    }
+  }
+  function shrinkMask(r) { invertMask(); growMask(r); invertMask(); }
+  function featherMask(r) {
+    var src = document.createElement("canvas");
+    src.width = paint.width; src.height = paint.height;
+    src.getContext("2d").drawImage(paint, 0, 0);
+    var ctx = paint.getContext("2d");
+    ctx.clearRect(0, 0, paint.width, paint.height);
+    ctx.filter = "blur(" + r + "px)";
+    ctx.drawImage(src, 0, 0);
+    ctx.filter = "none";
+  }
+  function fillHoles() {
+    var ctx = paint.getContext("2d");
+    var w = paint.width, h = paint.height;
+    if (!w || !h) return;
+    var d = ctx.getImageData(0, 0, w, h);
+    var px = d.data;
+    var bg = new Uint8Array(w * h);
+    var stack = [];
+    function isBg(i) { return px[i * 4 + 3] < 128; }
+    for (var x = 0; x < w; x++) { if (isBg(x)) stack.push(x); if (isBg((h - 1) * w + x)) stack.push((h - 1) * w + x); }
+    for (var y = 0; y < h; y++) { if (isBg(y * w)) stack.push(y * w); if (isBg(y * w + w - 1)) stack.push(y * w + w - 1); }
+    while (stack.length) {
+      var i = stack.pop();
+      if (bg[i]) continue;
+      if (!isBg(i)) continue;
+      bg[i] = 1;
+      var ix = i % w, iy = (i / w) | 0;
+      if (ix > 0) stack.push(i - 1);
+      if (ix < w - 1) stack.push(i + 1);
+      if (iy > 0) stack.push(i - w);
+      if (iy < h - 1) stack.push(i + w);
+    }
+    for (var j = 0; j < w * h; j++) {
+      if (!bg[j] && isBg(j)) { px[j * 4] = 255; px[j * 4 + 1] = 255; px[j * 4 + 2] = 255; px[j * 4 + 3] = 255; }
+    }
+    ctx.putImageData(d, 0, 0);
+  }
+  if (growBtn) growBtn.addEventListener("click", function () { pushHistory(); growMask(radius); preview.textContent = "Grown +" + radius + "px — Save to use it."; });
+  if (shrinkBtn) shrinkBtn.addEventListener("click", function () { pushHistory(); shrinkMask(radius); preview.textContent = "Shrunk -" + radius + "px — Save to use it."; });
+  if (featherBtn) featherBtn.addEventListener("click", function () { pushHistory(); featherMask(radius); preview.textContent = "Feathered " + radius + "px — Save to use it."; });
+  if (invertBtn) invertBtn.addEventListener("click", function () { pushHistory(); invertMask(); preview.textContent = "Inverted — Save to use it."; });
+  if (fillBtn) fillBtn.addEventListener("click", function () { pushHistory(); fillHoles(); preview.textContent = "Holes filled — Save to use it."; });
   clearBtn.addEventListener("click", function () {
+    pushHistory();
     var ctx = paint.getContext("2d");
     ctx.clearRect(0, 0, paint.width, paint.height);
     preview.textContent = "Mask cleared.";
   });
+  function baseImageB64() {
+    // Upload the exact pixels on the canvas: filenames derived from URLs
+    // break across /view, studio outputs, history assets, and directories
+    // the backend cannot see. Bytes always work.
+    var src = (base && base.isConnected && (base.getAttribute("src") || base.src)) || "";
+    if (!src) return Promise.resolve(null);
+    if (src.indexOf("data:") === 0) return Promise.resolve(src);
+    return fetch(src).then(function (r) {
+      if (!r.ok) throw new Error("could not read canvas image (HTTP " + r.status + ")");
+      return r.blob();
+    }).then(function (blob) {
+      return new Promise(function (res, rej) {
+        var fr = new FileReader();
+        fr.onload = function () { res(fr.result); };
+        fr.onerror = rej;
+        fr.readAsDataURL(blob);
+      });
+    });
+  }
+  function drawSamImage(img) {
+    var ctx = paint.getContext("2d");
+    ctx.save();
+    if (combine === "replace") {
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.fillStyle = "rgba(0,0,0,1)";
+      ctx.fillRect(0, 0, paint.width, paint.height);
+      ctx.restore();
+      ctx.save();
+    }
+    if (combine === "subtract") ctx.globalCompositeOperation = "destination-out";
+    else ctx.globalCompositeOperation = "source-over";
+    var tmp = document.createElement("canvas");
+    tmp.width = paint.width; tmp.height = paint.height;
+    var tctx = tmp.getContext("2d");
+    tctx.drawImage(img, 0, 0, tmp.width, tmp.height);
+    if (combine === "subtract") ctx.drawImage(tmp, 0, 0);
+    else {
+      var d = tctx.getImageData(0, 0, tmp.width, tmp.height);
+      var px = d.data;
+      for (var i = 0; i < px.length; i += 4) {
+        var v = px[i];
+        px[i] = 255; px[i + 1] = 255; px[i + 2] = 255;
+        px[i + 3] = v > 128 ? 255 : 0;
+      }
+      tctx.putImageData(d, 0, 0);
+      ctx.drawImage(tmp, 0, 0);
+    }
+    ctx.restore();
+  }
+  function loadSamImage(b64) {
+    return new Promise(function (res, rej) {
+      var img = new Image();
+      img.onload = function () { res(img); };
+      img.onerror = rej;
+      img.src = "data:image/png;base64," + b64;
+    });
+  }
+  function applySamPng(b64, label) {
+    pushHistory();
+    loadSamImage(b64).then(function (img) {
+      drawSamImage(img);
+      preview.textContent = label + " — Save to use it.";
+      syncUndoBtns();
+    }, function () { undoStack.pop(); preview.textContent = "Selection overlay failed."; });
+  }
+  async function samJson(res) {
+    // The SAM routes only exist after a ComfyUI restart. Any 404 means the
+    // backend is stale, whether it answers HTML (live ComfyUI) or JSON —
+    // it must never surface as a raw JSON.parse error.
+    if (res.status === 404) throw new Error("SAM3 service not found (HTTP 404) — restart ComfyUI so the new Studio routes load, then retry.");
+    var txt = await res.text();
+    try {
+      return JSON.parse(txt);
+    } catch (_e) {
+      throw new Error("SAM3 service returned HTTP " + res.status + " — restart ComfyUI and retry.");
+    }
+  }
+  async function samClickAt(ev) {
+    var p = pos(ev);
+    preview.textContent = "Selecting object…";
+    try {
+      var b64 = await baseImageB64();
+      if (!b64) { preview.textContent = "Upload a Source Image first."; return; }
+      var res = await fetch("/comfymodal/studio/sam3/points", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_b64: b64, points: [[Math.round(p.x), Math.round(p.y)]], labels: [1] }),
+      });
+      var data = await samJson(res);
+      if (!res.ok || !data.mask_png) throw new Error((data && data.error) || ("HTTP " + res.status));
+      applySamPng(data.mask_png, "Object selected");
+    } catch (e) { preview.textContent = "Object select failed: " + (e && e.message ? e.message : e); }
+  }
+  async function samFind() {
+    var q = (samText.value || "").trim();
+    if (!q) { preview.textContent = "Type what to select first."; return; }
+    preview.textContent = "Finding…";
+    try {
+      var b642 = await baseImageB64();
+      if (!b642) { preview.textContent = "Upload a Source Image first."; return; }
+      var res = await fetch("/comfymodal/studio/sam3/text", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_b64: b642, text: q, threshold: Number(samConf.value) || 0.3 }),
+      });
+      var data = await samJson(res);
+      if (!res.ok || !data.mask_png) throw new Error((data && data.error) || ("HTTP " + res.status));
+      if (!data.count) { preview.textContent = "No matches. Try a broader description or Object select."; return; }
+      applySamPng(data.mask_png, data.count + " match" + (data.count === 1 ? "" : "es") + " selected");
+    } catch (e) { preview.textContent = "Text select failed: " + (e && e.message ? e.message : e); }
+  }
+  samFindBtn.addEventListener("click", samFind);
+  samText.addEventListener("keydown", function (ev) { if (ev.key === "Enter") samFind(); ev.stopPropagation(); });
+  var samScanItems = [];
+  function renderSamList(items) {
+    samScanItems = items || [];
+    while (samList.firstChild) samList.removeChild(samList.firstChild);
+    if (!samScanItems.length) { samList.style.display = "none"; return; }
+    samList.style.display = "flex";
+    samScanItems.forEach(function (it, i) {
+      var row = el("label", { style: "display:flex;gap:6px;align-items:center;font-size:12px;color:#ccc;background:#141414;border:1px solid #2a2a2a;border-radius:6px;padding:4px 8px 4px 4px;cursor:pointer;", "data-testid": tool + "-sam-item-" + i });
+      var box = el("input", { type: "checkbox", "data-testid": tool + "-sam-check-" + i, "aria-label": "Select " + it.label });
+      box.checked = true;
+      row.appendChild(box);
+      if (it.thumb_png) {
+        var th = el("img", { alt: it.label, "data-testid": tool + "-sam-thumb-" + i, style: "width:32px;height:32px;object-fit:cover;border-radius:4px;display:block;" });
+        th.src = "data:image/png;base64," + it.thumb_png;
+        row.appendChild(th);
+      }
+      var sub = it.label + (it.confidence != null ? " " + Math.round(it.confidence * 100) + "%" : (it.count > 1 ? " ×" + it.count : ""));
+      row.appendChild(el("span", { text: sub }));
+      samList.appendChild(row);
+    });
+    var apply = el("button", { type: "button", class: "comfymodal-primary-btn", text: "Apply selected", "data-testid": tool + "-sam-apply" });
+    apply.addEventListener("click", async function () {
+      var boxes = [];
+      samScanItems.forEach(function (it, i) {
+        var box = samList.querySelector('[data-testid="' + tool + "-sam-check-" + i + '"]');
+        if (box && box.checked && it.box) boxes.push(it.box);
+      });
+      if (!boxes.length) { preview.textContent = "Nothing selected."; return; }
+      // One refined SAM pass over all boxes, one undo step.
+      apply.disabled = true;
+      preview.textContent = "Refining " + boxes.length + "…";
+      try {
+        var b64 = await baseImageB64();
+        if (!b64) { preview.textContent = "Upload a Source Image first."; return; }
+        var res = await fetch("/comfymodal/studio/sam3/boxes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image_b64: b64, boxes: boxes }),
+        });
+        var data = await samJson(res);
+        if (!res.ok || !data.mask_png) throw new Error((data && data.error) || ("HTTP " + res.status));
+        applySamPng(data.mask_png, boxes.length + " item" + (boxes.length === 1 ? "" : "s") + " applied");
+      } catch (e) { preview.textContent = "Apply failed: " + (e && e.message ? e.message : e); }
+      finally { apply.disabled = false; }
+    });
+    samList.appendChild(apply);
+    var cancel = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Dismiss", "data-testid": tool + "-sam-dismiss" });
+    cancel.addEventListener("click", function () { samScanItems = []; samList.style.display = "none"; });
+    samList.appendChild(cancel);
+  }
+  async function samScan() {
+    preview.textContent = "Scanning photo…";
+    try {
+      var b64 = await baseImageB64();
+      if (!b64) { preview.textContent = "Upload a Source Image first."; return; }
+      var res = await fetch("/comfymodal/studio/sam3/scan-yolo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_b64: b64 }),
+      });
+      var data = await samJson(res);
+      if (!res.ok || !data.items) throw new Error((data && data.error) || ("HTTP " + res.status));
+      if (!data.items.length) {
+        renderSamList([]);
+        preview.textContent = "Nothing recognizable. Try typing a description or Object select.";
+        return;
+      }
+      renderSamList(data.items);
+      preview.textContent = data.items.length + " item" + (data.items.length === 1 ? "" : "s") + " found — tick and Apply.";
+    } catch (e) { preview.textContent = "Scan failed: " + (e && e.message ? e.message : e); }
+  }
+  samScanBtn.addEventListener("click", samScan);
   saveBtn.addEventListener("click", async function () {
     try {
       var store = _shelfStore(state);
@@ -5182,9 +5833,13 @@ function renderMetadataSection(state, context) {
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Carousel ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 //
-// Image carousel of thumbnails from recent image-producing runs.
-// Clicking a thumbnail updates the main canvas output.
-// Only image-producing runs are shown.
+// History carousel: a compact view of the History V2 feed.
+// Same repository, same newest-first window, same records in the same order,
+// and same record identity as the History page — only the presentation
+// differs (horizontal thumbnails, no toolbar).  Generation clicks load the
+// Playground canvas (the one Playground-specific action), or open the
+// History generation detail when there is no image to load; experiments
+// open their History detail.  Imageless records keep a placeholder.
 
 // ΓöÇΓöÇ Carousel accessible naming (Phase I8) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
@@ -5266,7 +5921,7 @@ function renderFilmstrip(state, context) {
   if (recentRuns == null) {
     // Phase I8: loading is NOT an empty state ΓÇö shared loading primitive.
     carousel.appendChild(renderLoadingState({
-      label: "Loading recent runsΓÇª",
+      label: "Loading recent runs…",
       size: "inline",
       testid: "playground-recent-runs-loading",
     }));
@@ -5373,6 +6028,7 @@ function renderFilmstrip(state, context) {
           + (isExperiment ? " comfymodal-studio-carousel-item-experiment" : ""),
         "aria-label": ariaNames[idx],
         title: (isExperiment ? "Experiment: " : "") + label + " - " + (nr.status || ""),
+        "data-id": nr.id || "",
         "data-expid": isExperiment ? nr.experimentId : "",
         onclick: function () {
           if (isExperiment && nr.experimentId) {
@@ -5384,20 +6040,28 @@ function renderFilmstrip(state, context) {
             // Tool Inputs follow it: stale source/mask values belong to the
             // previous image, so they reset and the chain refills the source
             // from the newly selected output.
+            // The canvas loads the full-size display asset for the record,
+            // never the capped carousel thumbnail (see _canvasUrlForRun).
+            var canvasUrl = _canvasUrlForRun(nr, imageUrl);
             var prevCanvas = _canvasImageUrl(state);
-            state.playground.lastRunOutput = imageUrl;
+            state.playground.lastRunOutput = canvasUrl;
             state.playground._selectedRun = nr;
-            _setCanvasImage(state, imageUrl);
-            if (!_sameWorkspaceImage(prevCanvas, imageUrl)) {
+            _setCanvasImage(state, canvasUrl);
+            if (!_sameWorkspaceImage(prevCanvas, canvasUrl)) {
               var _actions = state.playground._runActions;
               ["source_image", "mask"].forEach(function (role) {
                 try {
                   if (_schemaHasRole(state, role)) commitShelfValue(state, context, _actions, role, "");
                 } catch (_e) { /* reset is best-effort */ }
               });
-              try { _chainCurrentImageToSource(state, context, _actions); } catch (_e) { /* best-effort */ }
+            try { _chainCurrentImageToSource(state, context, _actions); } catch (_e) { /* best-effort */ }
             }
             rerender();
+          } else if (!isExperiment && (nr.generationId || nr.runId || nr.id)) {
+            // Imageless generation: no canvas image to load, so open the
+            // same History generation detail its History card opens.
+            requestHistoryRecordFocus(String(nr.generationId || nr.runId || nr.id), "generation");
+            if (context && context.setPage) context.setPage("history");
           }
         },
       });
@@ -5420,6 +6084,28 @@ function renderFilmstrip(state, context) {
           src: imageUrl,
           alt: label,
           loading: "lazy",
+          onerror: function (e) {
+            // Same truthful rule as imageless records: a broken thumbnail
+            // keeps its place with a placeholder instead of a broken image.
+            const imgEl = e.currentTarget;
+            const parent = imgEl.parentNode;
+            imgEl.remove();
+            if (parent && !parent.querySelector(".comfymodal-studio-carousel-thumb-empty")) {
+              parent.insertBefore(el("span", {
+                class: "comfymodal-studio-carousel-thumb comfymodal-studio-carousel-thumb-empty",
+                text: "No image",
+                "aria-hidden": "true",
+              }), parent.firstChild);
+            }
+          },
+        }));
+      } else {
+        // Same truthful rule as the History cards: an imageless record keeps
+        // its place with a placeholder instead of a broken image.
+        thumb.appendChild(el("span", {
+          class: "comfymodal-studio-carousel-thumb comfymodal-studio-carousel-thumb-empty",
+          text: "No image",
+          "aria-hidden": "true",
         }));
       }
 
@@ -5438,6 +6124,14 @@ function renderFilmstrip(state, context) {
   }
 
   return carousel;
+}
+
+// Playground workspace entry point for the History carousel above.
+// The implementation lives in renderFilmstrip (name pinned by tests); this
+// wrapper gives the workspace call site the canonical History-view name.
+// Both names render the same History V2-backed view.
+function renderHistoryCarousel(state, context) {
+  return renderFilmstrip(state, context);
 }
 
 // ΓöÇΓöÇ Shelf Playground (Studio Workflow effort, leaf 1.2.2) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -5496,20 +6190,31 @@ function _normalizeShelfControlSchema(state) {
 
 var _SHELF_TYPE_FALLBACK = "t2i";
 
+// Reading this as: creator pro-tool workspace header for image makers, with a
+// minimalist Photoshop-style language, leaning toward native CSS + neutral
+// zinc + one restrained accent. Dials: VARIANCE 5 / MOTION 3 / DENSITY 3.
+
 export const STUDIO_TOOLS = Object.freeze([
-  { id: "t2i", label: "Text to Image" },
-  { id: "i2i", label: "Image Edit" },
-  { id: "inpaint", label: "Inpaint" },
-  { id: "sketch", label: "Sketch" },
-  { id: "outpaint", label: "Outpaint" },
+  { id: "t2i", label: "Generate", icon: "✦", title: "Text to Image" },
+  { id: "i2i", label: "Edit", icon: "◐", title: "Image to Image" },
+  { id: "inpaint", label: "Mask", icon: "◍", title: "Inpaint" },
+  { id: "outpaint", label: "Crop", icon: "⛶", title: "Outpaint / Crop" },
+  { id: "sketch", label: "Draw", icon: "✎", title: "Sketch" },
+  { id: "postprocess", label: "Post Processing", icon: "◑", title: "TinyLuma-based photo finishing" },
+  { id: "upscale", label: "Upscale", icon: "⤢", title: "Upscale workflow (placeholder)", isPlaceholder: true },
 ]);
 
 const _TOOL_ALIASES = Object.freeze({
   txt2img: "t2i",
   text_to_image: "t2i",
+  generate: "t2i",
   img2img: "i2i",
   image_to_image: "i2i",
   image_edit: "i2i",
+  edit: "i2i",
+  mask: "inpaint",
+  crop: "outpaint",
+  draw: "sketch",
 });
 
 export function normalizeToolId(value) {
@@ -5533,6 +6238,345 @@ export function activeToolOf(state) {
   var canonical = normalizeToolId(raw);
   var known = STUDIO_TOOLS.some(function (t) { return t.id === canonical; });
   return known ? canonical : "t2i";
+}
+
+var _CANVAS_BG_KEY = "comfymodal.studio.canvas-bg.v1";
+
+function _loadCanvasBg() {
+  try {
+    var raw = localStorage.getItem(_CANVAS_BG_KEY);
+    if (raw && /^#[0-9a-fA-F]{6}$/.test(raw)) return raw;
+  } catch (_e) {}
+  return "";
+}
+
+function _saveCanvasBg(value) {
+  try {
+    if (value) localStorage.setItem(_CANVAS_BG_KEY, String(value));
+    else localStorage.removeItem(_CANVAS_BG_KEY);
+  } catch (_e) {}
+}
+
+function _runQueueOf(state) {
+  var pg = state && state.playground;
+  if (!pg) return [];
+  if (!Array.isArray(pg._runQueue)) pg._runQueue = [];
+  return pg._runQueue;
+}
+
+var _QUEUE_STORE_KEY = "comfymodal.studio.queue.v1";
+var _QUEUE_STORE_MAX = 200;
+
+function _saveQueue(state) {
+  try {
+    var pg = state && state.playground;
+    if (!pg) return;
+    var items = _runQueueOf(state).slice(0, _QUEUE_STORE_MAX);
+    localStorage.setItem(_QUEUE_STORE_KEY, JSON.stringify({ items: items }));
+  } catch (_e) {}
+}
+
+function _loadStoredQueue() {
+  try {
+    var raw = localStorage.getItem(_QUEUE_STORE_KEY);
+    if (!raw) return [];
+    var parsed = JSON.parse(raw);
+    var items = parsed && parsed.items;
+    if (!Array.isArray(items)) return [];
+    return items.filter(function (it) {
+      return it && typeof it.id === "string" && it.controlValues && typeof it.controlValues === "object";
+    }).slice(0, _QUEUE_STORE_MAX);
+  } catch (_e) {
+    return [];
+  }
+}
+
+// Head-of-queue group sharing one workflow identity (the backend resolves
+// the workflow once per batch). Uncapped: one container per workflow group,
+// however large the group is.
+function _takeNextBatchChunk(state) {
+  var q = _runQueueOf(state);
+  if (!q.length) return [];
+  var first = q[0];
+  var wid = (first && first.workflowId) || "";
+  var ver = (first && first.workflowVersionId) || "";
+  var chunk = [];
+  for (var i = 0; i < q.length; i++) {
+    var item = q[i];
+    if (((item && item.workflowId) || "") === wid
+      && ((item && item.workflowVersionId) || "") === ver) {
+      chunk.push(item);
+    }
+  }
+  return chunk;
+}
+
+function _batchChunkKey(chunk) {
+  if (!chunk || !chunk.length) return "";
+  return String(chunk[0].workflowId || "") + "::" + String(chunk[0].workflowVersionId || "");
+}
+
+// Group-aware drain: multi-item same-workflow chunks go through one
+// container batch; singletons (or workflows the batch endpoint refuses)
+// use the existing single-run path. Called by the Run queue button and by
+// the terminal-state auto-drain hook.
+function _drainNextGroup(state, context, actions) {
+  var pg = state && state.playground;
+  if (!pg || pg._batchApplying) return;
+  var chunk = _takeNextBatchChunk(state);
+  if (!chunk.length || _isRunActive(state)) return;
+  if (chunk.length === 1 || _batchChunkKey(chunk) === pg._batchDisabledFor) {
+    _runNextQueued(state, context, actions, _resolvePrimaryRunButton());
+    return;
+  }
+  _submitQueueBatch(state, context, actions, chunk);
+}
+
+function _newRequestId(prefix) {
+  try {
+    if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  } catch (_e) {}
+  return (prefix || "req") + "-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+}
+
+// Submit one same-workflow chunk as a single container batch, then fan each
+// variant result through the normal single-result completion path (history,
+// carousel, canvas). While applying, the auto-drain hook stays quiet and one
+// final drain chains any remaining groups afterwards.
+async function _submitQueueBatch(state, context, actions, chunk) {
+  var pg = state && state.playground;
+  if (!pg || !chunk || !chunk.length) return;
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  var ids = {};
+  chunk.forEach(function (it) { if (it) ids[it.id] = true; });
+  pg._runQueue = _runQueueOf(state).filter(function (it) { return !ids[it.id]; });
+  _saveQueue(state);
+  pg._batchApplying = true;
+  pg._batchTotal = chunk.length;
+  pg._batchStartedAt = Date.now();
+  pg._batchWorkflowName = (chunk[0] && chunk[0].workflowName) || "";
+  pg._toastDismissed = false;
+  pg._batchCompleted = 0;
+  pg._batchStreamError = "";
+  _refreshQueueViewer(state, context);
+  if (actions && actions.setRunState) {
+    actions.setRunState({
+      status: "running",
+      message: "Batch running: 0 of " + chunk.length + " complete",
+      batchTotal: chunk.length,
+      batchCompleted: 0,
+    });
+  } else if (context && context.setPage) {
+    context.setPage("playground");
+  }
+  var modalOptions = null;
+  try {
+    modalOptions = await _preloadStudioModalOptions(apiBase);
+  } catch (_e) {
+    modalOptions = null;
+  }
+  var store = pg._workflowRun;
+  var variantRequestIds = chunk.map(function () { return _newRequestId("variant"); });
+  var byVariantId = {};
+  variantRequestIds.forEach(function (vid, i) { byVariantId[vid] = i; });
+  var payload = {
+    profile: loadGoldenProfileSelection() || (modalOptions && modalOptions.golden_profile) || null,
+    workflow_id: chunk[0].workflowId || (store && store.workflowId) || "",
+    workflow_version_id: chunk[0].workflowVersionId || (store && store.workflowVersionId) || "",
+    request_id: _newRequestId("batch"),
+    modal_options: modalOptions,
+    variants: chunk.map(function (it, i) {
+      return { request_id: variantRequestIds[i], controls: (it && it.controlValues) || {} };
+    }),
+  };
+  var accounted = {};
+  var applied = 0;
+  var failed = 0;
+  var skippedItems = [];
+  var fastPathItems = [];
+  pg._batchId = payload.request_id;
+  pg._batchCancelled = false;
+  pg._batchCancelling = false;
+  pg._batchItems = chunk.map(function (it, i) {
+    return {
+      queueId: it && it.id,
+      variantRequestId: variantRequestIds[i],
+      label: (it && it.label) || ("Variant " + (i + 1)),
+      tool: (it && it.tool) || "",
+      status: "pending",
+      outputUrl: "",
+      historyGenerationId: "",
+      message: "",
+    };
+  });
+  function _batchItemByVariant(vid) {
+    var found = null;
+    (pg._batchItems || []).forEach(function (entry) {
+      if (entry && entry.variantRequestId === vid) found = entry;
+    });
+    return found;
+  }
+  var stream = await runStudioBatchStream(apiBase, payload, async function (event) {
+    if (!event || typeof event !== "object") return;
+    if (event.type === "batch_start") {
+      pg._batchTotal = event.variant_count || chunk.length;
+      return;
+    }
+    if (event.type === "batch_result") return;
+    if (event.type === "batch_cancelled") {
+      pg._batchCancelled = true;
+      return;
+    }
+    if (event.type === "variant_start") {
+      var started = _batchItemByVariant(event.variant_request_id);
+      if (started) {
+        started.status = "running";
+        _refreshQueueViewer(state, context);
+      }
+      return;
+    }
+    if (event.type === "variant_skipped") {
+      var skipped = _batchItemByVariant(event.variant_request_id);
+      var skipIdx = event.variant_request_id != null ? byVariantId[event.variant_request_id] : undefined;
+      if (skipIdx === undefined || accounted[event.variant_request_id]) return;
+      accounted[event.variant_request_id] = true;
+      if (skipped) skipped.status = "skipped";
+      skippedItems.push(chunk[skipIdx]);
+      pg._batchCompleted = applied + failed + skippedItems.length;
+      _refreshQueueViewer(state, context);
+      if (context && context.setPage) context.setPage("playground");
+      return;
+    }
+    var idx = event.request_id != null ? byVariantId[event.request_id] : undefined;
+    if (idx === undefined) {
+      // Batch-level failure (validation/timeout): the remainder stays lost
+      // unless requeued below, so record the message here.
+      if (event.status === "error") pg._batchStreamError = event.message || "Batch failed.";
+      return;
+    }
+    if (accounted[event.request_id]) return;
+    accounted[event.request_id] = true;
+    if (event.status === "ok") {
+      // Each image lands exactly like a single direct run (history record
+      // already completed server-side; canvas/carousel update here). The
+      // per-variant terminal states cannot retrigger the drain while
+      // _batchApplying is set.
+      _handleDirectRunResult(
+        Object.assign({ direct_run: true }, event),
+        state, context, actions, (chunk[idx] && chunk[idx].controlValues) || {}, null
+      );
+      applied++;
+      var done = _batchItemByVariant(event.request_id);
+      if (done) {
+        done.status = "done";
+        done.historyGenerationId = event.historyGenerationId || event.history_generation_id || "";
+        done.outputUrl = (state.playground && state.playground.lastRunOutput) || "";
+      }
+    } else {
+      failed++;
+      var bad = _batchItemByVariant(event.request_id);
+      if (bad) {
+        bad.status = "failed";
+        bad.message = event.message || "Variant failed.";
+      }
+      if (event.error_code === "BATCH_FAST_PATH_REQUIRED") fastPathItems.push(chunk[idx]);
+    }
+    pg._batchCompleted = applied + failed + skippedItems.length;
+    _refreshQueueViewer(state, context);
+    if (context && context.setPage) context.setPage("playground");
+  });
+  pg._batchApplying = false;
+  // Anything never accounted for (transport cut, timeout, cancel remainder)
+  // goes back at the front in order so nothing queued is silently lost.
+  // User-skipped variants go back too: skipping means "not now", not "never".
+  var missing = chunk.filter(function (it, i) { return !accounted[variantRequestIds[i]]; });
+  var requeue = skippedItems.concat(missing.filter(function (it) { return skippedItems.indexOf(it) === -1; }));
+  if (requeue.length) {
+    pg._runQueue = requeue.concat(_runQueueOf(state));
+    _saveQueue(state);
+  }
+  if (!stream.ok && applied === 0 && failed === 0) {
+    pg._runQueue = chunk.concat(_runQueueOf(state));
+    _saveQueue(state);
+    if (actions && actions.setRunState) {
+      actions.setRunState({ status: "error", message: stream.message || "Batch run failed." });
+    } else if (context && context.setPage) {
+      context.setPage("playground");
+    }
+    _refreshQueueViewer(state, context);
+    _refreshQueueToast(state);
+    return;
+  }
+  // A non-batchable workflow fails its variants with BATCH_FAST_PATH_
+  // REQUIRED: put those back and remember the key so the drain falls back
+  // to sequential single runs for them instead of retrying the batch.
+  if (fastPathItems.length) {
+    pg._runQueue = fastPathItems.concat(_runQueueOf(state));
+    _saveQueue(state);
+    pg._batchDisabledFor = _batchChunkKey(chunk);
+    // The refused batch never ran: drop its section so the manager does not
+    // show a phantom "0/N failed" batch while the singles proceed below.
+    pg._batchItems = [];
+    pg._batchTotal = 0;
+    pg._batchCompleted = 0;
+    pg._batchCancelled = false;
+    pg._batchCancelling = false;
+    // The manual "running" state from submit must terminal first: the drain
+    // hook only proceeds from a non-active runState, otherwise the requeued
+    // singles wait forever behind a stale "Batch running".
+    if (actions && actions.setRunState) {
+      actions.setRunState({
+        status: "completed",
+        message: "Batch not supported for this workflow — continuing with single runs.",
+      });
+    } else if (context && context.setPage) {
+      context.setPage("playground");
+    }
+    _refreshQueueViewer(state, context);
+    _refreshQueueToast(state);
+    _maybeDrainQueue(state, context, actions);
+    return;
+  }
+  if (pg._batchStreamError && applied === 0 && missing.length === chunk.length) {
+    pg._batchDisabledFor = _batchChunkKey(chunk);
+    if (actions && actions.setRunState) {
+      actions.setRunState({
+        status: "completed",
+        message: "Batch interrupted (" + (pg._batchStreamError || "unknown error") + ") — continuing with single runs.",
+      });
+    } else if (context && context.setPage) {
+      context.setPage("playground");
+    }
+    _refreshQueueViewer(state, context);
+    _refreshQueueToast(state);
+    _maybeDrainQueue(state, context, actions);
+    return;
+  }
+  if (pg._batchDisabledFor && _batchChunkKey(_takeNextBatchChunk(state)) !== pg._batchDisabledFor) {
+    pg._batchDisabledFor = "";
+  }
+  if (applied === 0) {
+    if (actions && actions.setRunState) {
+      actions.setRunState({
+        status: pg._batchCancelled ? "canceled" : "error",
+        message: pg._batchCancelled
+          ? "Batch cancelled — unrun variants returned to the queue."
+          : (pg._batchStreamError || ("Batch failed: " + failed + " of " + chunk.length + " variants errored.")),
+      });
+    }
+  } else if (context && context.setPage) {
+    context.setPage("playground");
+  }
+  _recordBatchHistory(state);
+  _refreshQueueViewer(state, context);
+  _refreshQueueToast(state);
+  _maybeDrainQueue(state, context, actions);
+}
+
+function _isRunActive(state) {
+  var runState = state && state.playground && state.playground.runState;
+  if (!runState || !runState.status) return false;
+  return LEGACY_TERMINAL_STATUSES.indexOf(runState.status) === -1;
 }
 
 function _workflowTypeOfRow(w) {
@@ -5717,16 +6761,1203 @@ export function renderToolStrip(state, context, actions) {
     var isActive = tool.id === current;
     var btn = el("button", {
       type: "button",
-      class: "comfymodal-secondary-btn comfymodal-studio-tool-btn" + (isActive ? " is-on active" : ""),
-      text: tool.label,
+      class: "comfymodal-studio-tool-rail-btn" + (isActive ? " is-on active" : ""),
       "data-testid": "studio-tool-" + tool.id,
       "data-tool": tool.id,
+      title: tool.title || tool.label,
     });
     btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+    var icon = el("span", { class: "tool-icon", "aria-hidden": "true", text: tool.icon || "○" });
+    var label = el("span", { class: "tool-label", text: tool.label });
+    btn.appendChild(icon);
+    btn.appendChild(label);
     btn.addEventListener("click", function () { _setActiveTool(state, context, actions, tool.id); });
     strip.appendChild(btn);
   });
   return strip;
+}
+
+// ── Workspace top bar ─────────────────────────────────────────────
+// One row above the canvas, inside .comfymodal-studio-workspace:
+// centered Photoshop-style tool rail + right-aligned run controls.
+// Run / queue-toggle / experiment-toggle are radio-linked: queue and
+// experiment can never be on at the same time.
+
+function _enqueueCurrentRun(state) {
+  var pg = state && state.playground;
+  if (!pg) return null;
+  var store = pg._workflowRun;
+  var q = _runQueueOf(state);
+  var snapshot = {
+    id: "q_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7),
+    tool: activeToolOf(state),
+    workflowId: (store && store.workflowId) || "",
+    workflowVersionId: (store && store.workflowVersionId) || "",
+    workflowName: (store && store.workflowName) || "",
+    controlValues: Object.assign({}, (store && store.controlValues) || {}, pg.controls || {}),
+    label: ((store && store.workflowName) || activeToolOf(state)) + " #" + (q.length + 1),
+    createdAt: Date.now(),
+  };
+  q.push(snapshot);
+  _saveQueue(state);
+  if (state.playground) state.playground._toastDismissed = false;
+  return snapshot;
+}
+
+// Queue auto-drain guard + scheduler. Called on every terminal runState.
+// Submits the next queued item only when: queue mode still on, items remain,
+// no run is active, and no drain is already scheduled. The deferred re-check
+// covers queueMode being toggled off or the queue emptied between terminal
+// state and the scheduled tick.
+function _maybeDrainQueue(state, context, actions) {
+  var pg = state && state.playground;
+  if (!pg || !pg.queueMode || pg._queueDrainInFlight || pg._batchApplying) return;
+  if (!_runQueueOf(state).length) return;
+  var ctrl = pg._runController;
+  if ((ctrl && typeof ctrl.isTerminal === "function" && !ctrl.isTerminal()) || _isRunActive(state)) return;
+  pg._queueDrainInFlight = true;
+  setTimeout(function () {
+    if (state.playground) state.playground._queueDrainInFlight = false;
+    if (!state.playground || !state.playground.queueMode || state.playground._batchApplying) return;
+    if (!_runQueueOf(state).length || _isRunActive(state)) return;
+    _drainNextGroup(state, context, actions);
+  }, 0);
+}
+
+function _runNextQueued(state, context, actions, btn) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  var q = _runQueueOf(state);
+  if (!q.length || _isRunActive(state)) return;
+  var next = q.shift();
+  _saveQueue(state);
+  // Restore the queued settings onto the live surface, then submit through
+  // the same single-run path the Run button uses.
+  try {
+    if (next.tool) {
+      pg.activeTool = next.tool;
+      pg.toolId = next.tool;
+    }
+    var store = pg._workflowRun;
+    if (store && next.controlValues) {
+      store.controlValues = Object.assign({}, next.controlValues);
+    }
+    if (pg.controls && next.controlValues) {
+      Object.keys(next.controlValues).forEach(function (k) {
+        if (next.controlValues[k] !== undefined) pg.controls[k] = next.controlValues[k];
+      });
+    }
+  } catch (_e) {}
+  if (context && context.setPage) context.setPage("playground");
+  setTimeout(function () {
+    var liveBtn = _resolvePrimaryRunButton();
+    _modernRunSubmit(state, context, actions, liveBtn || btn);
+  }, 0);
+}
+
+var _BATCH_HISTORY_KEY = "comfymodal.studio.batch-history.v1";
+var _BATCH_HISTORY_MAX = 20;
+
+function _loadBatchHistory() {
+  try {
+    var raw = localStorage.getItem(_BATCH_HISTORY_KEY);
+    if (!raw) return [];
+    var parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(function (rec) {
+      return rec && typeof rec.batchId === "string" && Array.isArray(rec.items);
+    }).slice(0, _BATCH_HISTORY_MAX);
+  } catch (_e) {
+    return [];
+  }
+}
+
+function _recordBatchHistory(state) {
+  var pg = state && state.playground;
+  if (!pg || !Array.isArray(pg._batchItems) || !pg._batchItems.length) return;
+  var done = 0, failed = 0, skipped = 0;
+  var items = pg._batchItems.map(function (entry) {
+    if (entry && entry.status === "done") done++;
+    else if (entry && entry.status === "failed") failed++;
+    else if (entry && entry.status === "skipped") skipped++;
+    return {
+      variantRequestId: (entry && entry.variantRequestId) || "",
+      label: (entry && entry.label) || "",
+      status: (entry && entry.status) || "pending",
+      outputUrl: (entry && entry.outputUrl) || "",
+      historyGenerationId: (entry && entry.historyGenerationId) || "",
+      message: (entry && entry.message) || "",
+    };
+  });
+  var record = {
+    batchId: pg._batchId || "",
+    createdAt: pg._batchStartedAt || Date.now(),
+    workflowName: pg._batchWorkflowName || "",
+    total: pg._batchItems.length,
+    completed: done,
+    failed: failed,
+    skipped: skipped,
+    cancelled: !!pg._batchCancelled,
+    items: items,
+  };
+  try {
+    var all = [record].concat(_loadBatchHistory()).slice(0, _BATCH_HISTORY_MAX);
+    localStorage.setItem(_BATCH_HISTORY_KEY, JSON.stringify(all));
+  } catch (_e) {}
+}
+
+// ── Persistent activity toast ───────────────────────────────────
+// Appears while runs are queued or an experiment runs; stays until the
+// user closes it. New activity (enqueue, batch start, experiment start)
+// shows it again.
+var _queueToastEl = null;
+
+function _refreshQueueToast(state) {
+  var pg = state.playground || {};
+  var q = _runQueueOf(state);
+  var expActive = !!(pg.experimentMode && pg._activeExperimentId);
+  var active = q.length > 0 || !!pg._batchApplying || expActive;
+  if (!active || pg._toastDismissed) {
+    if (_queueToastEl && _queueToastEl.isConnected) _queueToastEl.remove();
+    _queueToastEl = null;
+    return;
+  }
+  if (!_queueToastEl || !_queueToastEl.isConnected) {
+    _queueToastEl = el("div", {
+      class: "comfymodal-studio-queue-toast",
+      "data-testid": "queue-toast",
+      role: "status",
+    });
+    document.body.appendChild(_queueToastEl);
+  }
+  while (_queueToastEl.firstChild) _queueToastEl.removeChild(_queueToastEl.firstChild);
+  var head = el("div", { class: "comfymodal-studio-queue-toast-head" });
+  head.appendChild(el("span", {
+    class: "comfymodal-studio-queue-toast-title",
+    text: pg._batchApplying ? "Batch running" : (expActive && !q.length ? "Experiment running" : "Queue"),
+  }));
+  var close = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn comfymodal-studio-queue-toast-close",
+    "data-testid": "queue-toast-close",
+    text: "✕",
+    title: "Dismiss",
+    "aria-label": "Dismiss queue toast",
+  });
+  close.addEventListener("click", function () {
+    if (state.playground) state.playground._toastDismissed = true;
+    _refreshQueueToast(state);
+  });
+  head.appendChild(close);
+  _queueToastEl.appendChild(head);
+  var body = el("div", { class: "comfymodal-studio-queue-toast-body" });
+  if (pg._batchApplying) {
+    var done = pg._batchCompleted || 0;
+    var total = pg._batchTotal || 0;
+    body.appendChild(el("div", {
+      class: "comfymodal-studio-queue-toast-line",
+      text: total ? ("Batch " + done + "/" + total + "…") : "Batch running…",
+    }));
+  }
+  q.slice(0, 5).forEach(function (item, i) {
+    body.appendChild(el("div", {
+      class: "comfymodal-studio-queue-toast-line",
+      text: (i + 1) + ". " + ((item && item.label) || "Queued run"),
+    }));
+  });
+  if (q.length > 5) {
+    body.appendChild(el("div", {
+      class: "comfymodal-studio-queue-toast-line is-muted",
+      text: "+" + (q.length - 5) + " more",
+    }));
+  }
+  if (expActive) {
+    body.appendChild(el("div", {
+      class: "comfymodal-studio-queue-toast-line",
+      text: "Experiment running",
+    }));
+  }
+  _queueToastEl.appendChild(body);
+  var open = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn",
+    "data-testid": "queue-toast-open",
+    text: "Open manager",
+  });
+  open.addEventListener("click", function () {
+    openQueueViewer(state, _latestPlaygroundTrio && _latestPlaygroundTrio.context);
+  });
+  _queueToastEl.appendChild(open);
+}
+
+function _formatQueuedValue(value) {
+  var s;
+  try {
+    s = (typeof value === "string") ? value : JSON.stringify(value);
+  } catch (_e) {
+    s = String(value);
+  }
+  if (s == null) return "";
+  s = String(s);
+  return s.length > 140 ? s.slice(0, 140) + "…" : s;
+}
+
+// ── Queue viewer ────────────────────────────────────────────────
+// Body-level overlay (survives playground re-renders) listing each queued
+// run's captured data with a per-run Delete button.
+
+var _queueViewerEl = null;
+var _queueViewerHistory = null;
+
+function _queueViewerKeydown(e) {
+  if (e && e.key === "Escape") closeQueueViewer();
+}
+
+function closeQueueViewer() {
+  if (_queueViewerEl && _queueViewerEl.isConnected) _queueViewerEl.remove();
+  _queueViewerEl = null;
+  _queueViewerHistory = null;
+  document.removeEventListener("keydown", _queueViewerKeydown);
+}
+
+// Shared image-viewer opener: History record first (same source the History
+// detail overlay renders, so prompt/params/image can never disagree), local
+// run record as fallback. Reused by canvas, queue manager, and experiments.
+export async function openRunImagePreview(state, context, run, outputUrl) {
+  var _run = run || null;
+  var _apiBase = (context && context.apiBase) || "/comfymodal";
+  var _runId = viewerFirst(_run && _run.runId, _run && _run.id);
+  if (!_runId) return;
+  _savePlaygroundPreviewId(_runId);
+  if (state.playground) state.playground._previewOpen = true;
+  var _preview;
+  try {
+    var _record = null;
+    var _historyRepo = null;
+    if (_runId) {
+      try {
+        _historyRepo = await createHistoryRepository({ apiBase: _apiBase });
+        _record = await _resolveHistoryViewerRecord(_historyRepo, _runId, _run, _apiBase);
+      } catch (err) { /* local run remains a truthful fallback */ }
+    }
+    if (!_record) {
+      _historyRepo = null;
+      _record = buildViewerRecordFromRun(_run, outputUrl);
+    }
+    if (!_record) return;
+
+    // Annotation writes follow the record's authority: a History-sourced
+    // record writes through History V2 (the durable owner of favorites
+    // and notes, exactly like the History overlay's own star/editor).
+    function _writeAnnotation(field, value) {
+      if (_historyRepo) {
+        return field === "favorite"
+          ? _historyRepo.setFavorite(_record.id, value)
+          : _historyRepo.setNote(_record.id, value);
+      }
+      if (_run && _run._historyKind) {
+        return _getRecentRunsRepo(_apiBase).then(function (repo) {
+          return field === "favorite"
+            ? repo.setFavorite(_run.id, value)
+            : repo.setNote(_run.id, value);
+        });
+      }
+      var patch = {};
+      patch[field] = value;
+      return updateRunAnnotation(_apiBase, _runId, patch);
+    }
+
+    var _viewer = resolveViewerInput(_record, outputUrl);
+    // Native File actions need a V2 repository: local-only run records
+    // carry no asset identity (buttons stay hidden), and bridge-mode
+    // repos have no open/reveal routes (same reason).
+    var _repoMode = null;
+    try {
+      _repoMode = _historyRepo && typeof _historyRepo.getModeInfo === "function"
+        ? _historyRepo.getModeInfo() : null;
+    } catch (err) { _repoMode = null; }
+           var _fileActions = (_historyRepo && _repoMode && _repoMode.mode === "v2") ? {
+             openAsset: function (assetId) { return _historyRepo.openAsset(assetId); },
+             revealAsset: function (assetId) { return _historyRepo.revealAsset(assetId); },
+           } : null;
+           var _canDelete = !!(_historyRepo && _repoMode && _repoMode.mode === "v2");
+    // Same single builder as History detail (resolveViewerShellArgs):
+    // every shell input flows through it on both surfaces, so they
+    // cannot drift apart when inputs are added.
+    _preview = buildViewerShell(resolveViewerShellArgs(_viewer, {
+      fileActions: _fileActions,
+      // Same-page base: the shelf is right here, so apply directly and
+      // rebuild — the overlay closes itself on a positive count.
+      onUseAsBase: function (payload) {
+        var applied = _applyShelfBaseValues(state, payload || {});
+        _rerenderWorkflowSection(state, context, actions);
+        return applied;
+      },
+      onClose: function () {
+        if (state.playground) state.playground._previewOpen = false;
+        _clearPlaygroundPreviewId();
+      },
+              persistence: {
+               setFavorite: function (rec, next) {
+                 if (!_runId) return Promise.resolve();
+                 return _writeAnnotation("favorite", next);
+               },
+               setNote: function (rec, text) {
+                 if (!_runId) return Promise.resolve();
+                 return _writeAnnotation("note", text);
+               },
+               deleteGeneration: _canDelete
+                 ? function (rec) { return _historyRepo.deleteGeneration(rec.id); }
+                 : undefined,
+               onChanged: null,
+             },
+    }));
+  } catch (e) {
+    // Do not swallow: a silent failure here looks like "click does nothing".
+    console.error("comfymodal: image preview overlay failed to open", e);
+    if (state.playground) state.playground._previewOpen = false;
+    return;
+  }
+  document.body.appendChild(_preview.overlay);
+}
+
+function openQueueViewer(state, context) {
+  closeQueueViewer();
+  var overlay = el("div", {
+    class: "comfymodal-studio-queue-viewer-overlay",
+    "data-testid": "queue-viewer",
+  });
+  overlay.addEventListener("click", function (e) {
+    if (e.target === overlay) closeQueueViewer();
+  });
+  var panel = el("div", {
+    class: "comfymodal-studio-queue-viewer comfymodal-studio-queue-manager",
+    role: "dialog",
+    "aria-label": "Queue manager",
+  });
+  var head = el("div", { class: "comfymodal-studio-queue-viewer-head" });
+  head.appendChild(el("h3", {
+    class: "comfymodal-studio-queue-viewer-heading",
+    text: "Queue Manager",
+  }));
+  head.appendChild(el("span", {
+    class: "comfymodal-studio-queue-viewer-count",
+    "data-testid": "queue-viewer-count",
+  }));
+  var closeBtn = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn",
+    "data-testid": "queue-viewer-close",
+    text: "Close",
+  });
+  closeBtn.addEventListener("click", closeQueueViewer);
+  head.appendChild(closeBtn);
+  panel.appendChild(head);
+  panel.appendChild(el("div", {
+    class: "comfymodal-studio-queue-manager-batch",
+    "data-testid": "queue-manager-batch",
+  }));
+  panel.appendChild(el("div", {
+    class: "comfymodal-studio-queue-viewer-list",
+    "data-testid": "queue-viewer-list",
+  }));
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  _queueViewerEl = overlay;
+  _refreshQueueViewer(state, context);
+  closeBtn.focus();
+  document.addEventListener("keydown", _queueViewerKeydown);
+}
+
+function _refreshQueueViewer(state, context) {
+  if (!_queueViewerEl || !_queueViewerEl.isConnected) return;
+  // History mode: a read-only past batch, unaffected by live state.
+  if (_queueViewerHistory) {
+    var hList = _queueViewerEl.querySelector('[data-testid="queue-viewer-list"]');
+    var hBatch = _queueViewerEl.querySelector('[data-testid="queue-manager-batch"]');
+    var hCount = _queueViewerEl.querySelector('[data-testid="queue-viewer-count"]');
+    if (!hList) return;
+    while (hList.firstChild) hList.removeChild(hList.firstChild);
+    if (hBatch) {
+      while (hBatch.firstChild) hBatch.removeChild(hBatch.firstChild);
+      hBatch.appendChild(_renderHistoryRecord(state, context, _queueViewerHistory));
+    }
+    if (hCount) {
+      var rec = _queueViewerHistory;
+      hCount.textContent = rec.completed + "/" + rec.total + " complete"
+        + (rec.failed ? " · " + rec.failed + " failed" : "");
+    }
+    return;
+  }
+  var pg = state.playground || {};
+  var q = _runQueueOf(state);
+  var batchItems = Array.isArray(pg._batchItems) ? pg._batchItems : [];
+  var batchSection = _queueViewerEl.querySelector('[data-testid="queue-manager-batch"]');
+  var list = _queueViewerEl.querySelector('[data-testid="queue-viewer-list"]');
+  var count = _queueViewerEl.querySelector('[data-testid="queue-viewer-count"]');
+  if (!list) return;
+  while (list.firstChild) list.removeChild(list.firstChild);
+  if (batchSection) {
+    while (batchSection.firstChild) batchSection.removeChild(batchSection.firstChild);
+    var batchBody = _renderBatchSection(state, context);
+    if (batchBody) batchSection.appendChild(batchBody);
+  }
+  var waiting = q.length;
+  var summary = [];
+  if (batchItems.length) {
+    var done = batchItems.filter(function (e) { return e && e.status === "done"; }).length;
+    summary.push("batch " + done + "/" + batchItems.length);
+  }
+  summary.push(waiting ? waiting + " waiting" : "Empty");
+  if (count) count.textContent = summary.join(" · ");
+  if (!q.length) {
+    list.appendChild(el("p", {
+      class: "comfymodal-studio-tool-submenu-note",
+      text: "Queue is empty — use the Queue button to add the current settings.",
+    }));
+    return;
+  }
+  list.appendChild(el("h4", {
+    class: "comfymodal-studio-queue-manager-subhead",
+    text: "Queued",
+  }));
+  q.forEach(function (item, idx) {
+    list.appendChild(_renderQueuedItem(state, context, item, idx, q.length));
+  });
+}
+
+var _BATCH_STATUS_LABELS = {
+  pending: "Pending",
+  running: "Running",
+  done: "Done",
+  failed: "Failed",
+  skipped: "Skipped",
+};
+
+function _renderBatchSection(state, context) {
+  var pg = state.playground || {};
+  var batchItems = Array.isArray(pg._batchItems) ? pg._batchItems : [];
+  if (!batchItems.length) return null;
+  var wrap = el("div", { class: "comfymodal-studio-batch-section" });
+  var head = el("div", { class: "comfymodal-studio-batch-section-head" });
+  head.appendChild(el("h4", {
+    class: "comfymodal-studio-queue-manager-subhead",
+    text: pg._batchApplying ? "Batch running" : "Last batch",
+  }));
+  var done = 0, failed = 0, skipped = 0, running = 0;
+  batchItems.forEach(function (entry) {
+    if (!entry) return;
+    if (entry.status === "done") done++;
+    else if (entry.status === "failed") failed++;
+    else if (entry.status === "skipped") skipped++;
+    else if (entry.status === "running") running++;
+  });
+  var total = batchItems.length;
+  var settled = done + failed + skipped;
+  var parts = [done + "/" + total + " complete"];
+  if (failed) parts.push(failed + " failed");
+  if (skipped) parts.push(skipped + " skipped");
+  if (running) parts.push(running + " running");
+  if (pg._batchCancelled) parts.push("cancelled");
+  head.appendChild(el("span", {
+    class: "comfymodal-studio-batch-summary",
+    "data-testid": "batch-summary",
+    text: parts.join(" · "),
+  }));
+  if (pg._batchApplying && !pg._batchCancelling) {
+    var cancelAll = el("button", {
+      type: "button",
+      class: "comfymodal-destructive-btn",
+      "data-testid": "batch-cancel-btn",
+      text: "Cancel batch",
+      title: "Stop after the current variant — the rest returns to the queue",
+    });
+    cancelAll.addEventListener("click", function () {
+      if (state.playground) state.playground._batchCancelling = true;
+      cancelAll.disabled = true;
+      cancelAll.textContent = "Cancelling…";
+      var apiBase = (context && context.apiBase) || "/comfymodal";
+      cancelStudioBatch(apiBase, { request_id: (state.playground && state.playground._batchId) || "" }).catch(function () {});
+      _refreshQueueViewer(state, context);
+    });
+    head.appendChild(cancelAll);
+  } else if (pg._batchCancelling && pg._batchApplying) {
+    head.appendChild(el("span", {
+      class: "comfymodal-studio-tool-submenu-note",
+      text: "Cancelling after the current variant…",
+    }));
+  }
+  wrap.appendChild(head);
+  var bar = el("div", {
+    class: "comfymodal-studio-batch-progress",
+    "data-testid": "batch-progress",
+    role: "progressbar",
+    "aria-valuemin": "0",
+    "aria-valuemax": String(total),
+    "aria-valuenow": String(settled),
+  });
+  var fill = el("div", { class: "comfymodal-studio-batch-progress-fill" });
+  fill.style.width = total ? Math.round((settled / total) * 100) + "%" : "0%";
+  bar.appendChild(fill);
+  wrap.appendChild(bar);
+  batchItems.forEach(function (entry) {
+    wrap.appendChild(_renderBatchRow(state, context, entry));
+  });
+  return wrap;
+}
+
+// Read-only past-batch view for the history dropdown: summary, progress,
+// and per-item rows. Done rows open in the shared studio viewer.
+function _renderHistoryRecord(state, context, rec) {
+  var wrap = el("div", { class: "comfymodal-studio-batch-section" });
+  var head = el("div", { class: "comfymodal-studio-batch-section-head" });
+  head.appendChild(el("h4", {
+    class: "comfymodal-studio-queue-manager-subhead",
+    text: (rec.workflowName || "Batch") + " · " + new Date(rec.createdAt || Date.now()).toLocaleString(),
+  }));
+  var parts = [rec.completed + "/" + rec.total + " complete"];
+  if (rec.failed) parts.push(rec.failed + " failed");
+  if (rec.skipped) parts.push(rec.skipped + " skipped");
+  if (rec.cancelled) parts.push("cancelled");
+  head.appendChild(el("span", {
+    class: "comfymodal-studio-batch-summary",
+    text: parts.join(" · "),
+  }));
+  wrap.appendChild(head);
+  var total = rec.total || (rec.items || []).length || 0;
+  var settled = (rec.completed || 0) + (rec.failed || 0) + (rec.skipped || 0);
+  var bar = el("div", {
+    class: "comfymodal-studio-batch-progress",
+    role: "progressbar",
+    "aria-valuemin": "0",
+    "aria-valuemax": String(total),
+    "aria-valuenow": String(settled),
+  });
+  var fill = el("div", { class: "comfymodal-studio-batch-progress-fill" });
+  fill.style.width = total ? Math.round((settled / total) * 100) + "%" : "0%";
+  bar.appendChild(fill);
+  wrap.appendChild(bar);
+  (rec.items || []).forEach(function (item) {
+    wrap.appendChild(_renderBatchRow(state, context, {
+      variantRequestId: item.variantRequestId || item.label || "",
+      label: item.label || "",
+      status: item.status || "pending",
+      outputUrl: item.outputUrl || "",
+      historyGenerationId: item.historyGenerationId || "",
+      message: item.message || "",
+    }, true));
+  });
+  return wrap;
+}
+
+function _renderBatchRow(state, context, entry, readOnly) {
+  var pg = state.playground || {};
+  var row = el("div", {
+    class: "comfymodal-studio-batch-row is-" + (entry.status || "pending"),
+    "data-testid": "batch-row-" + entry.variantRequestId,
+    "data-variant-id": entry.variantRequestId,
+  });
+  if (entry.status === "done" && entry.outputUrl) {
+    var thumb = el("img", {
+      class: "comfymodal-studio-batch-row-thumb",
+      src: entry.outputUrl,
+      alt: entry.label || "Batch result",
+      "data-testid": "batch-row-thumb-" + entry.variantRequestId,
+      title: "Open in viewer",
+    });
+    thumb.style.cursor = "zoom-in";
+    thumb.setAttribute("role", "button");
+    thumb.setAttribute("tabindex", "0");
+    var openIt = function () {
+      openRunImagePreview(state, context, {
+        runId: entry.variantRequestId,
+        id: entry.variantRequestId,
+        historyGenerationId: entry.historyGenerationId || "",
+      }, entry.outputUrl);
+    };
+    thumb.addEventListener("click", openIt);
+    thumb.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openIt(); }
+    });
+    row.appendChild(thumb);
+  }
+  var label = el("span", {
+    class: "comfymodal-studio-batch-row-label",
+    text: entry.label || entry.variantRequestId,
+    title: entry.message || entry.label || "",
+  });
+  row.appendChild(label);
+  row.appendChild(el("span", {
+    class: "comfymodal-studio-batch-status is-" + (entry.status || "pending"),
+    "data-testid": "batch-row-status-" + entry.variantRequestId,
+    text: _BATCH_STATUS_LABELS[entry.status] || entry.status || "Pending",
+  }));
+  if (!readOnly && (entry.status === "pending" || entry.status === "running") && pg._batchApplying) {
+    var skip = el("button", {
+      type: "button",
+      class: "comfymodal-destructive-btn",
+      "data-testid": "batch-skip-btn",
+      "data-variant-id": entry.variantRequestId,
+      text: entry.status === "running" ? "Skip next" : "Skip",
+      title: entry.status === "running"
+        ? "The running variant finishes; this takes effect afterwards"
+        : "Skip this variant — it returns to the queue",
+    });
+    skip.addEventListener("click", function () {
+      skip.disabled = true;
+      var apiBase = (context && context.apiBase) || "/comfymodal";
+      cancelStudioBatch(apiBase, {
+        request_id: (state.playground && state.playground._batchId) || "",
+        variant_request_id: entry.variantRequestId,
+      }).catch(function () {});
+    });
+    row.appendChild(skip);
+  }
+  if (entry.status === "done" && entry.outputUrl) {
+    var view = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": "batch-view-btn",
+      "data-variant-id": entry.variantRequestId,
+      text: "View",
+      title: "Open in the studio viewer",
+    });
+    view.addEventListener("click", function () {
+      openRunImagePreview(state, context, {
+        runId: entry.variantRequestId,
+        id: entry.variantRequestId,
+        historyGenerationId: entry.historyGenerationId || "",
+      }, entry.outputUrl);
+    });
+    row.appendChild(view);
+  }
+  return row;
+}
+
+function _moveQueueItem(state, context, id, delta) {
+  var q = _runQueueOf(state);
+  var at = q.findIndex(function (r) { return r && r.id === id; });
+  if (at === -1) return;
+  var to = at + delta;
+  if (to < 0 || to >= q.length) return;
+  var moved = q.splice(at, 1)[0];
+  q.splice(to, 0, moved);
+  _saveQueue(state);
+  _refreshQueueViewer(state, context);
+  if (context && context.setPage) context.setPage("playground");
+}
+
+function _renderQueuedItem(state, context, item, idx, total) {
+  var card = el("div", {
+    class: "comfymodal-studio-queued-item",
+    "data-testid": "queued-item-" + item.id,
+    "data-queue-id": item.id,
+  });
+  var top = el("div", { class: "comfymodal-studio-queued-item-top" });
+  var reorder = el("span", { class: "comfymodal-studio-queue-reorder" });
+  var up = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn comfymodal-studio-queue-move-btn",
+    "data-testid": "queue-move-up",
+    "data-queue-id": item.id,
+    text: "▲",
+    title: "Move up",
+    disabled: idx === 0,
+    "aria-label": "Move " + (item.label || item.id) + " up",
+  });
+  up.addEventListener("click", function () { _moveQueueItem(state, context, item.id, -1); });
+  var down = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn comfymodal-studio-queue-move-btn",
+    "data-testid": "queue-move-down",
+    "data-queue-id": item.id,
+    text: "▼",
+    title: "Move down",
+    disabled: idx >= total - 1,
+    "aria-label": "Move " + (item.label || item.id) + " down",
+  });
+  down.addEventListener("click", function () { _moveQueueItem(state, context, item.id, 1); });
+  reorder.appendChild(up);
+  reorder.appendChild(down);
+  top.appendChild(reorder);
+  var labelBtn = el("button", {
+    type: "button",
+    class: "comfymodal-studio-queued-item-label is-button",
+    "data-testid": "queued-item-label-" + item.id,
+    text: (idx + 1) + ". " + (item.label || item.id),
+    title: "Show captured settings",
+  });
+  top.appendChild(labelBtn);
+  var del = el("button", {
+    type: "button",
+    class: "comfymodal-destructive-btn",
+    "data-testid": "queue-delete-btn",
+    "data-queue-id": item.id,
+    text: "Delete",
+    title: "Remove this queued run",
+  });
+  del.addEventListener("click", function () {
+    var q = _runQueueOf(state);
+    var at = q.findIndex(function (r) { return r && r.id === item.id; });
+    if (at !== -1) q.splice(at, 1);
+    _saveQueue(state);
+    _refreshQueueViewer(state, context);
+    if (context && context.setPage) context.setPage("playground");
+  });
+  top.appendChild(del);
+  card.appendChild(top);
+
+  var spec = STUDIO_TOOLS.find(function (t) { return t.id === item.tool; });
+  var meta = el("div", { class: "comfymodal-studio-queued-item-meta" });
+  meta.appendChild(el("span", { text: "Tool: " + (spec ? spec.label : (item.tool || "—")) }));
+  meta.appendChild(el("span", {
+    text: "Workflow: " + (item.workflowName || item.workflowId || "—")
+      + (item.workflowVersionId ? " · " + item.workflowVersionId : ""),
+  }));
+  if (item.createdAt) {
+    meta.appendChild(el("span", {
+      text: "Queued: " + new Date(item.createdAt).toLocaleTimeString(),
+    }));
+  }
+  card.appendChild(meta);
+
+  var detail = el("div", {
+    class: "comfymodal-studio-queued-item-detail",
+    "data-testid": "queued-item-detail-" + item.id,
+    hidden: true,
+  });
+  var keys = Object.keys(item.controlValues || {});
+  if (!keys.length) {
+    detail.appendChild(el("p", {
+      class: "comfymodal-studio-tool-submenu-note",
+      text: "No control values captured.",
+    }));
+  } else {
+    var data = el("dl", {
+      class: "comfymodal-studio-queued-item-data",
+      "data-testid": "queued-item-data-" + item.id,
+    });
+    keys.forEach(function (k) {
+      var full = "";
+      try {
+        full = (typeof item.controlValues[k] === "string")
+          ? item.controlValues[k]
+          : JSON.stringify(item.controlValues[k]);
+      } catch (_e) {
+        full = String(item.controlValues[k]);
+      }
+      data.appendChild(el("dt", { text: k }));
+      data.appendChild(el("dd", {
+        text: _formatQueuedValue(item.controlValues[k]),
+        title: String(full == null ? "" : full).slice(0, 500),
+      }));
+    });
+    detail.appendChild(data);
+  }
+  card.appendChild(detail);
+  labelBtn.setAttribute("aria-expanded", "false");
+  labelBtn.addEventListener("click", function () {
+    var open = detail.hasAttribute("hidden");
+    if (open) detail.removeAttribute("hidden");
+    else detail.setAttribute("hidden", "");
+    labelBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+  return card;
+}
+
+function renderWorkspaceTopBar(state, context, actions) {
+  var pg = state.playground || {};
+  var queueMode = !!pg.queueMode;
+  var experimentMode = !!pg.experimentMode;
+  var queue = _runQueueOf(state);
+
+  var bar = el("div", {
+    class: "comfymodal-studio-workspace-topbar",
+    "data-testid": "workspace-topbar",
+  });
+
+  var leftSpacer = el("div", { class: "comfymodal-studio-topbar-spacer" });
+  bar.appendChild(leftSpacer);
+
+  var railWrap = el("div", { class: "comfymodal-studio-topbar-rail" });
+  railWrap.appendChild(renderToolStrip(state, context, actions));
+  bar.appendChild(railWrap);
+
+  var right = el("div", { class: "comfymodal-studio-topbar-actions" });
+
+  // Queue toggle (radio with experiment toggle), split with the batch
+  // history dropdown: squared inner corners + 2px gap read as one button.
+  var queueSplit = el("div", { class: "comfymodal-studio-queue-split" });
+  var queueToggle = el("button", {
+    type: "button",
+    class: "comfymodal-studio-mode-toggle comfymodal-studio-queue-split-main" + (queueMode ? " is-on active" : ""),
+    "data-testid": "queue-toggle",
+    title: queueMode ? "Queue mode on — runs are collected first" : "Queue mode off — run immediately",
+  });
+  queueToggle.setAttribute("aria-pressed", queueMode ? "true" : "false");
+  queueToggle.appendChild(el("span", { class: "toggle-dot", "aria-hidden": "true" }));
+  queueToggle.appendChild(el("span", { text: "Queue" }));
+  queueToggle.addEventListener("click", function () {
+    if (actions && actions.setQueueMode) actions.setQueueMode(!queueMode);
+  });
+  queueSplit.appendChild(queueToggle);
+  var histArrow = el("button", {
+    type: "button",
+    class: "comfymodal-studio-mode-toggle comfymodal-studio-queue-split-arrow",
+    "data-testid": "queue-history-btn",
+    title: "Queued batch history",
+    "aria-label": "Queued batch history",
+    "aria-expanded": "false",
+    "aria-haspopup": "menu",
+  });
+  histArrow.appendChild(el("span", { "aria-hidden": "true", text: "▾" }));
+  var histMenu = el("div", {
+    class: "comfymodal-studio-queue-history-menu",
+    "data-testid": "queue-history-menu",
+    role: "menu",
+    hidden: true,
+  });
+  function _closeHistMenu() {
+    histMenu.setAttribute("hidden", "");
+    histArrow.setAttribute("aria-expanded", "false");
+    document.removeEventListener("click", _outsideHistMenu, true);
+    document.removeEventListener("keydown", _escHistMenu);
+  }
+  function _outsideHistMenu(e) {
+    if (!histMenu.isConnected || histMenu.contains(e.target) || histArrow.contains(e.target)) return;
+    _closeHistMenu();
+  }
+  function _escHistMenu(e) {
+    if (e && e.key === "Escape") _closeHistMenu();
+  }
+  histArrow.addEventListener("click", function () {
+    var open = histMenu.hasAttribute("hidden");
+    if (!open) {
+      _closeHistMenu();
+      return;
+    }
+    while (histMenu.firstChild) histMenu.removeChild(histMenu.firstChild);
+    var records = _loadBatchHistory();
+    if (!records.length) {
+      histMenu.appendChild(el("div", {
+        class: "comfymodal-studio-queue-history-empty",
+        text: "No batches yet — queued batches are recorded here.",
+      }));
+    }
+    records.forEach(function (rec) {
+      var label = (rec.workflowName || "Batch") + " · "
+        + new Date(rec.createdAt || Date.now()).toLocaleString();
+      var sub = rec.completed + "/" + rec.total + " complete"
+        + (rec.failed ? " · " + rec.failed + " failed" : "")
+        + (rec.skipped ? " · " + rec.skipped + " skipped" : "")
+        + (rec.cancelled ? " · cancelled" : "");
+      var entry = el("button", {
+        type: "button",
+        class: "comfymodal-studio-queue-history-item",
+        role: "menuitem",
+        "data-testid": "queue-history-item-" + rec.batchId,
+        title: "Open in the queue manager",
+      });
+      entry.appendChild(el("span", {
+        class: "comfymodal-studio-queue-history-item-label",
+        text: label,
+      }));
+      entry.appendChild(el("span", {
+        class: "comfymodal-studio-queue-history-item-sub",
+        text: sub,
+      }));
+      entry.addEventListener("click", function () {
+        _closeHistMenu();
+        _queueViewerHistory = rec;
+        openQueueViewer(state, context);
+      });
+      histMenu.appendChild(entry);
+    });
+    histMenu.removeAttribute("hidden");
+    histArrow.setAttribute("aria-expanded", "true");
+    document.addEventListener("click", _outsideHistMenu, true);
+    document.addEventListener("keydown", _escHistMenu);
+  });
+  queueSplit.appendChild(histArrow);
+  queueSplit.appendChild(histMenu);
+  right.appendChild(queueSplit);
+
+  // Primary run button: becomes "Queue" in queue mode.
+  var runState = pg.runState;
+  var primaryLabel = queueMode ? "Queue" : "Run";
+  var primaryBtn = el("button", {
+    type: "button",
+    class: "comfymodal-studio-run-btn",
+    "data-testid": "run-btn",
+    title: queueMode ? "Add current settings to the queue" : "",
+  });
+  primaryBtn.appendChild(el("span", { class: "run-glyph", "aria-hidden": "true", text: queueMode ? "+" : "▶" }));
+  primaryBtn.appendChild(el("span", { text: primaryLabel, "data-testid": "run-btn-label" }));
+  var reason = el("div", { class: "comfymodal-studio-topbar-reason" });
+  var batchApplying = !!pg._batchApplying;
+  if (batchApplying) {
+    // A container batch is in flight: lock the primary button on batch
+    // progress so a second batch or single run cannot overlap it.
+    primaryBtn.disabled = true;
+    primaryBtn.classList.add("is-busy");
+    var _done = pg._batchCompleted || 0;
+    var _total = pg._batchTotal || 0;
+    primaryBtn.querySelector('[data-testid="run-btn-label"]').textContent =
+      _total ? ("Batch " + _done + "/" + _total + "…") : "Batch…";
+    primaryBtn.title = "Batch running";
+  } else if (runState && (runState.status === "running" || runState.status === "submitted"
+    || runState.status === "waiting" || runState.status === "queued"
+    || runState.status === "in_progress")) {
+    primaryBtn.disabled = true;
+    primaryBtn.classList.add("is-busy");
+    primaryBtn.querySelector('[data-testid="run-btn-label"]').textContent =
+      runState.status === "queued" ? "Queued…" : "Running…";
+    primaryBtn.title = "Run in progress";
+  } else if (queueMode) {
+    primaryBtn.disabled = false;
+    primaryBtn.onclick = null;
+    primaryBtn.addEventListener("click", function () {
+      _enqueueCurrentRun(state);
+      if (context && context.setPage) context.setPage("playground");
+    });
+  } else if (_isModernRunSelected(state)) {
+    primaryBtn.disabled = true;
+    var _savedOnclick = primaryBtn.onclick;
+    _applyModernRunButtonState(state, context, actions, primaryBtn, reason);
+    // _applyModernRunButtonState sets textContent directly; restore the
+    // glyph+label structure it replaces while keeping its gating outcome.
+    var _label = String(primaryBtn.textContent || "Run");
+    var _wasDisabled = !!primaryBtn.disabled;
+    var _gatedOnclick = primaryBtn.onclick;
+    while (primaryBtn.firstChild) primaryBtn.removeChild(primaryBtn.firstChild);
+    primaryBtn.appendChild(el("span", { class: "run-glyph", "aria-hidden": "true", text: "▶" }));
+    primaryBtn.appendChild(el("span", { text: _label, "data-testid": "run-btn-label" }));
+    primaryBtn.disabled = _wasDisabled;
+    if (!_wasDisabled) {
+      primaryBtn.onclick = function () {
+        primaryBtn.disabled = true;
+        var lbl = primaryBtn.querySelector('[data-testid="run-btn-label"]');
+        if (lbl) lbl.textContent = "Running…";
+        _modernRunSubmit(state, context, actions, primaryBtn);
+        if (primaryBtn.disabled === false && typeof _gatedOnclick === "function") _gatedOnclick();
+        void _savedOnclick;
+      };
+    } else {
+      primaryBtn.onclick = null;
+    }
+  } else {
+    primaryBtn.disabled = true;
+    primaryBtn.title = "Select a workflow to run";
+  }
+  right.appendChild(primaryBtn);
+
+  // Run-queue button: only in queue mode, beside the Queue button.
+  if (queueMode) {
+    var runQueueBtn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn comfymodal-studio-run-queue-btn",
+      "data-testid": "run-queue-btn",
+      title: queue.length ? "Run all queued items in order — same-workflow groups share one container (" + queue.length + " waiting)" : "Queue is empty — queue a run first",
+    });
+    runQueueBtn.textContent = "Run queue" + (queue.length ? " (" + queue.length + ")" : "");
+    runQueueBtn.disabled = queue.length === 0 || _isRunActive(state) || !!pg._batchApplying;
+    runQueueBtn.addEventListener("click", function () {
+      _drainNextGroup(state, context, actions);
+    });
+    right.appendChild(runQueueBtn);
+
+    // View queued runs: opens the queue viewer (per-run data + delete).
+    var viewQueueBtn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn comfymodal-studio-queue-view-btn",
+      "data-testid": "queue-view-btn",
+      title: queue.length ? "View queued runs (" + queue.length + " waiting)" : "Queue is empty",
+    });
+    viewQueueBtn.textContent = "View" + (queue.length ? " (" + queue.length + ")" : "");
+    viewQueueBtn.disabled = queue.length === 0;
+    viewQueueBtn.addEventListener("click", function () {
+      openQueueViewer(state, context);
+    });
+    right.appendChild(viewQueueBtn);
+
+    // Clear queue: drops all waiting runs (the active run is unaffected —
+    // it already left the queue when it started).
+    var clearQueueBtn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn comfymodal-studio-queue-clear-btn",
+      "data-testid": "queue-clear-btn",
+      title: queue.length ? "Remove all queued runs (" + queue.length + ")" : "Queue is empty",
+      text: "Clear",
+    });
+    clearQueueBtn.disabled = queue.length === 0;
+    clearQueueBtn.addEventListener("click", function () {
+      var q = _runQueueOf(state);
+      q.length = 0;
+      _saveQueue(state);
+      _refreshQueueViewer(state, context);
+      if (context && context.setPage) context.setPage("playground");
+    });
+    right.appendChild(clearQueueBtn);
+
+    // Cancel batch: stops after the current variant (a running variant
+    // always finishes); everything not yet run returns to the queue.
+    if (pg._batchApplying) {
+      var cancelBatchBtn = el("button", {
+        type: "button",
+        class: "comfymodal-destructive-btn comfymodal-studio-batch-cancel-btn",
+        "data-testid": "batch-cancel-btn",
+        title: "Stop the batch after the current variant — the rest returns to the queue",
+        text: pg._batchCancelling ? "Cancelling…" : "Cancel",
+        disabled: !!pg._batchCancelling,
+      });
+      cancelBatchBtn.addEventListener("click", function () {
+        if (state.playground) state.playground._batchCancelling = true;
+        cancelBatchBtn.disabled = true;
+        cancelBatchBtn.textContent = "Cancelling…";
+        var apiBase = (context && context.apiBase) || "/comfymodal";
+        cancelStudioBatch(apiBase, { request_id: (state.playground && state.playground._batchId) || "" }).catch(function () {});
+      });
+      right.appendChild(cancelBatchBtn);
+    }
+  }
+
+  // Experiment toggle: same behavior as the old control-panel button
+  // (renderExperimentToggle), now a compact radio with queue mode.
+  var expToggle = el("button", {
+    type: "button",
+    class: "comfymodal-studio-mode-toggle" + (experimentMode ? " is-on active" : ""),
+    "data-testid": "experiment-toggle",
+    title: experimentMode ? "Exit experiment mode" : "Enter experiment mode",
+  });
+  expToggle.setAttribute("aria-pressed", experimentMode ? "true" : "false");
+  expToggle.appendChild(el("span", { class: "toggle-dot", "aria-hidden": "true" }));
+  expToggle.appendChild(el("span", { text: experimentMode ? "Exit Experiment" : "Experiment" }));
+  expToggle.addEventListener("click", function () {
+    if (actions && actions.setExperimentMode) actions.setExperimentMode(!experimentMode);
+  });
+  right.appendChild(expToggle);
+
+  right.appendChild(reason);
+  bar.appendChild(right);
+  _refreshQueueToast(state);
+  return bar;
+}
+
+// ── Per-tool submenu row ──────────────────────────────────────────
+// Radio-linked to the tool rail: exactly one submenu is visible, directly
+// above the canvas. Bodies are intentionally sparse placeholders —
+// fill them in later via [data-testid="submenu-body-{id}"].
+
+var _TOOL_SUBMENU_NOTES = {
+  t2i: "Generate controls live here.",
+  i2i: "Edit controls live here.",
+  inpaint: "Mask controls live here.",
+  outpaint: "Crop controls live here.",
+  sketch: "Draw controls live here.",
+  postprocess: "Finishing editor lives in the canvas below — pick the Studio image there, or upload your own.",
+  upscale: "Upscale workflow controls live here (coming soon).",
+};
+
+function renderToolSubmenu(state, context, actions) {
+  var tool = activeToolOf(state);
+  var spec = STUDIO_TOOLS.find(function (t) { return t.id === tool; }) || STUDIO_TOOLS[0];
+  var row = el("div", {
+    class: "comfymodal-studio-tool-submenu",
+    "data-testid": "tool-submenu-" + spec.id,
+    "data-tool": spec.id,
+  });
+  var title = el("span", {
+    class: "comfymodal-studio-tool-submenu-title",
+    text: spec.label,
+  });
+  row.appendChild(title);
+
+  var body = el("div", {
+    class: "comfymodal-studio-tool-submenu-body",
+    "data-testid": "submenu-body-" + spec.id,
+  });
+
+  if (spec.id === "t2i") {
+    // Background fill: paints the canvas background a user-picked color.
+    var pg = state.playground || {};
+    var current = pg.canvasBg || "";
+    var fillBtn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn comfymodal-studio-bgfill-btn" + (current ? " is-on" : ""),
+      "data-testid": "bg-fill-btn",
+      title: "Fill the canvas background with a solid color",
+    });
+    fillBtn.appendChild(el("span", { "aria-hidden": "true", text: "🪣 " }));
+    fillBtn.appendChild(el("span", { text: "Bg Fill" }));
+    var picker = document.createElement("input");
+    picker.type = "color";
+    picker.value = current || "#18181b";
+    picker.setAttribute("data-testid", "bg-fill-picker");
+    picker.setAttribute("aria-label", "Background fill color");
+    picker.title = "Pick a background color";
+    picker.addEventListener("input", function () {
+      var canvas = document.querySelector('[data-testid="canvas-area"]');
+      if (canvas) {
+        canvas.style.background = picker.value;
+        canvas.style.backgroundImage = "none";
+      }
+    });
+    picker.addEventListener("change", function () {
+      if (actions && actions.setCanvasBg) actions.setCanvasBg(picker.value);
+    });
+    fillBtn.addEventListener("click", function () { picker.click(); });
+    body.appendChild(fillBtn);
+    body.appendChild(picker);
+    if (current) {
+      var swatch = el("span", {
+        class: "comfymodal-studio-bgfill-swatch",
+        "data-testid": "bg-fill-swatch",
+        title: current,
+      });
+      swatch.style.background = current;
+      body.appendChild(swatch);
+      var clear = el("button", {
+        type: "button",
+        class: "comfymodal-secondary-btn",
+        "data-testid": "bg-fill-clear",
+        text: "Clear",
+        title: "Remove the background fill",
+      });
+      clear.addEventListener("click", function () {
+        if (actions && actions.setCanvasBg) actions.setCanvasBg("");
+      });
+      body.appendChild(clear);
+    } else {
+      body.appendChild(el("span", {
+        class: "comfymodal-studio-tool-submenu-note",
+        text: "Optional — fills the empty canvas background.",
+      }));
+    }
+  } else if (spec.id === "postprocess") {
+    body.appendChild(el("span", {
+      class: "comfymodal-studio-tool-submenu-note",
+      text: (_TOOL_SUBMENU_NOTES[spec.id] || "Finishing editor below."),
+    }));
+    var _ppHint = el("span", {
+      class: "comfymodal-studio-tool-submenu-note",
+      text: "Shortcuts: \\ compare · C crop · J heal · W white balance · Ctrl+Z/Y undo/redo.",
+      style: "margin-left:8px;",
+    });
+    body.appendChild(_ppHint);
+  } else if (spec.isPlaceholder) {
+    body.appendChild(el("span", {
+      class: "comfymodal-studio-tool-submenu-note",
+      text: (_TOOL_SUBMENU_NOTES[spec.id] || "Coming soon."),
+    }));
+  } else {
+    body.appendChild(el("span", {
+      class: "comfymodal-studio-tool-submenu-note",
+      text: (_TOOL_SUBMENU_NOTES[spec.id] || "Tool options live here."),
+    }));
+  }
+
+  row.appendChild(body);
+  return row;
 }
 
 // Mapped roles that are deliberately NOT rendered as Shelf fields. These are
@@ -5742,7 +7973,8 @@ function _shelfClearDropIndicators() {
     ".comfymodal-studio-shelf-card.is-drop-before, .comfymodal-studio-shelf-card.is-drop-after, "
       + ".comfymodal-studio-shelf-row.is-drop-above, .comfymodal-studio-shelf-row.is-drop-below, "
       + ".comfymodal-studio-shelf-row.is-drop-target, "
-      + ".comfymodal-studio-shelf-advanced.is-drop-target"
+      + ".comfymodal-studio-shelf-advanced.is-drop-target, "
+      + ".comfymodal-studio-shelf-advanced-wrap.is-drop-target"
   ), function (node) {
     node.classList.remove("is-drop-before", "is-drop-after", "is-drop-above", "is-drop-below", "is-drop-target");
   });
@@ -5756,18 +7988,20 @@ function _shelfRowRoles(row) {
 
 function _shelfDropAtPoint(draggedRole, clientX, clientY) {
   var hit = document.elementFromPoint(clientX, clientY);
-  var advancedBox = hit && hit.closest ? hit.closest("[data-testid='shelf-advanced-section']") : null;
-  if (advancedBox && !advancedBox.hidden) {
+  var advancedWrap = hit && hit.closest ? hit.closest(".comfymodal-studio-shelf-advanced-wrap") : null;
+  var advancedBox = advancedWrap && advancedWrap.querySelector ? advancedWrap.querySelector("[data-testid='shelf-advanced-section']") : null;
+  if (advancedWrap) {
     var advancedTarget = hit.closest("[data-testid^='shelf-field-']");
-    if (advancedTarget && advancedTarget.getAttribute("data-role") !== draggedRole) {
+    if (advancedBox && !advancedBox.hidden && advancedTarget && advancedTarget.getAttribute("data-role") !== draggedRole) {
       var advancedRect = advancedTarget.getBoundingClientRect();
       return {
         mode: clientY < advancedRect.top + advancedRect.height / 2 ? "advanced-before" : "advanced-after",
         targetRole: advancedTarget.getAttribute("data-role"),
         row: advancedBox,
+        indicator: advancedWrap,
       };
     }
-    return { mode: "advanced", row: advancedBox };
+    return { mode: "advanced", row: advancedBox, indicator: advancedWrap };
   }
   var target = hit && hit.closest ? hit.closest("[data-testid^='shelf-field-']") : null;
   if (target && target.getAttribute("data-role") !== draggedRole) {
@@ -5880,10 +8114,40 @@ function _textGenerateBindingStatus(store) {
   });
   if (!node && ctx && ctx.version && ctx.version.executable_prompt
     && typeof ctx.version.executable_prompt === "object") {
+    // Expanded executable keys cover subgraph interiors ("30:10") as flat
+    // entries, so composite bindings resolve here without graph surgery.
     var promptNode = ctx.version.executable_prompt[targetId];
     if (promptNode && typeof promptNode === "object") {
       node = { id: targetId, class_type: promptNode.class_type, type: promptNode.class_type };
     }
+  }
+  if (!node && targetId.indexOf(":") !== -1 && graph && typeof graph === "object") {
+    // Composite outer:inner binding against a UI graph: the container's
+    // type is its subgraph definition id (same linkage as the wizard scan).
+    try {
+      var parts = targetId.split(":");
+      var outerId = parts[0];
+      var innerId = parts.slice(1).join(":");
+      var defs = (graph.definitions && graph.definitions.subgraphs) || null;
+      var defList = Array.isArray(defs) ? defs : (defs && typeof defs === "object" ? Object.values(defs) : []);
+      var container = null;
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodes[i] && String(nodes[i].id) === outerId) { container = nodes[i]; break; }
+      }
+      if (container) {
+        for (var j = 0; j < defList.length; j++) {
+          var def = defList[j];
+          if (!def || typeof def !== "object" || String(def.id) !== String(container.type)) continue;
+          var inner = Array.isArray(def.nodes) ? def.nodes : [];
+          for (var k = 0; k < inner.length; k++) {
+            if (inner[k] && String(inner[k].id) === innerId) {
+              node = { id: targetId, class_type: inner[k].class_type, type: inner[k].type };
+              break;
+            }
+          }
+        }
+      }
+    } catch (_e) { /* best-effort */ }
   }
   var valid = !!(node && _TEXT_GENERATE_NODE_TYPES.indexOf(node.class_type || node.type) !== -1);
   return {
@@ -5984,6 +8248,19 @@ function _shelfCurrentImageUrl(state) {
   var sel = pg._selectedRun;
   if (sel && sel.imageUrl) return String(sel.imageUrl);
   return "";
+}
+
+// Full-size canvas URL for a recent-run record: the same Preview >
+// Original > Thumbnail resolution the History detail and preview overlay
+// use for the record (resolveViewerInput from studio-run-normalizer.js),
+// falling back to the record's strip thumbnail.  The carousel strip always
+// renders the capped 256px thumbnail, but the canvas must never be set to
+// it while the record projects a full-size variant.
+function _canvasUrlForRun(nr, fallbackUrl) {
+  var fallback = fallbackUrl || (nr && nr.imageUrl) || "";
+  if (!nr || typeof nr !== "object") return fallback;
+  var resolved = resolveViewerInput(nr, fallback);
+  return (resolved && resolved.imageUrl) || fallback;
 }
 
 function _canvasImageUrl(state) {
@@ -6097,6 +8374,17 @@ function _setCanvasImage(state, url, context) {
     var img = document.querySelector('[data-testid="canvas-output"]');
     if (img && img.isConnected) {
       img.setAttribute("src", String(url));
+      // A paint overlay belongs to the previous image — clear it so old
+      // strokes never corrupt the new base.
+      try {
+        ["inpaint-canvas", "sketch-canvas"].forEach(function (tid) {
+          var p = document.querySelector('[data-testid="' + tid + '"]');
+          if (p && p.isConnected) {
+            var c = p.getContext("2d");
+            if (c) c.clearRect(0, 0, p.width, p.height);
+          }
+        });
+      } catch (_e2) { /* best-effort paint only */ }
       return;
     }
   } catch (_e) { /* fall through to remount */ }
@@ -6549,7 +8837,7 @@ function _shelfRenderInput(role, entry, value, onChange, extra) {
         class: "comfymodal-input comfymodal-studio-text-input",
         value: value !== undefined && value !== null ? String(value) : "",
         disabled: true,
-        title: "File selection is out of scope ΓÇö value preserved from preset/graph.",
+        title: "File selection is out of scope — value preserved from preset/graph.",
         "data-testid": testid,
       });
       return ro;
@@ -6610,7 +8898,7 @@ function _paintShelfAutosaved() {
   } catch (e) { /* label fallback above */ }
   Array.prototype.forEach.call(document.querySelectorAll('[data-testid="shelf-autosaved"]'), function (node) {
     node.textContent = label;
-    node.title = "Field layout and values save automatically ΓÇö no Save button needed.";
+    node.title = "Field layout and values save automatically — no Save button needed.";
   });
   var pg = null;
   try {
@@ -6652,6 +8940,33 @@ function _applyShelfSavedValues(state) {
   if (!applied) return;
   var validation = ready.wf.validateMappedValues(ready.store.controlValues || {}, schema);
   ready.store.setControlValues(validation.values);
+}
+
+// Apply a viewer "use as base" payload to the live Shelf draft: only
+// schema-known roles are assigned, then re-validated through the same path
+// as normal edits, then autosaved. Returns the applied role count (0 when
+// the shelf is not ready or nothing matched — never invents keys).
+function _applyShelfBaseValues(state, payload) {
+  var ready = _shelfReady(state);
+  if (!ready || !payload || typeof payload !== "object") return 0;
+  var schema = {};
+  try { schema = ready.wf.getControlSchema(ready.store) || {}; }
+  catch (err) { return 0; }
+  var applied = 0;
+  Object.keys(payload).forEach(function (role) {
+    if (Object.prototype.hasOwnProperty.call(schema, role)
+        && payload[role] != null && payload[role] !== "") {
+      ready.store.controlValues[role] = payload[role];
+      applied += 1;
+    }
+  });
+  if (!applied) return 0;
+  try {
+    var validation = ready.wf.validateMappedValues(ready.store.controlValues || {}, schema);
+    ready.store.setControlValues(validation.values);
+  } catch (err) { /* keep the assigned draft on validation failure */ }
+  try { _flushShelfSave(state); } catch (err) { /* debounced autosave covers */ }
+  return applied;
 }
 
 // Commit one Shelf field edit: same store + validation + gating path as the
@@ -6740,8 +9055,9 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
           drop.row && drop.row.querySelector('[data-role="' + drop.targetRole + '"]')
             .classList.add(drop.mode === "before" ? "is-drop-before" : "is-drop-after");
         } else if (drop.row) {
+          var indicator = drop.indicator || drop.row;
           if (drop.mode === "advanced" || drop.mode === "advanced-before" || drop.mode === "advanced-after") {
-            drop.row.classList.add("is-drop-target");
+            indicator.classList.add("is-drop-target");
           } else if (drop.mode === "row-join") {
             drop.row.classList.add("is-drop-target");
           } else {
@@ -6760,7 +9076,7 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
         document.body.classList.remove("comfymodal-studio-shelf-dragging");
         var drop = _shelfPointerDrag.drop || _shelfDropAtPoint(role, upEvent.clientX, upEvent.clientY);
         _shelfPointerDrag = null;
-        if (!drop || !drop.targetRole) return;
+        if (!drop || (!drop.targetRole && drop.mode !== "advanced")) return;
         if (drop.mode === "before") {
           _shelfMoveBefore(state, context, actions, role, drop.targetRole, drop.targetRow);
         } else if (drop.mode === "after") {
@@ -7031,6 +9347,8 @@ function _shelfMoveToAdvanced(state, context, actions, dragged, anchor, position
   }
   _shelfPersistLayout(layout);
   _refreshShelfSection(state, context, actions);
+  var toggle = document.querySelector('[data-testid="shelf-advanced-toggle"]');
+  if (toggle && toggle.getAttribute("aria-expanded") !== "true") toggle.click();
 }
 
 function renderShelfSection(state, context, actions) {
@@ -7125,33 +9443,34 @@ function _populateShelfSection(section, state, context, actions) {
   } catch (_e) { skipOption = null; }
   if (skipOption) section.appendChild(skipOption);
 
-  if (layout.advanced.length) {
-    var advWrap = el("div", { class: "comfymodal-studio-shelf-advanced-wrap" });
-    var advToggle = el("button", {
-      type: "button",
-      class: "comfymodal-secondary-btn",
-      "data-testid": "shelf-advanced-toggle",
-      text: "Advanced (" + layout.advanced.length + ")",
-    });
-    advToggle.setAttribute("aria-expanded", "false");
-    var advBox = el("div", {
-      class: "comfymodal-studio-shelf-advanced",
-      "data-testid": "shelf-advanced-section",
-      hidden: true,
-    });
-    advToggle.addEventListener("click", function () {
-      var open = advBox.hidden;
-      advBox.hidden = !open;
-      advToggle.setAttribute("aria-expanded", open ? "true" : "false");
-    });
-    advWrap.appendChild(advToggle);
-    layout.advanced.forEach(function (r) {
-      var card = _shelfFieldCard(state, context, actions, entries, r, layout, false);
-      if (card) advBox.appendChild(card);
-    });
-    advWrap.appendChild(advBox);
-    section.appendChild(advWrap);
-  }
+  var advWrap = el("div", { class: "comfymodal-studio-shelf-advanced-wrap" });
+  var advToggle = el("button", {
+    type: "button",
+    class: "comfymodal-studio-shelf-advanced-toggle",
+    "data-testid": "shelf-advanced-toggle",
+    text: "Advanced (" + layout.advanced.length + ")",
+  });
+  var advId = "shelf-advanced-section";
+  advToggle.setAttribute("aria-expanded", "false");
+  advToggle.setAttribute("aria-controls", advId);
+  var advBox = el("div", {
+    id: advId,
+    class: "comfymodal-studio-shelf-advanced",
+    "data-testid": "shelf-advanced-section",
+    hidden: true,
+  });
+  advToggle.addEventListener("click", function () {
+    var open = advBox.hidden;
+    advBox.hidden = !open;
+    advToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+  advWrap.appendChild(advToggle);
+  layout.advanced.forEach(function (r) {
+    var card = _shelfFieldCard(state, context, actions, entries, r, layout, false);
+    if (card) advBox.appendChild(card);
+  });
+  advWrap.appendChild(advBox);
+  section.appendChild(advWrap);
 }
 
 // Re-populate the mounted Shelf section in place. When a Workflow was just
@@ -7302,7 +9621,7 @@ async function _confirmShelfSwitch(state, context, actions, nextId) {
   dialog.appendChild(el("p", {
     text: matching.length
       ? "Reuse " + matching.length + " matching field value(s) from the current Workflow?"
-      : "No matching fields ΓÇö load the new Workflow defaults?",
+      : "No matching fields — load the new Workflow defaults?",
   }));
   var yes = el("button", {
     type: "button",

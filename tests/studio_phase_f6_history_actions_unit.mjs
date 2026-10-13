@@ -21,10 +21,16 @@ import {
   createHistoryRepository,
   deriveSingleResumeState,
   deriveRetryActionLabel,
+  normalizeDeleteResponse,
   normalizeExportResponse,
   normalizeFeedItem,
   normalizeHistoryOutput,
+  normalizeLocalAssetResponse,
 } from "../web/history-v2-repository.js";
+import {
+  setPendingPlaygroundBase,
+  takePendingPlaygroundBase,
+} from "../web/studio-playground-state.js";
 import {
   viewerDateText,
   viewerFileSizeText,
@@ -460,25 +466,26 @@ function stubFetch(responder) {
   assert.ok(UI_SRC.includes('["Variant", viewerFirst(opts.variant, "")]'),
     "shared overlay renders the Variant row from opts.variant");
   assert.ok(UI_SRC.includes('["Started", viewerDateText(record.startedAt)]'),
-    "Started renders through viewerDateText");
-  assert.ok(UI_SRC.includes('["Completed", viewerDateText(record.completedAt)]'),
-    "Completed renders through viewerDateText");
+    "Started renders through viewerDateText (with seconds)");
+  assert.ok(!UI_SRC.includes('["Completed"'),
+    "Completed row removed (Started + Run duration pin the run)");
   assert.ok(UI_SRC.includes("variant: opts.variant"),
     "shell forwards variant to the shared overlay");
-  assert.ok(DETAIL_SRC.includes("variant: viewer.output"),
-    "History detail passes the resolved asset label as variant");
-  assert.ok(PLAYGROUND_SRC.includes("variant: _viewer.output"),
-    "Playground preview passes the resolved asset label as variant");
-  section("8c. Variant row threaded on both surfaces; Started/Completed human-formatted");
+  assert.ok(DETAIL_SRC.includes("resolveViewerShellArgs(viewer, shellAdapters)"),
+    "History detail variants flow through the shared builder");
+  assert.ok(PLAYGROUND_SRC.includes("resolveViewerShellArgs(_viewer,"),
+    "Playground variants flow through the shared builder");
+  section("8c. Variant row threaded on both surfaces; Started human-formatted with seconds");
 }
 
-// ── 8d. Embedded-file recovery + file/lineage/note/styling ─────────────────
+// ── 8d. Embedded-file recovery + file/advanced/note/styling ───────────────
 //
 // Detail outputs carry embedded_params/embedded_models recovered from the
 // file's own prompt JSON: the params grid merges them at lowest priority
 // (snapshot/controls always win), and empty model lists backfill from them.
-// The File row (name + Open/Copy), lineage rows, and flat note editor are
-// pinned by source (they need DOM); colors/prompt size likewise.
+// The File row (name + Open/Copy), Advanced accordion, separate Note
+// accordion, and flat note editor are pinned by source (they need DOM);
+// colors/prompt size likewise.
 {
   const embOut = normalizeHistoryOutput({
     preview_url: "/p", filename: "gen.png", format: "png", path: "/data/gen.png",
@@ -532,16 +539,28 @@ function stubFetch(responder) {
     path.join(import.meta.dirname, "..", "web", "studio-styles.js"),
     "utf8",
   );
-  assert.ok(UI_SRC.includes("buildViewerFileRow(record, opts.imageUrl"),
+  assert.ok(UI_SRC.includes("buildViewerFileRow(record, opts.fileActions)"),
     "File row mounted in the shared overlay");
-  assert.ok(UI_SRC.includes('data-testid": "viewer-file-open'),
+  assert.ok(UI_SRC.includes('actionButton("viewer-file-open"'),
     "Open-file action rendered");
-  assert.ok(UI_SRC.includes('data-testid": "viewer-file-copy-path'),
+  assert.ok(UI_SRC.includes('actionButton("viewer-file-copy-path"'),
     "Copy-path action rendered");
-  assert.ok(UI_SRC.includes("buildViewerLineageRows(record)"),
-    "lineage rows mounted in the shared overlay");
+  assert.ok(UI_SRC.includes("buildViewerAdvancedRows(record)"),
+    "Advanced rows mounted in their own accordion");
+  assert.ok(UI_SRC.includes('buildViewerAccordion("Advanced"'),
+    "Advanced accordion exists");
+  assert.ok(UI_SRC.includes('buildViewerAccordion("Note"'),
+    "Note lives in its own accordion, not nested in Metadata");
   assert.ok(UI_SRC.includes("Request snapshot"),
     "snapshot state surfaced as lineage");
+  assert.ok(!UI_SRC.includes('["Completed"'),
+    "Completed row removed from Metadata");
+  assert.ok(UI_SRC.includes('|| "Not recorded"'),
+    "Workflow always renders, honestly marked when absent");
+  assert.ok(UI_SRC.includes('data-testid": "viewer-prompt-copy'),
+    "Copy prompt button rendered");
+  assert.ok(UI_SRC.includes('data-testid": "viewer-use-as-base'),
+    "Use-parameters-as-base button rendered");
   assert.ok(UI_SRC.includes('class: "comfymodal-studio-viewer-note-flat"'),
     "note editor is flat, not a nested card");
   assert.ok(STYLES_SRC.includes("background: #141414;"),
@@ -552,7 +571,171 @@ function stubFetch(responder) {
     "viewer stage transparent");
   assert.ok(STYLES_SRC.includes("font-size: 12px;"),
     "prompt text smaller");
-  section("8d. Embedded recovery merges lowest-priority; file/lineage/flat-note/colors pinned");
+  assert.ok(STYLES_SRC.includes("minmax(110px, 1fr)"),
+    "params grid breathes");
+  assert.ok(STYLES_SRC.includes("border-bottom: 1px solid #1e1e1e;"),
+    "metadata spec-sheet separators");
+  assert.ok(STYLES_SRC.includes("min-width: 112px;"),
+    "metadata key column aligns");
+  assert.ok(STYLES_SRC.includes(".comfymodal-studio-viewer-accordion-body[hidden]"),
+    "collapsed accordion bodies stay hidden (flex must not beat [hidden])");
+  section("8d. Embedded recovery merges lowest-priority; file/advanced/note/styling pinned");
+}
+
+// ── 8e. Native open / reveal asset actions ───────────────────────────────
+//
+// One bodyless POST each; empty ids never fetch; every outcome resolves a
+// normalized envelope. The File row renders Open file / Open folder buttons
+// only when an asset id and a fileActions adapter are present.
+{
+  const okRes = normalizeLocalAssetResponse(
+    { status: "ok", asset_id: "ast_1", action: "open", path: "C:\\img.png" }, {});
+  assert.equal(okRes.ok, true);
+  assert.equal(okRes.action, "open");
+  assert.equal(okRes.path, "C:\\img.png");
+  const errRes = normalizeLocalAssetResponse(
+    { status: "error", reason: "remote_asset", message: "remote" }, {});
+  assert.equal(errRes.ok, false);
+  assert.equal(errRes.reason, "remote_asset");
+
+  const stub = stubFetch((call) => ({
+    status: 200,
+    body: {
+      status: "ok",
+      action: call.url.endsWith("/reveal") ? "reveal" : "open",
+    },
+  }));
+  try {
+    const repo = await createHistoryRepository({ mode: "v2", apiBase: "/comfymodal" });
+    const opened = await repo.openAsset("ast_1");
+    assert.equal(opened.ok, true);
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].url, "/comfymodal/history-v2/assets/ast_1/open");
+    assert.equal(stub.calls[0].method, "POST");
+    assert.equal(stub.calls[0].body, null, "BODYLESS by contract — no path from the client");
+    const revealed = await repo.revealAsset("ast_1");
+    assert.equal(stub.calls[1].url, "/comfymodal/history-v2/assets/ast_1/reveal");
+    assert.equal(revealed.action, "reveal");
+    const empty = await repo.openAsset("");
+    assert.equal(empty.ok, false);
+    assert.equal(stub.calls.length, 2, "empty asset id never fetches");
+  } finally { stub.restore(); }
+
+  const withId = normalizeHistoryOutput({ preview_url: "/p", asset_id: "ast_9" });
+  assert.equal(withId.assetId, "ast_9");
+
+  const UI_SRC = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "web", "studio-ui.js"),
+    "utf8",
+  );
+  const DETAIL_SRC = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "web", "studio-history-v2-detail.js"),
+    "utf8",
+  );
+  assert.ok(UI_SRC.includes('actionButton("viewer-file-reveal"'),
+    "Open-folder action rendered");
+  assert.ok(UI_SRC.includes("fileActions: extra.fileActions != null ? extra.fileActions : opts.fileActions"),
+    "shell forwards fileActions on re-render");
+  assert.ok(DETAIL_SRC.includes("revealAsset: function (assetId) { return repo.revealAsset(assetId); }"),
+    "History detail wires reveal through the repository");
+  section("8e. Native open/reveal: bodyless POSTs, normalized envelopes, wired File actions");
+}
+
+// ── 8f. Viewer Delete button ─────────────────────────────────────────────
+//
+// One bodyless DELETE per generation; empty ids never fetch; every outcome
+// resolves a normalized envelope. The Run-line button is two-step
+// (Delete → Confirm delete + Cancel), renders only with a deleteGeneration
+// adapter and a record identity, and dismisses through the shell's own
+// close after notifying onChanged.
+{
+  const okRes = normalizeDeleteResponse(
+    { status: "ok", deleted: "gen_1" }, { generationId: "gen_1" });
+  assert.equal(okRes.ok, true);
+  assert.equal(okRes.deleted, true);
+  assert.equal(okRes.generationId, "gen_1");
+  const errRes = normalizeDeleteResponse(
+    { status: "error", message: "generation not found" }, { httpStatus: 404 });
+  assert.equal(errRes.ok, false);
+  assert.equal(errRes.httpStatus, 404);
+
+  const stub = stubFetch((call) => ({
+    status: 200,
+    body: { status: "ok", deleted: "gen_1" },
+  }));
+  try {
+    const repo = await createHistoryRepository({ mode: "v2", apiBase: "/comfymodal" });
+    const deleted = await repo.deleteGeneration("gen_1");
+    assert.equal(deleted.ok, true);
+    assert.equal(deleted.deleted, true);
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].url, "/comfymodal/history-v2/generations/gen_1");
+    assert.equal(stub.calls[0].method, "DELETE");
+    assert.equal(stub.calls[0].body, null, "BODYLESS by contract");
+    const empty = await repo.deleteGeneration("");
+    assert.equal(empty.ok, false);
+    assert.equal(stub.calls.length, 1, "empty generation id never fetches");
+  } finally { stub.restore(); }
+
+  const UI_SRC = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "web", "studio-ui.js"),
+    "utf8",
+  );
+  assert.ok(UI_SRC.includes("buildViewerDeleteButton(record, persistence,"),
+    "Run line mounts the shared delete button");
+  assert.ok(UI_SRC.includes('data-testid": "viewer-delete-confirm'),
+    "two-step confirm rendered");
+  assert.ok(UI_SRC.includes('data-testid": "viewer-delete-cancel'),
+    "cancel rendered");
+  assert.ok(UI_SRC.includes("onClose: close,"),
+    "overlay dismisses through the shell's own close");
+  section("8f. Viewer Delete: bodyless DELETE, normalized envelope, two-step button");
+}
+
+// ── 8g. "Use parameters as base" handoff ───────────────────────────────────
+//
+// The viewer button carries a shelf-keyed payload; the Playground applies it
+// to its own shelf through the validated path, while History stashes the
+// one-shot payload and navigates. The pending slot is exactly-once and
+// in-memory (never resurrects after reload).
+{
+  // Pending slot: set → take once → gone; non-objects rejected.
+  assert.equal(takePendingPlaygroundBase(), null);
+  setPendingPlaygroundBase({ prompt: "fox", seed: 7 });
+  setPendingPlaygroundBase(null);
+  assert.equal(takePendingPlaygroundBase(), null, "null clears without applying");
+  const payload = { prompt: "fox", seed: 7 };
+  setPendingPlaygroundBase(payload);
+  assert.equal(takePendingPlaygroundBase(), payload);
+  assert.equal(takePendingPlaygroundBase(), null, "exactly once");
+  setPendingPlaygroundBase("nope");
+  assert.equal(takePendingPlaygroundBase(), null);
+
+  const PLAYGROUND_SRC = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "web", "studio-playground.js"),
+    "utf8",
+  );
+  const HISTORY_SRC = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "web", "studio-history-v2.js"),
+    "utf8",
+  );
+  const DETAIL_SRC = fs.readFileSync(
+    path.join(import.meta.dirname, "..", "web", "studio-history-v2-detail.js"),
+    "utf8",
+  );
+  assert.ok(PLAYGROUND_SRC.includes("takePendingPlaygroundBase"),
+    "shelf build consumes the pending base");
+  assert.ok(PLAYGROUND_SRC.includes("_applyShelfBaseValues(state, payload"),
+    "base applies through the validated shelf path");
+  assert.ok(PLAYGROUND_SRC.includes("onUseAsBase: function (payload)"),
+    "Playground preview applies to its own shelf");
+  assert.ok(DETAIL_SRC.includes("onUseAsBase"),
+    "History detail forwards the base callback");
+  assert.ok(HISTORY_SRC.includes("setPendingPlaygroundBase(payload)"),
+    "History stashes the payload for the shelf");
+  assert.ok(HISTORY_SRC.includes('context.setPage("playground")'),
+    "History navigates to the Playground after stashing");
+  section("8g. Use-as-base: validated shelf apply on Playground, stash-and-navigate on History");
 }
 
 // ── 9. F10 UI wiring pins (Export ≠ Browser Download) ────────────────────

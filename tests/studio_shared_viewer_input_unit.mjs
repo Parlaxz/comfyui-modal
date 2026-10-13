@@ -16,6 +16,7 @@ import * as path from "node:path";
 import {
   normalizeFeedItem,
 } from "../web/history-v2-repository.js";
+import { createHistoryRepository } from "../web/history-v2-repository.js";
 import {
   buildViewerRecordFromRun,
   generationIdForLegacyRunId,
@@ -23,7 +24,7 @@ import {
   resolveViewerInput,
 } from "../web/studio-run-normalizer.js";
 import { selectGenerationDetailAsset } from "../web/studio-history-v2-detail.js";
-import { viewerMergedParams } from "../web/studio-ui.js";
+import { viewerMergedParams, resolveViewerShellArgs, viewerBasePayload } from "../web/studio-ui.js";
 
 const ROOT = path.join(import.meta.dirname, "..");
 const playgroundSource = fs.readFileSync(path.join(ROOT, "web", "studio-playground.js"), "utf8");
@@ -271,17 +272,26 @@ function localRun() {
 {
   assert.equal(playgroundSource.includes("buildViewerRecordFromRun(_run, outputUrl)"), true);
   assert.equal(playgroundSource.includes("resolveViewerInput(_record, outputUrl)"), true);
-  assert.equal(playgroundSource.includes("_viewer.imageUrl"), true);
-  assert.equal(playgroundSource.includes("_viewer.timing"), true);
+  assert.equal(playgroundSource.includes("resolveViewerShellArgs(_viewer,"), true,
+    "Playground mounts through the shared shell-args builder (image/timing/variant ride inside)");
   assert.equal(playgroundSource.includes("normalizeFeedItem("), false,
     "the Playground no longer re-normalizes History records locally");
   assert.equal(playgroundSource.includes("historyGenerationIdForRunId"), false,
     "no frontend derivation of backend identities");
   assert.equal(detailSource.includes("const viewer = resolveViewerInput(record);"), true,
     "History detail renders through the shared resolver too");
-  assert.equal(detailSource.includes("imageUrl: viewer.imageUrl"), true);
-  assert.equal(detailSource.includes("imageUrl: displayed.url"), false,
-    "history no longer resolves the displayed asset with its own copy");
+  assert.equal(detailSource.includes("resolveViewerShellArgs(viewer, shellAdapters)"), true,
+    "History detail re-renders through the shared builder (not a hand-built copy)");
+  assert.equal(detailSource.includes("imageUrl: viewer.imageUrl"), false,
+    "history no longer hand-assembles shell inputs beside the builder");
+  assert.equal(playgroundSource.includes("fileActions: _fileActions"), true,
+    "Playground preview forwards native File actions when a V2 repo resolved the record");
+  assert.equal(detailSource.includes("revealAsset: function (assetId) { return repo.revealAsset(assetId); }"), true,
+    "History detail forwards native File actions");
+  // Structural sync lock: both mounts assemble shell inputs through the one
+  // builder — a new input added anywhere else cannot reach only one surface.
+  assert.equal(detailSource.includes("resolveViewerShellArgs(null, shellAdapters)"), true,
+    "History detail creates the shell through the shared builder");
   section("7. Both surfaces mount the shell through the shared resolver");
 }
 
@@ -305,6 +315,124 @@ function localRun() {
 }
 
 console.log("\nAll shared viewer-input contract tests passed.");
+
+// ── 10. One shell-args builder feeds every mount ─────────────────────────
+//
+// resolveViewerShellArgs is the single choke point for buildViewerShell
+// inputs: History detail (create + re-render) and Playground preview all
+// assemble through it, so a future input cannot land on one surface and
+// miss the other. Pure mapping — tested directly, no DOM.
+{
+  const persistence = { setFavorite: async function () {}, onChanged: null };
+  const fileActions = {
+    openAsset: async function () { return {}; },
+    revealAsset: async function () { return {}; },
+  };
+  const onClose = function () {};
+  const viewer = {
+    record: { id: "gen_1" },
+    output: { kind: "preview", url: "/p", label: "Preview" },
+    imageUrl: "/p",
+    timing: { sampling_ms: 1 },
+  };
+  const args = resolveViewerShellArgs(viewer, { persistence, fileActions, onClose });
+  assert.deepEqual(Object.keys(args).sort(),
+    ["fileActions", "fileSize", "format", "imageUrl", "onClose", "onUseAsBase", "persistence", "record", "timing", "variant"]);
+  assert.equal(args.record, viewer.record);
+  assert.equal(args.imageUrl, "/p");
+  assert.equal(args.timing, viewer.timing);
+  assert.equal(args.variant, "Data Saver");
+  assert.equal(args.fileActions, fileActions, "adapters pass through by reference");
+  assert.equal(args.persistence, persistence);
+  assert.equal(args.onClose, onClose);
+
+  // Variant names the DISPLAYED bytes (asset-policy selection first):
+  // backend served_variant is only a last resort, because it can disagree
+  // with the policy (served "original" on a data-saver display).
+  const servedArgs = resolveViewerShellArgs({
+    record: { id: "gen_2", featuredOutput: { servedVariant: "original", format: "png", original_format: "png", data_saver_format: "webp" } },
+    output: { kind: "data_saver", url: "/ds", label: "Data Saver" },
+    imageUrl: "/ds",
+    timing: {},
+  }, { persistence, fileActions, onClose });
+  assert.equal(servedArgs.variant, "Data Saver");
+  assert.equal(servedArgs.format, "webp");
+
+  // Pre-load mount: bare-body opts, adapters still ride along.
+  const bare = resolveViewerShellArgs(null, { persistence, fileActions });
+  assert.equal(bare.record, undefined);
+  assert.equal(bare.imageUrl, undefined);
+  assert.equal(bare.timing, undefined);
+  assert.equal(bare.variant, "");
+  assert.equal(bare.fileActions, fileActions);
+  assert.equal(bare.onClose, undefined);
+
+  // Missing output label degrades to an empty variant, never undefined.
+  assert.equal(resolveViewerShellArgs({ record: {} }, {}).variant, "");
+
+  // Variant names the DISPLAYED bytes (asset-policy selection first):
+  // backend served_variant is only a last resort, because it can disagree
+  // with the policy (served "original" on a data-saver display).
+  const dsViewer = {
+    record: { featuredOutput: { servedVariant: "original" } },
+    output: { kind: "data_saver", url: "/p", label: "Data Saver" },
+    imageUrl: "/p",
+    timing: {},
+  };
+  assert.equal(resolveViewerShellArgs(dsViewer, {}).variant, "Data Saver");
+  const origViewer = {
+    record: { featuredOutput: { servedVariant: "original" } },
+    output: { kind: "original", url: "/o", label: "Original" },
+    imageUrl: "/o",
+    timing: {},
+  };
+  assert.equal(resolveViewerShellArgs(origViewer, {}).variant, "Original");
+
+  // Repo action-surface parity: open/reveal travel with export on every
+  // repository flavor, so File-row buttons never outrun repo support.
+  for (const mode of ["v2", "bridge"]) {
+    const repo = await createHistoryRepository({ mode: mode, apiBase: "/comfymodal" });
+    assert.equal(typeof repo.openAsset, "function", mode + " exposes openAsset");
+    assert.equal(typeof repo.revealAsset, "function", mode + " exposes revealAsset");
+    assert.equal(typeof repo.exportAsset, "function", mode + " exposes exportAsset");
+  }
+  section("10. One shell-args builder feeds every mount; repo action parity");
+}
+
+// ── 11. Base payload for "Use parameters as base" ─────────────────────────
+//
+// Shelf-role keyed, empties omitted, numerics coerced: applying it through
+// the normal validated shelf path can never blank a field or invent keys.
+{
+  const thin = normalizeFeedItem({
+    id: "gen_thin", status: "completed",
+    prompt: "a fox",
+    outputs: [{
+      preview_url: "/p",
+      embedded_params: { seed: 23, steps: 25, cfg: 1, sampler: "euler", scheduler: "simple", denoise: 1 },
+    }],
+    featured_output_index: 0,
+  });
+  assert.deepEqual(viewerBasePayload(thin), {
+    prompt: "a fox",
+    seed: 23, steps: 25, guidance: 1, cfg: 1,
+    sampler: "euler", scheduler: "simple", denoise: 1,
+  });
+  assert.deepEqual(viewerBasePayload({}), {});
+  assert.deepEqual(viewerBasePayload(null), {});
+  const sized = viewerBasePayload({ params: { width: "1024", height: 768 } });
+  assert.equal(sized.width, 1024);
+  assert.equal(sized.height, 768);
+  // Snapshot values ride the same keys the shelf validates.
+  const rich = normalizeFeedItem({
+    id: "gen_rich", status: "completed",
+    params: { prompt: "p", negative_prompt: "n", seed: 1, guidance: 7 },
+  });
+  const richPayload = viewerBasePayload(rich);
+  assert.equal(richPayload.negative_prompt, "n");
+  assert.equal(richPayload.guidance, 7);
+  section("11. Base payload is shelf-keyed, sparse, and numeric-safe");
+}
 
 // ── 9. Legacy run-id derivation matches production exactly ────────────────
 //

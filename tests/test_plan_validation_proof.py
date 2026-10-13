@@ -189,6 +189,30 @@ class TestPlanValidationProof(unittest.TestCase):
                     collect_validation_proof=True,
                 )
 
+    def test_invalid_workflow_error_names_failing_node(self):
+        """The failure names the per-node cause, not just the empty rollup."""
+        with _stub_modules({
+            "execution": _make_fake_execution(
+                [], valid=False,
+                error={"type": "prompt_outputs_failed_validation",
+                       "message": "Prompt outputs failed validation",
+                       "details": "", "extra_info": {}},
+                node_errors={"8": {
+                    "errors": [{"type": "required_input_missing",
+                                "message": "Required input is missing",
+                                "details": "clip"}],
+                    "dependent_outputs": ["13"],
+                    "class_type": "TextGenerate",
+                }},
+            ),
+            "nodes": _make_fake_nodes(),
+        }):
+            with self.assertRaisesRegex(RuntimeError, r"node 8 \(TextGenerate\)"):
+                self.mod.build_execution_plan(
+                    dict(WORKFLOW_A), prompt_id="p1", validate=False,
+                    collect_validation_proof=True,
+                )
+
     def test_payload_deterministic(self):
         """Identical inputs produce identical payloads and hashes."""
         with _stub_modules({

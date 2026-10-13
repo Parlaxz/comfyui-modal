@@ -409,7 +409,7 @@ def _ordered_ids(values: Any) -> tuple[str, ...]:
 
 OUTPUT_FORMATS = ("original", "webp_lossless", "webp_lossy", "jpeg")
 WEBP_LOSSLESS_COMPRESSION = ("fast", "balanced", "max")
-OUTPUT_MODES = ("original", "preview")
+OUTPUT_MODES = ("original", "data_saver")
 DEFAULT_OUTPUT_QUALITY = 75
 DEFAULT_PREVIEW_QUALITY = 70
 # E2D: encoder-effort policy.  The historical field name carries the
@@ -444,6 +444,11 @@ def normalize_output_mode(value: Any) -> str:
     raw = "original" if value is None else str(value).strip().lower()
     if not raw:
         raw = "original"
+    raw = {
+        "preview": "data_saver",
+        "data-saver": "data_saver",
+        "datasaver": "data_saver",
+    }.get(raw, raw)
     if raw not in OUTPUT_MODES:
         raise ValueError(
             f"unsupported output mode {value!r}; expected one of "
@@ -545,22 +550,37 @@ def normalize_output_conversion_options(value: Mapping[str, Any] | None) -> dict
     return normalized
 
 
+def _output_enabled(raw: Any) -> bool:
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(raw)
+
+
 def normalize_output_intent_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
     """Freeze output mode and Preview codec settings at plan acceptance."""
     source = dict(value) if isinstance(value, Mapping) else {}
     raw_mode = source.get("output_mode")
-    if raw_mode is None and "preview_enabled" in source:
-        raw_mode = "preview" if bool(source.get("preview_enabled")) else "original"
+    if raw_mode is None:
+        if "data_saver_default" in source:
+            raw_mode = "data_saver" if _output_enabled(source.get("data_saver_default")) else "original"
+        elif "preview_enabled" in source:
+            raw_mode = "preview" if _output_enabled(source.get("preview_enabled")) else "original"
     output_mode = normalize_output_mode(raw_mode)
     normalized = dict(source)
     normalized["output_mode"] = output_mode
 
     conversion = source.get("output_conversion_options", source.get("output_conversion"))
     conversion = dict(conversion) if isinstance(conversion, Mapping) else {}
-    if output_mode == "preview":
-        conversion.setdefault("format", source.get("preview_codec", "webp"))
+    if output_mode == "data_saver":
+        conversion.setdefault(
+            "format",
+            source.get("data_saver_codec", source.get("preview_codec", "webp")),
+        )
         if conversion.get("quality") is None:
-            conversion["quality"] = source.get("preview_quality", DEFAULT_PREVIEW_QUALITY)
+            conversion["quality"] = source.get(
+                "data_saver_quality",
+                source.get("preview_quality", DEFAULT_PREVIEW_QUALITY),
+            )
         # E2D: freeze the fast encoder effort into the accepted Preview intent
         # so replay/history truth carries the effective lossy method.
         conversion.setdefault("webp_lossless_compression", PREVIEW_WEBP_EFFORT)
@@ -612,7 +632,7 @@ class ExecutionOptions:
         object.__setattr__(self, "production_output_node_ids", _normalized_ids(self.production_output_node_ids))
         output_mode = normalize_output_mode(self.output_mode)
         conversion = dict(self.output_conversion_options or {})
-        if output_mode == "preview":
+        if output_mode == "data_saver":
             conversion.setdefault("format", "webp")
             if conversion.get("quality") is None:
                 conversion["quality"] = DEFAULT_PREVIEW_QUALITY
@@ -672,14 +692,24 @@ class ExecutionOptions:
             if key not in conversion and key in source:
                 conversion[key] = source[key]
         raw_output_mode = source.get("output_mode")
-        if raw_output_mode is None and "preview_enabled" in source:
-            raw_output_mode = "preview" if bool(source.get("preview_enabled")) else "original"
+        if raw_output_mode is None:
+            if "data_saver_default" in source:
+                raw_output_mode = (
+                    "data_saver" if _output_enabled(source.get("data_saver_default")) else "original"
+                )
+            elif "preview_enabled" in source:
+                raw_output_mode = "preview" if _output_enabled(source.get("preview_enabled")) else "original"
         output_mode = normalize_output_mode(raw_output_mode)
-        if output_mode == "preview":
+        if output_mode == "data_saver":
             if "format" not in conversion:
-                conversion["format"] = source.get("preview_codec", "webp")
+                conversion["format"] = source.get(
+                    "data_saver_codec", source.get("preview_codec", "webp")
+                )
             if conversion.get("quality") is None:
-                conversion["quality"] = source.get("preview_quality", DEFAULT_PREVIEW_QUALITY)
+                conversion["quality"] = source.get(
+                    "data_saver_quality",
+                    source.get("preview_quality", DEFAULT_PREVIEW_QUALITY),
+                )
         if "output_conversion" in source:
             _record_compatibility_key("output_conversion")
 
@@ -704,6 +734,9 @@ class ExecutionOptions:
             "preview_enabled",
             "preview_codec",
             "preview_quality",
+            "data_saver_default",
+            "data_saver_codec",
+            "data_saver_quality",
             "quality",
             "webp_lossless_compression",
             "result_route",

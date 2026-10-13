@@ -314,9 +314,12 @@ def test_archive_sync_generation_is_content_derived_not_uuid():
     assert len(expected) == 64, "content-derived generation must be the canonical SHA-256"
 
 
-def test_startup_init_generation_is_content_derived():
-    """The startup init generation-record fallback must be content-derived,
-    not a UUID, so baked/runtime generation identity can match."""
+def test_startup_does_not_fabricate_generation_record():
+    """Startup must not fabricate a generation record.
+
+    The generation record is written exclusively by the custom-nodes
+    publisher on real sync.  A startup-side fallback would invent identity
+    for unvalidated content, so the old ``startup_init_generation_record``
+    writer must stay out of the startup path."""
     src = (ROOT / "comfyapp.py").read_text(encoding="utf-8-sig")
-    assert "reason=\"startup_init_generation_record\"" in src
-    assert "content_generation=_cn_init_generation or None" in src
+    assert "startup_init_generation_record" not in src

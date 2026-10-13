@@ -12,10 +12,13 @@ Route summary (all under ``/comfymodal/history-v2``):
 
     GET   /comfymodal/history-v2/feed                         — mixed/single feed
     GET   /comfymodal/history-v2/generations/{generation_id}  — generation detail
+    DELETE /comfymodal/history-v2/generations/{generation_id} — delete generation + owned data
     POST  /comfymodal/history-v2/generations/{generation_id}/original        — Generate Original (E3B2)
     POST  /comfymodal/history-v2/generations/{generation_id}/original/retry  — Retry failed Original (E3B2)
     POST  /comfymodal/history-v2/generations/{generation_id}/resume         — Resume interrupted ordinary Single (F1A)
     GET   /comfymodal/history-v2/experiments/{experiment_id}  — experiment detail
+    DELETE /comfymodal/history-v2/experiments/{experiment_id} — delete experiment + owned data
+    POST  /comfymodal/history-v2/bulk-delete                 — delete selected records
     PATCH /comfymodal/history-v2/generations/{generation_id}/favorite
     PATCH /comfymodal/history-v2/generations/{generation_id}/note
     PATCH /comfymodal/history-v2/generations/{generation_id}/featured
@@ -23,6 +26,8 @@ Route summary (all under ``/comfymodal/history-v2``):
     PATCH /comfymodal/history-v2/experiments/{experiment_id}/note
     GET   /comfymodal/history-v2/assets/{asset_id}            — managed asset bytes
     POST  /comfymodal/history-v2/assets/{asset_id}/export     — configured-folder Export (F9)
+    POST  /comfymodal/history-v2/assets/{asset_id}/open       — open file in the OS default viewer
+    POST  /comfymodal/history-v2/assets/{asset_id}/reveal     — reveal file in the OS file manager
 
 The repository is constructed per request (cheap: idempotent store
 initialization) from ``<data_root>/.studio_history_v2/history_v2.db``.
@@ -41,6 +46,9 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -69,8 +77,20 @@ _log = logging.getLogger(__name__)
 BASE = "/comfymodal/history-v2"
 ASSET_URL_PREFIX = f"{BASE}/assets/"
 
-# Asset types that count as "output" imagery (thumbnail / preview / original).
-_OUTPUT_TYPES = frozenset({"thumbnail", "preview", "original"})
+# Asset types that count as "output" imagery.  ``preview`` is the legacy
+# storage spelling for the canonical data_saver variant.
+_OUTPUT_TYPES = frozenset({"thumbnail", "preview", "data_saver", "original"})
+
+
+def _canonical_variant(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"preview", "data_saver", "data-saver", "datasaver"}:
+        return "data_saver"
+    return "original" if raw == "original" else raw
+
+
+def _is_data_saver_asset(asset: Asset) -> bool:
+    return asset.type in {"preview", "data_saver"}
 
 # Terminal experiment statuses: once reached, "completed_at" reflects
 # updated_at instead of staying null.
@@ -105,6 +125,7 @@ _EXP_STATUS_ALIASES = {
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+_MAX_DELETE_IDS = 100
 
 # Canonical camelCase param keys → accepted backend key aliases.
 _PARAM_SPEC = [
@@ -151,6 +172,24 @@ async def _read_json(request: web.Request) -> Optional[dict[str, Any]]:
     except Exception:
         return None
     return body if isinstance(body, dict) else None
+
+
+def _delete_ids_from_body(
+    body: dict[str, Any], canonical: str, alias: str
+) -> list[str]:
+    """Read one delete-id field, accepting the frontend's short alias."""
+    values: list[str] = []
+    for key in (canonical, alias):
+        if key not in body:
+            continue
+        raw = body[key]
+        if not isinstance(raw, list):
+            raise ValueError(f"{key} must be an array of non-empty strings")
+        values.extend(raw)
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("ids must be non-empty strings")
+    return values
 
 
 def _parse_bool(value: Optional[str]) -> Optional[bool]:
@@ -253,6 +292,28 @@ def _probe_image_dimensions(managed_path: str) -> tuple[Optional[int], Optional[
     except Exception:
         pass
     return None, None
+
+
+def _probe_image_format(managed_path: str) -> Optional[str]:
+    """Lowercase container format from image bytes, or None when unknown.
+
+    Byte truth beats the stored/extension-derived format: files materialized
+    before extension sniffing can carry WebP bytes under a ``.png`` name, and
+    the viewer's Format row must describe the bytes, not the name. Header-only
+    read; remote or unreadable files yield None so callers fall back.
+    """
+    if not managed_path or str(managed_path).startswith("modal://"):
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(managed_path) as img:
+            fmt = img.format
+        if isinstance(fmt, str) and fmt.strip():
+            return fmt.strip().lower()
+    except Exception:
+        pass
+    return None
 
 
 # ComfyUI API-format node types whose inputs carry generation params, and the
@@ -426,7 +487,7 @@ def _asset_attempt_is_completed(
     attempt = next((a for a in attempts if a.run_id == asset.run_id), None)
     if attempt is None or attempt.status != "completed":
         return False
-    return required_mode is None or attempt.mode == required_mode
+    return required_mode is None or _canonical_variant(attempt.mode) == _canonical_variant(required_mode)
 
 
 def _select_variant(
@@ -439,11 +500,14 @@ def _select_variant(
     candidates = [
         asset
         for asset in assets
-        if asset.type == asset_type
+        if (
+            (_is_data_saver_asset(asset) if asset_type in {"preview", "data_saver"}
+             else asset.type == asset_type)
         and (
             _asset_is_usable_variant(asset, attempts, required_mode)
-            if check_availability
-            else _asset_attempt_is_completed(asset, attempts, required_mode)
+             if check_availability
+             else _asset_attempt_is_completed(asset, attempts, required_mode)
+         )
         )
     ]
     return max(candidates, key=lambda asset: (asset.created_at, asset.asset_id), default=None)
@@ -485,6 +549,52 @@ def _asset_byte_size(asset: Asset) -> Optional[int]:
     return size if isinstance(size, int) and size >= 0 else None
 
 
+def _resolve_local_asset_file(repo: Any, asset_id: str):
+    """Resolve an asset id to its local file, or a failure triple.
+
+    Returns ``(path, None)`` on success, else ``(None, (reason, message,
+    http_status))``. Only files already registered in the History store and
+    present on local disk resolve — ``modal://`` (remote) assets and unknown
+    ids never do, so these routes can never be steered at arbitrary paths:
+    the client supplies only an asset id, the filesystem path comes from the
+    database.
+    """
+    asset = repo.get_asset(asset_id)
+    if asset is None:
+        return None, ("asset_not_found", "asset not found in History V2 store", 404)
+    managed_path = str(asset.managed_path or "")
+    if not managed_path or managed_path.startswith("modal://"):
+        return None, ("remote_asset", "remote assets have no local file to open", 409)
+    path = Path(managed_path)
+    if not path.is_file():
+        return None, ("file_missing", "asset file not found on disk", 404)
+    return path, None
+
+
+def _launch_local_path(path: Path, *, reveal: bool) -> None:
+    """Open a file (default app) or reveal it (file manager), detached.
+
+    Windows: ``os.startfile`` / ``explorer /select,``. macOS: ``open`` /
+    ``open -R``. Linux: ``xdg-open`` on the file / its directory. Raises on
+    launch failure; never blocks on the child.
+    """
+    if os.name == "nt":
+        if reveal:
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        else:
+            os.startfile(str(path))  # noqa: S606 — path is DB-owned, see above
+        return
+    if sys.platform == "darwin":
+        cmd = ["open", "-R", str(path)] if reveal else ["open", str(path)]
+        subprocess.Popen(cmd)
+        return
+    if os.name == "posix":
+        target = str(path.parent) if reveal else str(path)
+        subprocess.Popen(["xdg-open", target])
+        return
+    raise OSError(f"unsupported platform for local open: {os.name}/{sys.platform}")
+
+
 def _build_outputs(
     assets: list[Asset],
     gen_thumb_url: str = "",
@@ -521,6 +631,20 @@ def _build_outputs(
             group, "preview", attempts, "preview", check_availability=False
         )
         original, original_failed = _original_projection(group, attempts)
+        group_run_ids = {asset.run_id for asset in group if asset.run_id}
+        effective_attempt = max(
+            (attempt for attempt in (attempts or []) if attempt.run_id in group_run_ids),
+            key=lambda attempt: (attempt.created_at, attempt.run_id),
+            default=None,
+        )
+        effective_mode = _canonical_variant(effective_attempt.mode) if effective_attempt else (
+            "data_saver" if preview else "original" if original else ""
+        )
+        original_available = bool(original or (preview and effective_mode == "data_saver"))
+        served_variant = (
+            "data_saver" if preview and effective_mode == "data_saver"
+            else "original" if original else None
+        )
         primary = original or preview or thumb or ordered[0]
         managed_path = str(primary.managed_path or "")
         width, height = primary.width, primary.height
@@ -535,15 +659,48 @@ def _build_outputs(
                     height = probed_height
             embedded_params, embedded_models = _recover_embedded_params(managed_path)
         output_format = primary.format or None
+        if include_embedded:
+            # Byte truth first: files materialized before extension sniffing
+            # can carry WebP bytes under a .png name, and the viewer's Format
+            # row must describe the bytes, not the name.
+            output_format = _probe_image_format(managed_path) or output_format
         if not output_format:
             ext = Path(primary.filename or "").suffix.lstrip(".").lower()
             output_format = ext or None
+        # Per-variant formats so the viewer can label the DISPLAYED bytes
+        # truthfully (primary prefers original, but data-saver display is
+        # usually webp while the stored original is png).
+        data_saver_format = (preview.format or None) or (
+            Path(preview.filename or "").suffix.lstrip(".").lower() or None
+        ) if preview else None
+        original_format = (original.format or None) or (
+            Path(original.filename or "").suffix.lstrip(".").lower() or None
+        ) if original else None
+        if include_embedded:
+            # Same byte-truth rule per variant: a stored misnamed format
+            # (WebP bytes under a .png name/row) must not shadow the probe,
+            # or the viewer's Format row describes the name, not the bytes.
+            if preview is not None:
+                data_saver_format = (
+                    _probe_image_format(str(preview.managed_path or ""))
+                    or data_saver_format
+                )
+            if original is not None:
+                original_format = (
+                    _probe_image_format(str(original.managed_path or ""))
+                    or original_format
+                )
         output = {
             "index": len(outputs),
             "asset_id": primary.asset_id,
             "thumb_url": _asset_url(thumb.asset_id) if thumb else "",
             "preview_url": _asset_url(preview.asset_id) if preview else "",
+            "data_saver_url": _asset_url(preview.asset_id) if preview else "",
+            "preview_asset_id": preview.asset_id if preview else None,
+            "data_saver_asset_id": preview.asset_id if preview else None,
             "original_url": _asset_url(original.asset_id) if original else "",
+            "served_variant": served_variant,
+            "original_available": original_available,
             "original_failed": original_failed,
             "status": "success",
             # Viewer-content fields: resolution (asset-measured W×H, always
@@ -553,11 +710,16 @@ def _build_outputs(
             "width": width,
             "height": height,
             "byte_size": _asset_byte_size(primary),
+            "data_saver_byte_size": _asset_byte_size(preview) if preview else None,
+            "original_byte_size": _asset_byte_size(original) if original else None,
             # File identity for the viewer's File row (name + open/copy):
             # the stored filename, container format, and a display path
             # (local managed path, or the modal:// URI for remote assets).
             "filename": primary.filename or "",
             "format": output_format,
+            "data_saver_format": data_saver_format,
+            "preview_format": data_saver_format,
+            "original_format": original_format,
             "path": managed_path,
             # Embedded-file recovery (detail only): exact sampler params and
             # loader model names read back from the file's own prompt JSON.
@@ -565,8 +727,10 @@ def _build_outputs(
             "embedded_models": embedded_models,
         }
         if export_state_of is not None:
-            output["preview_asset_id"] = preview.asset_id if preview else None
             output["preview_export_state"] = (
+                export_state_of(preview.asset_id) if preview else None
+            )
+            output["data_saver_export_state"] = (
                 export_state_of(preview.asset_id) if preview else None
             )
             output["original_asset_id"] = original.asset_id if original else None
@@ -640,7 +804,7 @@ def _generation_feed_item(
         export_state_of=export_state_of,
         include_embedded=include_embedded,
     )
-    has_original = any(output["original_url"] for output in outputs)
+    has_original = any(output["original_available"] for output in outputs)
     has_preview = any(output["preview_url"] for output in outputs)
 
     completed_at: Optional[str] = None
@@ -1193,6 +1357,11 @@ def _detail_cell(
         assets, "preview", attempts, "preview", check_availability=False
     )
     original, original_failed = _original_projection(assets, attempts)
+    latest_attempt = max(
+        attempts, key=lambda attempt: (attempt.created_at, attempt.run_id), default=None
+    )
+    effective_mode = _canonical_variant(latest_attempt.mode if latest_attempt else "")
+    original_available = bool(original or (preview and effective_mode == "data_saver"))
 
     duration_ms: Optional[int] = None
     pairs: list[tuple[int, int]] = []
@@ -1235,7 +1404,12 @@ def _detail_cell(
         "generation_id": cell.generation_id,
         "thumb_url": _asset_url(thumb.asset_id) if thumb else "",
         "preview_url": _asset_url(preview.asset_id) if preview else "",
+        "data_saver_url": _asset_url(preview.asset_id) if preview else "",
+        "preview_asset_id": preview.asset_id if preview else None,
+        "data_saver_asset_id": preview.asset_id if preview else None,
         "original_url": _asset_url(original.asset_id) if original else "",
+        "served_variant": "data_saver" if preview and effective_mode == "data_saver" else "original" if original else None,
+        "original_available": original_available,
         "original_failed": original_failed,
         "duration_ms": duration_ms,
         "favorite": bool(fav_by_gen.get(cell.generation_id, False))
@@ -1969,6 +2143,49 @@ def register_history_v2_routes(
             return _json_error(400, "asset does not belong to generation")
         return web.json_response({"status": "ok", "featured_asset_id": asset_id})
 
+    @_route("delete", f"{BASE}/generations/{{generation_id}}")
+    async def history_v2_generation_delete(request: web.Request) -> web.Response:
+        """Delete one generation; running generations are allowed."""
+        generation_id = request.match_info["generation_id"]
+        if not isinstance(generation_id, str) or not generation_id.strip():
+            return _json_error(400, "generation_id must be a non-empty string")
+        repo = _open_repo()
+        try:
+            deleted = repo.delete_generation(generation_id)
+        except Exception:
+            _log.exception("History V2 delete crashed for %s", generation_id)
+            return _json_error(500, "delete failed unexpectedly")
+        if not deleted:
+            return _json_error(404, "generation not found")
+        return web.json_response({"status": "ok", "deleted": generation_id})
+
+    @_route("post", f"{BASE}/bulk-delete")
+    async def history_v2_bulk_delete(request: web.Request) -> web.Response:
+        """Delete up to 100 generations/experiments in one transaction."""
+        body = await _read_json(request)
+        if body is None:
+            return _json_error(400, "Invalid JSON body")
+        try:
+            generation_ids = _delete_ids_from_body(body, "generation_ids", "generations")
+            experiment_ids = _delete_ids_from_body(body, "experiment_ids", "experiments")
+        except ValueError as exc:
+            return _json_error(400, str(exc))
+        if not generation_ids and not experiment_ids:
+            return _json_error(400, "at least one generation or experiment id is required")
+        if len(generation_ids) + len(experiment_ids) > _MAX_DELETE_IDS:
+            return _json_error(400, "at most 100 ids may be deleted at once")
+        repo = _open_repo()
+        try:
+            result = repo.bulk_delete(
+                generation_ids=generation_ids, experiment_ids=experiment_ids
+            )
+        except ValueError as exc:
+            return _json_error(400, str(exc))
+        except Exception:
+            _log.exception("History V2 bulk delete crashed")
+            return _json_error(500, "delete failed unexpectedly")
+        return web.json_response({"status": "ok", **result})
+
     # ── Experiment annotations ─────────────────────────────────────────
 
     @_route("patch", f"{BASE}/experiments/{{experiment_id}}/favorite")
@@ -1984,6 +2201,22 @@ def register_history_v2_routes(
         if not repo.set_experiment_favorite(experiment_id, favorite):
             return _json_error(404, "experiment not found")
         return web.json_response({"status": "ok", "favorite": favorite})
+
+    @_route("delete", f"{BASE}/experiments/{{experiment_id}}")
+    async def history_v2_experiment_delete(request: web.Request) -> web.Response:
+        """Delete one experiment and its generation-owned records."""
+        experiment_id = request.match_info["experiment_id"]
+        if not isinstance(experiment_id, str) or not experiment_id.strip():
+            return _json_error(400, "experiment_id must be a non-empty string")
+        repo = _open_repo()
+        try:
+            deleted = repo.delete_experiment(experiment_id)
+        except Exception:
+            _log.exception("History V2 delete crashed for experiment %s", experiment_id)
+            return _json_error(500, "delete failed unexpectedly")
+        if not deleted:
+            return _json_error(404, "experiment not found")
+        return web.json_response({"status": "ok", "deleted": experiment_id})
 
     @_route("patch", f"{BASE}/experiments/{{experiment_id}}/note")
     async def history_v2_experiment_note(request: web.Request) -> web.Response:
@@ -2034,7 +2267,6 @@ def register_history_v2_routes(
         return web.Response(body=body, content_type=_content_type_for(asset))
 
     # ── Configured-folder Export (F9) ──────────────────────────────────
-
     @_route("post", f"{BASE}/assets/{{asset_id}}/export")
     async def history_v2_asset_export(request: web.Request) -> web.Response:
         """Export ONE selected managed asset into the configured output folder.
@@ -2165,4 +2397,78 @@ def register_history_v2_routes(
             result.message or "export failed",
             result.state,
             partial=result.partial,
+        )
+
+    # ── Native open / reveal (viewer File row) ──────────────────────────
+
+    @_route("post", f"{BASE}/assets/{{asset_id}}/open")
+    async def history_v2_asset_open(request: web.Request) -> web.Response:
+        """Open ONE managed asset file with the OS default application.
+
+        BODYLESS by contract: the selected ``asset_id`` uniquely identifies
+        the managed History source; the client sends no path. Only
+        database-registered local files resolve (see
+        ``_resolve_local_asset_file``) — remote assets are refused
+        truthfully, never fetched.
+        """
+        asset_id = request.match_info["asset_id"]
+        repo = _open_repo()
+        path, error = _resolve_local_asset_file(repo, asset_id)
+        if error is not None:
+            reason, message, status = error
+            return web.json_response(
+                {"status": "error", "asset_id": asset_id,
+                 "reason": reason, "message": message},
+                status=status,
+            )
+        assert path is not None
+        try:
+            _launch_local_path(path, reveal=False)
+        except Exception as exc:
+            _log.exception("History V2 open crashed for %s", asset_id)
+            return web.json_response(
+                {"status": "error", "asset_id": asset_id,
+                 "reason": "launch_failed",
+                 "message": f"could not open file: {str(exc)[:120]}"},
+                status=500,
+            )
+        return web.json_response(
+            {"status": "ok", "asset_id": asset_id,
+             "action": "open", "path": str(path)},
+            status=200,
+        )
+
+    @_route("post", f"{BASE}/assets/{{asset_id}}/reveal")
+    async def history_v2_asset_reveal(request: web.Request) -> web.Response:
+        """Reveal ONE managed asset file in the OS file manager.
+
+        Same BODYLESS contract and resolution truth as ``.../open``: only
+        database-registered local files resolve. On Windows the file is
+        selected in Explorer; elsewhere its containing folder opens.
+        """
+        asset_id = request.match_info["asset_id"]
+        repo = _open_repo()
+        path, error = _resolve_local_asset_file(repo, asset_id)
+        if error is not None:
+            reason, message, status = error
+            return web.json_response(
+                {"status": "error", "asset_id": asset_id,
+                 "reason": reason, "message": message},
+                status=status,
+            )
+        assert path is not None
+        try:
+            _launch_local_path(path, reveal=True)
+        except Exception as exc:
+            _log.exception("History V2 reveal crashed for %s", asset_id)
+            return web.json_response(
+                {"status": "error", "asset_id": asset_id,
+                 "reason": "launch_failed",
+                 "message": f"could not reveal file: {str(exc)[:120]}"},
+                status=500,
+            )
+        return web.json_response(
+            {"status": "ok", "asset_id": asset_id,
+             "action": "reveal", "path": str(path)},
+            status=200,
         )

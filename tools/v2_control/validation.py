@@ -1059,6 +1059,14 @@ def _durability_context_is_distinct_publication(context: tuple[str, ...]) -> boo
 
 def _durability_key_kind(key: Any) -> str | None:
     normalized = str(key).strip().lower().replace("-", "_")
+    if normalized in {
+        "byte_sidecar", "sidecar_file", "sidecar_sha256", "sidecar_byte_count",
+    }:
+        # Bytes-transport wire receipts (harness externalization of raw
+        # image bytes with SHA/length already matched): transport
+        # artifacts, never generated-output durability proof.  Without
+        # this, the off-mode gate trips on the harness's own receipts.
+        return None
     if normalized in {"true_durable", "true_durable_marked", "result_durable"}:
         return "true_durable"
     if normalized in {"pending_durability", "pendingdurability", "durability_invoked",

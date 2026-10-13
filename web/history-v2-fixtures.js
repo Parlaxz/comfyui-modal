@@ -12,6 +12,7 @@
 // padded with null to exactly 4 slots (null = empty block).
 
 import { normalizeFeedItem } from "./history-v2-repository.js";
+import { publishStudioSync } from "./studio-sync.js";
 
 // ── Fixed clock ──────────────────────────────────────────────────────────
 
@@ -562,6 +563,52 @@ export function createFixtureRepository() {
     return Promise.resolve({ featuredOutputIndex: index });
   }
 
+  function deleteGeneration(id) {
+    const index = generations.findIndex(function (item) { return item.id === id; });
+    if (index === -1) return Promise.resolve({ accepted: false, ok: false, message: "Generation not found: " + id });
+    generations.splice(index, 1);
+    publishStudioSync("history");
+    return Promise.resolve({ accepted: true, ok: true, deleted: id, generation_ids: [id], experiment_ids: [] });
+  }
+
+  function deleteExperiment(id) {
+    const index = experiments.findIndex(function (item) { return item.id === id; });
+    if (index === -1) return Promise.resolve({ accepted: false, message: "Experiment not found: " + id });
+    experiments.splice(index, 1);
+    publishStudioSync("history");
+    return Promise.resolve({ accepted: true, generation_ids: [], experiment_ids: [id] });
+  }
+
+  function bulkDelete(selection) {
+    const input = selection || {};
+    const generationIds = Array.isArray(input.generationIds) ? input.generationIds : [];
+    const experimentIds = Array.isArray(input.experimentIds) ? input.experimentIds : [];
+    const missingGenerationIds = generationIds.filter(function (id) {
+      return !generations.some(function (item) { return item.id === id; });
+    });
+    const missingExperimentIds = experimentIds.filter(function (id) {
+      return !experiments.some(function (item) { return item.id === id; });
+    });
+    const generationSet = new Set(generationIds);
+    const experimentSet = new Set(experimentIds);
+    for (let i = generations.length - 1; i >= 0; i--) {
+      if (generationSet.has(generations[i].id)) generations.splice(i, 1);
+    }
+    for (let i = experiments.length - 1; i >= 0; i--) {
+      if (experimentSet.has(experiments[i].id)) experiments.splice(i, 1);
+    }
+    if (generationIds.length - missingGenerationIds.length + experimentIds.length - missingExperimentIds.length > 0) {
+      publishStudioSync("history");
+    }
+    return Promise.resolve({
+      accepted: true,
+      generation_ids: generationIds.filter(function (id) { return missingGenerationIds.indexOf(id) === -1; }),
+      experiment_ids: experimentIds.filter(function (id) { return missingExperimentIds.indexOf(id) === -1; }),
+      missing_generation_ids: missingGenerationIds,
+      missing_experiment_ids: missingExperimentIds,
+    });
+  }
+
   function retryExperiment(experimentId) {
     return Promise.resolve({ accepted: true, message: "Fixture: retry queued for " + experimentId });
   }
@@ -595,6 +642,9 @@ export function createFixtureRepository() {
     retryExperiment: retryExperiment,
     generateOriginal: generateOriginal,
     generateOriginalForCell: generateOriginalForCell,
+    deleteGeneration: deleteGeneration,
+    deleteExperiment: deleteExperiment,
+    bulkDelete: bulkDelete,
     listFacets: listFacets,
   };
 }

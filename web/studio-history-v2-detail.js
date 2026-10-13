@@ -8,7 +8,7 @@
 // Appended to document.body; Escape closes via registerLayerHandler
 // (layer 3, matching the shared preview overlay).  All DOM via el().
 
-import { el, registerLayerHandler, buildViewerShell } from "./studio-ui.js";
+import { el, registerLayerHandler, buildViewerShell, resolveViewerShellArgs } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
 import { _formatDuration, resolveViewerInput } from "./studio-run-normalizer.js";
 import {
@@ -22,6 +22,7 @@ import {
   deriveRetryActionLabel,
   deriveSingleResumeState,
   generateOriginalEligibility,
+  isDataSaverKind,
   isTerminalAttemptStatus,
   selectDetailAsset,
   selectFeedAsset,
@@ -68,7 +69,7 @@ export function selectGenerationDetailAsset(record) {
 export function historyAttemptPurposeLabel(mode) {
   const key = mode == null ? "" : String(mode).toLowerCase();
   if (key === "original") return "Original";
-  if (key === "preview") return "Preview";
+  if (key === "preview" || key === "data_saver" || key === "data-saver" || key === "datasaver") return "Data Saver";
   return "Run";
 }
 
@@ -102,8 +103,30 @@ function _previewBadge() {
   return el("span", {
     class: "comfymodal-studio-history-v2-badge comfymodal-studio-history-v2-preview-badge",
     "data-testid": "history-v2-preview-badge",
-    text: "Preview",
+    "data-variant": "data_saver",
+    text: "Data Saver",
   });
+}
+
+function _servedVariantBadge(servedVariant) {
+  const key = String(servedVariant || "").toLowerCase();
+  if (key === "data_saver" || key === "datasaver" || key === "data-saver" || key === "preview") {
+    return el("span", {
+      class: "comfymodal-studio-history-v2-badge comfymodal-studio-history-v2-served-badge",
+      "data-testid": "history-v2-served-variant",
+      "data-variant": "data_saver",
+      text: "Data Saver",
+    });
+  }
+  if (key === "original") {
+    return el("span", {
+      class: "comfymodal-studio-history-v2-badge comfymodal-studio-history-v2-served-badge",
+      "data-testid": "history-v2-served-variant",
+      "data-variant": "original",
+      text: "Original",
+    });
+  }
+  return null;
 }
 
 // ── Main entry ────────────────────────────────────────────────────────────
@@ -114,13 +137,34 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
   // (record, imageUrl, timing) plus a behavioral persistence adapter.
   // There are no cosmetic opts: fav star, note editor, and timing section
   // are fixed in studio-ui.js so the two surfaces cannot drift apart.
-  const sharedShell = buildViewerShell({
+  // Shell inputs are assembled once, here, and reused for every re-render —
+  // both surfaces build them through resolveViewerShellArgs, so a new input
+  // can never land on one surface and not the other.
+  var repoMode = null;
+  try {
+    repoMode = (typeof repo.getModeInfo === "function") ? repo.getModeInfo() : null;
+  } catch (err) { repoMode = null; }
+  var canDelete = !!(repoMode && repoMode.mode === "v2");
+  const shellAdapters = {
     persistence: {
       setFavorite: function (rec, next) { return repo.setFavorite(rec.id, next); },
       setNote: function (rec, text) { return repo.setNote(rec.id, text); },
       onChanged: function () { if (typeof cbs.onChanged === "function") cbs.onChanged(); },
+      deleteGeneration: canDelete
+        ? function (rec) { return repo.deleteGeneration(rec.id); }
+        : undefined,
     },
-  });
+    fileActions: {
+      openAsset: function (assetId) { return repo.openAsset(assetId); },
+      revealAsset: function (assetId) { return repo.revealAsset(assetId); },
+    },
+    onUseAsBase: typeof callbacks.onUseAsBase === "function" ? callbacks.onUseAsBase : undefined,
+    // `close` is a hoisted function declaration below: the overlay's Delete
+    // button dismisses through the shell's own close, which runs this full
+    // surface cleanup (timers, layers, focus, onClose callback).
+    onClose: function () { close(); },
+  };
+  const sharedShell = buildViewerShell(resolveViewerShellArgs(null, shellAdapters));
   const overlay = sharedShell.overlay;
   const content = sharedShell.contentEl;
 
@@ -287,7 +331,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       const meta = _downloadFilenameMeta(currentRecord, index);
       const previewBtn = buildManagedAssetDownloadButton({
         url: out.previewUrl || out.thumbUrl,
-        variant: out.previewUrl ? "preview" : "thumbnail",
+        variant: out.previewUrl ? "data_saver" : "thumbnail",
         className: "comfymodal-studio-history-v2-menu-item",
         testId: "history-v2-output-download-" + (out.previewUrl ? "preview" : "thumbnail") + "-" + index,
         filenameMeta: meta,
@@ -312,7 +356,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       const previewExport = buildConfiguredExportButton({
         assetId: out.previewAssetId,
         exportState: out.previewExportState,
-        variant: "preview",
+        variant: "data_saver",
         className: "comfymodal-studio-history-v2-menu-item",
         testId: "history-v2-output-export-preview-" + index,
         noteTestId: EXPORT_NOTE_TESTID,
@@ -422,7 +466,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       }, asset.url
         ? [el("img", { class: "comfymodal-studio-history-v2-thumb-img", src: asset.url, alt: "Output " + (index + 1), onerror: _hideOnError })]
         : [el("span", { class: "comfymodal-studio-history-v2-output-thumb-empty", text: asset.label })]);
-      if (asset.kind === "preview") thumbEl.appendChild(_previewBadge());
+      if (isDataSaverKind(asset.kind)) thumbEl.appendChild(_previewBadge());
       const menuBtn = el("button", {
         class: "comfymodal-studio-history-v2-menu-btn",
         type: "button",
@@ -479,14 +523,16 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
         }),
       ])
       : el("div", { class: "comfymodal-studio-history-v2-slot-placeholder", text: "Preview pending" });
-    if (displayed.kind === "preview") previewBody.appendChild(_previewBadge());
+    if (isDataSaverKind(displayed.kind)) previewBody.appendChild(_previewBadge());
+    const servedBadge = _servedVariantBadge(feat.servedVariant);
+    if (servedBadge) previewBody.appendChild(servedBadge);
 
     // Browser Download for the displayed Preview variant.  A Thumbnail-only
     // output downloads truthfully labeled Thumbnail bytes — never renamed to
     // Preview.  Rendering this control performs ZERO asset GETs.
     const previewDownload = buildManagedAssetDownloadButton({
       url: feat.previewUrl || feat.thumbUrl || "",
-      variant: feat.previewUrl ? "preview" : "thumbnail",
+      variant: feat.previewUrl ? "data_saver" : "thumbnail",
       className: "comfymodal-secondary-btn",
       testId: feat.previewUrl ? "history-v2-download-preview" : "history-v2-download-thumbnail",
       filenameMeta: meta,
@@ -500,7 +546,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     const previewExport = buildConfiguredExportButton({
       assetId: feat.previewAssetId,
       exportState: feat.previewExportState,
-      variant: "preview",
+      variant: "data_saver",
       className: "comfymodal-secondary-btn",
       testId: "history-v2-export-preview",
       noteTestId: EXPORT_NOTE_TESTID,
@@ -510,7 +556,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     slots.appendChild(el("div", { class: "comfymodal-studio-history-v2-slot" }, [
       el("div", {
         class: "comfymodal-studio-history-v2-slot-title",
-        text: displayed.kind === "thumbnail" ? "Thumbnail" : "Preview",
+        text: displayed.kind === "thumbnail" ? "Thumbnail" : (displayed.kind === "original" ? "Original" : "Data Saver"),
       }),
       previewBody,
       previewDownload,
@@ -525,7 +571,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
           title: "Compare this image with another History output (client-side only)",
           onclick: function () {
             startCompare({
-              descriptor: _compareDescriptor(displayed.url, displayed.kind === "thumbnail" ? "Thumbnail" : "Preview", displayed.kind, record),
+              descriptor: _compareDescriptor(displayed.url, displayed.kind === "thumbnail" ? "Thumbnail" : (displayed.kind === "original" ? "Original" : "Data Saver"), displayed.kind, record),
               invoker: document.activeElement,
             });
           },
@@ -540,10 +586,10 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
           "data-testid": "history-v2-compare-original",
           type: "button",
           text: "Compare with Original",
-          title: "Compare the displayed Preview with its retained Original",
+          title: "Compare the displayed Data Saver with its retained Original",
           onclick: function () {
             openComparePair({
-              a: _compareDescriptor(displayed.url, displayed.kind === "thumbnail" ? "Thumbnail" : "Preview", displayed.kind, record),
+              a: _compareDescriptor(displayed.url, displayed.kind === "thumbnail" ? "Thumbnail" : "Data Saver", displayed.kind, record),
               b: _compareDescriptor(feat.originalUrl, "Original", "original", record),
               invoker: document.activeElement,
             });
@@ -1053,11 +1099,8 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     // Same shared resolver every full-size output surface uses: one record
     // projection, one image policy, one timing source.
     const viewer = resolveViewerInput(record);
-    sharedShell.render(viewer.record, {
-      imageUrl: viewer.imageUrl,
-      timing: viewer.timing,
-      variant: viewer.output && viewer.output.label ? viewer.output.label : "",
-    });
+    const args = resolveViewerShellArgs(viewer, shellAdapters);
+    sharedShell.render(args.record, args);
     _ensureDialogFocus();
   }
 

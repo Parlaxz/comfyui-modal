@@ -93,9 +93,10 @@ from output_saver import (
 # history_v2_store data-root derivation convention.
 _DEFAULT_COMFYUI_ROOT = str(Path(__file__).resolve().parents[2])
 
-# Workflow-name component cap so pathological names cannot push the final
-# path past Windows MAX_PATH once date/seed/index/ext are appended.
-_MAX_NAME_COMPONENT = 80
+# Workflow-name component cap so exported filenames stay short: with the
+# date/seed/index/ext suffixes the total lands around ~70 chars, and the
+# cap also guards pathological names against Windows MAX_PATH.
+_MAX_NAME_COMPONENT = 32
 
 # Source-extension mapping used on the byte-preserving fast path
 # (output_format == "original"); mirrors output_converter._FORMAT_META and

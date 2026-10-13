@@ -10,6 +10,7 @@ import tools.benchmark_v2_direct as benchmark
 from tools.v2_control.validation import (
     CanonicalLedgerValidator,
     RunRecord,
+    _durability_key_kind,
     resolve_output_durability_mode,
 )
 from tests.v2ctl_fakes import FakeArtifactSet, FakeConfig, FakeFlag
@@ -342,3 +343,71 @@ def test_canonical_ledger_off_mode_uses_result_ready_endpoint(tmp_path: Path):
     )
 
     assert CanonicalLedgerValidator().validate(record, config) == []
+
+# -- Bytes-transport wire receipts are not durability evidence ----------
+# The harness externalizes raw image bytes to cohort files and records a
+# byte_sidecar receipt (SHA/length already matched, result_durable false).
+# The off-mode gate must not flag its own receipts; real durability
+# markers (commit/reopen/fsync/asset_write/true_durable) still fail.
+
+
+def _bytes_transport_event():
+    return {
+        "type": "result",
+        "data": {
+            "output_durability_mode": "off",
+            "durability_requested": False,
+            "result_durable": False,
+            "result_transport": "bytes",
+            "images": [{
+                "identity": "sha256:" + SHA,
+                "data": "",
+                "output_durability_mode": "off",
+                "durability_requested": False,
+                "result_durable": False,
+                "byte_sidecar": {
+                    "sidecar_file": "attempt_0.png",
+                    "sidecar_sha256": SHA,
+                    "sidecar_byte_count": 3083864,
+                },
+            }],
+        },
+    }
+
+
+def test_off_mode_accepts_bytes_transport_wire_receipt():
+    scanned = benchmark._golden_p1_scan_events([_bytes_transport_event()])
+    assert scanned["sidecar"] == []
+    assert scanned["durability_claims"] == []
+    scan = _scan()
+    scan["sidecar"] = list(scanned["sidecar"])
+    scan["durability_claims"] = list(scanned["durability_claims"])
+    valid, failures, _details = benchmark._golden_p1_validate_attempt(
+        scan, expected_output_sha=SHA, expected_flags=None
+    )
+    assert valid, failures
+
+
+def test_wire_receipt_exclusion_is_narrow():
+    assert _durability_key_kind("byte_sidecar") is None
+    assert _durability_key_kind("sidecar_file") is None
+    assert _durability_key_kind("sidecar_sha256") is None
+    assert _durability_key_kind("sidecar_byte_count") is None
+    # Real durability markers keep their kinds.
+    assert _durability_key_kind("volume_commit") == "commit"
+    assert _durability_key_kind("reopen_verified") == "reopen"
+    assert _durability_key_kind("output_fsync") == "fsync"
+    assert _durability_key_kind("output_asset_write") == "asset_write"
+    assert _durability_key_kind("true_durable") == "true_durable"
+    assert _durability_key_kind("sidecar") == "sidecar"
+
+
+def test_off_mode_still_rejects_real_durability_work_alongside_receipt():
+    scan = _scan()
+    scan["commit"] = [(0, "result.volume_commit", 123)]
+    scan["durability_claims"] = [(0, {"volume_commit": True})]
+    valid, failures, _details = benchmark._golden_p1_validate_attempt(
+        scan, expected_output_sha=SHA, expected_flags=None
+    )
+    assert not valid
+    assert any("off mode" in failure for failure in failures)

@@ -1,7 +1,7 @@
 // Modal Studio — modern Experiment V2 user-facing flow against the fake API.
 
 import { test, expect } from "@playwright/test";
-import { setupFakeTest, enableExperimentMode } from "./helpers.mjs";
+import { setupFakeTest, enableExperimentMode, openExperimentManager } from "./helpers.mjs";
 
 const WORKFLOW_SELECTOR = '[data-testid="workflow-selector"]';
 
@@ -20,11 +20,12 @@ test.describe("Studio Modern Experiment V2 UI (fake backend)", () => {
       await page.locator(WORKFLOW_SELECTOR).selectOption("wf_text2img");
       await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 10000 });
       await enableExperimentMode(page);
+      const modal = await openExperimentManager(page);
 
-      await expect(page.getByTestId("experiment-v2-section")).toBeVisible();
-      await expect(page.getByTestId("run-experiment-inline-btn")).toHaveCount(0);
+      await expect(modal.getByTestId("experiment-v2-section")).toBeVisible();
+      await expect(modal.getByTestId("run-experiment-inline-btn")).toHaveCount(0);
 
-      await page.getByTestId("modern-experiment-submit-btn").click();
+      await modal.getByTestId("modern-experiment-submit-btn").click();
       await expect.poll(() => createBodies.length, { timeout: 10000 }).toBe(1);
 
       const body = createBodies[0];
@@ -45,7 +46,7 @@ test.describe("Studio Modern Experiment V2 UI (fake backend)", () => {
       const experimentId = await readActiveExperimentId();
       expect(experimentId).toBe(body.experiment_id);
 
-      const grid = page.getByTestId("experiment-v2-grid");
+      const grid = modal.getByTestId("experiment-v2-grid");
       await expect(grid).toBeVisible({ timeout: 10000 });
       await expect(grid.locator('[data-testid="experiment-v2-cell-cell_0"]')).toHaveCount(1);
 
@@ -61,7 +62,7 @@ test.describe("Studio Modern Experiment V2 UI (fake backend)", () => {
       await expect(
         grid.locator('[data-testid="experiment-v2-cell-cell_0"]')
       ).toHaveAttribute("data-cell-status", "completed", { timeout: 10000 });
-      await expect(page.getByTestId("experiment-v2-progress")).toHaveText("1/1 complete");
+      await expect(modal.getByTestId("experiment-v2-progress")).toHaveText("1/1 complete");
 
       // The accepted modern experiment is also visible through the real
       // History V2 adapter/detail surface, not only the polling route.

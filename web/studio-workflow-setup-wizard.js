@@ -201,32 +201,52 @@ const ROLE_SUGGESTIONS = Object.freeze({
 const TEXT_GENERATE_NODE_TYPES = Object.freeze(["TextGenerate", "TextGenerateLTX2Prompt"]);
 
 function _textGenerateNodeTargets(graphJson) {
-  const ui = _graphNodes(graphJson).filter((node) => {
-    return TEXT_GENERATE_NODE_TYPES.indexOf(_nodeTypeOf(node)) !== -1;
-  }).map((node) => ({
-    nodeId: node.id,
-    nodeType: _nodeTypeOf(node),
-    nodeTitle: _nodeTitleOf(node),
-  }));
-  if (ui.length) return ui;
+  const out = [];
+  const seen = new Set();
+  const push = (node, nodeId) => {
+    if (!node || nodeId == null) return;
+    if (TEXT_GENERATE_NODE_TYPES.indexOf(_nodeTypeOf(node)) === -1) return;
+    const key = String(nodeId);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ nodeId, nodeType: _nodeTypeOf(node), nodeTitle: _nodeTitleOf(node) });
+  };
+  const topNodes = _graphNodes(graphJson);
+  topNodes.forEach((node) => { if (node) push(node, node.id); });
+  // Subgraph interiors, mirroring suggestBindingTargets: a top-level
+  // container node's type is its subgraph definition id, and inner hits
+  // carry the composite outer:inner nodeId the mapping and execution
+  // layers already resolve. Single level only, same as catalog rows.
+  try {
+    const defs = _subgraphDefs(graphJson);
+    if (Object.keys(defs).length > 0) {
+      topNodes.forEach((node) => {
+        if (!node || node.id == null) return;
+        const def = defs[String(node.type)];
+        if (!def) return;
+        (Array.isArray(def.nodes) ? def.nodes : []).forEach((innerNode) => {
+          if (!innerNode || innerNode.id == null) return;
+          push(innerNode, String(node.id) + ":" + String(innerNode.id));
+        });
+      });
+    }
+  } catch (_e) { /* best-effort */ }
+  if (out.length) return out;
   // API-prompt fallback: {"8": {"class_type": "TextGenerate", ...}}.
   // _graphNodes only understands UI graphs, so a stored API-format graph
   // would otherwise scan as empty even with a TextGenerate node present.
+  // Expanded subgraph keys ("30:10") match here as plain entries.
   try {
     if (graphJson && typeof graphJson === "object"
       && !Array.isArray(graphJson) && !Array.isArray(graphJson.nodes)) {
-      const out = [];
       Object.keys(graphJson).forEach((id) => {
         const node = graphJson[id];
         if (!node || typeof node !== "object") return;
-        const t = node.class_type || "";
-        if (TEXT_GENERATE_NODE_TYPES.indexOf(t) === -1) return;
-        out.push({ nodeId: id, nodeType: t, nodeTitle: node.title || t });
+        push({ class_type: node.class_type, title: node.title, id }, id);
       });
-      return out;
     }
   } catch (_e) { /* best-effort */ }
-  return ui;
+  return out;
 }
 
 function _textGenerateCanvasTargets() {

@@ -125,6 +125,9 @@ class RuntimeTrace:
             event = replace(event, monotonic_ns=self._last_emitted_mono_ns + 1)
         self._last_emitted_mono_ns = event.monotonic_ns
         self._events.append(event)
+        if self._metadata.get("studio_progress"):
+            from .gantt_telemetry import publish_studio_trace_event
+            publish_studio_trace_event(self, event)
         return event
 
     def emit_at(

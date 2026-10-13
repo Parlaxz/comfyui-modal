@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import sys
 import tempfile
+import types
+from unittest import mock
 
 import pytest
 
@@ -8,6 +11,7 @@ from studio_domain import WorkflowDomainService, WorkflowDomainValidationError
 from studio_domain.models import Mapping
 from studio_workflow_run import (
     _build_plan_replay_meta,
+    _hydrate_missing_required_widget_defaults,
     prepare_effective_prompt,
 )
 
@@ -183,3 +187,34 @@ def test_bypass_falls_back_to_node_input_without_shelf_prompt():
     )
     assert non_string["workflow"]["consumer"]["inputs"]["text"] == "node template text"
     assert non_string["studio_meta"]["text_generate_prompt_source"] == "node_input"
+
+
+def test_hydrate_fills_none_optional_combo_with_schema_default():
+    fake_nodes = types.ModuleType("nodes")
+
+    class TextGenerate:
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {
+                "required": {"prompt": ("STRING", {"default": ""})},
+                "optional": {
+                    "mtp": (["auto", "off", "2"], {"default": "auto"}),
+                    "system_prompt": ("STRING", {}),
+                },
+            }
+
+    setattr(fake_nodes, "NODE_CLASS_MAPPINGS", {"TextGenerate": TextGenerate})
+    workflow = {
+        "214": {
+            "class_type": "TextGenerate",
+            "inputs": {"prompt": "hi", "mtp": None},
+        }
+    }
+    with mock.patch.dict(sys.modules, {"nodes": fake_nodes}):
+        evidence = _hydrate_missing_required_widget_defaults(workflow)
+
+    assert workflow["214"]["inputs"]["mtp"] == "auto"
+    assert workflow["214"]["inputs"]["prompt"] == "hi"
+    assert {"node_id": "214", "input": "mtp"} in evidence["hydrated"]
+    # Optional without a declared default is left untouched.
+    assert "system_prompt" not in workflow["214"]["inputs"]

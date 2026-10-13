@@ -118,6 +118,16 @@ test("wizard persists the selected workflow type", () => {
   assert.ok(src.includes("initialWorkflowType"), "edit mapping initializes from stored type");
 });
 
+test("text-generate scan covers subgraph interiors with composite ids", () => {
+  const src = readWeb("studio-workflow-setup-wizard.js");
+  const start = src.indexOf("function _textGenerateNodeTargets");
+  assert.ok(start !== -1, "text-generate scan exists");
+  const end = src.indexOf("\nfunction ", start + 1);
+  const body = src.slice(start, end === -1 ? undefined : end);
+  assert.ok(body.includes("_subgraphDefs"), "scan traverses subgraph definitions");
+  assert.ok(body.includes('":"'), "inner hits carry composite outer:inner ids");
+});
+
 test("playground has one tool strip and tool editors", () => {
   const src = readWeb("studio-playground.js");
   assert.ok(src.includes("studio-tool-strip"), "tool strip exists");

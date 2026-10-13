@@ -17,7 +17,7 @@
 //   6. Single-mode Playground runs are untouched.
 
 import { test, expect } from "@playwright/test";
-import { setupFakeTest, selectPreset, submitSingleRun } from "./helpers.mjs";
+import { setupFakeTest, selectPreset, submitSingleRun, openExperimentManager } from "./helpers.mjs";
 
 const WORKFLOW_SELECTOR = '[data-testid="workflow-selector"]';
 const SUBMIT_BTN = '[data-testid="modern-experiment-submit-btn"]';
@@ -51,22 +51,24 @@ test.describe("Studio Experiment V2 fallback closure (fake backend, H8)", () => 
     const tracker = trackCreatorPosts(page);
     try {
       await enableExperimentModeAndWait(page);
+      const modal = await openExperimentManager(page);
 
-      // The MODERN section mounts (gated); the legacy creator never does.
-      await expect(page.getByTestId("experiment-v2-section")).toBeVisible();
-      await expect(page.locator('[data-testid="run-experiment-inline-btn"]')).toHaveCount(0);
-      await expect(page.locator(SUBMIT_BTN)).toBeDisabled();
-      await expect(page.locator(REASON)).toHaveText(
+      // The MODERN section mounts (gated) in the manager popup; the legacy creator never does.
+      await expect(modal.getByTestId("experiment-v2-section")).toBeVisible();
+      await expect(modal.locator('[data-testid="run-experiment-inline-btn"]')).toHaveCount(0);
+      await expect(modal.locator(SUBMIT_BTN)).toBeDisabled();
+      await expect(modal.locator(REASON)).toHaveText(
         "Select a Workflow and Version before running an experiment."
       );
 
       // Existing contextual route to the Workflows owner.
-      const wfLink = page.locator('[data-testid="modern-experiment-workflows-link"]');
+      const wfLink = modal.locator('[data-testid="modern-experiment-workflows-link"]');
       await expect(wfLink).toBeVisible();
       await wfLink.click();
       await expect(page.locator(".comfymodal-studio-topnav button[data-page='workflows'].active")).toBeVisible();
       await fx.gotoPage("playground");
-      await expect(page.getByTestId("experiment-v2-section")).toBeVisible();
+      await expect(page.getByTestId("experiment-manager")).toBeVisible();
+      await expect(modal.getByTestId("experiment-v2-section")).toBeVisible();
 
       expect(tracker.legacy.length).toBe(0, "zero legacy creator POSTs while gated");
       expect(tracker.v2.length).toBe(0, "zero V2 POSTs while gated");
@@ -95,11 +97,12 @@ test.describe("Studio Experiment V2 fallback closure (fake backend, H8)", () => 
       await page.locator(WORKFLOW_SELECTOR).selectOption("wf_text2img");
       await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 10000 });
       await enableExperimentModeAndWait(page);
+      const modal = await openExperimentManager(page);
 
-      await expect(page.locator(SUBMIT_BTN)).toBeEnabled({ timeout: 10000 });
-      await expect(page.locator(REASON)).toHaveText("");
+      await expect(modal.locator(SUBMIT_BTN)).toBeEnabled({ timeout: 10000 });
+      await expect(modal.locator(REASON)).toHaveText("");
 
-      await page.locator(SUBMIT_BTN).click();
+      await modal.locator(SUBMIT_BTN).click();
       await expect.poll(() => createBodies.length, { timeout: 10000 }).toBe(1);
 
       const body = createBodies[0];
@@ -110,8 +113,8 @@ test.describe("Studio Experiment V2 fallback closure (fake backend, H8)", () => 
         preset_id: "wpres_a",
       });
 
-      // Live grid hydrates from the modern status endpoint.
-      const grid = page.getByTestId("experiment-v2-grid");
+      // Live grid hydrates from the modern status endpoint (inside the manager).
+      const grid = modal.getByTestId("experiment-v2-grid");
       await expect(grid).toBeVisible({ timeout: 10000 });
       await expect(grid.locator('[data-testid="experiment-v2-cell-cell_0"]')).toHaveCount(1);
 
@@ -288,10 +291,12 @@ test.describe("Studio Experiment V2 fallback closure (fake backend, H8)", () => 
         window.__studioApi.setPage("playground");
       });
 
-      // The modern section is the ONLY run surface (gated/runnable).
+      // The launcher host stays inline; the modern section (the ONLY run
+      // surface) renders in the manager popup.
       const surface = page.locator('[data-testid="experiment-run-surface"]');
       await expect(surface).toBeVisible({ timeout: 10000 });
-      await expect(surface.locator('[data-testid="experiment-v2-section"]')).toBeVisible();
+      const modal = await openExperimentManager(page);
+      await expect(modal.locator('[data-testid="experiment-v2-section"]')).toBeVisible();
       expect(await page.locator('[data-testid="experiment-grid-viewport"]').count()).toBe(0);
 
       // Clicking an EXP filmstrip item navigates to History instead of

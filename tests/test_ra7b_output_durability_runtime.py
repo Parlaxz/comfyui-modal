@@ -76,18 +76,72 @@ def test_off_result_is_ready_not_durable_and_has_inline_bytes(tmp_path):
     session.recorder.end_stage("golden_output", ready=True)
     session.recorder.mark_first_result_ready()
     session.request = gs.GoldenRequest(request_id="r1", prompt={})
+    session.golden_mode = "serial"
     session.runner = None
 
     result = session.build_final_result()
     assert result.true_durable is False
     assert result.result_durable is False
     assert result.output_durability_mode == "off"
-    assert base64.b64decode(result.image_data) == payload
+    # Bytes transport is the default: raw PNG bytes, no base64 expansion.
+    assert result.image_data == ""
+    assert result.image_raw is not None
+    assert bytes(result.image_raw) == payload
     assert result.byte_count == len(payload)
     assert gs.EVENT_FIRST_RESULT_READY in [event["name"] for event in session.recorder.events]
     telemetry = session.recorder.to_json_dict()
     assert telemetry["result_durable"] is False
     assert not any(stage["name"] == "golden_durable_commit" for stage in telemetry["stages"])
+
+    from comfymodal_runtime.result_delivery import materialize_modal_result
+
+    materialized = materialize_modal_result(
+        {
+            "images": [{
+                "filename": result.filename,
+                "node_id": result.output_node_id,
+                "output_key": "images",
+                "mime_type": result.mime_type,
+                "byte_count": result.byte_count,
+                "asset_id": result.image_sha256,
+                "data": "",
+                "raw_bytes": bytes(result.image_raw),
+            }],
+        },
+        output_dir=str(tmp_path),
+        prompt_id="r1",
+    )
+    assert materialized["image_count"] == 1
+    assert Path(materialized["written_files"][0]).read_bytes() == payload
+
+
+def test_off_result_base64_legacy_mode_keeps_data_envelope(tmp_path):
+    from comfymodal_runtime import golden_serial as gs
+
+    payload = b"encoded png bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    session = object.__new__(gs.GoldenSession)
+    session.durability_requested = False
+    session.pending_durability = None
+    session.output_artifact = ReadyOutputArtifact(
+        payload, digest, len(payload), "asset.png", width=2, height=3
+    )
+    session.recorder = gs.GoldenTelemetryRecorder()
+    session.recorder.output_durability_mode = "off"
+    session.recorder.durability_requested = False
+    session.recorder.begin_stage("golden_output")
+    session.recorder.end_stage("golden_output", ready=True)
+    session.recorder.mark_first_result_ready()
+    session.request = gs.GoldenRequest(
+        request_id="r1", prompt={}, result_transport="base64"
+    )
+    session.golden_mode = "serial"
+    session.runner = None
+
+    result = session.build_final_result()
+    assert result.image_raw is None
+    assert base64.b64decode(result.image_data) == payload
+    assert result.byte_count == len(payload)
 
     from comfymodal_runtime.result_delivery import materialize_modal_result
 
@@ -224,6 +278,7 @@ def test_direct_off_golden_output_stays_in_memory(tmp_path, monkeypatch):
     session.recorder.output_durability_mode = "off"
     session.recorder.durability_requested = False
     session.request = gs.GoldenRequest(request_id="off-output", prompt=prompt)
+    session.golden_mode = "serial"
     session.contract = gs.GoldenWorkflowContract(expected_output_png_sha256="")
     session.runner = runner
     session.node_map = node_map

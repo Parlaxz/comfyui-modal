@@ -880,6 +880,11 @@ class GoldenRequest:
     # source owner.
     cpu_qd2_prefetch: bool = False
     deep_trace: bool = False
+    # Result image wire representation.  ``bytes`` (default) carries raw PNG
+    # bytes out-of-band from any base64 text; ``base64`` keeps the legacy
+    # images[0].data envelope for diagnosis.  Normalized once at the request
+    # boundary like every other selector.
+    result_transport: str = "bytes"
     # Only the dedicated Studio Modal entrypoint may enable caller-selected
     # workflow/model identities.  Ordinary v2ctl requests remain fail-closed.
     studio_advisory: bool = False
@@ -895,6 +900,7 @@ class GoldenRequest:
         if not isinstance(self.cpu_qd2_prefetch, bool):
             raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
         object.__setattr__(self, "deep_trace", normalize_deep_trace_level(self.deep_trace) == "full")
+        object.__setattr__(self, "result_transport", normalize_result_transport(self.result_transport))
         if not isinstance(self.studio_advisory, bool):
             raise ValueError("golden_studio_advisory_must_be_bool")
 
@@ -922,6 +928,16 @@ def normalize_attention_backend(value: Any) -> str:
             "golden_attention_backend_invalid:"
             f"{value!r}; allowed={','.join(ATTENTION_BACKENDS)}"
         )
+    return normalized
+
+
+def normalize_result_transport(value: Any) -> str:
+    """Normalize and validate the ``result_transport`` request selector."""
+    if not isinstance(value, str):
+        raise ValueError("golden_result_transport_must_be_string")
+    normalized = value.strip().lower()
+    if normalized not in {"bytes", "base64"}:
+        raise ValueError(f"golden_result_transport_invalid:{value!r}")
     return normalized
 
 
@@ -8329,6 +8345,10 @@ class GoldenFinalResult:
     height: int = 0
     output_node_id: str = ""
     image_data: str = ""
+    # Raw encoded output bytes, populated only when the request selects the
+    # ``bytes`` result transport.  ``None`` (and base64 mode) keeps the
+    # historical images[0].data envelope untouched.
+    image_raw: Optional[bytes] = None
     golden_mode: str = "serial"
     # Advisory workflow-identity evidence.  ``None`` means the check never
     # ran; ``False`` means the executed prompt differed from the frozen
@@ -8617,6 +8637,7 @@ class GoldenSession:
         )
         pending = self.pending_durability
         artifact = getattr(self, "output_artifact", None)
+        image_raw: Optional[bytes] = None
         if output_mode == "strict":
             if pending is None or not pending.committed:
                 raise RuntimeError("final_result_requires_committed_pending_durability")
@@ -8647,7 +8668,16 @@ class GoldenSession:
             width = artifact.width
             height = artifact.height
             output_node_id = str(getattr(self, "output_node_id", ""))
-            image_data = base64.b64encode(artifact.raw_bytes).decode("ascii")
+            transport = str(
+                getattr(getattr(self, "request", None), "result_transport", "bytes")
+                or "bytes"
+            ).strip().lower()
+            if transport == "bytes":
+                image_data = ""
+                image_raw = bytes(artifact.raw_bytes)
+            else:
+                image_data = base64.b64encode(artifact.raw_bytes).decode("ascii")
+                image_raw = None
             result_durable = False
         reconcile = self.recorder.reconcile_seriality()
         return GoldenFinalResult(
@@ -8679,6 +8709,7 @@ class GoldenSession:
             height=height,
             output_node_id=output_node_id,
             image_data=image_data,
+            image_raw=image_raw,
             golden_mode=self.golden_mode,
             workflow_sha_match=self.workflow_sha_match,
             workflow_sha_warning=self.workflow_sha_warning,
@@ -12454,12 +12485,14 @@ def _session_source_policy(session: Any) -> str:
         return ""
 
 
-def _read_golden_m2_clip(path: str, *, transport: Any = None, role: str = "clip") -> dict[str, Any]:
-    """Adapt the canonical M2 loader to Golden's transport contract."""
-    from .golden_model_transport import get_golden_model_transport
+def _adapt_m2_loaded(loaded: Any) -> dict[str, Any]:
+    """Adapt a ``LoadedSafetensors`` to Golden's transport-result contract.
 
-    transport = transport or get_golden_model_transport()
-    loaded = transport.load_sync(path, role=role)
+    Shared by the synchronous read and the early-CLIP ticket join: both
+    produce the identical ``loaded`` object, so both report identical
+    stats/telemetry.  Raises on a malformed object (callers fall back to
+    their own read path).
+    """
     source = loaded.stats.get("source") or {}
     stats = dict(loaded.stats)
     stats.update({
@@ -12487,6 +12520,57 @@ def _read_golden_m2_clip(path: str, *, transport: Any = None, role: str = "clip"
         "data_start": loaded.layout.data_start,
         "data_bytes": loaded.layout.data_bytes,
     }
+
+
+def _read_golden_m2_clip(path: str, *, transport: Any = None, role: str = "clip") -> dict[str, Any]:
+    """Adapt the canonical M2 loader to Golden's transport contract."""
+    from .golden_model_transport import get_golden_model_transport
+
+    transport = transport or get_golden_model_transport()
+    loaded = transport.load_sync(path, role=role)
+    return _adapt_m2_loaded(loaded)
+
+
+async def _join_generic_clip_ticket(session: Any, path: str, rec: Any = None) -> dict[str, Any] | None:
+    """Await an early-CLIP transport ticket started before dispatch.
+
+    The generic studio path launches ``transport.load(path, role="clip")``
+    while executor setup runs; the stage joins it here instead of starting
+    its own synchronous read.  The awaited object is adapted with the
+    exact adapter the sync path uses, so stats/telemetry/owners are
+    identical.  A path mismatch, missing/failed task, or malformed result
+    returns None and the caller falls through to its normal read (strict
+    native fallback, counted by the caller).  Canonical runs never set
+    ``session._generic_clip_ticket`` and are untouched.  Never raises.
+    """
+    try:
+        ticket = getattr(session, "_generic_clip_ticket", None)
+        if not isinstance(ticket, dict):
+            return None
+        if str(ticket.get("path") or "") != str(path or ""):
+            return None
+        task = ticket.get("task")
+        if task is None:
+            return None
+        try:
+            ticket["consumed"] = True
+        except Exception:
+            pass
+        loaded = await task
+        if loaded is None:
+            return None
+        adapted = _adapt_m2_loaded(loaded)
+        try:
+            if rec is not None:
+                rec.event(
+                    "clip_load_ticket_consumed",
+                    path=os.path.basename(str(path)),
+                )
+        except Exception:
+            pass
+        return adapted
+    except Exception:
+        return None
 
 
 def _cpu_quant_markers_in_place(state_dicts: Any) -> int:
@@ -12703,9 +12787,20 @@ async def golden_clip_load(
             with clip_timing.span("source_open_read", boundary_kind="host_observed"):
                 with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
                     if _golden_model_transport_enabled() and _session_source_policy(session) != "legacy_qd":
-                        transport = _read_golden_m2_clip(
-                            path, transport=getattr(session, "model_transport", None)
+                        # Early-CLIP ticket (generic studio path only):
+                        # the transport read ran while executor setup ran.
+                        # The join awaits it and adapts the result with the
+                        # exact adapter below; a miss falls through to the
+                        # normal synchronous read.  The span then measures
+                        # join-wait only, and the ticket's own read wall
+                        # travels in its stats (same telemetry shape).
+                        transport = await _join_generic_clip_ticket(
+                            session, path, rec=rec,
                         )
+                        if transport is None:
+                            transport = _read_golden_m2_clip(
+                                path, transport=getattr(session, "model_transport", None)
+                            )
                     else:
                         transport = read_file_qd_gpu(
                             path,

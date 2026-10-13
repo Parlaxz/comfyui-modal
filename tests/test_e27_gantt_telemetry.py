@@ -8,6 +8,9 @@ import os
 import sys
 import time
 import unittest
+import io
+import json
+from contextlib import redirect_stdout
 
 os.environ.setdefault("COMFYMODAL_V2_GANTT_TELEMETRY", "1")
 
@@ -77,6 +80,24 @@ def _build_trace():
 
 
 class GanttSpanCollectionTest(unittest.TestCase):
+    def test_live_studio_boundaries_are_request_scoped_and_opt_in(self):
+        trace = RuntimeTrace(request_id="studio-live", process="remote_method")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            trace.emit("vae_decode_start")
+            trace.emit("vae_decode_end")
+        self.assertEqual(output.getvalue(), "")
+        trace.set_metadata(studio_progress=True)
+        with redirect_stdout(output):
+            start = trace.emit("vae_decode_start")
+            end = trace.emit("vae_decode_end")
+        events = [json.loads(line.split(" ", 1)[1]) for line in output.getvalue().splitlines()]
+        self.assertEqual([event["phase"] for event in events], ["started", "completed"])
+        self.assertEqual(events[0]["span_id"], events[1]["span_id"])
+        self.assertEqual(events[1]["entry_monotonic_ns"], start.monotonic_ns)
+        self.assertEqual(events[1]["end_monotonic_ns"], end.monotonic_ns)
+        self.assertEqual(events[1]["request_id"], "studio-live")
+
     def test_spans_collected_from_trace_pairs(self):
         trace = _build_trace()
         spans = _collect_spans(trace)

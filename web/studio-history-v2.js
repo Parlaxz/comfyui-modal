@@ -20,6 +20,7 @@ import { _formatDuration } from "./studio-run-normalizer.js";
 import { getOutputPreferences, normalizeOutputSaveFolder } from "./studio-output-preferences.js";
 import { renderGenerationDetail } from "./studio-history-v2-detail.js";
 import { renderExperimentDetail } from "./studio-history-v2-experiment.js";
+import { setPendingPlaygroundBase } from "./studio-playground-state.js";
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -174,11 +175,14 @@ export function selectGenerationFeedAsset(record) {
 }
 
 function _assetBadge(asset) {
-  return asset && asset.kind === "preview"
+  const kind = asset && asset.kind ? String(asset.kind).toLowerCase() : "";
+  const isSaver = kind === "data_saver" || kind === "datasaver" || kind === "data-saver" || kind === "preview";
+  return isSaver
     ? el("span", {
       class: "comfymodal-studio-history-v2-badge comfymodal-studio-history-v2-preview-badge",
       "data-testid": "history-v2-preview-badge",
-      text: "Preview",
+      "data-variant": "data_saver",
+      text: "Data Saver",
     })
     : null;
 }
@@ -272,6 +276,8 @@ export function renderHistoryV2(state, context) {
   let hasMore = false;
   let loading = true;
   let error = null;
+  let bulkMode = false;
+  const selectedKeys = new Set();
 
   // Stale-async guard: every fetch bumps the token; responses from an
   // outdated token are ignored so rapid filter changes never interleave.
@@ -290,6 +296,45 @@ export function renderHistoryV2(state, context) {
   const kindButtons = {};
   const statusButtons = {};
   const boolToggleEls = {};
+  let bulkToggleEl = null;
+  let bulkBarEl = null;
+  let bulkCountEl = null;
+  let bulkNoteEl = null;
+
+  function _selectionKey(record) {
+    return (record.kind === "experiment" ? "experiment" : "generation") + ":" + record.id;
+  }
+
+  function _clearSelection() {
+    selectedKeys.clear();
+    refreshBulkControls();
+  }
+
+  function _toggleSelection(record) {
+    const key = _selectionKey(record);
+    if (selectedKeys.has(key)) selectedKeys.delete(key);
+    else selectedKeys.add(key);
+    renderResults();
+    refreshBulkControls();
+  }
+
+  function _isSelected(record) {
+    return selectedKeys.has(_selectionKey(record));
+  }
+
+  function refreshBulkControls() {
+    if (bulkToggleEl) bulkToggleEl.setAttribute("aria-pressed", bulkMode ? "true" : "false");
+    if (bulkBarEl) bulkBarEl.hidden = !bulkMode;
+    if (bulkCountEl) bulkCountEl.textContent = selectedKeys.size + " selected";
+    const deleteButton = bulkBarEl && bulkBarEl.querySelector("[data-testid='history-v2-bulk-delete']");
+    if (deleteButton) deleteButton.disabled = selectedKeys.size === 0;
+  }
+
+  function _selectionLabel(record) {
+    return record.kind === "experiment"
+      ? "Select experiment " + (record.name || record.id || "")
+      : "Select generation " + (record.id || "");
+  }
 
   // ── Persistence ─────────────────────────────────────────────────────────
   function saveViewState() {
@@ -375,6 +420,7 @@ export function renderHistoryV2(state, context) {
       total = 0;
       nextCursor = null;
       hasMore = false;
+      _clearSelection();
     }
     renderResults();
 
@@ -417,6 +463,7 @@ export function renderHistoryV2(state, context) {
   }
 
   function onViewChange() {
+    _clearSelection();
     saveViewState();
     refreshControls();
     fetchFeed(true);
@@ -600,19 +647,31 @@ export function renderHistoryV2(state, context) {
     const timeText = _shortDateTime(record.startedAt);
     const durText = record.durationMs != null ? _formatDuration(record.durationMs) : "";
 
+    const selected = bulkMode && _isSelected(record);
     const card = el("div", {
-      class: "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card",
+      class: "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card" + (selected ? " comfymodal-studio-history-v2-card-selected" : ""),
       "data-testid": "history-v2-generation-card",
       "data-id": record.id,
       tabindex: "0",
       role: "button",
-      "aria-label": "Open generation " + (record.id || "") + (metaText ? " \u2014 " + metaText : ""),
-      onclick: function () { openGeneration(record.id); },
-      onkeydown: function (e) { _cardKeydown(e, function () { openGeneration(record.id); }); },
+      "aria-selected": bulkMode ? (selected ? "true" : "false") : "false",
+      "aria-label": "Open generation " + (record.id || "") + (metaText ? " — " + metaText : ""),
+      onclick: function () { bulkMode ? _toggleSelection(record) : openGeneration(record.id); },
+      onkeydown: function (e) { _cardKeydown(e, function () { bulkMode ? _toggleSelection(record) : openGeneration(record.id); }); },
     }, [
       _cardThumb(Object.assign({}, feat, {
         originalAvailable: !!(feat.originalAvailable || record.originalAvailable),
       }), record.prompt || "Generation output"),
+      el("input", {
+        type: "checkbox",
+        class: "comfymodal-studio-history-v2-card-select",
+        "data-testid": "history-v2-card-select",
+        "aria-label": _selectionLabel(record),
+        checked: selected,
+        hidden: !bulkMode,
+        onclick: function (e) { e.stopPropagation(); },
+        onchange: function (e) { e.stopPropagation(); _toggleSelection(record); },
+      }),
       el("div", { class: "comfymodal-studio-history-v2-card-top" }, [
         _statusChip(record.status),
         renderFavoriteStar(record),
@@ -667,17 +726,29 @@ export function renderHistoryV2(state, context) {
     const timeText = _shortDateTime(record.startedAt);
     const durText = record.durationMs != null ? _formatDuration(record.durationMs) : "";
 
+    const selected = bulkMode && _isSelected(record);
     const card = el("div", {
-      class: "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-experiment-card",
+      class: "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-experiment-card" + (selected ? " comfymodal-studio-history-v2-card-selected" : ""),
       "data-testid": "history-v2-experiment-card",
       "data-id": record.id,
       tabindex: "0",
       role: "button",
+      "aria-selected": bulkMode ? (selected ? "true" : "false") : "false",
       "aria-label": "Open experiment " + (record.name || record.id || ""),
-      onclick: function () { showExperiment(record.id); },
-      onkeydown: function (e) { _cardKeydown(e, function () { showExperiment(record.id); }); },
+      onclick: function () { bulkMode ? _toggleSelection(record) : showExperiment(record.id); },
+      onkeydown: function (e) { _cardKeydown(e, function () { bulkMode ? _toggleSelection(record) : showExperiment(record.id); }); },
     }, [
       coverGrid,
+      el("input", {
+        type: "checkbox",
+        class: "comfymodal-studio-history-v2-card-select",
+        "data-testid": "history-v2-card-select",
+        "aria-label": _selectionLabel(record),
+        checked: selected,
+        hidden: !bulkMode,
+        onclick: function (e) { e.stopPropagation(); },
+        onchange: function (e) { e.stopPropagation(); _toggleSelection(record); },
+      }),
       el("div", { class: "comfymodal-studio-history-v2-card-top" }, [
         _statusChip(record.status),
         renderFavoriteStar(record),
@@ -708,6 +779,14 @@ export function renderHistoryV2(state, context) {
         // stays truthful after detail-side mutations.
         fetchFeed(true);
       },
+      // Cross-page base handoff: stash the run's prompt + controls for the
+      // Playground shelf and navigate there; the next shelf build consumes
+      // the one-shot payload. Offered only when navigation exists.
+      onUseAsBase: (typeof context.setPage === "function") ? function (payload) {
+        setPendingPlaygroundBase(payload);
+        context.setPage("playground");
+        return 1;
+      } : undefined,
     });
   }
 
@@ -754,6 +833,66 @@ export function renderHistoryV2(state, context) {
     renderResultCount();
     renderResults();
     if (searchInput && typeof searchInput.focus === "function") searchInput.focus();
+  }
+
+  function setBulkMode(active) {
+    bulkMode = !!active;
+    if (!bulkMode) _clearSelection();
+    refreshBulkControls();
+    renderResults();
+  }
+
+  function selectAllLoaded() {
+    if (!bulkMode) return;
+    items.forEach(function (record) { if (record) selectedKeys.add(_selectionKey(record)); });
+    renderResults();
+    refreshBulkControls();
+  }
+
+  function clearBulkSelection() {
+    _clearSelection();
+    renderResults();
+  }
+
+  function doneBulkEditing() {
+    setBulkMode(false);
+    if (bulkToggleEl && typeof bulkToggleEl.focus === "function") bulkToggleEl.focus();
+  }
+
+  function _bulkResultNote(result, requested) {
+    if (!result || result.accepted === false) {
+      return (result && result.message) || "History could not delete the selected runs.";
+    }
+    const missing = []
+      .concat(Array.isArray(result.missing_generation_ids) ? result.missing_generation_ids : [])
+      .concat(Array.isArray(result.missing_experiment_ids) ? result.missing_experiment_ids : [])
+      .concat(Array.isArray(result.missing_generations) ? result.missing_generations : [])
+      .concat(Array.isArray(result.missing_experiments) ? result.missing_experiments : []);
+    if (missing.length) {
+      return "Deleted " + (requested - missing.length) + " of " + requested + " selected runs; "
+        + missing.length + " were already missing.";
+    }
+    return "Deleted " + requested + " selected run" + (requested === 1 ? "" : "s") + ".";
+  }
+
+  function deleteSelected() {
+    const selected = items.filter(function (record) { return record && _isSelected(record); });
+    if (!selected.length || !repo || typeof repo.bulkDelete !== "function") return;
+    const message = "Delete " + selected.length + " selected run(s)? This cannot be undone.";
+    if (typeof confirm === "function" && !confirm(message)) return;
+    const generationIds = selected.filter(function (r) { return r.kind !== "experiment"; }).map(function (r) { return r.id; });
+    const experimentIds = selected.filter(function (r) { return r.kind === "experiment"; }).map(function (r) { return r.id; });
+    const deleteButton = bulkBarEl && bulkBarEl.querySelector("[data-testid='history-v2-bulk-delete']");
+    if (deleteButton) deleteButton.disabled = true;
+    if (bulkNoteEl) bulkNoteEl.textContent = "Deleting…";
+    repo.bulkDelete({ generationIds: generationIds, experimentIds: experimentIds }).then(function (result) {
+      if (bulkNoteEl) bulkNoteEl.textContent = _bulkResultNote(result, selected.length);
+      _clearSelection();
+      fetchFeed(true);
+    }).catch(function (err) {
+      if (bulkNoteEl) bulkNoteEl.textContent = "Delete failed: " + ((err && err.message) || "unknown error");
+      refreshBulkControls();
+    });
   }
 
   // ── Toolbar ─────────────────────────────────────────────────────────────
@@ -835,6 +974,29 @@ export function renderHistoryV2(state, context) {
       onclick: function () { clearFilters(); },
     }));
 
+    bulkToggleEl = el("button", {
+      class: "comfymodal-studio-history-v2-toggle",
+      type: "button",
+      "data-testid": "history-v2-bulk-toggle",
+      "aria-pressed": bulkMode ? "true" : "false",
+      text: "Select",
+      onclick: function () { setBulkMode(!bulkMode); },
+    });
+    row1.appendChild(bulkToggleEl);
+
+    bulkBarEl = el("div", {
+      class: "comfymodal-studio-history-v2-bulk-bar",
+      "data-testid": "history-v2-bulk-bar",
+      hidden: !bulkMode,
+    }, [
+      bulkCountEl = el("span", { class: "comfymodal-studio-history-v2-bulk-count", "aria-live": "polite", text: "0 selected" }),
+      el("button", { type: "button", class: "comfymodal-studio-history-v2-bulk-action", "data-testid": "history-v2-bulk-select-all", text: "Select all", onclick: selectAllLoaded }),
+      el("button", { type: "button", class: "comfymodal-studio-history-v2-bulk-action", "data-testid": "history-v2-bulk-clear", text: "Clear", onclick: clearBulkSelection }),
+      el("button", { type: "button", class: "comfymodal-studio-history-v2-bulk-delete", "data-testid": "history-v2-bulk-delete", text: "Delete selected", disabled: true, onclick: deleteSelected }),
+      el("button", { type: "button", class: "comfymodal-studio-history-v2-bulk-action", "data-testid": "history-v2-bulk-done", text: "Done", onclick: doneBulkEditing }),
+      bulkNoteEl = el("span", { class: "comfymodal-studio-history-v2-bulk-note", "data-testid": "history-v2-bulk-note", role: "status", "aria-live": "polite" }),
+    ]);
+
     // Row 2: kind filter, status toggles, boolean toggles.
     const row2 = el("div", { class: "comfymodal-studio-history-v2-toolbar-row" });
 
@@ -889,7 +1051,7 @@ export function renderHistoryV2(state, context) {
 
     const BOOL_LABELS = {
       favoriteOnly: "Favorites only",
-      previewOnly: "Preview only",
+      previewOnly: "Data Saver only",
       originalAvailable: "Original available",
       hasImage: "Has image",
     };
@@ -959,6 +1121,7 @@ export function renderHistoryV2(state, context) {
     row3.appendChild(dateToInput);
 
     toolbar.appendChild(row1);
+    toolbar.appendChild(bulkBarEl);
     toolbar.appendChild(row2);
     toolbar.appendChild(row3);
     return toolbar;
@@ -994,6 +1157,7 @@ export function renderHistoryV2(state, context) {
     if (dateToInput) dateToInput.value = viewState.filters.dateTo || "";
     if (sortSelect) sortSelect.value = viewState.sort || "newest";
     refreshFacetSelects();
+    refreshBulkControls();
   }
 
   // ── Mount ───────────────────────────────────────────────────────────────

@@ -16,6 +16,36 @@
 // Run: node tests/studio_playground_run_unit.mjs
 
 import assert from "node:assert/strict";
+import { createGoldenProgressState, applyGoldenProgressPage, progressSpanView } from "../web/studio-golden-progress.js";
+
+{
+  const state = createGoldenProgressState("parallel-spans");
+  applyGoldenProgressPage(state, { events: [
+    { type: "gantt_span", request_id: state.requestId, name: "CLIP load", span_id: "clip", phase: "started", entry_monotonic_ns: 1e9 },
+    { type: "gantt_span", request_id: state.requestId, name: "UNET load", span_id: "unet", phase: "started", entry_monotonic_ns: 1.1e9 },
+  ] });
+  const observed = state.nodeSpans[0].observedAtMs;
+  state.nodeSpans.forEach(span => { span.observedAtMs = observed; });
+  assert.equal(progressSpanView(state, observed + 100).active.length, 0);
+  assert.equal(progressSpanView(state, observed + 101).active.map(s => s.label).join(" || "), "CLIP load || UNET load");
+  applyGoldenProgressPage(state, { events: [
+    { type: "gantt_span", request_id: state.requestId, name: "CLIP load", span_id: "clip", phase: "completed", entry_monotonic_ns: 1e9, end_monotonic_ns: 1.25e9 },
+    { type: "gantt_span", request_id: state.requestId, name: "CLIP load", span_id: "clip", phase: "started", entry_monotonic_ns: 1e9 },
+  ] });
+  assert.equal(state.nodeSpans.length, 2);
+  assert.equal(progressSpanView(state, observed + 500).active.map(s => s.label).join(" || "), "UNET load");
+  assert.equal(progressSpanView(state, observed + 500).visible.find(s => s.label === "CLIP load").elapsedMs, 250);
+  console.log("PASS: measured span threshold, parallel labels, completion and stale-start handling");
+}
+
+{
+  const view = progressSpanView({ gantt: { spans: [
+    { name: "NewCustomNode (node 12)", start_mono_ns: 0, end_mono_ns: 125e6, duration_ms: 125 },
+    { name: "SmallNode", start_mono_ns: 126e6, end_mono_ns: 226e6, duration_ms: 100 },
+  ] } });
+  assert.deepEqual(view.visible.map(s => s.label), ["NewCustomNode (node 12)"]);
+  console.log("PASS: terminal Gantt accepts new nodes and excludes spans at or below 100 ms");
+}
 import {
   createPlaygroundRunController,
   projectRunToLegacy,
@@ -612,6 +642,28 @@ function buildLegacyForStatus(status) {
 //
 // The Playground lane (I8) migrated page/section states onto the shared I3
 // primitives without touching execution behavior. This section pins those
+// 21. Modal status line never fabricates "Scheduling" past submission.
+// (Placed before the page-source contract block so it runs even while other
+// uncommitted page work trips later source guards.)
+{
+  const fs21 = await import("node:fs");
+  const pg21 = fs21.readFileSync(new URL("../web/studio-playground.js", import.meta.url), "utf8");
+  const modalCode = pg21.slice(pg21.indexOf("var _MODAL_PHASE_DISPLAY"), pg21.indexOf("function _goldenStageDuration"));
+  const modalText = new Function(modalCode + "; return _modalStatusText;")();
+  assert.equal(modalText({status:"running"}), "Modal: Waiting for remote startup");
+  assert.equal(modalText({status:"queued"}), "Modal: Waiting for remote startup");
+  assert.equal(modalText({status:"running", modalPhase:"snapshot_capturing"}), "Modal: Capturing snapshot");
+  assert.equal(modalText({status:"running", modalPhase:"restoring"}), "Modal: Restoring");
+  assert.equal(modalText({goldenProgress:{stages:[{stage:"golden_teardown", phase:"started"}]}}), "Modal: Cleaning up");
+  assert.ok(pg21.includes("GOLDEN_PROGRESS_UNKNOWN_REQUEST_LIMIT"),
+    "unknown-request cursor retries are bounded");
+  assert.ok(pg21.includes('generic_execution: "Running"'),
+    "generic-executor cursor phase has a truthful display name");
+  assert.ok(pg21.includes("Golden live progress is unavailable for this run"),
+    "an unregistered request surfaces once instead of spinning silently");
+  section("21. Modal Scheduling claim gated; silent cursor stream bounded");
+}
+
 // production-source contracts (no DOM needed — plain source reads):
 //   - h2 page title marker present
 //   - capabilities/recent-runs loading sites use renderLoadingState;

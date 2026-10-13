@@ -21,11 +21,13 @@ import pytest
 from comfymodal_runtime.prompt_signature_cache import (
     SCHEMA_VERSION,
     apply_memo_hit,
+    apply_memo_partial,
     build_node_memo_entry,
     canonical_inputs_hash,
     decode_hashable,
     encode_hashable,
     encode_is_changed,
+    is_link_value,
     load_signature_memo,
     memo_identity,
     memo_path,
@@ -35,6 +37,8 @@ from comfymodal_runtime.prompt_signature_cache import (
     save_signature_memo,
     set_store,
     get_store,
+    static_identity,
+    structure_fingerprint,
     topo_lazy_get,
     topo_lazy_pending_count,
     topo_lazy_persist,
@@ -734,3 +738,325 @@ def test_topo_lazy_identity_mismatch_fail_closed():
     assert topo_lazy_get(identity_b, "X", "y") is None
     set_store(identity_b, {"topo_lazy": {"X": {"y": {"lazy": "yes"}}}})
     assert topo_lazy_get(identity_b, "X", "y") is None
+
+
+# ── 12. Static structure identity + partial reuse (frozen-graph rule) ───
+# Saved workflows freeze node types/links/topology; only input VALUES
+# change per request.  The static key binds structure (+deployment-side
+# identity); per-node inputs_hash guards values; changed nodes (and their
+# descendants, whose signatures embed the ancestor chain) fall through to
+# the original computation, which skips populated keys.
+
+
+def _linked_prompt():
+    """Graph WITH list-links (real dynprompt shape): 1 → 2, 1 → 3, 2 → 3."""
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sd15.safetensors"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat", "clip": ["1", 1]}},
+        "3": {"class_type": "KSampler", "inputs": {"steps": 20, "seed": 7, "model": ["1", 0], "cond": ["2", 0]}},
+    }
+
+
+def _imm_sig(node, isc_val, mapping):
+    """Mirror get_immediate_node_signature (link-aware)."""
+    sig = [node["class_type"], isc_val]
+    for key in sorted((node.get("inputs") or {}).keys()):
+        val = node["inputs"][key]
+        if (
+            isinstance(val, list)
+            and len(val) == 2
+            and isinstance(val[0], str)
+            and val[0] in mapping
+        ):
+            sig.append((key, ("ANCESTOR", mapping[val[0]], val[1])))
+        else:
+            sig.append((key, val))
+    return sig
+
+
+def _linked_ancestry(prompt, node_id):
+    ancestors, mapping = [], {}
+
+    def _visit(cur):
+        node = prompt[cur]
+        for key in sorted((node.get("inputs") or {}).keys()):
+            val = node["inputs"][key]
+            if (
+                isinstance(val, list)
+                and len(val) == 2
+                and isinstance(val[0], str)
+                and val[0] in prompt
+                and val[0] not in mapping
+            ):
+                mapping[val[0]] = len(mapping)
+                _visit(val[0])
+                ancestors.append(val[0])
+
+    _visit(node_id)
+    return ancestors, mapping
+
+
+def _linked_node_signature(prompt, node_id, isc_values):
+    """Mirror get_node_signature (ancestor-embedding ground truth)."""
+    ancestors, mapping = _linked_ancestry(prompt, node_id)
+    parts = [_imm_sig(prompt[node_id], isc_values.get(node_id, False), mapping)]
+    for aid in ancestors:
+        parts.append(_imm_sig(prompt[aid], isc_values.get(aid, False), mapping))
+    return _to_hashable(parts)
+
+
+def _seed_static_store(static_hash, prompt, isc_values=None):
+    isc_values = isc_values or {}
+    nodes = {}
+    for nid, node in prompt.items():
+        nodes[nid] = build_node_memo_entry(
+            class_type=node["class_type"],
+            is_changed_value=isc_values.get(nid, False),
+            signature_value=_linked_node_signature(prompt, nid, isc_values),
+            inputs_hash=canonical_inputs_hash(node.get("inputs") or {}),
+        )
+    set_store(static_hash, {"nodes": nodes})
+    return nodes
+
+
+def _static_hash_for(prompt):
+    node_map = {str(nid): node for nid, node in prompt.items()}
+    return static_identity(
+        structure_hash=structure_fingerprint(node_map),
+        deployment_combined_hash="d",
+        custom_node_generation="g",
+        registry_proof={"nodes": {"CheckpointLoaderSimple": "v1"}},
+    )
+
+
+def _run_partial(static_hash, prompt, node_ids=None, isc_values=None):
+    keys, subcache_keys = {}, {}
+    dyn = _FakeDynPrompt(prompt)
+    isc = _FakeIsChanged(isc_values or {})
+    result = _run(
+        apply_memo_partial(
+            keys=keys,
+            subcache_keys=subcache_keys,
+            node_ids=list(node_ids or prompt.keys()),
+            get_node=dyn.get_node,
+            has_node=dyn.has_node,
+            get_is_changed=isc.get,
+            identity_hash=static_hash,
+        )
+    )
+    return result, keys, subcache_keys
+
+
+def test_is_link_value_mirrors_upstream():
+    assert is_link_value(["1", 0]) is True
+    assert is_link_value(["1", 0.0]) is True
+    assert is_link_value(("1", 0)) is False  # tuples are values, not links
+    assert is_link_value(["1"]) is False
+    assert is_link_value(["1", 0, 1]) is False
+    assert is_link_value([1, 0]) is False
+    assert is_link_value(["1", "0"]) is False
+    assert is_link_value("x") is False
+    assert is_link_value(None) is False
+
+
+def test_structure_fingerprint_stable_across_value_changes():
+    base = {str(nid): node for nid, node in _linked_prompt().items()}
+    edited = {str(nid): dict(node) for nid, node in _linked_prompt().items()}
+    edited["2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "a dog", "clip": ["1", 1]}}
+    edited["3"] = {"class_type": "KSampler", "inputs": {"steps": 21, "seed": 99, "model": ["1", 0], "cond": ["2", 0]}}
+    assert structure_fingerprint(base) == structure_fingerprint(edited)
+    assert structure_fingerprint(base) != ""
+
+
+def test_structure_fingerprint_sensitive_to_topology():
+    base = {str(nid): node for nid, node in _linked_prompt().items()}
+    retarget = {k: dict(v) for k, v in base.items()}
+    retarget["3"] = {"class_type": "KSampler", "inputs": {"steps": 20, "seed": 7, "model": ["2", 0], "cond": ["2", 0]}}
+    assert structure_fingerprint(retarget) != structure_fingerprint(base)
+    reclass = {k: dict(v) for k, v in base.items()}
+    reclass["2"] = {"class_type": "CLIPTextEncodeSDXL", "inputs": {"text": "a cat", "clip": ["1", 1]}}
+    assert structure_fingerprint(reclass) != structure_fingerprint(base)
+    added = dict(base)
+    added["4"] = {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0]}}
+    assert structure_fingerprint(added) != structure_fingerprint(base)
+    # Malformed / empty → "" (caller treats as static-incomplete).
+    assert structure_fingerprint({}) == ""
+    assert structure_fingerprint({"1": "junk"}) == ""
+    assert structure_fingerprint(None) == ""
+
+
+def test_static_identity_completeness():
+    full = _static_hash_for(_linked_prompt())
+    assert full["complete"] is True
+    assert full["static_hash"] and len(full["static_hash"]) == 64
+    # Value change keeps the SAME static key (the whole point).
+    edited = _linked_prompt()
+    edited["2"]["inputs"]["text"] = "a dog"
+    assert _static_hash_for(edited)["static_hash"] == full["static_hash"]
+    # Missing structure / deployment / generation → incomplete.
+    assert static_identity(structure_hash="", deployment_combined_hash="d", custom_node_generation="g")["complete"] is False
+    assert static_identity(structure_hash="s", deployment_combined_hash="", custom_node_generation="g")["complete"] is False
+    assert static_identity(structure_hash="s", deployment_combined_hash="d", custom_node_generation="")["complete"] is False
+    # Same structure, different deployment → different key (no cross-env reuse).
+    other = static_identity(
+        structure_hash=full["identity"]["structure_hash"],
+        deployment_combined_hash="d2",
+        custom_node_generation="g",
+        registry_proof={"nodes": {"CheckpointLoaderSimple": "v1"}},
+    )
+    assert other["static_hash"] != full["static_hash"]
+
+
+def test_partial_full_reuse_matches_original():
+    reset_store()
+    prompt = _linked_prompt()
+    static_hash = _static_hash_for(prompt)["static_hash"]
+    _seed_static_store(static_hash, prompt)
+    (hit_all, reason, reused), keys, subcache = _run_partial(static_hash, prompt)
+    assert hit_all is True
+    assert reason == ""
+    assert reused == set(prompt.keys())
+    for nid in prompt:
+        assert keys[nid] == _linked_node_signature(prompt, nid, {})
+        assert subcache[nid] == (nid, prompt[nid]["class_type"])
+
+
+def test_partial_leaf_value_change_reuses_unaffected():
+    reset_store()
+    prompt = _linked_prompt()
+    static_hash = _static_hash_for(prompt)["static_hash"]
+    _seed_static_store(static_hash, prompt)
+    # Edit a leaf value (sampler seed): node 3 dirty, 1 and 2 reusable.
+    changed = _linked_prompt()
+    changed["3"]["inputs"]["seed"] = 99
+    (hit_all, reason, reused), keys, _sub = _run_partial(static_hash, changed)
+    assert hit_all is False
+    assert reused == {"1", "2"}
+    assert "3" in reason
+    assert keys["1"] == _linked_node_signature(prompt, "1", {})
+    assert keys["2"] == _linked_node_signature(prompt, "2", {})
+    assert "3" not in keys  # caller computes it via the original path
+
+
+def test_partial_ancestor_change_poisons_descendant():
+    reset_store()
+    prompt = _linked_prompt()
+    static_hash = _static_hash_for(prompt)["static_hash"]
+    _seed_static_store(static_hash, prompt)
+    # Edit the LOADER filename: node 1 dirty, and 2/3 must NOT reuse even
+    # though their own inputs are byte-identical (their signatures embed
+    # node 1's chain).
+    changed = _linked_prompt()
+    changed["1"]["inputs"]["ckpt_name"] = "other.safetensors"
+    (hit_all, reason, reused), keys, _sub = _run_partial(static_hash, changed)
+    assert hit_all is False
+    assert reused == set()
+    assert keys == {}
+    assert "1" in reason  # first dirty in request order
+    # The staleness is real: a recomputed descendant signature differs.
+    assert _linked_node_signature(changed, "3", {}) != _linked_node_signature(prompt, "3", {})
+
+
+def test_partial_mid_graph_change_dirties_downstream_only():
+    reset_store()
+    prompt = _linked_prompt()
+    static_hash = _static_hash_for(prompt)["static_hash"]
+    _seed_static_store(static_hash, prompt)
+    # Edit node 2's text: node 1 (no dirty ancestors) reusable; node 3
+    # (descendant of 2) must recompute.
+    changed = _linked_prompt()
+    changed["2"]["inputs"]["text"] = "a dog"
+    (hit_all, reason, reused), keys, _sub = _run_partial(static_hash, changed)
+    assert hit_all is False
+    assert reused == {"1"}
+    assert "2" in reason
+    assert keys["1"] == _linked_node_signature(prompt, "1", {})
+    assert "2" not in keys and "3" not in keys
+
+
+def test_partial_no_entry_and_malformed_fail_closed():
+    reset_store()
+    prompt = _linked_prompt()
+    static_hash = _static_hash_for(prompt)["static_hash"]
+    (hit_all, reason, reused), keys, _sub = _run_partial(static_hash, prompt)
+    assert (hit_all, reason, reused, keys) == (False, "no_entry", set(), {})
+    set_store(static_hash, {"nodes": "junk"})
+    (hit_all2, reason2, reused2), keys2, _sub2 = _run_partial(static_hash, prompt)
+    assert hit_all2 is False and reused2 == set() and keys2 == {}
+    assert reason2 == "malformed_entry"
+
+
+def test_partial_unknown_node_and_class_mismatch_fail_closed():
+    reset_store()
+    prompt = _linked_prompt()
+    static_hash = _static_hash_for(prompt)["static_hash"]
+    _seed_static_store(static_hash, prompt)
+    # Unknown node requested → dirty, nothing populated for it.
+    (hit_all, reason, reused), keys, _sub = _run_partial(static_hash, prompt, node_ids=["1", "2", "3", "99"])
+    assert hit_all is False and reason == "unknown_node"
+    # Class change on a node → that node dirty.
+    changed = _linked_prompt()
+    changed["2"] = {"class_type": "Other", "inputs": {"text": "a cat", "clip": ["1", 1]}}
+    (hit_all2, reason2, reused2), _k2, _s2 = _run_partial(static_hash, changed)
+    assert hit_all2 is False and "2" in reason2
+    assert reused2 == {"1"}
+
+
+def test_partial_non_requested_static_ancestor_trusted():
+    reset_store()
+    prompt = _linked_prompt()
+    static_hash = _static_hash_for(prompt)["static_hash"]
+    _seed_static_store(static_hash, prompt)
+    # Request only node 3: ancestor 1 has static (False) is_changed and
+    # matching inputs → trusted without evaluating foreign is_changed;
+    # ancestor 2 likewise → node 3 reusable.
+    calls: list = []
+
+    async def _tracking_isc(nid):
+        calls.append(nid)
+        return False
+
+    keys, subcache = {}, {}
+    dyn = _FakeDynPrompt(prompt)
+    hit_all, reason, reused = _run(
+        apply_memo_partial(
+            keys=keys, subcache_keys=subcache, node_ids=["3"],
+            get_node=dyn.get_node, has_node=dyn.has_node,
+            get_is_changed=_tracking_isc, identity_hash=static_hash,
+        )
+    )
+    assert hit_all is True and reason == "" and reused == {"3"}
+    assert "1" not in calls and "2" not in calls  # no foreign evaluation
+
+
+def test_partial_non_requested_dynamic_ancestor_dirties():
+    reset_store()
+    prompt = _linked_prompt()
+    static_hash = _static_hash_for(prompt)["static_hash"]
+    _seed_static_store(static_hash, prompt, isc_values={"1": "non-static-token"})
+    # Ancestor 1's stored is_changed is not False and node 1 was not
+    # requested → cannot verify without foreign evaluation → node 3 dirty.
+    (hit_all, reason, reused), keys, _sub = _run_partial(static_hash, prompt, node_ids=["3"])
+    assert hit_all is False and reused == set() and keys == {}
+
+
+def test_partial_already_computed_keys_trusted():
+    reset_store()
+    prompt = _linked_prompt()
+    static_hash = _static_hash_for(prompt)["static_hash"]
+    _seed_static_store(static_hash, prompt)
+    # Node 1 already computed this request (in keys): trusted clean even
+    # with no evaluation, and descendants verify against it.
+    keys = {"1": _linked_node_signature(prompt, "1", {})}
+    subcache = {"1": ("1", "CheckpointLoaderSimple")}
+    dyn = _FakeDynPrompt(prompt)
+    isc = _FakeIsChanged({})
+    hit_all, reason, reused = _run(
+        apply_memo_partial(
+            keys=keys, subcache_keys=subcache, node_ids=list(prompt.keys()),
+            get_node=dyn.get_node, has_node=dyn.has_node,
+            get_is_changed=isc.get, identity_hash=static_hash,
+        )
+    )
+    assert hit_all is True and reason == ""
+    assert reused == {"2", "3"}

@@ -21,7 +21,8 @@
 // ── Variant vocabulary ───────────────────────────────────────────────────
 
 const VARIANT_NOUNS = {
-  preview: "Preview",
+  preview: "Data Saver",
+  data_saver: "Data Saver",
   original: "Original",
 };
 
@@ -96,7 +97,7 @@ function _paintNote(testId, text) {
 export function buildConfiguredExportButton(opts) {
   const o = opts || {};
   if (!o.assetId) return null;
-  const variant = o.variant === "original" ? "original" : "preview";
+  const variant = String(o.variant || "").toLowerCase() === "original" ? "original" : "data_saver";
   const action = deriveExportAction(o.exportState, variant);
   let inFlight = false;
 

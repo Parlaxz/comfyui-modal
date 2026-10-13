@@ -1,6 +1,10 @@
 {
   "auto_save_local": false,
+  "data_saver_codec": "webp",
+  "data_saver_default": "on",
+  "data_saver_quality": 70,
   "execution_mode": "v2",
+  "gpu": "rtx-pro-6000",
   "output_format": "original",
   "preview_codec": "webp",
   "preview_default": "on",

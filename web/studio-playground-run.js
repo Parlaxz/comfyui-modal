@@ -168,6 +168,14 @@ export function createPlaygroundRunController() {
     return _goldenProgress;
   }
 
+  // ── Modal lifecycle display (presentation only) ─────────────────────
+  // Latest raw modal_status phase/message seen on the ws stream for THIS run
+  // (identity-filtered like every other ws event). Never decides terminality;
+  // the progress section renders it as the "Modal:" status line so scheduling
+  // / restoring / snapshot work is visible instead of inferred.
+  let _modalPhase = null;
+  let _modalMessage = null;
+
   // Event source handles (for detach)
   let _sourceApi = null;
   const _sourceHandlers = [];
@@ -240,6 +248,14 @@ export function createPlaygroundRunController() {
       return;
     }
 
+    // Latest Modal lifecycle phase for the status line (presentation only).
+    if (type === "modal_status") {
+      if (detail.phase != null && String(detail.phase).trim() !== "") {
+        _modalPhase = String(detail.phase);
+      }
+      if (detail.message != null) _modalMessage = String(detail.message);
+    }
+
     // execution_success/execution_error belong to a locked ws execution; a
     // terminal ws event arriving before any execution_start is a stale
     // event from a previous execution and must not complete this run.
@@ -305,6 +321,8 @@ export function createPlaygroundRunController() {
       _lastExtras = {};
       _marks = [];
       _goldenProgress = null;
+      _modalPhase = null;
+      _modalMessage = null;
       mark("run_click");
       if (extras && typeof extras === "object") {
         _lastExtras = { ...extras };
@@ -365,6 +383,12 @@ export function createPlaygroundRunController() {
     /** Current Golden stage snapshot, or null when the run is not a Golden run. */
     getGoldenProgress() {
       return goldenProgressSnapshot(_goldenProgress);
+    },
+
+    /** Latest raw Modal lifecycle phase/message for this run, or nulls. */
+    getModalStatus() {
+      if (_modalPhase == null && _modalMessage == null) return null;
+      return { phase: _modalPhase, message: _modalMessage };
     },
 
     /** Attach backend identity after the submission response. */

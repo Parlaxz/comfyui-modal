@@ -175,13 +175,17 @@ export function normalizeHistoryOutput(raw, index) {
   return {
     index: out.index != null ? out.index : (index != null ? index : 0),
     outputId: _firstString(out.output_id, out.outputId, out.id),
+    // Primary managed-asset identity for native open/reveal actions.
+    assetId: _firstString(out.asset_id, out.assetId),
     // F6: canonical logical-output identity ("node:<id>:slot:<key>:item:<n>")
     // — per-output download actions key off this instead of array position
     // whenever the backend projects it.
     logicalKey: _firstString(out.logical_output_key, out.logicalKey),
     assetId: _firstString(out.asset_id, out.assetId),
     thumbUrl: _firstString(out.thumb_url, out.thumbUrl),
-    previewUrl: _firstString(out.preview_url, out.previewUrl),
+    previewUrl: _firstString(out.data_saver_url, out.data_saverUrl, out.dataSaverUrl, out.preview_url, out.previewUrl),
+    dataSaverUrl: _firstString(out.data_saver_url, out.data_saverUrl, out.dataSaverUrl, out.preview_url, out.previewUrl),
+    servedVariant: _firstString(out.served_variant, out.servedVariant),
     originalUrl: _firstString(out.original_url, out.originalUrl),
     originalFailed: _toBool(out.original_failed, _toBool(out.originalFailed, false)),
     originalAvailable: _toBool(out.original_available, _toBool(out.originalAvailable, false)),
@@ -191,9 +195,13 @@ export function normalizeHistoryOutput(raw, index) {
     width: _toIntOrNull(out.width),
     height: _toIntOrNull(out.height),
     byteSize: _toIntOrNull(out.byte_size != null ? out.byte_size : out.byteSize),
+    dataSaverByteSize: _toIntOrNull(out.data_saver_byte_size != null ? out.data_saver_byte_size : out.dataSaverByteSize),
+    originalByteSize: _toIntOrNull(out.original_byte_size != null ? out.original_byte_size : out.originalByteSize),
     // File identity for the viewer's File row (name + open/copy) and format.
     filename: _firstString(out.filename),
     format: _firstString(out.format),
+    dataSaverFormat: _firstString(out.data_saver_format, out.dataSaverFormat, out.preview_format, out.previewFormat),
+    originalFormat: _firstString(out.original_format, out.originalFormat),
     path: _firstString(out.path),
     // Embedded-file recovery (detail only): exact sampler params and loader
     // model names read back from the file's own prompt JSON. {} / [] when
@@ -207,9 +215,13 @@ export function normalizeHistoryOutput(raw, index) {
     // projection is authoritative: an Asset ID is NEVER inferred from URL
     // text, and an absent variant stays null so the UI renders no Export
     // action at all (older payloads without these fields stay safe).
-    previewAssetId: _firstString(out.preview_asset_id, out.previewAssetId),
+    previewAssetId: _firstString(out.data_saver_asset_id, out.dataSaverAssetId, out.preview_asset_id, out.previewAssetId),
+    dataSaverAssetId: _firstString(out.data_saver_asset_id, out.dataSaverAssetId, out.preview_asset_id, out.previewAssetId),
     previewExportState: normalizeExportState(
-      out.preview_export_state != null ? out.preview_export_state : out.previewExportState,
+      out.data_saver_export_state != null ? out.data_saver_export_state : (out.dataSaverExportState != null ? out.dataSaverExportState : (out.preview_export_state != null ? out.preview_export_state : out.previewExportState)),
+    ),
+    dataSaverExportState: normalizeExportState(
+      out.data_saver_export_state != null ? out.data_saver_export_state : (out.dataSaverExportState != null ? out.dataSaverExportState : (out.preview_export_state != null ? out.preview_export_state : out.previewExportState)),
     ),
     originalAssetId: _firstString(out.original_asset_id, out.originalAssetId),
     originalExportState: normalizeExportState(
@@ -264,17 +276,22 @@ export function normalizeExportResponse(data, base) {
   };
 }
 
+export function isDataSaverKind(kind) {
+  const k = String(kind || "").toLowerCase();
+  return k === "data_saver" || k === "datasaver" || k === "data-saver" || k === "preview";
+}
+
 export function selectFeedAsset(output) {
   const out = output && typeof output === "object" ? output : {};
+  if (out.previewUrl) return { kind: "data_saver", url: out.previewUrl, label: "Data Saver" };
   if (out.thumbUrl) return { kind: "thumbnail", url: out.thumbUrl, label: "Thumbnail" };
-  if (out.previewUrl) return { kind: "preview", url: out.previewUrl, label: "Preview" };
   if (out.originalUrl || out.originalAvailable) return { kind: "original", url: "", label: "Original available" };
   if (out.originalFailed) return { kind: "original-failed", url: "", label: "Original generation failed" };
   return { kind: "none", url: "", label: "No image" };
 }
 
 // Display-variant selection for a DETAIL surface (generation/cell detail).
-// Order: Preview (the display derivative) > Original > Thumbnail.
+// Order: Data Saver (the display derivative) > Original > Thumbnail.
 //
 // The thumbnail is a capped 256px derivative (history_v2_writer._THUMBNAIL_MAX
 // / comfyapp._PRODUCTION_THUMBNAIL_MAX), so when the real image is already
@@ -285,7 +302,7 @@ export function selectFeedAsset(output) {
 // Original-only case falls through to the label-only branch below.
 export function selectDetailAsset(output) {
   const out = output && typeof output === "object" ? output : {};
-  if (out.previewUrl) return { kind: "preview", url: out.previewUrl, label: "Preview" };
+  if (out.previewUrl) return { kind: "data_saver", url: out.previewUrl, label: "Data Saver" };
   if (out.thumbUrl && out.originalUrl && !out.originalFailed) {
     return { kind: "original", url: out.originalUrl, label: "Original" };
   }
@@ -463,7 +480,7 @@ export function deriveRetryActionLabel(record) {
     const a = attempts[i] || {};
     const mode = a.mode != null ? String(a.mode).toLowerCase() : "";
     const status = a.status != null ? String(a.status).toLowerCase() : "";
-    if (mode === "preview" && status === "completed") hasDerivativeStory = true;
+    if ((mode === "preview" || mode === "data_saver" || mode === "data-saver" || mode === "datasaver") && status === "completed") hasDerivativeStory = true;
     if (mode === "original" && status === "completed") hasDerivativeStory = true;
   }
   const feat = rec.featuredOutput && typeof rec.featuredOutput === "object" ? rec.featuredOutput : rec;
@@ -852,7 +869,12 @@ function _createBridgeRepository(apiBase) {
     retryOriginal: function () { return _notAvailable(); },
     retryOriginalForCell: function () { return _notAvailable(); },
     resumeGeneration: function () { return _notAvailable(); },
-    exportAsset: function () { return _notAvailable(); },
+     exportAsset: function () { return _notAvailable(); },
+     deleteGeneration: function () { return _notAvailable(); },
+     deleteExperiment: function () { return _notAvailable(); },
+     bulkDelete: function () { return _notAvailable(); },
+    openAsset: function () { return _notAvailable(); },
+    revealAsset: function () { return _notAvailable(); },
     listFacets: function () { return _bridgeListFacets(apiBase); },
   };
 }
@@ -1083,6 +1105,29 @@ function _createV2Repository(apiBase) {
     // already_exported and failures) resolve normalized — never rejected.
     exportAsset: function (assetId) {
       return _v2ExportAsset(apiBase, assetId);
+    },
+    // Delete generation — one bodyless DELETE.  Removes the record, its
+    // attempts/assets/snapshots, and owned managed files server-side;
+    // experiment members are refused truthfully.  Outcomes resolve
+    // normalized — never rejected.
+     deleteGeneration: function (generationId) {
+       return _v2DeleteGeneration(apiBase, generationId);
+     },
+     deleteExperiment: function (experimentId) {
+       return _v2DeleteExperiment(apiBase, experimentId);
+     },
+     bulkDelete: function (selection) {
+       return _v2BulkDelete(apiBase, selection);
+     },
+    // Native open / reveal — one bodyless POST each.  The backend opens the
+    // database-registered local file in the OS default viewer (open) or
+    // selects it in the file manager (reveal); remote assets are refused
+    // truthfully.  Outcomes resolve normalized — never rejected.
+    openAsset: function (assetId) {
+      return _v2LocalAssetAction(apiBase, assetId, "open");
+    },
+    revealAsset: function (assetId) {
+      return _v2LocalAssetAction(apiBase, assetId, "reveal");
     },
     listFacets: function () { return _v2ListFacets(apiBase); },
   };
@@ -1544,6 +1589,153 @@ function _v2RetryOriginal(apiBase, generationId) {
 // error.  Every outcome — including HTTP/network failures — RESOLVES a
 // normalized envelope so callers can paint one truthful note and refresh
 // durably without unhandled rejections.
+
+/**
+ * Normalize a native open/reveal backend response (frozen contract:
+ * status / asset_id / action / path on success; status / reason / message
+ * on failure).  Accepts both snake_case and camelCase.  Every outcome —
+ * including empty ids and HTTP/network failures — RESOLVES a normalized
+ * envelope so callers paint one truthful note without rejections.
+ * @param {object|null|undefined} data parsed backend payload
+ * @param {object} [base] fields to merge (e.g. httpStatus, assetId)
+ * @returns {object} normalized action result
+ */
+export function normalizeLocalAssetResponse(data, base) {
+  const raw = data && typeof data === "object" ? data : {};
+  const b = base && typeof base === "object" ? base : {};
+  const ok = _firstString(raw.status, b.status) === "ok";
+  return {
+    ok: ok,
+    assetId: _firstString(raw.asset_id, raw.assetId, b.assetId),
+    action: _firstString(raw.action, b.action),
+    path: _firstString(raw.path, b.path),
+    reason: _firstString(raw.reason, b.reason),
+    message: _firstString(raw.message, b.message, raw.detail),
+    httpStatus: b.httpStatus != null ? b.httpStatus : null,
+  };
+}
+
+function _v2LocalAssetAction(apiBase, assetId, action) {
+  const id = assetId == null ? "" : String(assetId);
+  if (!id) {
+    // No fetch without an Asset identity (records without one stay inert).
+    return Promise.resolve(normalizeLocalAssetResponse({
+      status: "error", reason: "asset_unavailable", message: "Asset ID unavailable",
+    }, { assetId: id, action: action }));
+  }
+  const url = apiBase + "/history-v2/assets/" + encodeURIComponent(id) + "/" + action;
+  return fetch(url, { method: "POST" })
+    .then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) {
+        const base = { httpStatus: res.status, assetId: id, action: action };
+        if (res.ok) {
+          return normalizeLocalAssetResponse(data || {}, base);
+        }
+        if (data && typeof data === "object") {
+          return normalizeLocalAssetResponse(data, base);
+        }
+        return normalizeLocalAssetResponse({
+          status: "error",
+          reason: "http_" + res.status,
+          message: "Request failed (HTTP " + res.status + ")",
+        }, base);
+      });
+    })
+    .catch(function (err) {
+      return normalizeLocalAssetResponse({
+        status: "error",
+        reason: "network_error",
+        message: "History V2 unavailable: " + (err && err.message ? err.message : "network error"),
+      }, { httpStatus: null, assetId: id, action: action });
+    });
+}
+
+/**
+ * Normalize a delete-generation backend response (frozen contract:
+ * status / generation_id / files_removed on success; status / message on
+ * failure).  Every outcome — including empty ids and HTTP/network failures
+ * — RESOLVES a normalized envelope so callers close/refresh without
+ * unhandled rejections.
+ * @param {object|null|undefined} data parsed backend payload
+ * @param {object} [base] fields to merge (e.g. httpStatus, generationId)
+ * @returns {object} normalized delete result
+ */
+export function normalizeDeleteResponse(data, base) {
+  const raw = data && typeof data === "object" ? data : {};
+  const b = base && typeof base === "object" ? base : {};
+  const ok = _firstString(raw.status, b.status) === "ok";
+  return {
+    ok: ok,
+    deleted: ok,
+    generationId: _firstString(raw.generation_id, raw.generationId, b.generationId),
+    filesRemoved: raw.files_removed != null ? raw.files_removed : (raw.filesRemoved != null ? raw.filesRemoved : null),
+    reason: _firstString(raw.reason, b.reason),
+    message: _firstString(raw.message, b.message, raw.detail),
+    httpStatus: b.httpStatus != null ? b.httpStatus : null,
+  };
+}
+
+function _v2DeleteGeneration(apiBase, generationId) {
+  const id = generationId == null ? "" : String(generationId);
+  if (!id) {
+    // No fetch without a Generation identity.
+    return Promise.resolve(normalizeDeleteResponse({
+      status: "error", reason: "generation_unavailable", message: "Generation ID unavailable",
+    }, { generationId: id }));
+  }
+  const url = apiBase + "/history-v2/generations/" + encodeURIComponent(id);
+  return fetch(url, { method: "DELETE" })
+    .then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) {
+        const base = { httpStatus: res.status, generationId: id };
+        if (res.ok) {
+          const result = normalizeDeleteResponse(data || {}, base);
+          publishStudioSync("history");
+          return result;
+        }
+        if (data && typeof data === "object") {
+          return normalizeDeleteResponse(data, base);
+        }
+        return normalizeDeleteResponse({
+          status: "error",
+          reason: "http_" + res.status,
+          message: "Delete request failed (HTTP " + res.status + ")",
+        }, base);
+      });
+    })
+    .catch(function (err) {
+      return normalizeDeleteResponse({
+        status: "error",
+        reason: "network_error",
+        message: "History V2 unavailable: " + (err && err.message ? err.message : "network error"),
+      }, { httpStatus: null, generationId: id });
+    });
+}
+
+function _v2DeleteExperiment(apiBase, experimentId) {
+  const id = experimentId == null ? "" : String(experimentId);
+  if (!id) return Promise.reject(new Error("Experiment ID unavailable"));
+  const url = apiBase + "/history-v2/experiments/" + encodeURIComponent(id);
+  return _v2FetchJson(url, { method: "DELETE" }).then(function (data) {
+    publishStudioSync("history");
+    return data;
+  });
+}
+
+function _v2BulkDelete(apiBase, selection) {
+  const input = selection && typeof selection === "object" ? selection : {};
+  const generationIds = Array.isArray(input.generationIds) ? input.generationIds : [];
+  const experimentIds = Array.isArray(input.experimentIds) ? input.experimentIds : [];
+  const url = apiBase + "/history-v2/bulk-delete";
+  return _v2FetchJson(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ generation_ids: generationIds, experiment_ids: experimentIds }),
+  }).then(function (data) {
+    publishStudioSync("history");
+    return data;
+  });
+}
 
 function _v2ExportAsset(apiBase, assetId) {
   const id = assetId == null ? "" : String(assetId);

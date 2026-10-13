@@ -514,9 +514,12 @@ test.describe("Studio ZIT E2E", () => {
     await expect.poll(() => postedExperiment !== null, { timeout: 15000 }).toBe(true);
     expect(postedExperiment.definition.workflows[0].workflow_id).toBe(wfId);
     expect(postedExperiment.definition.axes.seed.values.map(Number).sort((a, b) => a - b).length).toBe(2);
-    const grid = page.locator('[data-testid="experiment-v2-grid"]');
+    await page.locator('[data-testid="experiment-manager-open"]').click();
+    const expModal = page.locator('[data-testid="experiment-manager"]');
+    await expect(expModal).toBeVisible({ timeout: 10000 });
+    const grid = expModal.locator('[data-testid="experiment-v2-grid"]');
     await expect(grid.locator('[data-testid^="experiment-v2-cell-zit_cell_"]')).toHaveCount(4, { timeout: 15000 });
-    await expect(page.locator('[data-testid="experiment-v2-progress"]')).toContainText("4/4 complete", { timeout: 15000 });
+    await expect(expModal.locator('[data-testid="experiment-v2-progress"]')).toContainText("4/4 complete", { timeout: 15000 });
 
     // ── 6. History: feed, detail, favorite, note, experiment 2x2 ─────
     await page.locator('.comfymodal-studio-topnav [data-page="history"]').click();

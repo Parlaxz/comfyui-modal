@@ -31,6 +31,12 @@ from .output_delivery import (
     _measure_json_bytes,
     build_asset_descriptor_list,
 )
+from .contracts import normalize_output_mode
+
+
+def _normalize_result_variant(value: Any, default: str) -> str:
+    raw = str(value or default).strip().lower()
+    return "thumbnail" if raw == "thumbnail" else normalize_output_mode(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -170,8 +176,10 @@ def build_materialized_output_entry(
         "asset_id": remote_entry.get("asset_id", ""),
         "identity": remote_entry.get("identity", ""),
         "backend_path": remote_entry.get("backend_path", remote_entry.get("path", "")),
-        "output_mode": remote_entry.get("output_mode", "original"),
-        "variant": remote_entry.get("variant", remote_entry.get("output_mode", "original")),
+        "output_mode": normalize_output_mode(remote_entry.get("output_mode", "original")),
+        "variant": _normalize_result_variant(
+            remote_entry.get("variant"), remote_entry.get("output_mode", "original")
+        ),
         "logical_output_key": remote_entry.get("logical_output_key", ""),
     }
 
@@ -561,11 +569,19 @@ def materialize_modal_result(
         fallback_index: int = 0,
     ) -> None:
         nonlocal image_count, video_count, output_bytes_written, total_decode_time_ms, total_write_time_ms
-        has_data = "data" in entry and entry["data"]
+        raw_field = entry.get("raw_bytes")
+        if isinstance(raw_field, (bytes, bytearray)) and raw_field:
+            # Bytes transport: raw PNG bytes ride the entry; no base64 decode.
+            raw_bytes = bytes(raw_field)
+            has_data = True
+        else:
+            has_data = bool("data" in entry and entry["data"])
+            raw_bytes = b""
         if has_data:
-            t0 = time.monotonic()
-            raw_bytes = base64.b64decode(entry["data"], validate=True)
-            total_decode_time_ms += (time.monotonic() - t0) * 1000.0
+            if not raw_bytes:
+                t0 = time.monotonic()
+                raw_bytes = base64.b64decode(entry["data"], validate=True)
+                total_decode_time_ms += (time.monotonic() - t0) * 1000.0
             local_filename = entry.get("filename", f"output_{fallback_index}.bin")
             local_path = unique_path(output_dir, local_filename)
             local_filename = os.path.basename(local_path)
@@ -729,9 +745,16 @@ def materialize_modal_result(
             "byte_count": primary_entry.get("byte_count", 0),
             "asset_id": primary_entry.get("asset_id", ""),
             "backend_path": primary_entry.get("backend_path", ""),
-            "output_mode": primary_entry.get("output_mode", adapted.get("output_mode", "original")),
-            "variant": primary_entry.get(
-                "variant", adapted.get("variant", adapted.get("output_mode", "original"))
+            "output_mode": normalize_output_mode(
+                primary_entry.get("output_mode", adapted.get("output_mode", "original"))
+            ),
+            "variant": _normalize_result_variant(
+                primary_entry.get("variant"),
+                adapted.get("variant", adapted.get("output_mode", "original")),
+            ),
+            "served_variant": _normalize_result_variant(
+                primary_entry.get("served_variant"),
+                primary_entry.get("variant", adapted.get("variant", adapted.get("output_mode", "original"))),
             ),
             "logical_output_key": primary_entry.get("logical_output_key", ""),
         }
@@ -801,6 +824,14 @@ def materialize_modal_result(
         "history_outputs": history_outputs,
         "materialized_outputs": materialized_outputs,
         "primary_output": primary_output,
+        "output_mode": normalize_output_mode(adapted.get("output_mode", "original")),
+        "variant": _normalize_result_variant(
+            adapted.get("variant"), adapted.get("output_mode", "original")
+        ),
+        "served_variant": _normalize_result_variant(
+            adapted.get("served_variant"),
+            adapted.get("variant", adapted.get("output_mode", "original")),
+        ),
         "written_files": written_files,
         "image_count": image_count,
         "video_count": video_count,

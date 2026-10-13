@@ -3,13 +3,15 @@
 // The Playground recent-runs filmstrip hydrates ONLY from
 // GET /history-v2/feed?limit=50&order=newest&kind=mixed through
 // createHistoryRepository({ mode: "v2" }).  This spec pins the mandated
-// Wave-D behaviors against the deterministic fake backend:
+// history-view behaviors against the deterministic fake backend:
 //
-//   - Singles + EXP-badged experiments appear newest-first, deduplicated.
-//   - Single click → canvas; EXP click → History V2 modern detail page.
+//   - EVERY History V2 feed record appears newest-first, deduplicated — the
+//     strip is a view of the History page, not a filtered subset.
+//   - Single click → canvas; imageless-single click → History generation
+//     detail; EXP click → History V2 modern detail page.
 //   - Old migrated records follow truthful visibility rules
 //     (scenario history_v2_wave_d).
-//   - Missing-thumbnail records never render a broken image.
+//   - Imageless records keep a placeholder and never render a broken image.
 //   - ZERO legacy routes are touched: no GET /run-history, /history,
 //     /experiments hydration; no POST /studio/experiment creator; no
 //     /experiments/{id} polls or /stop-now controls during pure navigation;
@@ -31,7 +33,7 @@
 // this file carries only one light end-to-end V2-creator submission mapping.
 
 import { test, expect } from "@playwright/test";
-import { setupFakeTest, enableExperimentMode } from "./helpers.mjs";
+import { setupFakeTest, enableExperimentMode, openExperimentManager } from "./helpers.mjs";
 
 const ITEM = ".comfymodal-studio-carousel-item";
 const EXP_ITEM = ".comfymodal-studio-carousel-item-experiment";
@@ -91,15 +93,18 @@ async function readFilmstripDom(page) {
     els.map((el) => {
       const img = el.querySelector("img");
       return {
+        id: el.getAttribute("data-id") || "",
         expid: el.getAttribute("data-expid") || "",
         imgSrc: img ? img.getAttribute("src") || "" : "",
+        placeholder: !!el.querySelector(".comfymodal-studio-carousel-thumb-empty"),
       };
     })
   );
 }
 
-/** Map a DOM entry to its durable record id (expid, or asset-url prefix). */
+/** Map a DOM entry to its durable record id (data-id, expid, or asset-url prefix). */
 function domIdOf(entry) {
+  if (entry.id) return entry.id;
   if (entry.expid) return entry.expid;
   const m = entry.imgSrc.match(/\/assets\/([^/?]+)/);
   return m ? decodeURIComponent(m[1]).replace(/_o\d+_(thumb|preview)$/, "") : "";
@@ -107,9 +112,9 @@ function domIdOf(entry) {
 
 /**
  * Compute the EXPECTED filmstrip contents from the same feed page the UI
- * hydrates from, applying refreshRecentRuns' client-side rules:
- * experiments always appear; generations only when finished WITH an image
- * URL; sorted newest-first by completedAt||startedAt; deduplicated by id.
+ * hydrates from.  The strip shows EVERY feed record newest-first by
+ * completedAt||startedAt, deduplicated by id — the same window the History
+ * page reads, with no image/status filtering.
  */
 async function expectedFilmstrip(page) {
   const res = await page.request.get("/comfymodal/history-v2/feed?limit=50&order=newest&kind=mixed");
@@ -118,23 +123,7 @@ async function expectedFilmstrip(page) {
   const entries = [];
   for (const rec of body.items || []) {
     const ts = rec.completed_at || rec.started_at || rec.created_at || "";
-    if (rec.kind === "experiment") {
-      let imageUrl = "";
-      for (const c of Array.isArray(rec.cells) ? rec.cells : []) {
-        if (c && (c.thumb_url || c.preview_url)) {
-          imageUrl = c.thumb_url || c.preview_url;
-          break;
-        }
-      }
-      entries.push({ id: rec.id, imageUrl, ts });
-      continue;
-    }
-    if (rec.status !== "completed" && rec.status !== "completed_with_failures") continue;
-    const outs = Array.isArray(rec.outputs) ? rec.outputs : [];
-    const feat = outs[rec.featured_output_index || 0] || outs[0];
-    const imageUrl = feat ? feat.thumb_url || feat.preview_url || "" : "";
-    if (!imageUrl) continue;
-    entries.push({ id: rec.id, imageUrl, ts });
+    entries.push({ id: rec.id, ts });
   }
   entries.sort((a, b) => b.ts.localeCompare(a.ts));
   const seen = new Set();
@@ -153,15 +142,25 @@ test.describe("Recent runs ← History V2 hydration & ordering", () => {
       const domIds = dom.map(domIdOf);
       const expected = await expectedFilmstrip(page);
 
-      // 3+4. DOM order == expected newest-first eligible order, no dupes.
+      // 3+4. DOM order == expected newest-first feed order, no dupes.
       expect(domIds).toEqual(expected.map((e) => e.id));
       expect(new Set(domIds).size).toBe(domIds.length);
 
-      // 1. Generation items point at History V2 managed assets.
+      // 1. Generation items WITH images point at History V2 managed assets.
       const genEntries = dom.filter((d) => !d.expid && d.imgSrc);
       expect(genEntries.length).toBeGreaterThan(0);
       for (const g of genEntries) {
         expect(g.imgSrc).toMatch(/^\/comfymodal\/history-v2\/assets\//);
+      }
+
+      // 1b. Imageless records keep their place with a placeholder (same rule
+      // as the History cards): failed/canceled/interrupted/no-output
+      // generations are all present, with no img and a placeholder marker.
+      for (const id of ["gen_failed", "gen_canceled", "gen_interrupted", "gen_no_image"]) {
+        expect(domIds).toContain(id);
+        const entry = dom.find((d) => domIdOf(d) === id);
+        expect(entry.imgSrc).toBe("");
+        expect(entry.placeholder).toBe(true);
       }
 
       // 2. Experiment items carry the EXP badge + data-expid.
@@ -169,7 +168,7 @@ test.describe("Recent runs ← History V2 hydration & ordering", () => {
       await expect(expItem.locator(".comfymodal-studio-carousel-exp-badge")).toHaveText("EXP");
       expect(await expItem.getAttribute("data-expid")).toBeTruthy();
 
-      // 3. First item is the newest eligible record of the default seed.
+      // 3. First item is the newest record of the default seed.
       expect(domIds[0]).toBe("gen_ok");
       fx.assertNoConsoleErrors();
     } finally {
@@ -177,22 +176,30 @@ test.describe("Recent runs ← History V2 hydration & ordering", () => {
     }
   });
 
-  test("10. missing-thumbnail record renders truthfully (no broken img)", async ({ page }) => {
+  test("10. imageless records render placeholders (no broken img)", async ({ page }) => {
     const fx = await setupFakeTest(page);
     try {
       await expect(page.locator(ITEM).first()).toBeVisible({ timeout: 20000 });
 
-      // gen_no_image is completed but produced NO outputs — it must be absent
-      // from the strip entirely, and every rendered thumb has a real src.
+      // Every rendered thumb has a real src — placeholders carry no img at
+      // all, so a missing src can never render broken.
       const srcs = await page.locator("img.comfymodal-studio-carousel-thumb").evaluateAll(
         (els) => els.map((el) => el.getAttribute("src") || "")
       );
       expect(srcs.length).toBeGreaterThan(0);
       for (const src of srcs) expect(src.trim()).not.toBe("");
-      expect(srcs.some((s) => s.includes("gen_no_image"))).toBe(false);
 
-      const domIds = (await readFilmstripDom(page)).map(domIdOf);
-      expect(domIds).not.toContain("gen_no_image");
+      // gen_no_image is completed but produced NO outputs — it keeps its
+      // newest-first place with a "No image" placeholder, exactly like its
+      // History card.
+      const dom = await readFilmstripDom(page);
+      const domIds = dom.map(domIdOf);
+      expect(domIds).toContain("gen_no_image");
+      const noImage = dom.find((d) => domIdOf(d) === "gen_no_image");
+      expect(noImage.imgSrc).toBe("");
+      expect(noImage.placeholder).toBe(true);
+      const noImageItem = page.locator(`${ITEM}[data-id="gen_no_image"]`);
+      await expect(noImageItem.locator(".comfymodal-studio-carousel-thumb-empty")).toHaveText("No image");
       fx.assertNoConsoleErrors();
     } finally {
       fx.guard.dispose();
@@ -267,7 +274,7 @@ test.describe("Recent runs ← History V2 hydration & ordering", () => {
 // ── Routing & annotations ────────────────────────────────────────────────
 
 test.describe("Recent runs routing & annotations", () => {
-  test("5. single click loads the generation into the canvas", async ({ page }) => {
+  test("5. single click loads the full-size generation into the canvas", async ({ page }) => {
     const fx = await setupFakeTest(page);
     try {
       const genItem = page.locator(ITEM).filter({ has: page.locator('img[src*="gen_ok"]') }).first();
@@ -278,7 +285,17 @@ test.describe("Recent runs routing & annotations", () => {
 
       const canvas = page.locator('[data-testid="canvas-output"]');
       await expect(canvas).toBeVisible({ timeout: 10000 });
-      expect(await canvas.getAttribute("src")).toBe(itemSrc);
+      const canvasSrc = await canvas.getAttribute("src");
+      // The canvas loads the record's full-size display asset (the same
+      // Preview > Original resolution the History detail uses) — never the
+      // capped 256px carousel thumbnail.
+      expect(canvasSrc).not.toBe(itemSrc);
+      expect(canvasSrc).toMatch(/^\/comfymodal\/history-v2\/assets\//);
+      const res = await page.request.get("/comfymodal/history-v2/feed?limit=50&order=newest&kind=mixed");
+      expect(res.ok()).toBe(true);
+      const rec = (await res.json().then((b) => b.items || [])).find((r) => r.id === "gen_ok");
+      const feat = rec.outputs[rec.featured_output_index || 0] || rec.outputs[0];
+      expect(canvasSrc).toBe(feat.preview_url || feat.original_url);
       fx.assertNoConsoleErrors();
     } finally {
       fx.guard.dispose();
@@ -345,8 +362,9 @@ test.describe("Recent runs routing & annotations", () => {
       await page.locator(WF_SELECTOR).selectOption("wf_text2img");
       await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 10000 });
       await enableExperimentMode(page);
+      const modal = await openExperimentManager(page);
 
-      const btn = page.locator(SUBMIT_BTN);
+      const btn = modal.locator(SUBMIT_BTN);
       await expect(btn).toBeEnabled({ timeout: 10000 });
       await btn.click();
 
@@ -387,7 +405,8 @@ test.describe("Legacy state safety & old-record visibility", () => {
 
       const surface = page.locator('[data-testid="experiment-run-surface"]');
       await expect(surface).toBeVisible({ timeout: 10000 });
-      await expect(surface.locator('[data-testid="experiment-v2-section"]')).toBeVisible();
+      const modal = await openExperimentManager(page);
+      await expect(modal.locator('[data-testid="experiment-v2-section"]')).toBeVisible();
       expect(await page.locator(GRID_VIEWPORT).count()).toBe(0);
 
       // Zero creator POSTs (legacy OR v2 — a stale pointer must not create),
@@ -454,18 +473,21 @@ test.describe("Legacy state safety & old-record visibility", () => {
     try {
       await expect(page.locator(ITEM).first()).toBeVisible({ timeout: 20000 });
 
-      // Visibility rules: the migrated single WITH an image appears; the one
-      // WITHOUT an image does not; the mirrored experiment appears; the
-      // modern generation (newest) appears first.
+      // Visibility rules: every migrated record appears newest-first — the
+      // single WITH an image, the one WITHOUT an image (placeholder), and
+      // the mirrored experiment; the modern generation (newest) is first.
       const dom = await readFilmstripDom(page);
       const domIds = dom.map(domIdOf);
       expect(domIds[0]).toBe("gen_wave_d_modern");
       expect(domIds).toContain("gen_wave_d_legacy_image");
       expect(domIds).toContain("exp_wave_d_legacy");
-      expect(domIds).not.toContain("gen_wave_d_legacy_noimage");
+      expect(domIds).toContain("gen_wave_d_legacy_noimage");
+      const legacyNoImage = dom.find((d) => domIdOf(d) === "gen_wave_d_legacy_noimage");
+      expect(legacyNoImage.imgSrc).toBe("");
+      expect(legacyNoImage.placeholder).toBe(true);
 
-      // The imageless legacy single IS still viewable through the History
-      // page search (durable record, just not filmstrip-eligible).
+      // The imageless legacy single IS also viewable through the History
+      // page search (same durable record, same detail).
       await fx.gotoPage("history");
       await expect(page.locator('[data-testid="history-v2-page"]')).toBeVisible({ timeout: 15000 });
       await page.locator('[data-testid="history-v2-search"]').fill("gen_wave_d_legacy_noimage");

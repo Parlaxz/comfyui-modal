@@ -2617,3 +2617,14 @@ change_requires = "deploy"
 runtime_exposed = true
 owner = "generic-overlap"
 description = "Generic load overlap: role-bound CLIP loads first, UNET defers past the text-encode window, both model files get page-cache warming hints. Plain sources decline to native only while on."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_RESULT_TRANSPORT"
+type = "enum"
+default = "bytes"
+enum_values = ["bytes", "base64"]
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "nic-audit"
+description = "Golden result image wire representation: bytes (default, raw PNG bytes in images[0].raw_bytes, no base64 expansion) or base64 (legacy images[0].data envelope for diagnosis). Run-scoped via the result_transport request key; image bytes and identity are identical either way."

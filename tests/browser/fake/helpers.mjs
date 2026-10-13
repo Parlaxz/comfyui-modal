@@ -178,6 +178,19 @@ export async function enableExperimentMode(page) {
   await page.locator('[data-testid="experiment-mode"]').waitFor({ state: "visible", timeout: 10000 });
 }
 
+// ── Experiment manager popup ───────────────────────────────────────────
+// The run surface (submit/progress/cell grid) lives in a popup modal, not
+// the control panel. Open it after enabling experiment mode; scope all
+// section/grid/submit locators to the returned modal.
+export async function openExperimentManager(page) {
+  const openBtn = page.locator('[data-testid="experiment-manager-open"]');
+  await openBtn.waitFor({ state: "visible", timeout: 10000 });
+  await openBtn.click();
+  const modal = page.locator('[data-testid="experiment-manager"]');
+  await expect(modal).toBeVisible({ timeout: 10000 });
+  return modal;
+}
+
 export async function selectComparePreset(page, presetId) {
   const cb = page.locator(`[data-testid="compare-preset-${presetId}"]`).first();
   // Preset rows load async; the checkbox is in the DOM (hidden) once loaded.

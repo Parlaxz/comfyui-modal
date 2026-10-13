@@ -959,7 +959,7 @@ export function viewerDateText(v) {
   if (isNaN(d.getTime())) return String(v);
   try {
     return d.toLocaleDateString(undefined, { month: "short", day: "numeric" })
-      + ", " + d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+      + ", " + d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" });
   } catch (err) {
     return String(v);
   }
@@ -1121,10 +1121,65 @@ export function viewerFirst() {
   return "";
 }
 
+// Base payload for "Use parameters as base": the run's prompt + sampler
+// controls keyed by SHELF role (prompt, negative_prompt, seed, steps,
+// guidance/cfg, sampler, scheduler, denoise, width, height) so the
+// Playground can apply them through its normal validated shelf path. Only
+// known non-empty values are included, so applying never blanks a field
+// the run did not record. Width/height are numeric. Models/workflow are
+// deliberately excluded: the shelf has no model picker and workflows are
+// selected by identity, never by name.
+export function viewerBasePayload(record) {
+  var rec = record || {};
+  var params = viewerMergedParams(rec);
+  var out = {};
+  function put(key, value) {
+    if (value == null || value === "") return;
+    out[key] = value;
+  }
+  put("prompt", viewerFirst(rec.prompt, params.prompt));
+  put("negative_prompt", viewerFirst(
+    rec.negativePrompt, rec.negative_prompt,
+    params.negative_prompt, params.negativePrompt));
+  put("seed", params.seed);
+  put("steps", params.steps);
+  var scale = viewerFirst(params.guidance, params.cfg);
+  put("guidance", scale);
+  put("cfg", scale);
+  put("sampler", params.sampler);
+  put("scheduler", params.scheduler);
+  put("denoise", params.denoise);
+  ["width", "height"].forEach(function (key) {
+    var n = Number(params[key]);
+    if (Number.isFinite(n) && n > 0) out[key] = n;
+  });
+  return out;
+}
+
 // Cropped prompt accordion: ~3 lines visible with a fade; click or
-// Enter/Space expands to the full text.
+// Enter/Space expands to the full text. The header carries a Copy prompt
+// button (copies the prompt text only) with transient Copied feedback.
 export function buildViewerPromptAccordion(prompt, negative) {
   var wrap = el("div", { class: "comfymodal-studio-viewer-prompts" });
+  var copyBtn = el("button", {
+    class: "comfymodal-secondary-btn comfymodal-studio-viewer-prompt-copy",
+    type: "button",
+    "data-testid": "viewer-prompt-copy",
+    text: "Copy prompt",
+    title: "Copy the prompt text",
+  });
+  copyBtn.addEventListener("click", function (e) {
+    e.stopPropagation();
+    if (copyBtn.disabled) return;
+    copyBtn.disabled = true;
+    _copyTextToClipboard(String(prompt || ""), function (ok) {
+      copyBtn.textContent = ok ? "Copied" : "Copy failed";
+      setTimeout(function () {
+        copyBtn.disabled = false;
+        copyBtn.textContent = "Copy prompt";
+      }, 1200);
+    });
+  });
   var value = el("div", {
     class: "comfymodal-studio-viewer-prompt-value",
     tabindex: "0",
@@ -1145,7 +1200,10 @@ export function buildViewerPromptAccordion(prompt, negative) {
   value.addEventListener("keydown", function (e) {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
   });
-  wrap.appendChild(el("div", { class: "comfymodal-studio-viewer-prompt-label", text: "Prompt" }));
+  wrap.appendChild(el("div", { class: "comfymodal-studio-viewer-prompts-head" }, [
+    el("div", { class: "comfymodal-studio-viewer-prompt-label", text: "Prompt" }),
+    copyBtn,
+  ]));
   wrap.appendChild(value);
   if (negative) {
     wrap.appendChild(el("div", { class: "comfymodal-studio-viewer-negative" }, [
@@ -1255,6 +1313,65 @@ export function buildViewerBody(opts = {}) {
   return body;
 }
 
+// Single choke point for every buildViewerShell mount. Both full-size
+// surfaces (History detail, Playground preview) resolve a viewer through the
+// shared resolveViewerInput and pass it through HERE — creation and
+// re-render alike — so a new shell input is added once and can never drift
+// between surfaces again. Pure data mapping (no DOM), unit-tested in Node.
+//
+// viewer:   a resolveViewerInput() result, or null/undefined pre-load (which
+//           yields bare-body opts: no record, no image, no variant).
+// adapters: behavioral only — { persistence, fileActions, onClose } —
+//           passed through by reference, never reshaped.
+export function resolveViewerShellArgs(viewer, adapters) {
+  var v = viewer && typeof viewer === "object" ? viewer : {};
+  var out = v.output && typeof v.output === "object" ? v.output : {};
+  var a = adapters && typeof adapters === "object" ? adapters : {};
+  var rec = v.record && typeof v.record === "object" ? v.record : {};
+  var feat = rec.featuredOutput && typeof rec.featuredOutput === "object" ? rec.featuredOutput : {};
+  var servedRaw = String(feat.servedVariant || feat.served_variant || "").toLowerCase();
+  var served = servedRaw === "data_saver" || servedRaw === "datasaver" || servedRaw === "data-saver" || servedRaw === "preview"
+    ? "Data Saver"
+    : (servedRaw === "original" ? "Original" : "");
+  var labelRaw = out.label ? String(out.label) : "";
+  var labelNorm = /preview/i.test(labelRaw) ? "Data Saver" : labelRaw;
+  var kindRaw = String(out.kind || "").toLowerCase();
+  var kindNorm = (kindRaw === "data_saver" || kindRaw === "datasaver" || kindRaw === "data-saver" || kindRaw === "preview")
+    ? "Data Saver"
+    : (kindRaw === "original" ? "Original" : "");
+  // The Variant row must describe the DISPLAYED bytes, which are picked by
+  // the shared asset policy (label/kind) — backend served_variant is only a
+  // last resort, because it can disagree with the policy (e.g. served
+  // "original" on a record whose policy selection is the data-saver
+  // preview, which is what the zoom stage actually shows).
+  var variant = labelNorm || kindNorm || served;
+  // Format of the DISPLAYED bytes, not the stored primary: data-saver
+  // display is usually webp while the retained original is png.
+  var format = variant === "Data Saver"
+    ? (feat.dataSaverFormat || feat.data_saver_format || feat.preview_format || feat.format || "")
+    : (variant === "Original"
+      ? (feat.originalFormat || feat.original_format || feat.format || "")
+      : (feat.format || ""));
+  // File size of the DISPLAYED bytes (data-saver vs original differ).
+  var fileSize = variant === "Data Saver"
+    ? (feat.dataSaverByteSize != null ? feat.dataSaverByteSize : (feat.data_saver_byte_size != null ? feat.data_saver_byte_size : ""))
+    : (variant === "Original"
+      ? (feat.originalByteSize != null ? feat.originalByteSize : (feat.original_byte_size != null ? feat.original_byte_size : ""))
+      : "");
+  return {
+    record: v.record,
+    imageUrl: v.imageUrl,
+    timing: v.timing,
+    variant: variant,
+    format: format,
+    fileSize: fileSize,
+    fileActions: a.fileActions != null ? a.fileActions : null,
+    onUseAsBase: typeof a.onUseAsBase === "function" ? a.onUseAsBase : null,
+    persistence: a.persistence,
+    onClose: a.onClose,
+  };
+}
+
 // Full overlay shell (backdrop + content + close + viewer body) with
 // Escape/backdrop close and invoker focus restore.
 // Callers pass DATA only: { record, imageUrl, timing, persistence }.
@@ -1307,12 +1424,19 @@ export function buildViewerShell(opts = {}) {
   // `variant` is data (the displayed image's Preview/Original/Thumbnail
   // label from the shared asset policy), not cosmetic: it renders the
   // always-visible Variant row so the viewer answers "is this a preview?".
+  // The overlay's onClose is the shell's own close (DOM removal + surface
+  // cleanup + user onClose, idempotent) so the Delete button can dismiss
+  // the modal after a successful delete on either surface.
   content.appendChild(opts.record ? buildSharedViewerOverlay({
     record: opts.record,
     imageUrl: opts.imageUrl,
     timing: opts.timing,
     variant: opts.variant,
+    format: opts.format,
+    fileSize: opts.fileSize,
+    fileActions: opts.fileActions,
     persistence: opts.persistence,
+    onClose: close,
   }) : buildViewerBody(opts));
   overlay.appendChild(content);
 
@@ -1323,7 +1447,12 @@ export function buildViewerShell(opts = {}) {
       imageUrl: extra.imageUrl != null ? extra.imageUrl : opts.imageUrl,
       timing: extra.timing != null ? extra.timing : opts.timing,
       variant: extra.variant != null ? extra.variant : opts.variant,
+      format: extra.format != null ? extra.format : opts.format,
+      fileSize: extra.fileSize != null ? extra.fileSize : opts.fileSize,
+      fileActions: extra.fileActions != null ? extra.fileActions : opts.fileActions,
+      onUseAsBase: extra.onUseAsBase != null ? extra.onUseAsBase : opts.onUseAsBase,
       persistence: opts.persistence,
+      onClose: close,
     };
     while (content.firstChild) content.removeChild(content.firstChild);
     content.appendChild(closeBtn);
@@ -1343,7 +1472,10 @@ export function buildViewerShell(opts = {}) {
 // The one viewer composition used by every full-size output surface.
 // Callers pass DATA only: an already-resolved record plus imageUrl/timing,
 // an optional `variant` label (the displayed image's Preview/Original/
-// Thumbnail kind from the shared asset policy), and an optional behavioral
+// Thumbnail kind from the shared asset policy), an optional `fileActions`
+// adapter ({ openAsset(assetId), revealAsset(assetId) }) for the File row's
+// native buttons, an optional `onUseAsBase(payload)` callback for the Run
+// Data "Use parameters as base" button, and an optional behavioral
 // `persistence` adapter
 // ({ setFavorite(record, next), setNote(record, text), onChanged() }).
 // The fav star, note editor, params grid, and timing section are fixed here —
@@ -1361,6 +1493,7 @@ function _viewerPersistence(opts) {
   return {
     setFavorite: typeof p.setFavorite === "function" ? p.setFavorite : async function () {},
     setNote: typeof p.setNote === "function" ? p.setNote : async function () {},
+    deleteGeneration: typeof p.deleteGeneration === "function" ? p.deleteGeneration : null,
     onChanged: typeof p.onChanged === "function" ? p.onChanged : null,
   };
 }
@@ -1393,6 +1526,82 @@ export function buildViewerFavoriteStar(record, persistence) {
     if (persist.onChanged) persist.onChanged();
   });
   return star;
+}
+
+// Delete button for the viewer's Run line: two-step inline confirm
+// (Delete → Confirm delete + Cancel), no window.confirm. On success it
+// notifies persistence.onChanged (feed refresh) and calls onClose (the
+// shell's own close, which removes the overlay and runs surface cleanup).
+// Rendered only when the persistence adapter offers deleteGeneration AND
+// the record has an identity; otherwise returns null (no dead button).
+export function buildViewerDeleteButton(record, persistence, onClose) {
+  var rec = record || {};
+  var persist = persistence || {};
+  if (typeof persist.deleteGeneration !== "function") return null;
+  if (rec.id == null || rec.id === "") return null;
+  var wrap = el("span", { class: "comfymodal-studio-viewer-delete-wrap" });
+  var delBtn = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn comfymodal-studio-viewer-delete",
+    "aria-label": "Delete this generation",
+    title: "Delete this generation",
+    "data-testid": "viewer-delete",
+    text: "Delete",
+  });
+  var confirmBtn = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn comfymodal-studio-viewer-delete-confirm",
+    "aria-label": "Confirm delete",
+    title: "Deletes the record, its attempts/assets, and owned files",
+    "data-testid": "viewer-delete-confirm",
+    text: "Confirm delete",
+    hidden: true,
+  });
+  var cancelBtn = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn",
+    "aria-label": "Cancel delete",
+    "data-testid": "viewer-delete-cancel",
+    text: "Cancel",
+    hidden: true,
+  });
+  function setArmed(armed) {
+    delBtn.hidden = armed;
+    confirmBtn.hidden = !armed;
+    cancelBtn.hidden = !armed;
+  }
+  delBtn.addEventListener("click", function () { setArmed(true); });
+  cancelBtn.addEventListener("click", function () { setArmed(false); });
+  confirmBtn.addEventListener("click", async function () {
+    if (confirmBtn.disabled) return;
+    confirmBtn.disabled = true;
+    cancelBtn.disabled = true;
+    confirmBtn.textContent = "Deleting\u2026";
+    var failed = "";
+    try {
+      var result = await persist.deleteGeneration(rec);
+      // Every repository flavor resolves a truthy-ok/accepted envelope on
+      // success (v2 normalized, fixture accepted, bridge refused) — and the
+      // v2 client never rejects, so a throw is a transport-level failure.
+      if (result && (result.ok || result.accepted)) {
+        if (typeof persist.onChanged === "function") persist.onChanged();
+        if (typeof onClose === "function") onClose();
+        return;
+      }
+      failed = result && result.message ? String(result.message) : "Delete was not accepted";
+    } catch (err) {
+      failed = err && err.message ? String(err.message) : "Delete failed";
+    }
+    confirmBtn.disabled = false;
+    cancelBtn.disabled = false;
+    confirmBtn.textContent = "Confirm delete";
+    confirmBtn.title = failed;
+    setArmed(false);
+  });
+  wrap.appendChild(delBtn);
+  wrap.appendChild(confirmBtn);
+  wrap.appendChild(cancelBtn);
+  return wrap;
 }
 
 // Note editor for the viewer's Metadata accordion: Save/Cancel plus an
@@ -1476,29 +1685,71 @@ export function viewerSnapshotText(record) {
   if (/missing_request_snapshot/.test(reason)) return "not saved for this run";
   return reason ? "unavailable (" + reason + ")" : "unavailable";
 }
-
-export function buildViewerLineageRows(record) {
+export function buildViewerAdvancedRows(record) {
   var rec = record || {};
-  var rows = [];
-  function row(key, value) {
-    if (value == null || value === "") return;
-    rows.push(el("div", { class: "comfymodal-studio-viewer-row" }, [
-      el("span", { class: "comfymodal-studio-viewer-row-key", text: key }),
-      el("span", { class: "comfymodal-studio-viewer-row-value", text: String(value) }),
-    ]));
+  var pairs = [];
+  var runId = rec.runId || rec.id;
+  if (runId) pairs.push(["Run ID", runId]);
+  if (rec.id && rec.id !== runId) pairs.push(["Generation", rec.id]);
+  if (Array.isArray(rec.models) && rec.models.length) {
+    pairs.push(["Models", rec.models.join(", ")]);
   }
-  if (rec.id) row("Generation", rec.id);
-  if (rec.runId && rec.runId !== rec.id) row("Run", rec.runId);
   var attempts = Array.isArray(rec.attempts) ? rec.attempts : [];
   attempts.forEach(function (a, i) {
     var mode = (a && a.mode) || "run";
     var status = (a && a.status) || "";
-    row(attempts.length > 1 ? "Attempt " + (i + 1) : "Attempt",
-      status ? mode + " \u00b7 " + status : mode);
+    pairs.push([attempts.length > 1 ? "Attempt " + (i + 1) : "Attempt",
+      status ? mode + " \u00b7 " + status : mode]);
   });
   var snap = viewerSnapshotText(rec);
-  if (snap) row("Request snapshot", snap);
-  return rows;
+  if (snap) pairs.push(["Request snapshot", snap]);
+  return pairs
+    .map(buildViewerMetaRow)
+    .filter(function (row) { return row != null; });
+}
+
+// "Use parameters as base": fills the Playground shelf with this run's
+// prompt + sampler controls (see viewerBasePayload). Rendered only when the
+// caller supplies onUseAsBase AND the record yields a non-empty payload.
+// The adapter returns the applied count; a positive count dismisses the
+// overlay so the user lands on the filled shelf.
+export function buildViewerUseAsBaseButton(record, onUseAsBase, onClose) {
+  var payload = viewerBasePayload(record);
+  if (typeof onUseAsBase !== "function") return null;
+  if (!payload || Object.keys(payload).length === 0) return null;
+  var btn = el("button", {
+    class: "comfymodal-secondary-btn comfymodal-studio-viewer-use-base",
+    type: "button",
+    "data-testid": "viewer-use-as-base",
+    text: "Use parameters as base",
+    title: "Fill the Playground shelf with this run's prompt and controls",
+  });
+  btn.addEventListener("click", function () {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    var applied = 0;
+    try { applied = Number(onUseAsBase(payload)) || 0; }
+    catch (err) { applied = 0; }
+    if (applied > 0) {
+      if (typeof onClose === "function") onClose();
+      return;
+    }
+    btn.textContent = "Nothing to apply";
+    setTimeout(function () {
+      btn.disabled = false;
+      btn.textContent = "Use parameters as base";
+    }, 1400);
+  });
+  return btn;
+}
+
+// One metadata spec row ([key, value] → element or null when blank).
+export function buildViewerMetaRow(pair) {
+  var text = viewerValueText(pair[1]);
+  return text ? el("div", { class: "comfymodal-studio-viewer-row" }, [
+    el("span", { class: "comfymodal-studio-viewer-row-key", text: pair[0] }),
+    el("span", { class: "comfymodal-studio-viewer-row-value", text: text }),
+  ]) : null;
 }
 
 // Clipboard write with a non-Clipboard-API fallback (older contexts).
@@ -1523,21 +1774,23 @@ function _copyTextToClipboard(text, done) {
   }
 }
 
-// File row for the viewer's Metadata: stored filename plus an Open-file
-// action (opens the displayed image URL) and a copy-path action (copies the
-// managed path / remote URI). Flat row, no card. Returns null when neither
-// a filename nor a path is known.
-export function buildViewerFileRow(record, imageUrl) {
+// File row for the viewer's Metadata: stored filename plus native actions —
+// Open file (OS default viewer), Open folder (file manager), Copy path.
+// All three POST through the caller's `fileActions` adapter
+// ({ openAsset(assetId), revealAsset(assetId) }) so only database-registered
+// local files can ever be launched; remote/unknown assets show no buttons.
+// Flat row, no card. Returns null when neither a filename nor a path known.
+export function buildViewerFileRow(record, fileActions) {
   var rec = record || {};
   var outs = Array.isArray(rec.outputs) ? rec.outputs : [];
   var feat = rec.featuredOutput && typeof rec.featuredOutput === "object" ? rec.featuredOutput : {};
-  function first(key) {
-    var keys = Array.isArray(key) ? key : [key];
+  function first(keys) {
+    var list = Array.isArray(keys) ? keys : [keys];
     var sources = [feat].concat(outs);
     for (var i = 0; i < sources.length; i++) {
       var o = sources[i] || {};
-      for (var j = 0; j < keys.length; j++) {
-        var v = o[keys[j]];
+      for (var j = 0; j < list.length; j++) {
+        var v = o[list[j]];
         if (v != null && v !== "") return String(v);
       }
     }
@@ -1545,42 +1798,65 @@ export function buildViewerFileRow(record, imageUrl) {
   }
   var filename = first("filename");
   var path = first("path");
+  var assetId = first(["assetId", "asset_id"]);
   if (!filename && !path) return null;
+  var actions = fileActions && typeof fileActions === "object" ? fileActions : {};
   var valueWrap = el("span", { class: "comfymodal-studio-viewer-row-value comfymodal-studio-viewer-file-value" });
   valueWrap.appendChild(el("span", {
     class: "comfymodal-studio-viewer-file-name",
     text: filename || path,
     title: path || filename,
   }));
-  if (imageUrl) {
-    valueWrap.appendChild(el("a", {
-      class: "comfymodal-secondary-btn comfymodal-studio-viewer-file-btn",
-      href: imageUrl,
-      target: "_blank",
-      rel: "noopener",
-      "data-testid": "viewer-file-open",
-      text: "Open file",
-    }));
-  }
-  if (path) {
-    var copyBtn = el("button", {
+  function actionButton(testid, label, title, send) {
+    var btn = el("button", {
       class: "comfymodal-secondary-btn comfymodal-studio-viewer-file-btn",
       type: "button",
-      "data-testid": "viewer-file-copy-path",
-      text: "Copy path",
-      title: "Copy the file path",
+      "data-testid": testid,
+      text: label,
+      title: title,
     });
-    copyBtn.addEventListener("click", function () {
-      copyBtn.disabled = true;
-      _copyTextToClipboard(path, function (ok) {
-        copyBtn.textContent = ok ? "Copied" : "Copy failed";
-        setTimeout(function () {
-          copyBtn.disabled = false;
-          copyBtn.textContent = "Copy path";
-        }, 1200);
-      });
+    btn.addEventListener("click", async function () {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = label + "\u2026";
+      var message = "";
+      try {
+        var result = await send();
+        if (result && result.ok) {
+          btn.textContent = label === "Copy path" ? "Copied" : "Opened";
+        } else {
+          btn.textContent = "Failed";
+          message = result && result.message ? String(result.message) : "";
+        }
+      } catch (err) {
+        btn.textContent = "Failed";
+        message = err && err.message ? String(err.message) : "";
+      }
+      if (message) btn.title = message;
+      setTimeout(function () {
+        btn.disabled = false;
+        btn.textContent = label;
+      }, 1400);
     });
-    valueWrap.appendChild(copyBtn);
+    return btn;
+  }
+  if (assetId && typeof actions.openAsset === "function") {
+    valueWrap.appendChild(actionButton("viewer-file-open", "Open file",
+      "Open in the system default viewer", function () { return actions.openAsset(assetId); }));
+  }
+  if (assetId && typeof actions.revealAsset === "function") {
+    valueWrap.appendChild(actionButton("viewer-file-reveal", "Open folder",
+      "Reveal in the file manager", function () { return actions.revealAsset(assetId); }));
+  }
+  if (path) {
+    valueWrap.appendChild(actionButton("viewer-file-copy-path", "Copy path",
+      "Copy the file path: " + path, function () {
+        return new Promise(function (resolve) {
+          _copyTextToClipboard(path, function (ok) {
+            resolve({ ok: ok, message: ok ? "" : "clipboard unavailable" });
+          });
+        });
+      }));
   }
   return el("div", { class: "comfymodal-studio-viewer-row" }, [
     el("span", { class: "comfymodal-studio-viewer-row-key", text: "File" }),
@@ -1600,53 +1876,51 @@ export function buildSharedViewerOverlay(opts = {}) {
   if (record.startedAt) runLine.push(el("span", { class: "comfymodal-studio-viewer-muted", text: viewerDateText(record.startedAt) }));
   if (record.durationMs != null) runLine.push(el("span", { class: "comfymodal-studio-viewer-muted", text: viewerDurationText(record.durationMs) }));
   runLine.push(buildViewerFavoriteStar(record, persistence));
+  var deleteBtn = buildViewerDeleteButton(record, persistence,
+    typeof opts.onClose === "function" ? opts.onClose : null);
+  if (deleteBtn) runLine.push(deleteBtn);
 
+  var useAsBaseBtn = buildViewerUseAsBaseButton(record,
+    typeof opts.onUseAsBase === "function" ? opts.onUseAsBase : null,
+    typeof opts.onClose === "function" ? opts.onClose : null);
   var right = [
     buildViewerCard("Run", [el("div", { class: "comfymodal-studio-viewer-run-line" }, runLine)]),
     buildViewerCard("Run Data", [
       buildViewerPromptAccordion(prompt, negative),
       buildViewerParamsGrid(params, "preview-parameters", record),
+      useAsBaseBtn,
     ]),
   ];
+  // Core file facts. Completed is deliberately absent (Started + the Run
+  // line's duration already pin the run in time); Workflow always renders
+  // ("Not recorded" when no workflow/preset was captured).
   var metaRows = [
-    ["Run ID", record.runId || record.id],
     ["Variant", viewerFirst(opts.variant, "")],
     ["Started", viewerDateText(record.startedAt)],
-    ["Completed", viewerDateText(record.completedAt)],
-    ["Workflow", viewerFirst(record.workflow, record.preset)],
+    ["Workflow", viewerFirst(record.workflow, record.preset) || "Not recorded"],
     ["Version", record.workflowVersion],
     ["Resolution", viewerResolutionText(params, record)],
-    ["File size", viewerFileSizeText(viewerFileSizeValue(record))],
+    ["File size", viewerFileSizeText(opts.fileSize != null && opts.fileSize !== "" ? opts.fileSize : viewerFileSizeValue(record))],
     ["Format", viewerFirst(
+      opts.format,
       record.featuredOutput && record.featuredOutput.format,
       Array.isArray(record.outputs) && record.outputs[0] ? record.outputs[0].format : ""
     )],
-  ].map(function (pair) {
-    var text = viewerValueText(pair[1]);
-    return text ? el("div", { class: "comfymodal-studio-viewer-row" }, [
-      el("span", { class: "comfymodal-studio-viewer-row-key", text: pair[0] }),
-      el("span", { class: "comfymodal-studio-viewer-row-value", text: text }),
-    ]) : null;
-  });
-  var fileRow = buildViewerFileRow(record, opts.imageUrl || "");
+  ].map(buildViewerMetaRow).filter(function (row) { return row != null; });
+  var fileRow = buildViewerFileRow(record, opts.fileActions);
   if (fileRow) metaRows.push(fileRow);
-  if (Array.isArray(record.models) && record.models.length) {
-    metaRows.push(el("div", { class: "comfymodal-studio-viewer-row" }, [
-      el("span", { class: "comfymodal-studio-viewer-row-key", text: "Models" }),
-      el("span", { class: "comfymodal-studio-viewer-row-value", text: record.models.join(", ") }),
-    ]));
-  }
   if (Array.isArray(record.tags) && record.tags.length) {
-    metaRows.push(el("div", { class: "comfymodal-studio-viewer-row" }, [
-      el("span", { class: "comfymodal-studio-viewer-row-key", text: "Tags" }),
-      el("span", { class: "comfymodal-studio-viewer-row-value", text: record.tags.join(", ") }),
-    ]));
+    metaRows.push(buildViewerMetaRow(["Tags", record.tags.join(", ")]));
   }
-  // Lineage: flat rows (no sub-card) — generation/run identity, attempts,
-  // request-snapshot state.
-  buildViewerLineageRows(record).forEach(function (row) { if (row) metaRows.push(row); });
-  metaRows.push(buildViewerNoteEditor(record, persistence));
   right.push(buildViewerAccordion("Metadata", metaRows));
+
+  // Advanced: identity, provenance, replay state.
+  var advancedRows = buildViewerAdvancedRows(record);
+  if (advancedRows.length > 0) {
+    right.push(buildViewerAccordion("Advanced", advancedRows));
+  }
+
+  right.push(buildViewerAccordion("Note", [buildViewerNoteEditor(record, persistence)]));
 
   // Truthful failure chrome: a failed full-quality render with a retained
   // preview gets the documented badge under the zoom stage on both surfaces.
@@ -1655,7 +1929,7 @@ export function buildSharedViewerOverlay(opts = {}) {
     stageBadges.push(el("div", {
       class: "comfymodal-studio-viewer-badge",
       "data-testid": "viewer-render-failed-badge",
-      text: "Original failed \u2014 preview retained",
+      text: "Original failed \u2014 Data Saver retained",
     }));
   }
 

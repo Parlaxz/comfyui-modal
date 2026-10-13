@@ -89,6 +89,11 @@ from .contracts import (
 )
 
 
+def _normalize_variant(value: Any, default: str) -> str:
+    raw = str(value or default).strip().lower()
+    return "thumbnail" if raw == "thumbnail" else normalize_output_mode(raw)
+
+
 # ---------------------------------------------------------------------------
 # Structured result types
 # ---------------------------------------------------------------------------
@@ -298,7 +303,7 @@ def build_asset_descriptor_list(
     No base64 data is computed or included — this is the pure metadata path.
     """
     output_mode = normalize_output_mode(output_mode)
-    variant = str(variant or output_mode)
+    variant = _normalize_variant(variant, output_mode)
     _opt_t0 = time.monotonic_ns() if opt_diag_enabled() else None
     descriptors: list[AssetDescriptor] = []
     for item in attempt.items:
@@ -384,7 +389,7 @@ def build_derivative_descriptors(
     ``parent_identity``.  Returns plain AssetDescriptor-shaped dicts.
     """
     output_mode = normalize_output_mode(output_mode)
-    primary_variant = str(variant or output_mode)
+    primary_variant = _normalize_variant(variant, output_mode)
     derivatives: list[dict[str, Any]] = []
     for item in attempt.items:
         if not item.thumbnail_bytes:
@@ -455,7 +460,7 @@ def attempt_to_descriptor_result(
       - ``asset_descriptors`` list with full ``AssetDescriptor`` dicts
     """
     output_mode = normalize_output_mode(output_mode)
-    variant = str(variant or output_mode)
+    variant = _normalize_variant(variant, output_mode)
     descriptors = build_asset_descriptor_list(
         attempt,
         generation=generation,

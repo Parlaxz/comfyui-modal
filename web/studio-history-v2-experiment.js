@@ -121,7 +121,7 @@ export function historyCellAttemptCount(cell) {
 export function historyAttemptPurposeLabel(mode) {
   const key = mode == null ? "" : String(mode).toLowerCase();
   if (key === "original") return "Original";
-  if (key === "preview") return "Preview";
+  if (key === "preview" || key === "data_saver" || key === "data-saver" || key === "datasaver") return "Data Saver";
   return "Run";
 }
 
@@ -214,11 +214,15 @@ function _hideOnError(e) {
   e.currentTarget.style.display = "none";
 }
 
-function _previewBadge() {
+function _previewBadge(servedVariant) {
+  const key = String(servedVariant || "").toLowerCase();
+  const variant = key === "original" ? "original" : "data_saver";
+  const text = variant === "original" ? "Original" : "Data Saver";
   return el("span", {
     class: "comfymodal-studio-history-v2-badge comfymodal-studio-history-v2-preview-badge",
     "data-testid": "history-v2-preview-badge",
-    text: "Preview",
+    "data-variant": variant,
+    text: text,
   });
 }
 
@@ -890,7 +894,7 @@ export async function renderExperimentDetail(experimentId, repo, callbacks) {
               },
             }),
           ]);
-          if (asset.kind === "preview") thumb.appendChild(_previewBadge());
+          if (asset.kind === "preview" || asset.kind === "data_saver") thumb.appendChild(_previewBadge(cell.servedVariant || asset.kind));
           return thumb;
         }())
         : _cellAssetPlaceholder(asset),
@@ -1003,9 +1007,9 @@ export async function renderExperimentDetail(experimentId, repo, callbacks) {
 
     const avail = [];
     const displayed = selectDetailAsset(cell);
-    if (displayed.kind === "preview") avail.push("Preview available");
+    if (displayed.kind === "preview" || displayed.kind === "data_saver") avail.push("Data Saver available");
     else if (displayed.kind === "thumbnail") avail.push("Thumbnail available");
-    else avail.push("No preview");
+    else avail.push("No data saver");
     if (cell.originalUrl) avail.push("Original available");
     else if (cell.originalFailed) avail.push("Original failed");
     else avail.push("No original");
@@ -1028,7 +1032,7 @@ export async function renderExperimentDetail(experimentId, repo, callbacks) {
     const dlRow = el("div", { class: "comfymodal-studio-history-v2-action-row" });
     const previewDownload = buildManagedAssetDownloadButton({
       url: cell.previewUrl || cell.thumbUrl || "",
-      variant: cell.previewUrl ? "preview" : "thumbnail",
+      variant: cell.previewUrl ? "data_saver" : "thumbnail",
       className: "comfymodal-secondary-btn",
       testId: "history-v2-cell-download-" + (cell.previewUrl ? "preview" : "thumbnail") + "-" + key,
       filenameMeta: dlMeta,
@@ -1055,7 +1059,7 @@ export async function renderExperimentDetail(experimentId, repo, callbacks) {
     const cellPreviewExport = buildConfiguredExportButton({
       assetId: cell.previewAssetId,
       exportState: cell.previewExportState,
-      variant: "preview",
+      variant: "data_saver",
       className: "comfymodal-secondary-btn",
       testId: "history-v2-cell-export-preview-" + key,
       noteTestId: CELL_EXPORT_NOTE_TESTID,

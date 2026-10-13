@@ -947,6 +947,9 @@ def _default_modal_settings() -> dict:
         "preview_default": "off",
         "preview_codec": "webp",
         "preview_quality": 70,
+        "data_saver_default": "off",
+        "data_saver_codec": "webp",
+        "data_saver_quality": 70,
         # ── Phase 8: execution mode ──
         "execution_mode": MODE_V2,
         # ── F8: canonical selected GPU (persisted server authority) ──
@@ -1079,13 +1082,25 @@ _modal_settings_cache: dict | None = None
 
 
 def _normalize_preview_settings(settings: dict) -> dict:
-    if settings.get("preview_default") not in ("off", "on"):
-        settings["preview_default"] = "off"
-    if settings.get("preview_codec") != "webp":
-        settings["preview_codec"] = "webp"
-    quality = settings.get("preview_quality")
+    default = settings.get("data_saver_default", settings.get("preview_default", "off"))
+    if isinstance(default, bool):
+        default = "on" if default else "off"
+    if default not in ("off", "on"):
+        default = "off"
+    codec = settings.get("data_saver_codec", settings.get("preview_codec", "webp"))
+    if codec != "webp":
+        codec = "webp"
+    quality = settings.get("data_saver_quality", settings.get("preview_quality"))
     if isinstance(quality, bool) or not isinstance(quality, int) or not 1 <= quality <= 100:
-        settings["preview_quality"] = 70
+        quality = 70
+    # Canonical internal settings are data_saver; mirror legacy keys for old
+    # clients and existing .modal_settings.json files.
+    settings["data_saver_default"] = default
+    settings["data_saver_codec"] = codec
+    settings["data_saver_quality"] = quality
+    settings["preview_default"] = default
+    settings["preview_codec"] = codec
+    settings["preview_quality"] = quality
     return settings
 
 
@@ -1122,6 +1137,13 @@ def _load_modal_settings() -> dict:
         with open(_MODAL_SETTINGS_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
         if isinstance(saved, dict):
+            for canonical, legacy in (
+                ("data_saver_default", "preview_default"),
+                ("data_saver_codec", "preview_codec"),
+                ("data_saver_quality", "preview_quality"),
+            ):
+                if canonical not in saved and legacy in saved:
+                    saved[canonical] = saved[legacy]
             merged = dict(defaults)
             for key in defaults:
                 if key in saved and isinstance(saved[key], type(defaults[key])):
@@ -1187,6 +1209,14 @@ def _save_modal_settings(settings: dict) -> dict:
     global _modal_settings_cache
     defaults = _default_modal_settings()
     current = _load_modal_settings()
+    settings = dict(settings)
+    for canonical, legacy in (
+        ("data_saver_default", "preview_default"),
+        ("data_saver_codec", "preview_codec"),
+        ("data_saver_quality", "preview_quality"),
+    ):
+        if canonical not in settings and legacy in settings:
+            settings[canonical] = settings[legacy]
     merged = dict(defaults)
     for key in defaults:
         if key in settings and isinstance(settings[key], type(defaults[key])):
@@ -1541,13 +1571,63 @@ def _workspace_manifest() -> dict:
 
 def _save_workspace_deploy_state(workspace_id: str, version: str | None, fingerprint: str | None, deployed_at: str | None = None, deployment_command: str | None = None) -> None:
     registry = _workspace_registry()
-    registry.setdefault("deploy_state_by_workspace", {})[workspace_id] = {
+    _states = registry.setdefault("deploy_state_by_workspace", {})
+    _previous = _states.get(workspace_id)
+    _entry = {
         "comfyapp_version": version,
         "custom_nodes_fingerprint": fingerprint,
         "deployed_at": deployed_at,
         "deployment_command": deployment_command,
     }
+    # Preserve the last run's dependency status across deploy-state saves;
+    # it is only replaced by newer run evidence, never wiped by a deploy.
+    if isinstance(_previous, dict) and isinstance(_previous.get("last_dependency_status"), dict):
+        _entry["last_dependency_status"] = _previous["last_dependency_status"]
+    _states[workspace_id] = _entry
     _workspace_store.save_workspace_registry(_WORKSPACES_FILE, registry)
+
+
+def _extract_dependency_status(result: dict) -> dict | None:
+    """Find the remote dependency_status in a run result. Never raises."""
+    try:
+        if not isinstance(result, dict):
+            return None
+        _cands = [result.get("dependency_status")]
+        for _key in ("policy", "preflight"):
+            _sub = result.get(_key)
+            _cands.append(_sub.get("dependency_status") if isinstance(_sub, dict) else None)
+        for _cand in _cands:
+            if isinstance(_cand, dict) and "prepared" in _cand:
+                return _cand
+        if "dependency_prepared" in result:
+            return {
+                "prepared": bool(result.get("dependency_prepared", True)),
+                "reason": str(result.get("dependency_reason", "") or ""),
+                "cause": "", "solution": "",
+                "baked_hash": "", "current_hash": "",
+                "changed_nodes": [], "missing_in_volume": [],
+                "repair_mode": "", "checked_at_unix": time.time(),
+            }
+        return None
+    except Exception:
+        return None
+
+
+def _save_workspace_dependency_status(workspace_id: str, status: dict) -> None:
+    """Persist the last run's dependency status onto the workspace state. Never raises."""
+    try:
+        if not workspace_id or not isinstance(status, dict):
+            return
+        registry = _workspace_registry()
+        _states = registry.setdefault("deploy_state_by_workspace", {})
+        _entry = _states.get(workspace_id)
+        if not isinstance(_entry, dict):
+            _entry = {}
+            _states[workspace_id] = _entry
+        _entry["last_dependency_status"] = dict(status)
+        _workspace_store.save_workspace_registry(_WORKSPACES_FILE, registry)
+    except Exception as _e:
+        print(f"[comfyui-modal] dependency status save failed: {_e!r}")
 
 
 def _load_workspace_deploy_state(workspace_id: str) -> dict:
@@ -2566,6 +2646,7 @@ async def _execute_job(item: tuple, item_id: int):
         trace.mark("t2c_modal_call_start")
         trace.mark("client_modal_call_start", trace.get("t2c_modal_call_start") or remote_started)
         trace.mark("client_modal_submit_done", trace.get("t2c_modal_call_start") or remote_started)
+        _send(sid, "modal_status", {"prompt_id": prompt_id, "message": "Waiting for remote startup", "phase": "awaiting_remote"})
         if os.environ.get("COMFYMODAL_PREDISPATCH_DEBUG"):
             print(f"[predispatch] phase=before_gpu_spawn t={time.time()}")
 
@@ -3240,6 +3321,23 @@ async def _execute_job(item: tuple, item_id: int):
                     "direct_route": True,
                 }
 
+        # ── Dependency status: remember the last run's mismatch for Studio ──
+        # Never fail the request due to persistence.
+        try:
+            _dep_status = _extract_dependency_status(result) if isinstance(result, dict) else None
+            if _dep_status is not None:
+                _dep_ws_id = ""
+                if isinstance(_request_workspace, dict):
+                    _dep_ws_id = str(
+                        _request_workspace.get("id", "")
+                        or _request_workspace.get("workspace_id", "")
+                        or ""
+                    )
+                if _dep_ws_id:
+                    _save_workspace_dependency_status(_dep_ws_id, _dep_status)
+        except Exception as _dep_persist_exc:
+            print(f"[comfyui-modal] dependency status persist failed: {_dep_persist_exc!r}")
+
         finalized = True
 
         total_ms = round((time.time() - local_started) * 1000, 1)
@@ -3475,6 +3573,37 @@ async def _publish_custom_nodes_or_skip(
             result.setdefault("message", "Custom nodes already published; no deploy or refresh needed.")
         elif result["status"] != "ok":
             result.setdefault("message", f"Custom node publication failed: {decision.reason}")
+        if decision.action == "blocked" and decision.reason == "destructive_custom_node_publication_blocked":
+            # Surface WHICH remote files the local tree lacks so Studio can
+            # show the cause and offer an explicit replace-volume confirm.
+            # Bounded: per package first 10 paths, max 10 packages.
+            try:
+                _delta = decision.destructive_delta if isinstance(decision.destructive_delta, dict) else {}
+                _pkgs = []
+                for _entry in (_delta.get("packages") or [])[:10]:
+                    if not isinstance(_entry, dict):
+                        continue
+                    _paths = [str(p) for p in (_entry.get("missing_paths") or [])][:10]
+                    _pkgs.append({
+                        "package": str(_entry.get("package", "")),
+                        "missing_count": int(_entry.get("missing_count", 0) or 0),
+                        "missing_paths": _paths,
+                    })
+                result["publication"]["destructive"] = {
+                    "previous_generation": str(_delta.get("previous_generation", "") or "")[:32],
+                    "candidate_generation": str(_delta.get("candidate_generation", "") or "")[:32],
+                    "packages": _pkgs,
+                }
+                _total_missing = sum(p["missing_count"] for p in _pkgs)
+                _pkg_names = ", ".join(p["package"] for p in _pkgs[:5])
+                result["message"] = (
+                    "Custom node publication blocked: the local tree is missing "
+                    f"{_total_missing} file(s) present on the volume"
+                    f" ({_pkg_names}). Confirm to replace the volume contents "
+                    "with the local tree, or restore the files locally first."
+                )
+            except Exception:
+                pass
         return result
     except Exception as exc:
         return {
@@ -3648,8 +3777,14 @@ async def _run_workspace_swap_job(swap_id: str, workspace: dict, plan: dict):
 
         with _swap_jobs_lock:
             _swap_jobs[swap_id]["phase"] = "syncing_custom_nodes"
-            _swap_jobs[swap_id]["sync_message"] = "Checking custom-node publication..."
-        cn_result = await _publish_custom_nodes_or_skip(cn_root, workspace)
+            _swap_jobs[swap_id]["sync_message"] = "Publishing local custom nodes to the workspace volume (forced)..."
+        # Workspace swap always forces the volume to match the local tree:
+        # the swap target's volume may hold another tree entirely, so the
+        # destructive guard is deliberately overridden here.  Manual syncs
+        # elsewhere keep the guard unless explicitly confirmed.
+        cn_result = await _publish_custom_nodes_or_skip(
+            cn_root, workspace, allow_destructive=True
+        )
 
         if cn_result.get("status") != "ok":
             with _swap_jobs_lock:
@@ -4915,6 +5050,9 @@ if _server:
             "preview_default": settings.get("preview_default", "off"),
             "preview_codec": settings.get("preview_codec", "webp"),
             "preview_quality": settings.get("preview_quality", 70),
+            "data_saver_default": settings.get("data_saver_default", "off"),
+            "data_saver_codec": settings.get("data_saver_codec", "webp"),
+            "data_saver_quality": settings.get("data_saver_quality", 70),
             # ── H12: V2-only public execution ──
             # execution_mode is always the executable V2; the retired
             # available_execution_modes / execution_readiness engine lists
@@ -4969,6 +5107,10 @@ if _server:
             "preview_default",
             "preview_codec",
             "preview_quality",
+            "preview_enabled",
+            "data_saver_default",
+            "data_saver_codec",
+            "data_saver_quality",
         }
         _settings_update = {}
         for key in _setting_keys:
@@ -5005,10 +5147,43 @@ if _server:
                 ):
                     valid = False
                     _err_key = "preview_quality"
+            if "preview_enabled" in _settings_update and not isinstance(
+                _settings_update["preview_enabled"], bool
+            ):
+                valid = False
+                _err_key = "preview_enabled"
+            if "data_saver_default" in _settings_update:
+                _ds_default = _settings_update["data_saver_default"]
+                if _ds_default not in ("off", "on"):
+                    valid = False
+                    _err_key = "data_saver_default"
+            if "data_saver_codec" in _settings_update and _settings_update["data_saver_codec"] != "webp":
+                valid = False
+                _err_key = "data_saver_codec"
+            if "data_saver_quality" in _settings_update:
+                _ds_quality = _settings_update["data_saver_quality"]
+                if (
+                    isinstance(_ds_quality, bool)
+                    or not isinstance(_ds_quality, int)
+                    or _ds_quality < 1
+                    or _ds_quality > 100
+                ):
+                    valid = False
+                    _err_key = "data_saver_quality"
             if not valid:
                 return web.json_response(
                     {"status": "error", "message": f"invalid value for {_err_key}"}, status=400
                 )
+            if "preview_enabled" in _settings_update:
+                _settings_update["data_saver_default"] = (
+                    "on" if _settings_update["preview_enabled"] else "off"
+                )
+            if "preview_default" in _settings_update and "data_saver_default" not in _settings_update:
+                _settings_update["data_saver_default"] = _settings_update["preview_default"]
+            if "preview_codec" in _settings_update and "data_saver_codec" not in _settings_update:
+                _settings_update["data_saver_codec"] = _settings_update["preview_codec"]
+            if "preview_quality" in _settings_update and "data_saver_quality" not in _settings_update:
+                _settings_update["data_saver_quality"] = _settings_update["preview_quality"]
             _save_modal_settings(_settings_update)
 
         # ── H12: execution mode (V2 only; v1/legacy/shadow rejected) ──
@@ -5264,6 +5439,20 @@ if _server:
         synced_cn = sorted(local_cn_set & remote_cn)
         pending_cn = sorted(local_cn_set - remote_cn)
 
+        # Last run's remote dependency validation, if any.  None when no run
+        # has reported one yet.  Studio shows cause + solution + sync button
+        # whenever this exists and prepared is false.  Never fail status.
+        _dep_section = None
+        try:
+            _ws = _active_workspace() or {}
+            _ws_id = str(_ws.get("id", "") or _ws.get("workspace_id", "") or "")
+            if _ws_id:
+                _dep_section = _load_workspace_deploy_state(_ws_id).get("last_dependency_status")
+                if not isinstance(_dep_section, dict):
+                    _dep_section = None
+        except Exception:
+            _dep_section = None
+
         return web.json_response({
             "status": "ok",
             "models": {
@@ -5278,6 +5467,7 @@ if _server:
                 "synced": synced_cn,
                 "pending": pending_cn,
             },
+            "dependency": _dep_section,
         })
 
     @_server.routes.post("/comfymodal/sync/models")
@@ -5355,8 +5545,20 @@ if _server:
         if workspace is None:
             return web.json_response({"status": "error", "message": "No active workspace configured"}, status=400)
 
+        # Explicit destructive override only: replacing volume contents that
+        # the local tree lacks.  Defaults to False (fail-closed guard).
+        _allow_destructive = False
         try:
-            result = await _sync_custom_nodes_and_maybe_deploy(cn_root, workspace)
+            _body = await request.json()
+            if isinstance(_body, dict):
+                _allow_destructive = bool(_body.get("allow_destructive", False))
+        except Exception:
+            _allow_destructive = False
+
+        try:
+            result = await _sync_custom_nodes_and_maybe_deploy(
+                cn_root, workspace, allow_destructive=_allow_destructive
+            )
             publication = result.get("publication") or {}
             if result.get("status") == "ok" and publication.get("verified_publication"):
                 from remote_inventory import invalidate as _invalidate_remote_inventory
@@ -7044,6 +7246,11 @@ if _server:
     from dependency_resolver import DependencyResolver as _DependencyResolver
     _dependency_resolver = _DependencyResolver(_NODE_DIR, _COMFYUI_ROOT)
     register_workflow_routes(_server, _NODE_DIR, resolver=_dependency_resolver)
+    try:
+        from studio_sam import register_sam_routes
+        register_sam_routes(_server)
+    except Exception as _e:
+        print(f"[comfyui-modal] Studio SAM3 routes unavailable: {_e}")
     from model_library_routes import register_model_library_routes
 
     _studio_custom_node_sync_status = {}
@@ -7316,6 +7523,233 @@ if _server:
             if not ws.get(key) and dest.get(key):
                 ws[key] = dest[key]
         return ws
+    @_server.routes.post("/comfymodal/studio/batch_cancel")
+    async def studio_batch_cancel(request: web.Request) -> web.Response:
+        """Cooperative batch cancellation (best-effort).
+
+        Body: {request_id: batch id, variant_request_id?: one pending variant}.
+        Without a variant id the whole batch stops after its current variant;
+        with one, that pending variant is skipped (the caller requeues it).
+        Flags land in the shared Dict the batch generator checks BEFORE each
+        variant — never mid-variant.  A running variant always finishes.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
+
+        _cancel_batch_id = str((body or {}).get("request_id") or "").strip()
+        if not _cancel_batch_id:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error_code": "BATCH_REQUEST_ID_REQUIRED",
+                    "message": "request_id is required to cancel a batch",
+                },
+                status=400,
+            )
+        _cancel_variant_id = str((body or {}).get("variant_request_id") or "").strip()
+        try:
+            import modal as _cancel_modal
+
+            _cancel_ws = _golden_workspace() or {}
+            _cancel_token_id = str(_cancel_ws.get("token_id") or "")
+            _cancel_token_secret = str(_cancel_ws.get("token_secret") or "")
+            if not _cancel_token_id or not _cancel_token_secret:
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error_code": "GOLDEN_WORKSPACE_REQUIRED",
+                        "message": "an active Modal workspace is required to cancel a batch",
+                    },
+                    status=400,
+                )
+            _cancel_environment = str(_cancel_ws.get("environment") or "") or None
+            _cancel_client = _cancel_modal.Client.from_credentials(
+                _cancel_token_id, _cancel_token_secret
+            )
+            _cancel_dict = _cancel_modal.Dict.from_name(
+                "comfymodal-studio-batch-cancel",
+                create_if_missing=True,
+                client=_cancel_client,
+                environment_name=_cancel_environment,
+            )
+            if _cancel_variant_id:
+                _cancel_dict.put(f"batch:{_cancel_batch_id}:skip:{_cancel_variant_id}", True)
+            else:
+                _cancel_dict.put(f"batch:{_cancel_batch_id}:cancel", True)
+        except Exception as _cancel_error:
+            return web.json_response(
+                {"status": "error", "message": str(_cancel_error)[:500]},
+                status=500,
+            )
+        return web.json_response({
+            "status": "ok",
+            "request_id": _cancel_batch_id,
+            "variant_request_id": _cancel_variant_id,
+        })
+
+    @_server.routes.post("/comfymodal/studio/run_batch")
+    async def studio_run_batch(request: web.Request) -> web.Response:
+        """Execute a Studio queue batch: N control variants, ONE Modal container.
+
+        Expects JSON body:
+            profile: str — Golden profile (same dispatch as /studio/run)
+            workflow_id / workflow_version_id: str — resolved once for all variants
+            request_id: str — batch id (each variant carries its own request_id)
+            variants: [{request_id: str, controls: dict}, ...] — max 50
+            modal_options: dict
+
+        Streams NDJSON (one JSON object per line) as variants complete:
+        prep-failure entries, batch_start, one single-shaped ok/error entry
+        per variant AS EACH IMAGE LANDS, then a final batch_result summary.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
+
+        _batch_variants = (body or {}).get("variants", [])
+        if not isinstance(_batch_variants, list) or not _batch_variants:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error_code": "BATCH_VARIANTS_REQUIRED",
+                    "message": "variants must be a non-empty list",
+                },
+                status=400,
+            )
+        _batch_profile = str(
+            (body or {}).get("profile")
+            or (body or {}).get("profile_name")
+            or ""
+        ).strip()
+        if not _batch_profile:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error_code": "GOLDEN_PROFILE_REQUIRED",
+                    "message": "profile is required for a Golden Studio batch run",
+                },
+                status=400,
+            )
+        try:
+            import asyncio as _batch_asyncio
+            import json as _batch_json
+            from studio_golden_run import run_golden_workflow_batch_stream
+
+            _batch_version_id = str(
+                (body or {}).get("workflow_version_id")
+                or (body or {}).get("workflowVersionId")
+                or ""
+            ).strip()
+            if not _batch_version_id:
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error_code": "GOLDEN_WORKFLOW_REQUIRED",
+                        "message": (
+                            "workflow_version_id is required for a Golden Studio batch run"
+                        ),
+                    },
+                    status=400,
+                )
+            _batch_request_id = str(
+                (body or {}).get("request_id")
+                or (body or {}).get("requestId")
+                or ""
+            ).strip()
+            if not _batch_request_id:
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error_code": "GOLDEN_REQUEST_ID_REQUIRED",
+                        "message": "request_id is required for a Golden Studio batch run",
+                    },
+                    status=400,
+                )
+            _batch_record = _golden_deploy_record(_batch_profile)
+            if _batch_record is not None and not _batch_record.get("deployed"):
+                _batch_job = await _start_golden_deploy_job(
+                    _batch_profile, _batch_record
+                )
+                return web.json_response(
+                    {
+                        "status": "deploying",
+                        "message": (
+                            "You forgot to deploy. Deploying "
+                            + _batch_profile
+                            + " now; run again when it finishes."
+                        ),
+                        "profile": _batch_profile,
+                        "deploy": _batch_job,
+                    },
+                    status=202,
+                )
+            # One container runs the whole batch: allow a full single-run
+            # budget per variant.  Results stream as NDJSON so each image
+            # lands on the client as its variant completes, not in one
+            # huge buffered response at the end.
+            _batch_timeout = 1800.0 * max(1, len(_batch_variants))
+            _batch_response = web.StreamResponse()
+            _batch_response.content_type = "application/x-ndjson"
+            await _batch_response.prepare(request)
+
+            async def _forward_batch():
+                async for _batch_event in run_golden_workflow_batch_stream(
+                    workflow_id=str((body or {}).get("workflow_id") or ""),
+                    version_id=_batch_version_id,
+                    variants=_batch_variants,
+                    request_id=_batch_request_id,
+                    node_dir=_NODE_DIR,
+                    profile_name=_batch_profile,
+                    modal_options=(body or {}).get("modal_options"),
+                    workspace=_golden_workspace(),
+                ):
+                    await _batch_response.write(
+                        (_batch_json.dumps(_batch_event) + "\n").encode("utf-8")
+                    )
+
+            try:
+                await _batch_asyncio.wait_for(_forward_batch(), timeout=_batch_timeout)
+            except _batch_asyncio.TimeoutError:
+                # Truthful timeout: the container may keep working, but the
+                # HTTP lane stops waiting instead of hanging forever.
+                try:
+                    await _batch_response.write(
+                        (_batch_json.dumps({
+                            "status": "error",
+                            "error_code": "BATCH_TIMEOUT",
+                            "message": "batch timed out waiting for variants",
+                            "request_id": _batch_request_id,
+                        }) + "\n").encode("utf-8")
+                    )
+                except Exception:
+                    pass
+            except ConnectionResetError:
+                # Client went away mid-batch: completed variants are already
+                # durable in History.  Return the (partial) stream rather
+                # than a fresh JSON error, which aiohttp rejects once the
+                # response has been prepared.
+                try:
+                    await _batch_response.write_eof()
+                except Exception:
+                    pass
+                return _batch_response
+            except Exception as _batch_write_error:
+                _log.warning("Golden Studio batch stream write failed: %s", _batch_write_error)
+            try:
+                await _batch_response.write_eof()
+            except Exception:
+                pass
+            return _batch_response
+        except Exception as _batch_dispatch_error:
+            _log.warning("Golden Studio batch dispatch failed: %s", _batch_dispatch_error)
+            return web.json_response(
+                {"status": "error", "message": str(_batch_dispatch_error)},
+                status=500,
+            )
+
     @_server.routes.post("/comfymodal/studio/run")
     async def studio_run(request: web.Request) -> web.Response:
         """Execute a single Studio preset run.

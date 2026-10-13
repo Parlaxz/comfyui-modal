@@ -48,6 +48,7 @@ export function renderWorkspacesSection(container, apiBase, bus) {
       installingKey: null,
       swapId: null,
       progress: null,
+      workflowFilenames: null,
       installedKeys: {},
       collapsedGroups: {},
       timer: null,
@@ -713,6 +714,52 @@ export function renderWorkspacesSection(container, apiBase, bus) {
     return total ? Math.max(0, Math.min(100, (completed / total) * 100)) : 0;
   }
 
+  function addWorkflowFilename(filenames, value) {
+    if (typeof value !== "string") return;
+    const name = value.trim();
+    if (!name) return;
+    const basename = name.split(/[\\/]/).pop();
+    if (!basename) return;
+    filenames.add(name.toLowerCase());
+    filenames.add(basename.toLowerCase());
+  }
+
+  // Models missing across ALL saved workflows (latest version each), sourced
+  // from the server's own dependency resolution
+  // (latest_version_state.reasons: "missing model '<file>' (<role>)").
+  // Deliberately not the live canvas: an unloaded img2img workflow's models
+  // must still highlight. Best effort — never blocks the panel.
+  async function fetchSavedWorkflowMissingFilenames() {
+    const filenames = new Set();
+    try {
+      const res = await fetch(`${apiBase}/studio/workflows`);
+      const data = await res.json();
+      const workflows = (data && Array.isArray(data.workflows)) ? data.workflows : [];
+      workflows.forEach((wf) => {
+        const verState = wf && wf.latest_version_state;
+        const reasons = (verState && Array.isArray(verState.reasons)) ? verState.reasons : [];
+        reasons.forEach((reason) => {
+          if (typeof reason !== "string") return;
+          const m = reason.match(/missing model '([^']+)'/);
+          if (m) addWorkflowFilename(filenames, m[1]);
+        });
+      });
+    } catch { /* Saved-workflow hints must never block the panel. */ }
+    return filenames;
+  }
+
+  function workflowFilenameCount(filenames) {
+    return new Set(Array.from(filenames || []).map((name) => String(name).split(/[\\/]/).pop().toLowerCase())).size;
+  }
+
+  function refreshWorkflowFilenames() {
+    fetchSavedWorkflowMissingFilenames().then((filenames) => {
+      if (!state.manifestInstall.open) return;
+      state.manifestInstall.workflowFilenames = filenames;
+      renderManifestInstall();
+    }).catch(() => {});
+  }
+
   function closeManifestInstall() {
     state.manifestInstall.open = false;
     renderManifestInstall();
@@ -752,6 +799,15 @@ export function renderWorkspacesSection(container, apiBase, bus) {
     if (!models.length) {
       body.appendChild(el("div", { text: "No manifest models found.", style: "font-size:11px;color:#aaa;" }));
       return;
+    }
+
+    const workflowFilenames = installState.workflowFilenames;
+    if (workflowFilenames && workflowFilenames.size) {
+      body.appendChild(el("div", {
+        text: `Yellow = needed by saved workflows (${workflowFilenameCount(workflowFilenames)})`,
+        "data-testid": "backend-manifest-install-needed-hint",
+        style: "font-size:11px;color:#f5a623;margin-bottom:6px;",
+      }));
     }
 
     const groups = new Map();
@@ -798,11 +854,23 @@ export function renderWorkspacesSection(container, apiBase, bus) {
           }));
         } else {
           const installing = installState.installingKey === entry.key;
+          const filename = String(entry.model.filename || "");
+          const needed = !!(workflowFilenames && workflowFilenames.has(filename.toLowerCase()));
           const installRowBtn = el("button", {
             type: "button", text: installing ? "Installing..." : "Install",
             "data-testid": `backend-manifest-install-row-${entry.model.folder}-${entry.model.filename}`,
             style: "width:auto;padding:3px 9px;font-size:10px;white-space:nowrap;",
           });
+          if (needed) {
+            installRowBtn.title = "Needed by a saved workflow";
+            installRowBtn.dataset.needed = "true";
+            installRowBtn.style.cssText += "background:#f5a623;border:1px solid #f5a623;color:#1a1a1a;font-weight:700;";
+            info.appendChild(el("span", {
+              text: "Needed",
+              "data-testid": `backend-manifest-install-needed-${entry.model.folder}-${entry.model.filename}`,
+              style: "background:#f5a623;color:#1a1a1a;padding:1px 4px;font-size:9px;font-weight:700;white-space:nowrap;",
+            }));
+          }
           installRowBtn.disabled = state.busy || (installState.installingKey && !installing);
           installRowBtn.addEventListener("click", () => startManifestInstall(entry.model));
           info.appendChild(installRowBtn);
@@ -998,6 +1066,7 @@ export function renderWorkspacesSection(container, apiBase, bus) {
       state.manifestInstall.installedKeys = {};
       setBusy(false);
       renderManifestInstall();
+      refreshWorkflowFilenames();
       return;
     }
     state.manifestInstall.loading = false;
@@ -1018,8 +1087,10 @@ export function renderWorkspacesSection(container, apiBase, bus) {
     state.manifestInstall.loading = true;
     state.manifestInstall.data = null;
     state.manifestInstall.message = "";
+    state.manifestInstall.workflowFilenames = null;
     state.manifestInstall.installedKeys = {};
     renderManifestInstall();
+    refreshWorkflowFilenames();
     setProgress("Scanning manifest for active workspace...", "#888");
     scanManifestForInstall();
   }

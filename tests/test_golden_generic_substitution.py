@@ -1457,3 +1457,524 @@ class TestOverlapUnetTicket:
             request_id="r1", unet_ticket={"path": "x"}))
         assert out["ok"] is False
         assert out["reason"] == "unet_filenames_missing"
+
+
+class TestOverlapClipTicket:
+    """Early CLIP load ticket: launch, match, join-handoff, restore-cancel."""
+
+    @staticmethod
+    def _ctx(**kw):
+        base = {"overlap_plan": {
+            "eligible": True, "clip_node_id": "62",
+            "unet_node_id": "66", "forward_node_id": "67",
+            "deferral_allowed": True},
+            "overlap_clip_spec": {
+                "node_id": "62", "clip_name": "qwen.safetensors"},
+            "deployment_identity": {
+                "deployment_combined_hash": "dep",
+                "custom_nodes_generation": "gen"}}
+        base.update(kw)
+        return base
+
+    def test_match_ticket(self):
+        class _T:
+            def done(self):
+                return False
+
+        good = {"path": "/m/qwen.safetensors", "task": _T()}
+        assert ggl._match_clip_ticket(good, "/m/qwen.safetensors") is True
+        assert ggl._match_clip_ticket(good, "/m/other.safetensors") is False
+        # A finished ticket is accepted: joining a completed read is free
+        # (the early read winning its race is the normal case), and a
+        # failed one raises into the stage's existing fallback.
+        done = {"path": "/m/qwen.safetensors",
+                "task": type("D", (), {"done": lambda self: True})()}
+        assert ggl._match_clip_ticket(done, "/m/qwen.safetensors") is True
+        for bad in (None, [], "x", {}, {"path": "/m/qwen.safetensors"}):
+            assert ggl._match_clip_ticket(bad, "/m/qwen.safetensors") is False
+        assert ggl._match_clip_ticket(good, None) is False
+
+    def test_launch_rejections_never_raise(self):
+        assert ggl._overlap_launch_clip_load({})["started"] is False
+        assert ggl._overlap_launch_clip_load(None)["started"] is False
+        noplan = {"overlap_plan": {"eligible": False}}
+        assert ggl._overlap_launch_clip_load(noplan)["started"] is False
+        nospec = {"overlap_plan": {"eligible": True, "clip_node_id": "62"},
+                  "overlap_clip_spec": {"node_id": "62", "clip_name": None},
+                  "deployment_identity": {"deployment_combined_hash": "d",
+                                           "custom_nodes_generation": "g"}}
+        assert ggl._overlap_launch_clip_load(nospec)["started"] is False
+        assert ggl._overlap_launch_clip_load(nospec)["reason"] == "clip_filename_unresolved"
+        nodeploy = {"overlap_plan": {"eligible": True, "clip_node_id": "62"},
+                    "overlap_clip_spec": {"node_id": "62", "clip_name": "q.safetensors"}}
+        out = ggl._overlap_launch_clip_load(nodeploy)
+        assert out["started"] is False
+        assert out["reason"] == "deployment_identity_incomplete"
+
+    def test_launch_no_running_loop(self, monkeypatch):
+        active = self._ctx()
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver", lambda _f, _n: "/m/qwen.safetensors")
+        out = ggl._overlap_launch_clip_load(active)
+        assert out["started"] is False
+        assert out["reason"] == "no_running_loop"
+        assert "clip_ticket" not in active
+
+    def test_launch_starts_ticket(self, monkeypatch):
+        import sys as _sys
+        import types as _types
+
+        seen = {}
+
+        class _Transport:
+            async def load(self, path, role=None):
+                seen["path"] = path
+                seen["role"] = role
+                return {"views": "V"}
+
+        fake_mod = _types.ModuleType(
+            "comfymodal_runtime.golden_model_transport")
+        setattr(fake_mod, "get_golden_model_transport",
+                lambda: _Transport())
+        monkeypatch.setitem(
+            _sys.modules,
+            "comfymodal_runtime.golden_model_transport", fake_mod)
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver", lambda _f, _n: "/m/qwen.safetensors")
+        active = self._ctx()
+
+        async def _drive():
+            return ggl._overlap_launch_clip_load(active)
+
+        out = asyncio.run(_drive())
+        assert out["started"] is True
+        ticket = active.get("clip_ticket")
+        assert isinstance(ticket, dict)
+        assert ticket["path"] == "/m/qwen.safetensors"
+
+        async def _join():
+            return await ticket["task"]
+
+        assert asyncio.run(_join()) == {"views": "V"}
+        assert seen == {"path": "/m/qwen.safetensors", "role": "clip"}
+        # Second launch refuses (ticket exists).
+        out2 = asyncio.run(_drive())
+        assert out2["started"] is False
+        assert out2["reason"] == "ticket_already_exists"
+
+    def test_launch_transport_unavailable(self, monkeypatch):
+        import sys as _sys
+        import types as _types
+
+        fake_mod = _types.ModuleType(
+            "comfymodal_runtime.golden_model_transport")
+        setattr(fake_mod, "get_golden_model_transport", lambda: None)
+        monkeypatch.setitem(
+            _sys.modules,
+            "comfymodal_runtime.golden_model_transport", fake_mod)
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver", lambda _f, _n: "/m/qwen.safetensors")
+        active = self._ctx()
+
+        async def _drive():
+            return ggl._overlap_launch_clip_load(active)
+
+        out = asyncio.run(_drive())
+        assert out["started"] is False
+        assert out["reason"] == "transport_unavailable"
+
+    def test_install_launches_clip_ticket(self, monkeypatch):
+        import sys as _sys
+        import types as _types
+
+        calls = []
+        _install_fake_execution(monkeypatch, calls)
+        monkeypatch.setenv("COMFYMODAL_V2_GENERIC_OVERLAP", "1")
+
+        seen = {}
+
+        class _Transport:
+            async def load(self, path, role=None):
+                seen["path"] = path
+                seen["role"] = role
+                return {"views": "V"}
+
+        fake_mod = _types.ModuleType(
+            "comfymodal_runtime.golden_model_transport")
+        setattr(fake_mod, "get_golden_model_transport",
+                lambda: _Transport())
+        monkeypatch.setitem(
+            _sys.modules,
+            "comfymodal_runtime.golden_model_transport", fake_mod)
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver",
+            lambda _f, _n: "/m/qwen.safetensors")
+        wf = TestGenericOverlapPlan._zit_workflow()
+        sink = []
+        restore = None
+        try:
+
+            async def _drive():
+                return ggl.install_execution_dispatch_substitution(
+                    role_bindings=TestGenericOverlapPlan._zit_bindings(),
+                    holder=ggl.GenericLoaderHolder(),
+                    trace_emit=(lambda name, **kw: sink.append(
+                        (name, kw.get("metadata", {})))),
+                    request_id="r1",
+                    workflow=wf,
+                    deployment_identity={
+                        "deployment_combined_hash": "dep",
+                        "custom_nodes_generation": "gen"},
+                )
+
+            restore = asyncio.run(_drive())
+            assert restore is not None
+            stored = ggl._ACTIVE_DISPATCH_CTX
+            assert stored is not None
+            assert stored["overlap_clip_spec"]["clip_name"] == "qwen.safetensors"
+            ticket = stored.get("clip_ticket")
+            assert isinstance(ticket, dict)
+            assert ticket["path"] == "/m/qwen.safetensors"
+            assert seen == {"path": "/m/qwen.safetensors", "role": "clip"}
+            launches = [n for n, _m in sink if n == "generic_overlap_clip_launch"]
+            assert launches
+            restore()
+        finally:
+            monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP",
+                               raising=False)
+
+    def test_install_without_deployment_identity_launches_nothing(self, monkeypatch):
+        calls = []
+        _install_fake_execution(monkeypatch, calls)
+        monkeypatch.setenv("COMFYMODAL_V2_GENERIC_OVERLAP", "1")
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver",
+            lambda _f, _n: (_ for _ in ()).throw(AssertionError("must not resolve")))
+        wf = TestGenericOverlapPlan._zit_workflow()
+        sink = []
+        restore = None
+        try:
+
+            async def _drive():
+                return ggl.install_execution_dispatch_substitution(
+                    role_bindings=TestGenericOverlapPlan._zit_bindings(),
+                    holder=ggl.GenericLoaderHolder(),
+                    trace_emit=(lambda name, **kw: sink.append(
+                        (name, kw.get("metadata", {})))),
+                    request_id="r1",
+                    workflow=wf,
+                )
+
+            restore = asyncio.run(_drive())
+            assert restore is not None
+            stored = ggl._ACTIVE_DISPATCH_CTX
+            assert stored is not None
+            assert "clip_ticket" not in stored
+            restore()
+        finally:
+            monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP",
+                               raising=False)
+
+    def test_restore_cancels_pending_clip_ticket(self, monkeypatch):
+        calls = []
+        _install_fake_execution(monkeypatch, calls)
+        monkeypatch.setenv("COMFYMODAL_V2_GENERIC_OVERLAP", "1")
+        wf = TestGenericOverlapPlan._zit_workflow()
+        sink = []
+        restore = None
+        try:
+            restore = ggl.install_execution_dispatch_substitution(
+                role_bindings=TestGenericOverlapPlan._zit_bindings(),
+                holder=ggl.GenericLoaderHolder(),
+                trace_emit=(lambda name, **kw: sink.append(
+                    (name, kw.get("metadata", {})))),
+                request_id="r1",
+                workflow=wf,
+            )
+            assert restore is not None
+            log = []
+
+            class _Task:
+                def done(self):
+                    return False
+
+                def cancel(self):
+                    log.append("cancelled")
+
+            stored = ggl._ACTIVE_DISPATCH_CTX
+            assert stored is not None
+            stored["clip_ticket"] = {"path": "/m/qwen.safetensors",
+                                      "task": _Task()}
+            restore()
+            assert log == ["cancelled"]
+        finally:
+            monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP",
+                               raising=False)
+
+
+class TestOverlapVaeTicket:
+    """Early VAE load ticket: launch at sampler dispatch, match, cancel."""
+
+    @staticmethod
+    def _ctx(**kw):
+        base = {"overlap_plan": {
+            "eligible": True, "clip_node_id": "62",
+            "unet_node_id": "66", "forward_node_id": "67",
+            "deferral_allowed": True},
+            "overlap_vae_spec": {
+                "node_id": "1277", "vae_name": "ae.safetensors"},
+            "deployment_identity": {
+                "deployment_combined_hash": "dep",
+                "custom_nodes_generation": "gen"}}
+        base.update(kw)
+        return base
+
+    @staticmethod
+    def _sampler(obj_name="ClownsharKSampler_Beta"):
+        return type(obj_name, (), {})(), {"model": ["66", 0]}
+
+    def test_match_ticket(self):
+        class _T:
+            def done(self):
+                return False
+
+        good = {"path": "/m/ae.safetensors", "task": _T()}
+        assert ggl._match_vae_ticket(good, "/m/ae.safetensors") is True
+        assert ggl._match_vae_ticket(good, "/m/other.safetensors") is False
+        # A finished ticket is accepted: joining a completed read is free
+        # (the read winning the sampling race is the normal case), and a
+        # failed one raises into the stage's existing fallback.
+        done = {"path": "/m/ae.safetensors",
+                "task": type("D", (), {"done": lambda self: True})()}
+        assert ggl._match_vae_ticket(done, "/m/ae.safetensors") is True
+        for bad in (None, [], "x", {}, {"path": "/m/ae.safetensors"}):
+            assert ggl._match_vae_ticket(bad, "/m/ae.safetensors") is False
+        assert ggl._match_vae_ticket(good, None) is False
+
+    def test_launch_rejections_never_raise(self):
+        assert ggl._overlap_launch_vae_load({})["started"] is False
+        assert ggl._overlap_launch_vae_load(None)["started"] is False
+        noplan = {"overlap_plan": {"eligible": False}}
+        assert ggl._overlap_launch_vae_load(noplan)["started"] is False
+        nospec = {"overlap_plan": {"eligible": True},
+                  "overlap_vae_spec": {"node_id": "1277", "vae_name": None},
+                  "deployment_identity": {"deployment_combined_hash": "d",
+                                           "custom_nodes_generation": "g"}}
+        out = ggl._overlap_launch_vae_load(nospec)
+        assert out["started"] is False
+        assert out["reason"] == "vae_filename_unresolved"
+        nodeploy = {"overlap_plan": {"eligible": True},
+                    "overlap_vae_spec": {"node_id": "1277",
+                                         "vae_name": "ae.safetensors"}}
+        out2 = ggl._overlap_launch_vae_load(nodeploy)
+        assert out2["started"] is False
+        assert out2["reason"] == "deployment_identity_incomplete"
+
+    def test_launch_no_running_loop(self, monkeypatch):
+        active = self._ctx()
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver", lambda _f, _n: "/m/ae.safetensors")
+        out = ggl._overlap_launch_vae_load(active)
+        assert out["started"] is False
+        assert out["reason"] == "no_running_loop"
+        assert "vae_ticket" not in active
+
+    def test_launch_starts_ticket_with_stage_identical_call(self, monkeypatch):
+        import sys as _sys
+        import types as _types
+
+        seen = {}
+
+        class _Transport:
+            async def load(self, path, role=None):
+                seen["path"] = path
+                seen["role"] = role
+                return {"views": "V"}
+
+        fake_mod = _types.ModuleType(
+            "comfymodal_runtime.golden_model_transport")
+        setattr(fake_mod, "get_golden_model_transport",
+                lambda: _Transport())
+        monkeypatch.setitem(
+            _sys.modules,
+            "comfymodal_runtime.golden_model_transport", fake_mod)
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver", lambda _f, _n: "/m/ae.safetensors")
+        active = self._ctx()
+
+        async def _drive():
+            return ggl._overlap_launch_vae_load(active)
+
+        out = asyncio.run(_drive())
+        assert out["started"] is True
+        ticket = active.get("vae_ticket")
+        assert isinstance(ticket, dict)
+        assert ticket["path"] == "/m/ae.safetensors"
+
+        async def _join():
+            return await ticket["task"]
+
+        assert asyncio.run(_join()) == {"views": "V"}
+        # Identical to golden_vae_load's own call (no role override).
+        assert seen == {"path": "/m/ae.safetensors", "role": None}
+        out2 = asyncio.run(_drive())
+        assert out2["started"] is False
+        assert out2["reason"] == "ticket_already_exists"
+
+    def test_launch_transport_unavailable(self, monkeypatch):
+        import sys as _sys
+        import types as _types
+
+        fake_mod = _types.ModuleType(
+            "comfymodal_runtime.golden_model_transport")
+        setattr(fake_mod, "get_golden_model_transport", lambda: None)
+        monkeypatch.setitem(
+            _sys.modules,
+            "comfymodal_runtime.golden_model_transport", fake_mod)
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver", lambda _f, _n: "/m/ae.safetensors")
+        active = self._ctx()
+
+        async def _drive():
+            return ggl._overlap_launch_vae_load(active)
+
+        out = asyncio.run(_drive())
+        assert out["started"] is False
+        assert out["reason"] == "transport_unavailable"
+
+    def test_maybe_launch_fires_only_on_sampler(self):
+        obj, inputs = self._sampler()
+        out = ggl._overlap_maybe_launch_vae_on_dispatch(
+            {"overlap_plan": {"eligible": False}}, obj, inputs)
+        assert isinstance(out, dict) and out["started"] is False
+
+        _loader = type("CLIPLoader", (), {})()
+        assert ggl._overlap_maybe_launch_vae_on_dispatch(
+            self._ctx(), _loader, {"clip_name": ["q.safetensors"]}) is None
+        noctx = ggl._overlap_maybe_launch_vae_on_dispatch(None, obj, inputs)
+        assert isinstance(noctx, dict) and noctx["started"] is False
+
+    def test_maybe_launch_skips_already_dispatched_vae(self):
+        # Early-VAE workflows dispatch the VAE node before the sampler:
+        # launching then would only burn a read that teardown cancels.
+        obj, inputs = self._sampler()
+        active = self._ctx()
+        active["dispatched_nodes"] = {"62", "1277", "66"}
+        out = ggl._overlap_maybe_launch_vae_on_dispatch(active, obj, inputs)
+        assert isinstance(out, dict)
+        assert out["started"] is False
+        assert out["reason"] == "vae_already_dispatched"
+        assert "vae_ticket" not in active
+
+    def test_launch_refuses_while_unet_inflight(self):
+        # The shared transport serves a single generation at a time:
+        # a pending UNET read blocks the VAE launch (fail closed, the
+        # VAE stage reads synchronously as before).
+        class _Pending:
+            def done(self):
+                return False
+
+        active = self._ctx()
+        active["unet_ticket"] = {"path": "/m/z.safetensors", "task": _Pending()}
+        out = ggl._overlap_launch_vae_load(active)
+        assert out["started"] is False
+        assert out["reason"] == "transport_busy_unet_inflight"
+        assert "vae_ticket" not in active
+
+    def test_launch_proceeds_once_unet_done(self, monkeypatch):
+        import sys as _sys
+        import types as _types
+
+        class _Done:
+            def done(self):
+                return True
+
+        fake_mod = _types.ModuleType(
+            "comfymodal_runtime.golden_model_transport")
+        setattr(fake_mod, "get_golden_model_transport", lambda: None)
+        monkeypatch.setitem(
+            _sys.modules,
+            "comfymodal_runtime.golden_model_transport", fake_mod)
+        monkeypatch.setattr(
+            ggl, "_default_path_resolver", lambda _f, _n: "/m/ae.safetensors")
+        active = self._ctx()
+        active["unet_ticket"] = {"path": "/m/z.safetensors", "task": _Done()}
+
+        async def _drive():
+            return ggl._overlap_launch_vae_load(active)
+
+        import asyncio as _asyncio
+        out = _asyncio.run(_drive())
+        # Done UNET task: gate passes, launch continues to transport
+        # resolution (unavailable here) instead of refusing as busy.
+        assert out["started"] is False
+        assert out["reason"] == "transport_unavailable"
+
+    def test_install_builds_vae_spec(self, monkeypatch):
+        calls = []
+        _install_fake_execution(monkeypatch, calls)
+        monkeypatch.setenv("COMFYMODAL_V2_GENERIC_OVERLAP", "1")
+        wf = TestGenericOverlapPlan._zit_workflow(extra={
+            "1277": {"class_type": "VAELoader",
+                     "inputs": {"vae_name": "ae.safetensors"}}})
+        bindings = dict(TestGenericOverlapPlan._zit_bindings())
+        bindings["vae"] = {"node_id": "1277", "input_name": "vae_name"}
+        sink = []
+        restore = None
+        try:
+            restore = ggl.install_execution_dispatch_substitution(
+                role_bindings=bindings,
+                holder=ggl.GenericLoaderHolder(),
+                trace_emit=(lambda name, **kw: sink.append(
+                    (name, kw.get("metadata", {})))),
+                request_id="r1",
+                workflow=wf,
+                deployment_identity={
+                    "deployment_combined_hash": "dep",
+                    "custom_nodes_generation": "gen"},
+            )
+            assert restore is not None
+            stored = ggl._ACTIVE_DISPATCH_CTX
+            assert stored is not None
+            assert stored["overlap_vae_spec"] == {
+                "node_id": "1277", "vae_name": "ae.safetensors"}
+            restore()
+        finally:
+            monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP",
+                               raising=False)
+
+    def test_restore_cancels_pending_vae_ticket(self, monkeypatch):
+        calls = []
+        _install_fake_execution(monkeypatch, calls)
+        monkeypatch.setenv("COMFYMODAL_V2_GENERIC_OVERLAP", "1")
+        wf = TestGenericOverlapPlan._zit_workflow()
+        sink = []
+        restore = None
+        try:
+            restore = ggl.install_execution_dispatch_substitution(
+                role_bindings=TestGenericOverlapPlan._zit_bindings(),
+                holder=ggl.GenericLoaderHolder(),
+                trace_emit=(lambda name, **kw: sink.append(
+                    (name, kw.get("metadata", {})))),
+                request_id="r1",
+                workflow=wf,
+            )
+            assert restore is not None
+            log = []
+
+            class _Task:
+                def done(self):
+                    return False
+
+                def cancel(self):
+                    log.append("cancelled")
+
+            stored = ggl._ACTIVE_DISPATCH_CTX
+            assert stored is not None
+            stored["vae_ticket"] = {"path": "/m/ae.safetensors",
+                                    "task": _Task()}
+            restore()
+            assert log == ["cancelled"]
+        finally:
+            monkeypatch.delenv("COMFYMODAL_V2_GENERIC_OVERLAP",
+                               raising=False)

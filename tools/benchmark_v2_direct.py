@@ -10497,6 +10497,13 @@ def _golden_p1_positive_durability_claimed(value: Any) -> bool:
                     return True
             for key, child in current.items():
                 normalized = str(key).strip().lower().replace("-", "_")
+                if normalized == "byte_sidecar":
+                    # Wire-transport receipt (harness bytes externalization,
+                    # SHA/length already matched): skip the whole subtree —
+                    # it is never generated-output durability evidence, and
+                    # its "sidecar" naming would otherwise trip the off-mode
+                    # gate on the harness's own receipt.
+                    continue
                 child_context = context + (normalized,)
                 if _durability_context_is_distinct_publication(child_context):
                     continue
@@ -10561,6 +10568,7 @@ def _golden_p1_request_payload(
     source_launch_gap_ns: int | str | None = None,
     microscope_mode: str | None = None,
     qd_mode: str | None = None,
+    result_transport: str | None = None,
 ) -> dict[str, Any]:
     """Compatibility wrapper for the dependency-free payload builder."""
     from tools.v2_control.golden_payload import _golden_p1_request_payload as build
@@ -10579,6 +10587,7 @@ def _golden_p1_request_payload(
         source_launch_gap_ns=source_launch_gap_ns,
         microscope_mode=microscope_mode,
         qd_mode=qd_mode,
+        result_transport=result_transport,
     )
 
 
@@ -10816,6 +10825,137 @@ def _golden_p1_extract_telemetry(events: list[Any]) -> dict[str, Any] | None:
             telemetry = candidate.get("golden_telemetry")
             if isinstance(telemetry, dict):
                 return telemetry
+    return None
+
+
+def _golden_p1_externalize_result_bytes(
+    events: list[Any], cohort_dir: Any, events_file: str
+) -> tuple[dict[str, Any], str | None]:
+    """Move terminal-result raw PNG bytes into a sidecar file.
+
+    In ``bytes`` result transport the terminal event carries
+    ``images[].raw_bytes`` as real bytes, which ``json.dumps`` cannot
+    preserve (``default=str`` would store a useless repr).  Each entry is
+    written to an invocation-bound ``attempt_<i>.png`` sidecar, verified
+    against its own SHA256/length metadata, and replaced in place by an
+    explicit reference.  Returns (sidecar_info, error); error is None on
+    success, including when no raw bytes are present (base64 mode).
+    """
+    import hashlib
+
+    sidecars: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        images = data.get("images")
+        if not isinstance(images, list):
+            continue
+        for pos, entry in enumerate(images):
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("raw_bytes")
+            if raw is None:
+                continue
+            if not isinstance(raw, (bytes, bytearray)):
+                return (
+                    {"sidecars": sidecars},
+                    f"result raw_bytes malformed: images[{pos}] has "
+                    f"{type(raw).__name__}, not bytes",
+                )
+            raw = bytes(raw)
+            expected_sha = str(
+                entry.get("identity", "") or ""
+            ).removeprefix("sha256:").strip() or str(
+                entry.get("asset_id", "") or ""
+            ).strip()
+            expected_len = entry.get("byte_count")
+            stem = str(events_file)
+            if stem.endswith(".json"):
+                stem = stem[: -len(".json")]
+            if stem.endswith("_events"):
+                stem = stem[: -len("_events")]
+            name = f"{stem}.png" if len(images) == 1 else f"{stem}_{pos}.png"
+            observed_sha = hashlib.sha256(raw).hexdigest()
+            if (expected_sha and observed_sha != expected_sha) or (
+                isinstance(expected_len, int)
+                and not isinstance(expected_len, bool)
+                and len(raw) != expected_len
+            ):
+                bad_name = name + ".mismatch"
+                try:
+                    (cohort_dir / bad_name).write_bytes(raw)
+                except OSError:
+                    pass
+                return (
+                    {"sidecars": sidecars},
+                    f"result sidecar receipt mismatch: images[{pos}] observed "
+                    f"sha={observed_sha[:16]} len={len(raw)} "
+                    f"expected sha={expected_sha[:16]} len={expected_len}",
+                )
+            try:
+                (cohort_dir / name).write_bytes(raw)
+            except OSError as exc:
+                return (
+                    {"sidecars": sidecars},
+                    f"result sidecar write failed: {name}: {exc}"[:300],
+                )
+            entry.pop("raw_bytes", None)
+            entry["byte_sidecar"] = {
+                "sidecar_file": name,
+                "sidecar_sha256": observed_sha,
+                "sidecar_byte_count": len(raw),
+            }
+            sidecars.append(entry["byte_sidecar"])
+    return {"sidecars": sidecars}, None
+
+
+def _golden_p1_check_result_transport_shape(
+    terminal_event: Any, expected_transport: str
+) -> str | None:
+    """Fail-closed shape check: the actual image representation must match.
+
+    ``bytes`` requires non-empty ``raw_bytes`` with empty ``data``;
+    ``base64`` requires non-empty string ``data`` with no raw bytes.
+    Strict/durable results carry no inline image and are not checked here.
+    Returns an error string or None.
+    """
+    if not isinstance(terminal_event, dict):
+        return None
+    data = terminal_event.get("data")
+    if not isinstance(data, dict):
+        return None
+    if str(data.get("output_durability_mode", "off")).strip().lower() == "strict":
+        return None
+    images = data.get("images")
+    if not images:
+        return None
+    entry = images[0] if isinstance(images, list) else None
+    if not isinstance(entry, dict):
+        return "result images[0] malformed"
+    raw = entry.get("raw_bytes")
+    b64 = entry.get("data")
+    if expected_transport == "bytes":
+        if isinstance(raw, (bytes, bytearray)) and raw:
+            if b64 not in ("", None):
+                return "result transport mismatch: bytes mode must not carry base64 data"
+            return None
+        # Post-externalization form: verified sidecar receipt stands in for
+        # the bytes (the extractor only records it after SHA/length match).
+        sidecar = entry.get("byte_sidecar")
+        if (
+            isinstance(sidecar, dict)
+            and sidecar.get("sidecar_sha256")
+            and sidecar.get("sidecar_byte_count")
+        ):
+            return None
+        return "result transport mismatch: expected raw bytes, none received"
+    if not isinstance(b64, str) or not b64:
+        return "result transport mismatch: expected base64 data, none received"
+    if raw not in (None, b"", ""):
+        return "result transport mismatch: base64 mode must not carry raw bytes"
     return None
 
 
@@ -11920,6 +12060,34 @@ async def _run_golden_p1(
                 "valid": paired,
                 "evidence": pairing_evidence,
             }
+            # Bytes transport carries real bytes the events JSON cannot hold:
+            # externalize to a verified PNG sidecar before persisting.
+            sidecar_info, sidecar_error = _golden_p1_externalize_result_bytes(
+                events, cohort_dir, artifact["events_file"]
+            )
+            artifact["result_bytes_sidecar"] = sidecar_info
+            # Expected wire representation for this attempt.  Strict durability
+            # never uses the inline image path, so it expects the descriptor.
+            requested_transport = str(
+                os.environ.get("COMFYMODAL_GOLDEN_RESULT_TRANSPORT") or "bytes"
+            ).strip().lower()
+            if requested_transport not in {"bytes", "base64"}:
+                raise ValueError("golden_result_transport_invalid")
+            if (
+                str(os.environ.get("COMFYMODAL_OUTPUT_DURABILITY") or "")
+                .strip()
+                .lower()
+                == "strict"
+            ):
+                expected_transport = "descriptor"
+            else:
+                expected_transport = requested_transport
+            artifact["result_transport_requested"] = requested_transport
+            artifact["result_transport_expected"] = expected_transport
+            merged_expected_flags = dict(expected_flags or {})
+            merged_expected_flags.setdefault(
+                "COMFYMODAL_GOLDEN_RESULT_TRANSPORT", expected_transport
+            )
             (cohort_dir / artifact["events_file"]).write_text(
                 json.dumps(events, default=str, indent=2), encoding="utf-8"
             )
@@ -11927,7 +12095,7 @@ async def _run_golden_p1(
             valid, failures, details = _golden_p1_validate_attempt(
                 scan,
                 expected_output_sha=expected_output_sha,
-                expected_flags=expected_flags,
+                expected_flags=merged_expected_flags,
                 require_seriality=not parallel,
             )
             artifact["validation"] = details
@@ -11954,6 +12122,24 @@ async def _run_golden_p1(
                 for _i, ident in scan["identities"]:
                     identity.update(ident)
             artifact["identity"] = identity
+            # Fail-closed shape + sidecar receipt: the actual representation
+            # must match the expected transport, and sidecar extraction must
+            # have verified SHA/length before the events file was written.
+            if sidecar_error:
+                failures.append(sidecar_error)
+                valid = False
+            shape_error = _golden_p1_check_result_transport_shape(
+                terminal_event, expected_transport
+            )
+            if shape_error:
+                failures.append(shape_error)
+                valid = False
+            terminal_transport_effective = None
+            if terminal_event is not None:
+                terminal_transport_effective = (terminal_event.get("data") or {}).get(
+                    "result_transport"
+                ) if isinstance(terminal_event.get("data"), dict) else None
+            artifact["result_transport_effective"] = terminal_transport_effective
             terminal_identity: dict[str, Any] = {}
             if terminal_event is not None:
                 terminal_data = terminal_event.get("data")

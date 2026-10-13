@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import threading
 import time
+import json
 from typing import Any, Iterable, Mapping
 
 from .env import env_flag
@@ -110,6 +111,35 @@ def gantt_enabled() -> bool:
 
 def lane_for(name: str) -> str:
     return _NAME_LANE_DEFAULTS.get(name, "MAIN")
+
+
+def publish_studio_span(trace: Any, name: str, start_ns: int, end_ns: int | None = None) -> None:
+    if trace is None or not getattr(trace, "_metadata", {}).get("studio_progress"):
+        return
+    try:
+        print("[v2.studio_span] " + json.dumps({
+            "type": "gantt_span", "request_id": trace.request_id,
+            "span_id": f"{name}:{start_ns}", "name": name,
+            "phase": "started" if end_ns is None else "completed",
+            "entry_monotonic_ns": start_ns, "end_monotonic_ns": end_ns,
+        }, separators=(",", ":")), flush=True)
+    except Exception:
+        pass
+
+
+def publish_studio_trace_event(trace: Any, event: Any) -> None:
+    try:
+        starts = getattr(trace, "_studio_span_starts", None)
+        if starts is None:
+            starts = trace._studio_span_starts = {}
+        for key, (begin, end, label, _lane) in _TRACE_EVENT_SPANS.items():
+            if event.name == begin:
+                starts[key] = event.monotonic_ns
+                publish_studio_span(trace, label, event.monotonic_ns)
+            elif event.name == end and key in starts:
+                publish_studio_span(trace, label, starts.pop(key), event.monotonic_ns)
+    except Exception:
+        pass
 
 
 # ── In-memory span registry (thread-safe, bounded) ────────────────────────

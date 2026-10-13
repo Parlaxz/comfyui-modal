@@ -700,6 +700,17 @@ class SettingsAndConcurrencyTests(ExportRouteTestBase):
         self.assertEqual(sidecar["output_index"], 0)
         self.assertEqual(sidecar["asset_id"], asset.asset_id)
 
+    async def test_long_workflow_names_stay_short(self):
+        gen = self._gen(preset_id="preset_gen", preset_name="Gen Preset")
+        self._snapshot(gen.generation_id, name="A Very Long Workflow Name That Goes On And On Beyond Reason " * 3)
+        attempt = self._completed_attempt(gen.generation_id, "preview")
+        asset, _ = self._attach_local(gen.generation_id, attempt.run_id)
+        status, body = await self._export(asset.asset_id)
+        self.assertEqual(status, 200, body)
+        filename = Path(body["destination_path"]).name
+        self.assertIn("seed-4242", filename)
+        self.assertLessEqual(len(filename), 80, filename)
+
     async def test_bodyless_route_ignores_client_supplied_identity(self):
         gen = self._gen()
         self._snapshot(gen.generation_id)

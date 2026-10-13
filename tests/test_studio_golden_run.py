@@ -14,6 +14,61 @@ from tools.v2_control import profile_catalog
 pytestmark = pytest.mark.fast_unit
 
 
+def test_modal_snapshot_lifecycle_uses_startup_boundaries_not_teardown():
+    phase = studio_golden_run._modal_lifecycle_phase
+    assert phase("[v2.startup_stage] stage=snapshot_startup_callback event=return status=ready") == "snapshot_capturing"
+    assert phase("Snapshot created. Restoring Function from memory snapshot.") == "restoring"
+    assert phase("", "TASK_STATE_QUEUED") == "scheduling"
+    assert phase("[v2.golden.progress] stage=golden_teardown") is None
+
+
+def test_studio_span_log_bridge_filters_foreign_requests_and_malformed_lines():
+    text = '\n'.join([
+        '[v2.studio_span] {"type":"gantt_span","request_id":"ours","span_id":"clip","phase":"started"}',
+        '[v2.studio_span] {"type":"gantt_span","request_id":"other","phase":"started"}',
+        '[v2.studio_span] broken json',
+    ])
+    events = studio_golden_run._studio_span_events(text, "ours")
+    assert [event["span_id"] for event in events] == ["clip"]
+
+
+@pytest.mark.asyncio
+async def test_modal_lifecycle_ignores_old_logs_and_reports_ambiguous_tasks(monkeypatch):
+    from modal.client import _Client
+    from modal.cli import app as modal_app_cli
+
+    store = GoldenStageEventStore()
+    store.start("lifecycle-test")
+    async def batches(query):
+        assert query.function_id == "fu-test"
+        for task, stamp in [("ta-old", 9), ("ta-one", 11), ("ta-two", 12)]:
+            yield SimpleNamespace(
+                entry_id=str(stamp), app_done=False, task_id=task,
+                items=[SimpleNamespace(timestamp=stamp, task_state=0,
+                    data="[v2.lifecycle] method=startup snap=True status=ready")],
+            )
+        yield SimpleNamespace(entry_id="done", app_done=True, items=[])
+    client = SimpleNamespace(stub=SimpleNamespace(AppGetLogs=SimpleNamespace(unary_stream=batches)))
+    async def credentials(*args):
+        return client
+    async def resolve(*args):
+        return "ap-test", "", None
+    async def hydrate():
+        pass
+    monkeypatch.setattr(_Client, "from_credentials", credentials)
+    monkeypatch.setattr(modal_app_cli, "resolve_app_identifier", resolve)
+    method = SimpleNamespace(object_id="fu-test", hydrate=SimpleNamespace(aio=hydrate))
+    await studio_golden_run._observe_modal_lifecycle(
+        SimpleNamespace(target={"app": "test-app"}),
+        {"token_id": "test", "token_secret": "test"}, method,
+        "lifecycle-test", store, 10,
+    )
+    events = store.read("lifecycle-test")["events"]
+    assert [(event["phase"], event["task_id"]) for event in events] == [
+        ("snapshot_capturing", "ta-one"), ("lifecycle_unknown", "ta-two"),
+    ]
+
+
 def test_stage_store_cursor_is_idempotent_and_bounded() -> None:
     store = GoldenStageEventStore(max_events=2, max_runs=1, ttl_seconds=60)
     store.start("studio-1")
@@ -260,6 +315,92 @@ async def test_selected_workflow_controls_reach_configured_golden_method(monkeyp
     assert store.read("studio-test")["terminal"] is True
 
 
+def test_materialize_image_uses_date_names(monkeypatch, tmp_path) -> None:
+    import base64
+    import re
+    from datetime import datetime
+
+    import local_artifacts
+
+    monkeypatch.setattr(
+        local_artifacts, "get_studio_outputs_dir", lambda: tmp_path / "outputs"
+    )
+    raw = b"fakepng-bytes"
+    result = {
+        "images": [{
+            "asset_id": "815df67881e0b8cd",
+            "byte_count": len(raw),
+            "data": base64.b64encode(raw).decode("ascii"),
+        }],
+    }
+    materialized = studio_golden_run._materialize_image(
+        result, "de521c37-fae8-4f97-8ceb-4ed539187d20"
+    )
+    names = materialized["output_paths"]
+    assert len(names) == 1
+    assert re.fullmatch(r"golden_\d{4}-\d{2}-\d{2}_\d{6}(_\d+)?.png", names[0]), names[0]
+    assert len(names[0]) <= 32, names[0]
+    assert (tmp_path / "outputs" / names[0]).read_bytes() == raw
+    assert "data" not in materialized["images"][0]
+
+
+def test_materialized_names_disambiguate_same_second_collisions(tmp_path) -> None:
+    from datetime import datetime
+
+    out_dir = tmp_path / "outputs"
+    out_dir.mkdir()
+    now = datetime(2026, 10, 12, 15, 30, 22)
+    first = studio_golden_run._materialized_image_name(out_dir, now=now)
+    assert first == "golden_2026-10-12_153022.png"
+    (out_dir / first).write_bytes(b"x")
+    second = studio_golden_run._materialized_image_name(out_dir, now=now)
+    assert second == "golden_2026-10-12_153022_1.png"
+
+
+def test_sniff_image_extension_reads_magic_bytes() -> None:
+    sniff = studio_golden_run._sniff_image_extension
+    assert sniff(bytes.fromhex("89504e470d0a1a0a") + b"\x00" * 8) == "png"
+    assert sniff(b"RIFF\x00\x00\x00\x00WEBP") == "webp"
+    assert sniff(b"\xff\xd8\xff\xe0" + b"\x00" * 8) == "jpg"
+    assert sniff(b"GIF89a" + b"\x00" * 8) == "gif"
+    assert sniff(b"BM" + b"\x00" * 10) == "bmp"
+    assert sniff(b"not-an-image-at-all!") is None
+    assert sniff(b"short") is None
+    assert sniff(None) is None
+
+
+def test_materialize_image_names_by_actual_bytes(monkeypatch, tmp_path) -> None:
+    import base64
+    import io
+    import re
+
+    from PIL import Image
+
+    import local_artifacts
+
+    monkeypatch.setattr(
+        local_artifacts, "get_studio_outputs_dir", lambda: tmp_path / "outputs"
+    )
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(buffer, format="WEBP")
+    raw = buffer.getvalue()
+    result = {
+        "images": [{
+            "asset_id": "815df67881e0b8cd",
+            "byte_count": len(raw),
+            "data": base64.b64encode(raw).decode("ascii"),
+        }],
+    }
+    materialized = studio_golden_run._materialize_image(
+        result, "de521c37-fae8-4f97-8ceb-4ed539187d20"
+    )
+    names = materialized["output_paths"]
+    assert len(names) == 1
+    # WebP bytes must never land in a .png name (previously hardcoded).
+    assert re.fullmatch(r"golden_\d{4}-\d{2}-\d{2}_\d{6}(_\d+)?.webp", names[0]), names[0]
+    assert (tmp_path / "outputs" / names[0]).read_bytes() == raw
+
+
 def test_golden_history_meta_records_actual_executor_method() -> None:
     profile = profile_catalog.GoldenProfile(
         name="golden-test",
@@ -459,3 +600,93 @@ async def test_golden_fast_path_repairs_empty_dropdown_link(monkeypatch, tmp_pat
     prompt = captured["payload"]["prompt"]
     assert prompt["6"]["inputs"]["DropdownState"] == '{"type": "float", "value": 1.0}'
     assert captured["payload"]["extra_data"]["repaired_empty_dropdowns"] != []
+
+
+@pytest.mark.asyncio
+async def test_generic_run_marks_cursor_and_hides_plan_received(monkeypatch, tmp_path) -> None:
+    """A non-canonical workflow takes the generic executor, which streams no
+    Golden stages. The cursor must carry the generic_execution marker (so the
+    UI can name the executor) and must NOT carry the generic executor's own
+    plan_received status (which would refreeze the UI on "Starting up")."""
+    target = {
+        "app": "configured-app",
+        "class": "ModalRuntimeEntrypointV2",
+        "method": "run_golden_parallel_stream",
+    }
+    profile = profile_catalog.GoldenProfile(
+        name="golden-test",
+        owner="test",
+        target=target,
+        resources={"gpu": "H100", "cpu": 12, "memory_mb": 24576},
+        config=SimpleNamespace(),  # type: ignore[arg-type]
+        receipt=SimpleNamespace(deploy_fingerprint="deploy-test"),  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(studio_golden_run, "resolve_golden_profile", lambda name: profile)
+
+    class RemoteGenerator:
+        def aio(self, payload, **kwargs):
+            async def events():
+                yield {"type": "status", "phase": "plan_received", "request_id": "studio-generic"}
+                yield {"type": "result", "sequence": 9, "data": {"image": "ok"}}
+
+            return events()
+
+    handle = SimpleNamespace(
+        run_golden_studio_stream=SimpleNamespace(remote_gen=RemoteGenerator()),
+        run_plan_stream=SimpleNamespace(remote_gen=RemoteGenerator()),
+    )
+    bundle = {
+        "status": "ok",
+        "workflow": {"workflow_id": "wf"},
+        "version": {"workflow_version_id": "wv"},
+        "preset": {"preset_id": "preset", "values": {}},
+        "defaults": {},
+        "control_schema": {},
+        "mapping": {"output_node_id": "1"},
+        "executable_prompt": {
+            "1": {"class_type": "TestNode", "inputs": {}},
+        },
+    }
+    import studio_workflow_run
+    monkeypatch.setattr(
+        studio_workflow_run,
+        "resolve_workflow_run_bundle",
+        lambda *args, **kwargs: bundle,
+    )
+
+    def fake_build_plan(bundle_arg, values, *args, **kwargs):
+        return (
+            SimpleNamespace(
+                to_dict=lambda: {
+                    "workflow": bundle_arg["executable_prompt"],
+                    "output_node_ids": ["1"],
+                }
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(studio_workflow_run, "build_workflow_execution_plan", fake_build_plan)
+
+    store = GoldenStageEventStore(max_events=16, max_runs=2, ttl_seconds=60)
+    result = await studio_golden_run.run_golden_workflow(
+        workflow_id="wf",
+        version_id="wv",
+        preset_id="preset",
+        controls={},
+        request_id="studio-generic",
+        node_dir=tmp_path,
+        profile_name="golden-test",
+        event_store=store,
+        handle_factory=lambda *_args: handle,
+    )
+    assert result["status"] == "ok"
+    page = store.read("studio-generic", 0)
+    phases = [
+        (event.get("type"), event.get("phase"))
+        for event in page["events"]
+    ]
+    assert ("status", "generic_execution") in phases
+    assert not any(
+        phase == "plan_received" for _type, phase in phases
+    ), "generic plan_received must not reach the polled cursor"
+    assert page["terminal"] is True

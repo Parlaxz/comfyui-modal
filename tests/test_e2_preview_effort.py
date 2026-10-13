@@ -143,7 +143,7 @@ class PreviewDefaultContractTests(unittest.TestCase):
             "preview_codec": "webp",
             "production": {"enabled": False},
         })
-        self.assertEqual(options.output_mode, "preview")
+        self.assertEqual(options.output_mode, "data_saver")
         conversion = options.output_conversion_options
         self.assertEqual(conversion["format"], "webp_lossy")
         self.assertEqual(conversion["quality"], 70)
@@ -340,7 +340,7 @@ class ExperimentPlanRoundTripTests(unittest.TestCase):
             plan = experiment_plan.build_cell_plan(definition, str(ROOT))
 
         for cell in plan.cells:
-            self.assertEqual(cell.output_mode, "preview")
+            self.assertEqual(cell.output_mode, "data_saver")
             cell_plan_dict = dict(cell.execution_plan_dict or {})
             conversion = cell_plan_dict["execution_options"]["output_conversion_options"]
             self.assertEqual(conversion["format"], "webp_lossy")
