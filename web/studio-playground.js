@@ -1932,10 +1932,16 @@ function _workflowSelectEl(state, actions, context) {
   if (!store.workflowId) placeholder.selected = true;
   select.appendChild(placeholder);
   var tool = activeToolOf(state);
+  // Phase 2 compatibility: Edit/Select runs on ordinary I2I workflows, but
+  // the shelf dropdown still lists dedicated legacy inpaint workflows as an
+  // expert override — otherwise they would have no entry point.
+  var _selectListsLegacy = (tool === "i2i" && activeModeOf(state) === "edit" && activeSubtoolOf(state) === "select");
   var rows = (store.library || []).filter(function (w) {
     var t = _workflowTypeOfRow(w);
     if (!t) return true;
-    return t === tool;
+    if (t === tool) return true;
+    if (_selectListsLegacy && t === "inpaint") return true;
+    return false;
   });
   if (!rows.length) {
     select.appendChild(el("option", { value: "", text: "No workflows for this tool yet", disabled: true, selected: true }));
@@ -4567,7 +4573,7 @@ function renderCanvas(state, context, actions) {
     ]));
   }
   var _paintToolId = activeToolOf(state);
-  var _isPaintTool = _paintToolId === "inpaint" || _paintToolId === "sketch";
+  var _isPaintTool = _paintToolId === "inpaint" || _paintToolId === "sketch" || _isSelectOnI2I(state);
   // Paint tools work on the main canvas: with no run output yet, show the
   // paint base (usually the uploaded Source Image) there instead of a
   // second small canvas inside the editor box.
@@ -4747,6 +4753,11 @@ function _editorBaseImageUrl(state) {
 function _renderToolEditor(state, context, actions, canvasEl) {
   var tool = activeToolOf(state);
   if (tool === "inpaint" || tool === "sketch") return _renderPaintEditor(state, tool, context, actions, canvasEl);
+  // Phase 2: the same selection editor serves Edit/Select on I2I. The editor
+  // keeps the "inpaint" id so testids, overlay clearing, and shelf save paths
+  // stay stable; legacy dedicated inpaint workflows render through the branch
+  // above. No Inpaint execution method is implemented here (Phase 3).
+  if (_isSelectOnI2I(state)) return _renderPaintEditor(state, "inpaint", context, actions, canvasEl);
   if (tool === "outpaint") return _renderOutpaintEditor(state, context, actions);
   return null;
 }
@@ -4776,9 +4787,11 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   var brushBtn = mkBtn("Brush", "brush", true);
   var eraseBtn = mkBtn("Erase", "erase", false);
   var lassoBtn = isMask ? mkBtn("Lasso", "lasso", false) : null;
-  var rectBtn = isMask ? mkBtn("Rect", "rect", false) : null;
+  var rectBtn = isMask ? mkBtn("Rectangle", "rect", false) : null;
   var objBtn = isMask ? mkBtn("Object", "object", false) : null;
-  var textBtn = isMask ? mkBtn("Text", "text", false) : null;
+  // SAM3 is an implementation detail: the user-facing concept is Detect
+  // (the "text" testid is kept stable for existing tests/selectors).
+  var textBtn = isMask ? mkBtn("Detect", "text", false) : null;
   function setMode(m) {
     mode = m;
     [brushBtn, eraseBtn, lassoBtn, rectBtn, objBtn, textBtn].forEach(function (b) { if (b) b.classList.remove("is-on"); });
@@ -4838,7 +4851,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   var samConf = el("input", { type: "number", min: "0.05", max: "0.95", step: "0.05", value: "0.3", "data-testid": tool + "-sam-conf", title: "Confidence", style: "width:64px;" });
   var samFindBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Find", "data-testid": tool + "-sam-find" });
   var samScanBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Scan photo", title: "List everything detected so you can pick instead of typing", "data-testid": tool + "-sam-scan" });
-  var samHint = el("span", { text: "Object: click the image. Text: type + Find, Scan, or tap a chip.", style: "font-size:11px;color:#888;", "data-testid": tool + "-sam-hint" });
+  var samHint = el("span", { text: "Object: click the image. Detect: type + Find, Scan, or tap a chip.", style: "font-size:11px;color:#888;", "data-testid": tool + "-sam-hint" });
   samRow.appendChild(samText);
   samRow.appendChild(samConf);
   samRow.appendChild(samFindBtn);
@@ -5244,7 +5257,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
       if (!res.ok || !data.mask_png) throw new Error((data && data.error) || ("HTTP " + res.status));
       if (!data.count) { preview.textContent = "No matches. Try a broader description or Object select."; return; }
       applySamPng(data.mask_png, data.count + " match" + (data.count === 1 ? "" : "es") + " selected");
-    } catch (e) { preview.textContent = "Text select failed: " + (e && e.message ? e.message : e); }
+    } catch (e) { preview.textContent = "Detect failed: " + (e && e.message ? e.message : e); }
   }
   samFindBtn.addEventListener("click", samFind);
   samText.addEventListener("keydown", function (ev) { if (ev.key === "Enter") samFind(); ev.stopPropagation(); });
@@ -6390,15 +6403,28 @@ var STUDIO_SUBTOOL_LABELS = Object.freeze({
 // the existing local postprocess engine, so they map to null (no workflow
 // type change, no selection reset when entering Post). Later-phase
 // placeholders (references/layout/guidance) have no execution type yet.
+// Phase 2: Edit/Select is I2I + selection UI, not a separate workflow
+// family — an ordinary I2I workflow stays selected while masking. Dedicated
+// legacy inpaint workflows remain usable: selecting one still opens
+// Edit/Select (see _defaultShellForTool) as a compatibility override.
 function _subtoolExecutionType(mode, subtool) {
   if (mode === "post") return null;
   switch (subtool) {
     case "text": return mode === "edit" ? "i2i" : "t2i";
-    case "select": return "inpaint";
+    case "select": return "i2i";
     case "expand": return "outpaint";
     case "sketch": return "sketch";
     default: return null;
   }
+}
+
+// Phase 2 selection context: Edit/Select on an ordinary I2I workflow.
+// One explicit predicate (not a framework) shared by the editor dispatch,
+// canvas base routing, and workflow-picker scoping below.
+function _isSelectOnI2I(state) {
+  return activeToolOf(state) === "i2i"
+    && activeModeOf(state) === "edit"
+    && activeSubtoolOf(state) === "select";
 }
 
 // Sensible visible shell for an internal execution type. A sketch type
@@ -6893,6 +6919,9 @@ function _defaultSubtoolForMode(state, mode) {
   }
   for (var i = 0; i < subs.length; i++) {
     if (_subtoolExecutionType(mode, subs[i]) === currentTool) return subs[i];
+    // Compatibility: a legacy dedicated inpaint workflow has no subtool of
+    // its own anymore — it lives in Edit/Select on top of the I2I family.
+    if (currentTool === "inpaint" && mode === "edit" && subs[i] === "select") return subs[i];
   }
   return subs[0];
 }
@@ -9547,6 +9576,11 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
         _recordImageEdge(state, next, "");
         _setCanvasImage(state, _lineageDisplayUrl(next), context);
         _clearBoundMask(state, context, actions);
+      } else if (role === "source_image" && !next) {
+        // Clearing the source must not leave its mask behind: the mask was
+        // painted for a different image.
+        if (state.playground) state.playground.sourceFollowsCanvas = false;
+        _clearBoundMask(state, context, actions);
       }
     }, extra));
   }
@@ -9955,7 +9989,9 @@ function _openShelfPickerDialog(state, context, actions) {
   dialog.appendChild(renderWorkflowPicker({
     apiBase: apiBase,
     mode: "single",
-    workflowType: activeToolOf(state),
+    // Same compatibility as the shelf dropdown: Edit/Select offers ordinary
+    // I2I workflows plus legacy dedicated inpaint workflows.
+    workflowTypes: _isSelectOnI2I(state) ? ["i2i", "inpaint"] : activeToolOf(state),
     selectedIds: currentId ? [currentId] : [],
     confirmLabel: "Use workflow",
     onConfirm: function (ids) {

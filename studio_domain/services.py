@@ -153,13 +153,13 @@ BINDABLE_INPUT_CATALOG: dict[str, dict[str, Any]] = {
                      "rules": {}, "binding": _EXACT_BINDING},
     "mask": {"key": "mask", "name": "Mask", "block": "image",
              "input_kind": "image", "required_for": ("inpaint",),
-             "optional_for": ("sketch", "outpaint"), "experiment_eligible": False,
+             "optional_for": ("i2i", "sketch", "outpaint"), "experiment_eligible": False,
              "rules": {}, "binding": _EXACT_BINDING},
 }
 T2I_REQUIRED_INPUTS = ("prompt", "seed", "model_unet", "vae", "clip")
 T2I_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler", "width", "height")
 I2I_REQUIRED_INPUTS = ("prompt", "seed", "model_unet", "vae", "clip", "source_image")
-I2I_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler", "width", "height")
+I2I_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler", "width", "height", "mask")
 INPAINT_REQUIRED_INPUTS = ("prompt", "seed", "model_unet", "vae", "clip", "source_image", "mask")
 INPAINT_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler", "width", "height")
 SKETCH_REQUIRED_INPUTS = ("prompt", "seed", "model_unet", "vae", "clip", "source_image")

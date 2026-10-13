@@ -1070,6 +1070,9 @@ def prepare_effective_prompt(
         "text_generate_node_id": target if target not in ("", None) else None,
     }
     workflow = applied["workflow"]
+    _synced = _sync_mask_editor_widget_state(workflow, values)
+    if _synced:
+        _log.debug("Studio synced mask widget state on node(s): %s", _synced)
     if not skip:
         return {"workflow": workflow, "studio_meta": metadata}
     error = _validate_text_generate_target(workflow, target)
@@ -1107,6 +1110,61 @@ def prepare_effective_prompt(
         }
     effective.pop(str(target), None)
     return {"workflow": effective, "studio_meta": metadata}
+
+
+def _sync_mask_editor_widget_state(
+    workflow: dict[str, Any], values: dict[str, Any]
+) -> list[str]:
+    """Mirror a Studio mask filename into Pixaroma-style editor widget state.
+
+    PixaromaInpaintCrop's MASK *link* input only accepts MASK tensors:
+    resolve_inpaint_mask() drops anything else, so a mask filename
+    submitted there is silently ignored and the crop falls back to the
+    whole image (a painted mask with a full-image edit). The node instead
+    reads its own editor file via
+    ``inputs["InpaintCropWidget"] = {"state_json": {"mask_path": ...}}``.
+
+    The node_input mapping is kept as-is (the remote file collector keys
+    off the ``mask`` input string to ship the bytes); this additionally
+    writes ``mask_path`` into any InpaintCropWidget dict already present
+    on the applied copy. No-op when the mask value is blank, the widget
+    is absent, or its state cannot be merged into. Returns synced node
+    ids (diagnostics only).
+    """
+    synced: list[str] = []
+    if not isinstance(workflow, dict) or not isinstance(values, dict):
+        return synced
+    raw = values.get("mask", "")
+    name = raw.strip() if isinstance(raw, str) else ""
+    if not name:
+        return synced
+    # Strip annotated references ("file [input]") to the bare input-dir file.
+    for suffix in (" [input]", " [output]", " [temp]"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)].rstrip()
+            break
+    if not name or "/" in name.replace("\\", "/") or name in (".", ".."):
+        return synced
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        widget = inputs.get("InpaintCropWidget")
+        if not isinstance(widget, dict):
+            continue
+        try:
+            sj = widget.get("state_json", "{}")
+            meta = json.loads(sj) if isinstance(sj, str) and sj.strip() else {}
+            if not isinstance(meta, dict):
+                continue
+            meta["mask_path"] = name
+            widget["state_json"] = json.dumps(meta, sort_keys=True)
+            synced.append(str(node_id))
+        except Exception:
+            continue
+    return synced
 
 
 def _hydrate_missing_required_widget_defaults(

@@ -285,6 +285,36 @@ export function renderImageBlock(props = {}) {  const wrap = el("div", { ...cont
     } catch (_e) { /* caller surfaces errors via run gating; keep prior value */ }
   });
   row.appendChild(file);
+  const ingestFile = async (f) => {
+    if (!f || typeof props.onChange !== "function") return;
+    try {
+      const name = await uploadImageBlob(f, f.name);
+      props.onChange(name);
+    } catch (_e) { /* keep prior value, same as file handler */ }
+  };
+  wrap.setAttribute("tabindex", "0");
+  wrap.addEventListener("dragover", (ev) => {
+    ev.preventDefault();
+    wrap.style.outline = "1px dashed #888";
+  });
+  wrap.addEventListener("dragleave", () => { wrap.style.outline = ""; });
+  wrap.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    wrap.style.outline = "";
+    const f = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+    if (f && (!f.type || f.type.indexOf("image/") === 0)) ingestFile(f);
+  });
+  wrap.addEventListener("paste", (ev) => {
+    const items = ev.clipboardData && ev.clipboardData.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type && item.type.indexOf("image/") === 0) {
+        ev.preventDefault();
+        ingestFile(item.getAsFile());
+        break;
+      }
+    }
+  });
   if (typeof props.onToggleLink === "function") {
     // A checkmark, not an action button: it shows whether this input is
     // currently bound to the canvas image, and (un)checking (un)binds it.

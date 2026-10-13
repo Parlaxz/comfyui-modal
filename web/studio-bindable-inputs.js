@@ -145,7 +145,7 @@ export const BINDABLE_INPUTS = Object.freeze({
     block: "image",
     inputKind: "image",
     requiredFor: ["inpaint"],
-    optionalFor: ["sketch", "outpaint"],
+    optionalFor: ["i2i", "sketch", "outpaint"],
     experimentEligible: false,
     rules: Object.freeze({}),
   }),
@@ -212,6 +212,9 @@ export const I2I_OPTIONAL_INPUTS = Object.freeze([
   "sampler",
   "width",
   "height",
+  // Phase 2: Edit/Select paints masks on ordinary I2I workflows. Optional
+  // only — I2I runs never require a mask; Phase 3 consumes it for Inpaint.
+  "mask",
 ]);
 
 export const INPAINT_REQUIRED_INPUTS = Object.freeze([

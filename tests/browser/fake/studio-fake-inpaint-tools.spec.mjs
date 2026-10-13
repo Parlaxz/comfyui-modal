@@ -18,8 +18,22 @@ async function selectWorkflow(page, id) {
   await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 15000 });
 }
 
+// Phase-1 shell: modes on the rail, tools in the submenu. Mask lives at
+// Edit → Select, Draw at Edit → Sketch.
+async function gotoMask(page) {
+  await page.locator('[data-testid="studio-tool-edit"]').click();
+  await page.locator('[data-testid="studio-subtool-select"]').click();
+  await expect(page.locator('[data-testid="inpaint-editor"]')).toBeVisible({ timeout: 10000 });
+}
+
+async function gotoSketch(page) {
+  await page.locator('[data-testid="studio-tool-edit"]').click();
+  await page.locator('[data-testid="studio-subtool-sketch"]').click();
+  await expect(page.locator('[data-testid="sketch-editor"]')).toBeVisible({ timeout: 10000 });
+}
+
 async function openInpaintWithSource(page) {
-  await page.locator('[data-testid="studio-tool-inpaint"]').click();
+  await gotoMask(page);
   await selectWorkflow(page, "wf_inpaint");
   await expect(page.locator('[data-testid="inpaint-editor"]')).toBeVisible({ timeout: 10000 });
   await page.locator('[data-testid="shelf-input-source_image-file"]').setInputFiles(SOURCE_FIXTURE);
@@ -64,6 +78,10 @@ test.describe("Studio inpaint advanced tools (fake backend)", () => {
         "radius", "combine", "clear", "save"]) {
         await expect(page.locator(`[data-testid="inpaint-${id}"]`)).toBeVisible();
       }
+      // Phase 2 user-facing language: Object / Detect (SAM3 stays an
+      // implementation detail; testids are unchanged).
+      await expect(page.locator('[data-testid="inpaint-text"]')).toHaveText("Detect");
+      await expect(page.locator('[data-testid="inpaint-rect"]')).toHaveText("Rectangle");
       await expect(page.locator('[data-testid="inpaint-sam-row"]')).toBeHidden();
       await expect(page.locator('[data-testid="inpaint-combine"]')).toHaveValue("add");
       await page.locator('[data-testid="inpaint-text"]').click();
@@ -174,9 +192,8 @@ test.describe("Studio inpaint advanced tools (fake backend)", () => {
   test("Sketch paints on the main canvas too", async ({ page }) => {
     const fx = await setupFakeTest(page);
     try {
-      await page.locator('[data-testid="studio-tool-sketch"]').click();
+      await gotoSketch(page);
       await selectWorkflow(page, "wf_sketch");
-      await expect(page.locator('[data-testid="sketch-editor"]')).toBeVisible({ timeout: 10000 });
       await page.locator('[data-testid="shelf-input-source_image-file"]').setInputFiles(SOURCE_FIXTURE);
       await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 10000 });
       const wrap = page.locator('[data-testid="sketch-canvas-wrap"]');
@@ -197,9 +214,8 @@ test.describe("Studio inpaint advanced tools (fake backend)", () => {
   test("Scan list renders and Apply refines boxes in one undo step", async ({ page }) => {
     const fx = await setupFakeTest(page);
     try {
-      await page.locator('[data-testid="studio-tool-inpaint"]').click();
+      await gotoMask(page);
       await selectWorkflow(page, "wf_inpaint");
-      await expect(page.locator('[data-testid="inpaint-editor"]')).toBeVisible({ timeout: 10000 });
       await page.locator('[data-testid="shelf-input-source_image-file"]').setInputFiles(SOURCE_FIXTURE);
       await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 10000 });
       await page.waitForTimeout(1200);
@@ -241,9 +257,8 @@ test.describe("Studio inpaint advanced tools (fake backend)", () => {
   test("SAM UI gates: no source, empty text", async ({ page }) => {
     const fx = await setupFakeTest(page);
     try {
-      await page.locator('[data-testid="studio-tool-inpaint"]').click();
+      await gotoMask(page);
       await selectWorkflow(page, "wf_inpaint");
-      await expect(page.locator('[data-testid="inpaint-editor"]')).toBeVisible({ timeout: 10000 });
       // Object click with no source uploaded.
       await page.locator('[data-testid="inpaint-object"]').click();
       const canvas = page.locator('[data-testid="inpaint-canvas"]');
@@ -272,7 +287,7 @@ test.describe("Studio inpaint advanced tools (fake backend)", () => {
       });
       await page.locator('[data-testid="inpaint-sam-text"]').fill("person");
       await page.locator('[data-testid="inpaint-sam-find"]').click();
-      await expect(page.locator('[data-testid="inpaint-mask-preview"]')).toContainText(/Text select failed.*restart ComfyUI/i);
+      await expect(page.locator('[data-testid="inpaint-mask-preview"]')).toContainText(/Detect failed.*restart ComfyUI/i);
       await expect(page.locator('[data-testid="inpaint-mask-preview"]')).not.toContainText(/JSON\.parse/i);
       expect(samBody).toBeTruthy();
       expect(String(samBody.image_b64 || "")).toMatch(/^data:image\//);
@@ -281,7 +296,7 @@ test.describe("Studio inpaint advanced tools (fake backend)", () => {
       // Chips fill the query and run Find (fake backend 404s, proving the call).
       await page.locator('[data-testid="inpaint-sam-chip-face"]').click();
       await expect(page.locator('[data-testid="inpaint-sam-text"]')).toHaveValue("face");
-      await expect(page.locator('[data-testid="inpaint-mask-preview"]')).toContainText(/Text select failed.*restart ComfyUI/i);
+      await expect(page.locator('[data-testid="inpaint-mask-preview"]')).toContainText(/Detect failed.*restart ComfyUI/i);
       // Scan posts the canvas pixels for YOLO proposing; the fake
       // backend 404s, proving the call.
       let scanBody = null;

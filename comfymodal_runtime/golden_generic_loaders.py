@@ -707,10 +707,14 @@ async def compose_generic_unet_load(
 
     Scaled-FP8 / non-uniform / unknown-dtype files are rejected by the
     stage contract itself (clean fallback reason, never an exception
-    here).  An early-load ticket (started while CLIP work ran) is
-    attached to the session when it names this same resolved file; the
-    stage joins it instead of starting a second read.  Returns
-    ``{"ok": True, "loaded": patcher, "session": ...,
+    here).  Files carrying raw ``*.comfy_quant`` descriptors are routed
+    to the QD demand arm without entering the stage: every golden
+    dtype-plan builder rejects those markers fail-closed while the QD
+    arm carries them CPU-only into native construction, so the stage
+    attempt is provably doomed.  An early-load ticket (started while
+    CLIP work ran) is attached to the session when it names this same
+    resolved file; the stage joins it instead of starting a second
+    read.  Returns ``{"ok": True, "loaded": patcher, "session": ...,
     "owners": [...], "source_arm": "golden_unet", ...}`` or ``{"ok":
     False, "reason": ...}``.  Never raises.
     """
@@ -744,6 +748,23 @@ async def compose_generic_unet_load(
         except Exception:
             header_bit = ""
             header_info = {"ok": False}
+        try:
+            _hd_ok = bool(isinstance(header_info, dict)
+                           and header_info.get("ok"))
+            _cq = int((header_info.get("comfy_quant_key_count", 0) or 0)
+                      ) if isinstance(header_info, dict) else 0
+        except Exception:
+            _hd_ok, _cq = False, 0
+        if _hd_ok and _cq > 0:
+            # Deterministic QD route (see docstring): skip the doomed
+            # stage attempt; the caller takes the QD demand arm.
+            elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+            return {"ok": False,
+                    "reason": (f"unet_comfy_quant_qd_routed:{_cq}"
+                               + (header_bit or "")),
+                    "elapsed_ms": elapsed_ms,
+                    "source_arm": "golden_unet",
+                    "header": header_info}
         from .golden_serial import golden_unet_load
 
         session = build_generic_unet_session(
@@ -1548,11 +1569,11 @@ def _install_fp8_fallback_log_guard() -> bool:
 def _describe_safetensors_header(path: Any) -> dict[str, Any]:
     """Header-only safetensors survey (no payload read).
 
-    Returns dtype histogram, ``scaled_fp8`` key inventory, and
-    quantization-metadata presence for stage-contract diagnosis (e.g.
-    designing mixed/FP8 UNET adoption from the file's real composition).
-    Header JSON is kilobytes; the multi-GB payload is never touched.
-    Never raises.
+    Returns dtype histogram, ``scaled_fp8`` key inventory,
+    ``.comfy_quant`` descriptor count, and quantization-metadata presence
+    for stage-contract diagnosis (e.g. designing mixed/FP8 UNET adoption
+    from the file's real composition). Header JSON is kilobytes; the
+    multi-GB payload is never touched. Never raises.
     """
     try:
         with open(str(path), "rb") as handle:
@@ -1568,6 +1589,7 @@ def _describe_safetensors_header(path: Any) -> dict[str, Any]:
         histogram: dict[str, int] = {}
         scaled_keys: list[str] = []
         quantized_keys = 0
+        comfy_quant_keys = 0
         total = 0
         for key, info in header.items():
             if key == "__metadata__":
@@ -1579,6 +1601,8 @@ def _describe_safetensors_header(path: Any) -> dict[str, Any]:
             histogram[dtype] = histogram.get(dtype, 0) + 1
             if "scaled_fp8" in key_text:
                 scaled_keys.append(key_text)
+            if key_text.endswith(".comfy_quant"):
+                comfy_quant_keys += 1
             if (
                 key_text.endswith(".comfy_quant")
                 or key_text.endswith(".weight_scale")
@@ -1597,6 +1621,7 @@ def _describe_safetensors_header(path: Any) -> dict[str, Any]:
             "scaled_fp8_keys": scaled_keys[:25],
             "scaled_fp8_key_count": len(scaled_keys),
             "quantized_key_count": quantized_keys,
+            "comfy_quant_key_count": comfy_quant_keys,
             "has_quantization_metadata": "_quantization_metadata" in metadata,
             "metadata_keys": sorted(str(k) for k in metadata.keys())[:25],
         }

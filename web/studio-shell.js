@@ -105,6 +105,9 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
   let syncInFlight = false;
   let lastSyncResult = "";
   let lastSyncData = null;
+  let lastSyncError = "";
+  let lastSyncStatus = null;
+  let redeployInFlight = false;
 
   function shortHash(value) {
     return typeof value === "string" && value ? value.slice(0, 8) : "—";
@@ -118,22 +121,46 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
     return fallback;
   }
 
+  function syncServiceErrorText(data, status) {
+    const candidate = data && (data.message || data.error);
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+    if (candidate && typeof candidate === "object") {
+      const nested = candidate.detail || candidate.message || candidate.code;
+      if (typeof nested === "string" && nested.trim()) return nested;
+    }
+    return `Sync service unavailable (HTTP ${status}).`;
+  }
+
   function renderSyncNotice(status) {
-    const dependency = status && status.dependency;
-    const pending = Array.isArray(status && status.custom_nodes && status.custom_nodes.pending)
-      ? status.custom_nodes.pending : [];
+    if (status !== undefined) lastSyncStatus = status;
+    const effective = status !== undefined ? status : lastSyncStatus;
+    const dependency = effective && effective.dependency;
+    const pending = Array.isArray(effective && effective.custom_nodes && effective.custom_nodes.pending)
+      ? effective.custom_nodes.pending : [];
     const mismatch = dependency && dependency.prepared === false;
     const hasResult = Boolean(lastSyncResult);
+    const hasError = Boolean(lastSyncError);
     while (syncNotice.firstChild) syncNotice.removeChild(syncNotice.firstChild);
-    if (!mismatch && !pending.length && !hasResult) {
+    if (!mismatch && !pending.length && !hasResult && !hasError) {
       syncNotice.hidden = true;
       return;
     }
     syncNotice.hidden = false;
-    const banner = el("section", {
-      class: `comfymodal-studio-sync-notice ${mismatch ? "mismatch" : pending.length ? "pending" : "result"}`,
-      ...(mismatch ? { "data-testid": "dep-mismatch-banner", role: "alert", "aria-live": "polite" } : {}),
-    });
+    const bannerClass = mismatch
+      ? "mismatch"
+      : hasError && !pending.length
+        ? "mismatch error"
+        : pending.length ? "pending" : "result";
+    const bannerAttrs = { class: `comfymodal-studio-sync-notice ${bannerClass}` };
+    if (mismatch) {
+      bannerAttrs["data-testid"] = "dep-mismatch-banner";
+      bannerAttrs.role = "alert";
+      bannerAttrs["aria-live"] = "polite";
+    } else if (hasError && !pending.length) {
+      bannerAttrs["data-testid"] = "sync-service-error";
+      bannerAttrs.role = "alert";
+    }
+    const banner = el("section", bannerAttrs);
     if (mismatch) {
       banner.appendChild(el("div", { class: "comfymodal-studio-sync-title", text: "Studio dependencies need syncing" }));
       banner.appendChild(el("div", { class: "comfymodal-studio-sync-copy", text: dependency.cause || "Dependency mismatch detected." }));
@@ -143,16 +170,34 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
       const details = [dependency.reason, `baked ${shortHash(dependency.baked_hash)} / current ${shortHash(dependency.current_hash)}`, names.length ? names.join(", ") : "no affected nodes listed"]
         .filter(Boolean).join(" · ");
       banner.appendChild(el("div", { class: "comfymodal-studio-sync-detail", text: details }));
+    } else if (hasError && !pending.length) {
+      banner.appendChild(el("div", { class: "comfymodal-studio-sync-title", text: "Sync service unavailable" }));
+      banner.appendChild(el("div", { class: "comfymodal-studio-sync-copy", text: lastSyncError }));
     } else if (pending.length) {
       banner.appendChild(el("div", { class: "comfymodal-studio-sync-copy", text: `${pending.length} custom node(s) not yet published to the volume` }));
     }
     const actions = el("div", { class: "comfymodal-studio-sync-actions" });
-    actions.appendChild(el("button", {
-      type: "button", class: "comfymodal-primary-btn",
-      text: syncInFlight ? "Syncing…" : "Sync deps / custom nodes",
-      "data-testid": "dep-sync-button", disabled: syncInFlight,
-      onclick: function () { syncCustomNodes(); },
-    }));
+    if (hasError && !mismatch && !pending.length) {
+      actions.appendChild(el("button", {
+        type: "button", class: "comfymodal-primary-btn",
+        text: redeployInFlight ? "Redeploying…" : "Redeploy",
+        "data-testid": "sync-redeploy-button", disabled: redeployInFlight,
+        onclick: function () { redeployFromSyncError(); },
+      }));
+      actions.appendChild(el("button", {
+        type: "button", class: "comfymodal-secondary-btn",
+        text: "Retry",
+        "data-testid": "sync-retry-button",
+        onclick: function () { lastSyncResult = ""; renderSyncNotice(); fetchSyncStatus(); },
+      }));
+    } else {
+      actions.appendChild(el("button", {
+        type: "button", class: "comfymodal-primary-btn",
+        text: syncInFlight ? "Syncing…" : "Sync deps / custom nodes",
+        "data-testid": "dep-sync-button", disabled: syncInFlight,
+        onclick: function () { syncCustomNodes(); },
+      }));
+    }
     banner.appendChild(actions);
     if (hasResult) banner.appendChild(el("div", { class: "comfymodal-studio-sync-result", "data-testid": "dep-sync-result", text: lastSyncResult, role: "status" }));
     const destructive = lastSyncData && lastSyncData.publication && lastSyncData.publication.reason === "destructive_custom_node_publication_blocked"
@@ -179,13 +224,93 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
     syncNotice.appendChild(banner);
   }
 
+  // Deploy-first gate: same server truth as studio-backend-deployment.js
+  // (ready means ready, error means error). In-flight states (deploying /
+  // starting / unknown, per isDeployInFlight in studio-backend-api.js) and
+  // inconclusive checks fall through to the normal sync attempt so transient
+  // deploys preserve current behavior; only an explicit error or an explicit
+  // non-ready state short-circuits. Direct fetch avoids module cycles.
+  async function readDeployState() {
+    try {
+      const response = await fetch(`${context.apiBase}/deploy/status`);
+      let data = null;
+      try { data = await response.json(); } catch { data = null; }
+      if (!response.ok || !data || typeof data !== "object") return null;
+      const state = typeof data.state === "string" && data.state ? data.state : "";
+      const message = typeof data.message === "string" && data.message.trim() ? data.message : "";
+      return { state, message };
+    } catch {
+      return null;
+    }
+  }
+
+  function isDeployReadyState(state) {
+    return state === "ready";
+  }
+
+  function isDeployInFlightState(state) {
+    return state === "deploying" || state === "starting" || state === "unknown";
+  }
+
+  function isDeployExplicitlyNotReady(deploy) {
+    return Boolean(deploy)
+      && !isDeployReadyState(deploy.state)
+      && !isDeployInFlightState(deploy.state);
+  }
+
   async function fetchSyncStatus() {
     try {
+      const deploy = await readDeployState();
+      if (isDeployExplicitlyNotReady(deploy)) {
+        lastSyncError = deploy.message || "Modal app is not deployed / not ready.";
+        renderSyncNotice();
+        return;
+      }
       const response = await fetch(`${context.apiBase}/sync/status`);
-      const data = await response.json();
-      if (response.ok) renderSyncNotice(data);
+      let data = null;
+      try { data = await response.json(); } catch { data = null; }
+      if (response.ok) {
+        lastSyncError = "";
+        renderSyncNotice(data);
+      } else {
+        lastSyncError = syncServiceErrorText(data, response.status);
+        renderSyncNotice(data);
+      }
     } catch {
       // Keep the last known warning visible through transient poll failures.
+      // Do NOT clear lastSyncError here: only a successful fetch or an
+      // explicit non-OK response updates the error state.
+    }
+  }
+
+  async function redeployFromSyncError() {
+    if (redeployInFlight) return;
+    redeployInFlight = true;
+    renderSyncNotice();
+    try {
+      const response = await fetch(`${context.apiBase}/deploy`, { method: "POST" });
+      let data = null;
+      try { data = await response.json(); } catch { data = null; }
+      const deployStatus = data && data.status;
+      if (deployStatus === "started" || deployStatus === "already_deploying") {
+        lastSyncResult = deployStatus === "started"
+          ? "Redeploy started."
+          : "Redeploy already running — showing live status.";
+      } else {
+        const detail = data && (data.message || data.error);
+        let detailText = "";
+        if (typeof detail === "string" && detail.trim()) detailText = detail;
+        else if (detail && typeof detail === "object") {
+          const nested = detail.detail || detail.message || detail.code;
+          if (typeof nested === "string" && nested.trim()) detailText = nested;
+        }
+        lastSyncResult = detailText || `Redeploy failed (HTTP ${response.status}).`;
+      }
+    } catch {
+      lastSyncResult = "Redeploy failed: unable to reach the deploy service.";
+    } finally {
+      redeployInFlight = false;
+      renderSyncNotice();
     }
   }
 
@@ -196,6 +321,13 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
     lastSyncData = null;
     renderSyncNotice({ dependency: null, custom_nodes: { pending: [] } });
     try {
+      const deploy = await readDeployState();
+      if (isDeployExplicitlyNotReady(deploy)) {
+        lastSyncData = null;
+        lastSyncResult = "Modal app is not deployed. Redeploy first, then sync.";
+        renderSyncNotice({ dependency: null, custom_nodes: { pending: [] } });
+        return;
+      }
       const request = requestBody
         ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) }
         : { method: "POST" };

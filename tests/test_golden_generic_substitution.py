@@ -1146,6 +1146,65 @@ class TestPlainDeclineSwitchGate:
                                raising=False)
 
 
+class TestComfyQuantQdRoute:
+    """*.comfy_quant UNETs route deterministically to the QD demand arm.
+
+    Every golden dtype-plan builder rejects raw ``.comfy_quant``
+    descriptors fail-closed, while the QD arm carries them CPU-only
+    into native construction: the stage attempt is provably doomed,
+    so compose must decline before session build / stage import.
+    """
+
+    @staticmethod
+    def _header_file(tmp_path, keys):
+        import json as _json
+
+        header = {k: {"dtype": "F32", "shape": [1],
+                      "data_offsets": [0, 4]} for k in keys}
+        raw = _json.dumps(header).encode("utf-8")
+        target = tmp_path / "u.safetensors"
+        target.write_bytes(len(raw).to_bytes(8, "little") + raw)
+        return str(target)
+
+    def test_survey_counts_comfy_quant_keys(self, tmp_path):
+        path = self._header_file(
+            tmp_path, ["a.weight", "b.comfy_quant", "c.scale_weight"])
+        out = ggl._describe_safetensors_header(path)
+        assert out["ok"] is True
+        assert out["comfy_quant_key_count"] == 1
+        assert out["quantized_key_count"] == 2
+
+    def test_compose_routes_without_stage(self, monkeypatch, tmp_path):
+        path = self._header_file(tmp_path, ["a.weight", "a.comfy_quant"])
+
+        def boom(**_kw):
+            raise AssertionError("stage must not be entered")
+
+        monkeypatch.setattr(ggl, "build_generic_unet_session", boom)
+        out = asyncio.run(ggl.compose_generic_unet_load(
+            unet_filenames=["u.safetensors"], folder="diffusion_models",
+            request_id="r1", path_resolver=lambda _f, _n: path))
+        assert out["ok"] is False
+        assert out["reason"].startswith("unet_comfy_quant_qd_routed:1")
+        assert out["source_arm"] == "golden_unet"
+
+    def test_compose_without_markers_keeps_stage_path(
+            self, monkeypatch, tmp_path):
+        # No markers: the survey passes through and the existing vram
+        # gate (not the new route) still decides, proving the route is
+        # marker-gated and nothing else changed.
+        path = self._header_file(tmp_path, ["a.weight"])
+        monkeypatch.setattr(
+            ggl, "activate_golden_dynamic_vram",
+            lambda: {"activated": False, "already_activated": False,
+                     "reason": "gate_not_set"})
+        out = asyncio.run(ggl.compose_generic_unet_load(
+            unet_filenames=["u.safetensors"], folder="diffusion_models",
+            request_id="r1", path_resolver=lambda _f, _n: path))
+        assert out["ok"] is False
+        assert "dynamic_vram_unavailable" in out["reason"]
+
+
 class TestGenericOverlapPick:
     """Pick policy + advise hints: ordering only, never execution."""
 

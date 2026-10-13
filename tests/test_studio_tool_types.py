@@ -61,7 +61,9 @@ def test_source_image_and_mask_first_class():
         "i2i", "inpaint", "sketch", "outpaint",
     }
     assert BINDABLE_INPUT_CATALOG["mask"]["required_for"] == ("inpaint",)
-    assert set(BINDABLE_INPUT_CATALOG["mask"]["optional_for"]) == {"sketch", "outpaint"}
+    # Phase 2: Edit/Select paints masks on ordinary I2I workflows (optional —
+    # I2I runs never require one; Phase 3 consumes it for Inpaint methods).
+    assert set(BINDABLE_INPUT_CATALOG["mask"]["optional_for"]) == {"i2i", "sketch", "outpaint"}
     assert "source_image" in I2I_REQUIRED_INPUTS
     assert "mask" in INPAINT_REQUIRED_INPUTS
 

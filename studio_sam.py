@@ -197,17 +197,51 @@ def _detect(model, image, conditioning, points, threshold, refine=2, bboxes=None
     from comfy_extras.nodes_sam3 import SAM3_Detect
     pos = [{"x": int(x), "y": int(y)} for x, y in points[0]]
     neg = [{"x": int(x), "y": int(y)} for x, y in points[1]]
-    out = SAM3_Detect.execute(
-        model,
-        image,
-        conditioning=conditioning,
-        bboxes=bboxes,
-        positive_coords=json.dumps(pos) if pos else None,
-        negative_coords=json.dumps(neg) if neg else None,
-        threshold=float(threshold),
-        refine_iterations=int(refine),
-        individual_masks=True,
-    )
+    # Headless call: no executing prompt, so the progress hook's
+    # server_instance.last_prompt_id/last_node_id lookup fails. Lend it
+    # ours, then restore (a real run may be concurrent).
+    try:
+        from server import PromptServer
+        _srv = PromptServer.instance
+    except Exception:
+        _srv = None
+    _saved = None
+    if _srv is not None:
+        _saved = (getattr(_srv, "last_prompt_id", None),
+                  getattr(_srv, "last_node_id", None),
+                  hasattr(_srv, "last_prompt_id"),
+                  hasattr(_srv, "last_node_id"))
+        _srv.last_prompt_id = "studio-sam"
+        _srv.last_node_id = "studio-sam-detect"
+    try:
+        out = SAM3_Detect.execute(
+            model,
+            image,
+            conditioning=conditioning,
+            bboxes=bboxes,
+            positive_coords=json.dumps(pos) if pos else None,
+            negative_coords=json.dumps(neg) if neg else None,
+            threshold=float(threshold),
+            refine_iterations=int(refine),
+            individual_masks=True,
+        )
+    finally:
+        if _srv is not None and _saved is not None:
+            _pid, _nid, _had_pid, _had_nid = _saved
+            if _had_pid:
+                _srv.last_prompt_id = _pid
+            else:
+                try:
+                    delattr(_srv, "last_prompt_id")
+                except AttributeError:
+                    pass
+            if _had_nid:
+                _srv.last_node_id = _nid
+            else:
+                try:
+                    delattr(_srv, "last_node_id")
+                except AttributeError:
+                    pass
     masks = out[0].detach().to("cpu").float()
     if masks.ndim == 2:
         masks = masks.unsqueeze(0)
