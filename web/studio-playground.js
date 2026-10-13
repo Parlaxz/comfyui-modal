@@ -4922,6 +4922,31 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
 
   var undoStack = [];
   var redoStack = [];
+  // Phase 2: undo history belongs to one source image. Overlay pixels are
+  // wiped on source replace/clear (see _setCanvasImage / _clearPaintOverlays),
+  // but this editor closure — and its stacks — survives; an Undo afterwards
+  // must not resurrect strokes painted on another image. The overlay element
+  // carries the source it was painted on; history is reconciled against the
+  // live shelf value before any push/undo/redo. Derived state only — no new
+  // store fields.
+  function sourceKeyNow() {
+    try {
+      var st = _shelfStore(state);
+      var v = st && st.controlValues && st.controlValues.source_image;
+      return String(v || "");
+    } catch (_e) { return ""; }
+  }
+  function reconcileHistoryForSource() {
+    var key = sourceKeyNow();
+    if ((paint.dataset.sourceKey || "") === key) return false;
+    paint.dataset.sourceKey = key;
+    var had = undoStack.length || redoStack.length;
+    undoStack.length = 0;
+    redoStack.length = 0;
+    syncUndoBtns();
+    if (had) preview.textContent = "Mask cleared.";
+    return true;
+  }
   function snapshot() {
     try {
       if (!paint.width || !paint.height) return null;
@@ -4938,6 +4963,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     img.src = url;
   }
   function pushHistory() {
+    reconcileHistoryForSource();
     var s = snapshot();
     if (s == null) return;
     undoStack.push(s);
@@ -4951,12 +4977,14 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   }
   syncUndoBtns();
   function doUndo() {
+    reconcileHistoryForSource();
     if (!undoStack.length) return;
     var cur = snapshot();
     if (cur != null) redoStack.push(cur);
     restore(undoStack.pop(), function () { preview.textContent = "Undone — Save to use it."; syncUndoBtns(); });
   }
   function doRedo() {
+    reconcileHistoryForSource();
     if (!redoStack.length) return;
     var cur = snapshot();
     if (cur != null) undoStack.push(cur);
@@ -8769,6 +8797,33 @@ function _resolveCanvasFile(state, url) {
   return null;
 }
 
+// A resolved on-drive hit is only a hit when the file is really servable:
+// remote/golden outputs resolve to annotated names with no bytes behind
+// them. Verify with one cheap HEAD; anything inconclusive preserves the old
+// behavior (assume present) so local flows never regress.
+async function _viewFileExists(filename) {
+  try {
+    var m = String(filename || "").match(/^(.*) \[(input|output|temp)\]$/);
+    var url = m
+      ? "/view?filename=" + encodeURIComponent(m[1]) + "&type=" + m[2]
+      : "/view?filename=" + encodeURIComponent(String(filename || "")) + "&type=input";
+    var r = await fetch(url, { method: "HEAD" });
+    if (!r) return true;
+    if (r.status === 404) return false;
+    return true;
+  } catch (_e) { return true; }
+}
+
+// Async version of _resolveCanvasFile for link flows: phantom hits fall
+// through so callers fetch → upload real bytes instead of committing a name
+// that previews and runs nowhere.
+async function _resolveVerifiedCanvasFile(state, url) {
+  var hit = null;
+  try { hit = _resolveCanvasFile(state, url); } catch (_e) { hit = null; }
+  if (hit && hit.filename && !(await _viewFileExists(hit.filename))) return null;
+  return hit;
+}
+
 // Same workspace image under different references: exact match or shared
 // ?filename= identity only. Bare basenames are NOT compared — two different
 // directories can hold the same filename, and mistaking them would silently
@@ -8836,6 +8891,26 @@ function _clearBoundMask(state, context, actions) {
   try {
     if (_schemaHasRole(state, "mask")) commitShelfValue(state, context, actions, "mask", "");
   } catch (_e) { /* best-effort */ }
+}
+
+// The editor base image is gone (source cleared): wipe paint overlays
+// directly. Same clearing _setCanvasImage applies when a new source replaces
+// the old one.
+function _clearPaintOverlays() {
+  try {
+    ["inpaint-canvas", "sketch-canvas"].forEach(function (tid) {
+      var p = document.querySelector('[data-testid="' + tid + '"]');
+      if (p && p.isConnected) {
+        var c = p.getContext("2d");
+        if (c) c.clearRect(0, 0, p.width, p.height);
+      }
+    });
+    // The status line must not keep claiming paint that no longer exists.
+    ["inpaint-mask-preview", "sketch-mask-preview"].forEach(function (tid) {
+      var n = document.querySelector('[data-testid="' + tid + '"]');
+      if (n && n.isConnected) n.textContent = "Mask cleared.";
+    });
+  } catch (_e) { /* best-effort paint only */ }
 }
 
 function _restoreCanvasImage(state) {
@@ -9069,7 +9144,7 @@ async function _linkUrlAsSource(state, context, actions, role, url, prefix) {
   _setLinkState(state, true, "");
   _refreshShelfSection(state, context, actions);
   try {
-    var hit = _resolveCanvasFile(state, url);
+    var hit = await _resolveVerifiedCanvasFile(state, url);
     if (hit && hit.filename) {
       if (_selectionIdentity(_shelfStore(state)) !== identity) return "";
       commitShelfValue(state, context, actions, role, hit.filename);
@@ -9196,8 +9271,9 @@ async function _shelfUseHistoryAsSource(state, context, actions, role, url) {
   var store = _shelfStore(state);
   var identity = _selectionIdentity(store);
   // Prefer the on-drive file when the URL resolves to one (no duplicate).
+  // Verified: phantom annotated names fall through to fetch → upload below.
   var hit = null;
-  try { hit = _resolveCanvasFile(state, url); } catch (_e) { hit = null; }
+  try { hit = await _resolveVerifiedCanvasFile(state, url); } catch (_e) { hit = null; }
   if (hit && hit.filename) {
     if (_selectionIdentity(_shelfStore(state)) !== identity) return;
     commitShelfValue(state, context, actions, role, hit.filename);
@@ -9576,11 +9652,20 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
         _recordImageEdge(state, next, "");
         _setCanvasImage(state, _lineageDisplayUrl(next), context);
         _clearBoundMask(state, context, actions);
+        // The canvas sync above does not rebuild the shelf card: refresh it
+        // so Replace (upload or drop) shows the new preview instead of a
+        // stale one. Image commits are discrete (no text focus to lose).
+        _refreshShelfSection(state, context, actions);
       } else if (role === "source_image" && !next) {
-        // Clearing the source must not leave its mask behind: the mask was
-        // painted for a different image.
+        // Clearing the source must not leave its mask or paint behind: the
+        // mask was painted for a different image, and with no base URL left
+        // _syncEditorBaseImage above is a no-op — so wipe the overlays here
+        // (same clearing a replace applies) and refresh the shelf card so it
+        // shows the honest empty state instead of the removed preview.
         if (state.playground) state.playground.sourceFollowsCanvas = false;
         _clearBoundMask(state, context, actions);
+        _clearPaintOverlays();
+        _refreshShelfSection(state, context, actions);
       }
     }, extra));
   }

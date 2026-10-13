@@ -314,4 +314,22 @@ test.describe("Studio inpaint advanced tools (fake backend)", () => {
       await fx.assertNoConsoleErrors([/404/]);
     } finally {}
   });
+
+  test("source Clear wipes paint and history (Undo cannot resurrect)", async ({ page }) => {
+    const fx = await setupFakeTest(page);
+    try {
+      await openInpaintWithSource(page);
+      await paintStroke(page, "inpaint");
+      expect(await canvasAlphaSum(page, "inpaint")).toBeGreaterThan(0);
+      await page.locator('[data-testid="shelf-input-source_image-clear"]').click();
+      await expect(page.locator('[data-testid="shelf-input-source_image-empty"]')).toBeVisible({ timeout: 10000 });
+      expect(await canvasAlphaSum(page, "inpaint")).toBe(0);
+      await expect(page.locator('[data-testid="inpaint-mask-preview"]')).toContainText(/Mask cleared/i);
+      // History belonged to the removed source: Undo must stay a no-op.
+      await page.locator('[data-testid="inpaint-undo"]').click();
+      expect(await canvasAlphaSum(page, "inpaint")).toBe(0);
+      await expect(page.locator('[data-testid="inpaint-undo"]')).toBeDisabled();
+      await fx.assertNoConsoleErrors();
+    } finally {}
+  });
 });

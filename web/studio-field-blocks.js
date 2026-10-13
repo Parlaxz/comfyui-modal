@@ -127,6 +127,10 @@ function _imagePreviewSrc(value, previewUrl) {
   if (!value) return "";
   const v = String(value);
   if (/^(blob:|data:|https?:\/\/|\/)/.test(v)) return v;
+  // Annotated workspace references ("name [output]") keep their directory:
+  // preview from the matching /view type instead of a 404 bare filename.
+  const m = v.match(/^(.*) \[(input|output|temp)\]$/);
+  if (m) return "/view?filename=" + encodeURIComponent(m[1]) + "&type=" + m[2];
   return "/view?filename=" + encodeURIComponent(v) + "&type=input";
 }
 
@@ -175,7 +179,10 @@ function _openHistoryBrowser(props) {
       role: "dialog",
       "aria-label": "Choose an image from history",
     });
-    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;display:flex;align-items:center;justify-content:center;";
+    // z-index 99999: this browser is body-level but opened from inside the
+    // Studio modal, whose own chrome stacks up to ~10090 — 1000 leaves it
+    // buried and unclickable (same precedent as other Studio dialogs).
+    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center;";
     const dialog = el("div", {
       class: "comfymodal-studio-history-dialog",
       "data-testid": testid + "-history-panel",
