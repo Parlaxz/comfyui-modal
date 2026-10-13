@@ -822,6 +822,93 @@ export function takeWorkflowHandoff() {
   }
 }
 
+// ── Phase 1 visible shell (Generate / Edit / Post Processing) ────────────
+//
+// The visible shell is UI organization only: exactly two values,
+// activeMode + activeSubtool, persisted under one versioned key. Internal
+// execution types (t2i/i2i/inpaint/outpaint/sketch/postprocess/upscale),
+// draft/result keys (presetId::featureId), and the legacy tool key stay
+// untouched. Unknown/malformed payloads degrade to null so callers fall
+// back to the mode default or migrate from the existing tool key.
+
+const SHELL_KEY = "comfymodal.studio.playground.shell.v1";
+
+export const SHELL_MODES = Object.freeze(["generate", "edit", "post"]);
+
+export const SHELL_SUBTOOLS = Object.freeze({
+  generate: Object.freeze(["text", "references", "layout", "sketch", "guidance"]),
+  edit: Object.freeze(["text", "select", "expand", "sketch"]),
+  post: Object.freeze(["adjust", "color", "detail", "effects", "crop", "heal", "upscale"]),
+});
+
+// Later-phase placeholders: visible but with no execution path. Simple
+// membership list — labels live with the caller. Single source for the
+// shell run gate shared by the playground topbar and experiment submits.
+export const SHELL_PLACEHOLDERS = Object.freeze(["references", "layout", "guidance", "upscale"]);
+
+/**
+ * Honest execution gate for views with no runnable workflow path: Post
+ * (local engine) and later-phase placeholders. Returns the user-facing
+ * reason, or null when the normal workflow path applies. Unknown input
+ * fails open (null) so callers never block on a not-yet-restored shell.
+ * @param {string} mode
+ * @param {string} subtool
+ * @returns {string|null}
+ */
+export function shellGateReason(mode, subtool) {
+  if (mode === "post") {
+    if (subtool === "upscale") return "Upscale arrives in a later phase — execution is disabled.";
+    if (SHELL_SUBTOOLS.post.indexOf(subtool) !== -1) {
+      return "Post Processing runs locally — use Save or Export in the editor below.";
+    }
+    return null;
+  }
+  if (SHELL_PLACEHOLDERS.indexOf(subtool) !== -1) {
+    if (mode === "generate" || mode === "edit") {
+      var labels = { references: "References", layout: "Layout", guidance: "Guidance", upscale: "Upscale" };
+      return (labels[subtool] || subtool) + " arrives in a later phase — execution is disabled.";
+    }
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Load the persisted visible shell selection.
+ * @returns {{mode: string, subtool: string}|null} null when missing/invalid
+ */
+export function loadShellSelection() {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    const raw = localStorage.getItem(SHELL_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const mode = typeof parsed.mode === "string" ? parsed.mode : "";
+    const subtool = typeof parsed.subtool === "string" ? parsed.subtool : "";
+    if (SHELL_MODES.indexOf(mode) === -1) return null;
+    if (SHELL_SUBTOOLS[mode].indexOf(subtool) === -1) return null;
+    return { mode, subtool };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Persist the visible shell selection. Invalid pairs are ignored.
+ * @param {string} mode
+ * @param {string} subtool
+ */
+export function saveShellSelection(mode, subtool) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    if (SHELL_MODES.indexOf(mode) === -1) return;
+    if (SHELL_SUBTOOLS[mode].indexOf(subtool) === -1) return;
+    localStorage.setItem(SHELL_KEY, JSON.stringify({ mode, subtool }));
+  } catch (e) {
+    // Ignore
+  }
+}
 // One-shot "use as base" parameter payload (a past run's prompt + sampler
 // controls) for the Playground shelf. Deliberately IN-MEMORY, not
 // localStorage: it is consumed by the next shelf build in this session,

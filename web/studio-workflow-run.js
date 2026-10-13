@@ -209,8 +209,16 @@ export async function loadWorkflowLibrary(apiBase, store) {
  * @returns {Promise<{ok: boolean, error?: string, reasons?: string[]}>}
  */
 export async function loadRunContext(apiBase, store, workflowId, versionId) {
+  // Request-generation guard: rapid actual type switching fires overlapping
+  // selections. A stale response must not overwrite the store the newer
+  // selection now owns — compare against the live workflow id captured at
+  // entry before applying anything.
+  var _reqWf = workflowId != null ? String(workflowId) : "";
   try {
     const data = await getWorkflowRunContext(apiBase, workflowId, versionId);
+    if (_reqWf && store && String(store.workflowId || "") !== _reqWf) {
+      return { ok: false, error: "superseded", reasons: ["superseded"], superseded: true };
+    }
     if (!data || data.status !== "ok") {
       const msg = (data && (data.message || data.error)) || "failed to load run context";
       store.setStatus("error");
@@ -261,6 +269,13 @@ export async function loadRunContext(apiBase, store, workflowId, versionId) {
  * @returns {Promise<{ok: boolean, error?: string, reasons?: string[]}>}
  */
 export async function selectWorkflow(apiBase, store, workflowId) {
+  // Monotonic selection generation: each new selection supersedes older
+  // in-flight ones. Checked after every await so a slow loser returns a
+  // marked failure instead of overwriting the winner's store — callers
+  // ignore superseded results without clobbering status or selection.
+  var _gen = (store._selGen = ((store._selGen || 0) + 1));
+  function _stale() { return store._selGen !== _gen; }
+  function _superseded() { return { ok: false, error: "superseded", reasons: ["superseded"], superseded: true }; }
   store.setStatus("loading");
   store.setError("");
   try {
@@ -286,6 +301,7 @@ export async function selectWorkflow(apiBase, store, workflowId) {
     // that the separate versions request would only repeat.
     if (latestVersionId) {
       ctxResult = await loadRunContext(apiBase, store, workflowId, latestVersionId);
+      if (_stale() || (ctxResult && ctxResult.superseded)) return _superseded();
       if (ctxResult.ok) {
         const loadedVersion = store.runContext && store.runContext.version;
         store.setVersions(loadedVersion ? [loadedVersion] : []);
@@ -299,6 +315,7 @@ export async function selectWorkflow(apiBase, store, workflowId) {
     // reports no versions, still needs the history list to choose a version.
     if (!ctxResult || !ctxResult.ok) {
       const versionsData = await listWorkflowVersions(apiBase, workflowId);
+      if (_stale()) return _superseded();
       const versions = (versionsData && Array.isArray(versionsData.versions)) ? versionsData.versions : [];
       store.setVersions(versions);
 
@@ -317,6 +334,7 @@ export async function selectWorkflow(apiBase, store, workflowId) {
         return { ok: false, error: "workflow has no runnable version", reasons: ["no versions"] };
       }
       ctxResult = await loadRunContext(apiBase, store, workflowId, versionId);
+      if (_stale() || (ctxResult && ctxResult.superseded)) return _superseded();
     }
 
     if (!ctxResult.ok) {
@@ -361,6 +379,11 @@ export async function selectVersion(apiBase, store, versionId) {
     store.setSkipTextGenerate(false);
 
     const ctxResult = await loadRunContext(apiBase, store, store.workflowId, versionId);
+    // A tool switch cleared the store mid-flight: loadRunContext reports
+    // superseded via its workflow-id guard. Pass it through (never convert
+    // to an error) so callers yield to the newer tool instead of showing
+    // "superseded" or clobbering the new selection.
+    if (ctxResult && ctxResult.superseded) return ctxResult;
     if (!ctxResult.ok) {
       store.setStatus("error");
       return { ok: false, error: ctxResult.error, reasons: ctxResult.reasons };

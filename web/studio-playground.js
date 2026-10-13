@@ -47,6 +47,12 @@ import {
   setCarouselCleared,
   isCarouselCleared,
   loadGoldenProfileSelection,
+  saveShellSelection,
+  loadShellSelection,
+  SHELL_MODES,
+  SHELL_SUBTOOLS,
+  SHELL_PLACEHOLDERS,
+  shellGateReason,
 } from "./studio-playground-state.js";
 import {
   createPlaygroundRunController,
@@ -907,6 +913,8 @@ export async function hydratePlayground(state, context) {
     state.playground.activeTool = normalizeToolId(savedTool || featureId || "t2i");
     state.playground.toolId = state.playground.activeTool;
     _SHELF_TYPE_FALLBACK = state.playground.activeTool;
+    // Visible shell restores once in renderControlPanel (single owner) so a
+    // first paint already shows the persisted mode/subtool.
     _restoreCanvasImage(state);
   }
   const targetPresetId = "";
@@ -1113,6 +1121,7 @@ function renderControlPanel(state, context) {
       }
     }
     state.playground._hydrationDone = true;
+    _restoreShellState(state);
     hydratePlayground(state, context).then(function () {
       if (context && context.setPage) {
         // Check if the backend <select> dropdown is open (focused).
@@ -1142,27 +1151,51 @@ function renderControlPanel(state, context) {
 
   // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Workflow Selector (modern workflow-driven runs) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
   // Empty-state only until a workflow is chosen.
-  panel.appendChild(renderWorkflowSelector(state, context, actions));
+  // Phase 1 shell: Post runs the existing local engine (no workflow
+  // selection, no shelf fields here), and later-phase placeholders show an
+  // honest note instead of stale workflow fields. The workflow selector
+  // stays live in placeholder views so picker behavior is preserved.
+  var _shellMode = activeModeOf(state);
+  var _shellSub = activeSubtoolOf(state);
+  var _isPostView = _shellMode === "post";
+  var _isPlaceholderView = !_isPostView && _isPlaceholderSubtool(_shellSub);
+
+  if (_isPostView) {
+    panel.appendChild(el("p", {
+      class: "comfymodal-studio-control-note",
+      "data-testid": "post-side-note",
+      text: "Post Processing runs in the local editor in the canvas area — Adjust, Color, Detail, Effects, Crop, and Heal controls live there.",
+    }));
+  } else {
+    panel.appendChild(renderWorkflowSelector(state, context, actions));
+
+    if (_isPlaceholderView) {
+      panel.appendChild(el("p", {
+        class: "comfymodal-studio-control-note",
+        "data-testid": "placeholder-side-note",
+        text: (STUDIO_SUBTOOL_LABELS[_shellSub] || _shellSub)
+          + " arrives in a later phase — workflow execution is disabled for this view. Your workflow, values, and current image are preserved.",
+      }));
+    } else if (_isModernRunSelected(state)) {
+      panel.appendChild(renderShelfSection(state, context, actions));
+    }
+  }
 
   _renderGoldenDeployNotice(panel, context);
 
-  // Shelf field cards (Studio Workflow effort, leaf 1.2.2): bound field
-  // cards for the selected Workflow. Prompt fixed at top; output stays the
-  // right-side result panel (never a movable card).
-  if (_isModernRunSelected(state)) {
-    panel.appendChild(renderShelfSection(state, context, actions));
+  // Reset to defaults link (workflow views only — Post and placeholders
+  // show no shelf fields to reset).
+  if (!_isPostView && !_isPlaceholderView) {
+    const resetLink = el("button", {
+      class: "comfymodal-studio-reset-link",
+      text: "Reset to defaults",
+      style: "background:none;border:none;color:var(--color-accent);cursor:pointer;font-size:var(--font-size-sm);padding:4px 0;text-decoration:underline;",
+      onclick: function () {
+        if (actions && actions.resetToDefaults) actions.resetToDefaults();
+      },
+    });
+    panel.appendChild(resetLink);
   }
-
-  // Reset to defaults link
-  const resetLink = el("button", {
-    class: "comfymodal-studio-reset-link",
-    text: "Reset to defaults",
-    style: "background:none;border:none;color:var(--color-accent);cursor:pointer;font-size:var(--font-size-sm);padding:4px 0;text-decoration:underline;",
-    onclick: function () {
-      if (actions && actions.resetToDefaults) actions.resetToDefaults();
-    },
-  });
-  panel.appendChild(resetLink);
 
   return panel;
 }
@@ -1680,7 +1713,7 @@ function workflowGatingInfo(store, wf, state) {
   return { text: reasons.length ? reasons.join("; ") : "Not runnable", color: "#d9a441" };
 }
 
-function _syncActiveToolToSelection(state) {
+function _syncActiveToolToSelection(state, opts) {
   try {
     var pg = state && state.playground;
     var store = pg && pg._workflowRun;
@@ -1702,6 +1735,24 @@ function _syncActiveToolToSelection(state) {
       try {
         _storageSet("comfymodal.studio.playground.tool.v1", canonical);
       } catch (_e) {}
+      // The execution type actually changed (e.g. manual picker change):
+      // update the visible shell sensibly. A sketch workflow keeps the
+      // already-visible Generate/Edit Sketch choice when compatible,
+      // otherwise the new type takes its default shell view. Views that
+      // did not change type (Post, same-type switches) keep their shell.
+      // Background restores (reload/queue drain) update the execution
+      // truth above but never override the intended shell: a persisted
+      // Post view or a newer user shell choice survives initialization,
+      // and the workflow family reconciles to the desired type instead.
+      var background = !!(opts && opts.background);
+      var preserveShell = background
+        && (pg.activeMode === "post" || _subtoolExecutionType(pg.activeMode, pg.activeSubtool) === null);
+      var shell = preserveShell ? null : _defaultShellForTool(canonical, pg.activeMode, pg.activeSubtool);
+      if (shell && (pg.activeMode !== shell.mode || pg.activeSubtool !== shell.subtool)) {
+        pg.activeMode = shell.mode;
+        pg.activeSubtool = shell.subtool;
+        _persistShellState(state);
+      }
       return true;
     }
     return false;
@@ -1909,6 +1960,7 @@ function _workflowTypeLabel(state) {
   const workflow = ctx && ctx.workflow;
   const raw = (ctx && (ctx.workflow_type || ctx.workflowType || ctx.type))
     || (workflow && (workflow.workflow_type || workflow.workflowType || workflow.type))
+    || activeToolOf(state)
     || (store && (store.workflowType || store.featureId))
     || (state && state.playground && state.playground.featureId);
   const key = String(raw || "").toLowerCase();
@@ -1922,7 +1974,7 @@ function _workflowTypeLabel(state) {
     image_edit: "Image to image",
     inpaint: "Inpainting",
     sketch: "Sketch",
-    outpaint: "Outpaint",
+    outpaint: "Expand",
     upscale: "Upscaling",
     postprocess: "Post processing",
   };
@@ -2093,21 +2145,22 @@ container.appendChild(el("div", {
 }
 
 function _rerenderWorkflowSection(state, context, actions, opts) {
+  // Shelf: restore durably autosaved values into the store independent of
+  // selector DOM presence. Post views render no workflow selector, so an
+  // early DOM return here used to drop the restore and a reload in Post
+  // lost the saved values when returning to the same workflow type. The
+  // store (not the DOM) is the source of truth; paint below is best-effort.
+  if (opts && opts.applySaved) _applyShelfSavedValues(state);
   const container = document.querySelector('[data-testid="workflow-selector-section"]');
   if (!container) return;
   // Shelf: normalize an array-shaped control_schema (as served by the
   // deterministic workflow mock) into the role-keyed object the frozen
   // run-context contract uses (real backend serves a dict). No-op when the
-  // schema is already an object ΓÇö every downstream consumer (mapped
+  // schema is already an object — every downstream consumer (mapped
   // controls, gating, validation, run payload, Shelf) reads it through
   // getControlSchema, so one normalization point fixes them uniformly.
   _normalizeShelfControlSchema(state);
   _populateWorkflowSelector(container, state, context, actions);
-  // Shelf: restore durably autosaved values only when the caller opted in
-  // (workflow/version switches and persisted-selection restore). Preset
-  // switches and handoffs carry explicit values and must not be clobbered.
-  // The Shelf cards refresh in every case (prompt fixed top, layout, stale).
-  if (opts && opts.applySaved) _applyShelfSavedValues(state);
   // One-shot "use as base" payload stashed by a viewer (History detail or
   // the canvas preview): applied to the live draft before the cards build,
   // so the filled values render immediately. Taken only when the shelf is
@@ -2265,6 +2318,10 @@ async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff
   var prevValues = Object.assign({}, store.controlValues || {});
 
   const wfRes = await wf.selectWorkflow(apiBase, store, handoff.workflowId);
+  // A newer tool switch owns the store now: yield without failing the
+  // handoff (which would clobber the new tool state with a "superseded"
+  // error and wipe the persisted selection).
+  if (wfRes && wfRes.superseded) return;
   if (!wfRes.ok) {
     _failWorkflowHandoff(wf, store, wfRes.error || missing);
     return;
@@ -2276,6 +2333,7 @@ async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff
       return;
     }
     const verRes = await wf.selectVersion(apiBase, store, handoff.workflowVersionId);
+    if (verRes && verRes.superseded) return;
     if (!verRes.ok) {
       _failWorkflowHandoff(wf, store, verRes.error || missing);
       return;
@@ -2330,6 +2388,9 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
   }
   const wfRes = await wf.selectWorkflow(apiBase, store, saved.workflowId);
   if (!wfRes.ok) {
+    // A superseded background restore must not clobber the newer selection
+    // that replaced it mid-flight (stale-response guard in workflow-run).
+    if (wfRes.superseded) return;
     store.statusLine = wfRes.error || "Saved workflow is no longer available";
     wf.clearWorkflowSelection();
     return;
@@ -2357,6 +2418,9 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
     }
     if (String(store.workflowVersionId || "") !== String(target.workflow_version_id || "")) {
       const verRes = await wf.selectVersion(apiBase, store, target.workflow_version_id);
+      // Superseded by a newer tool switch: yield, leaving the new tool's
+      // cleared store alone (never surface "superseded" as a version error).
+      if (verRes && verRes.superseded) return;
       if (!verRes.ok) {
         store.statusLine = verRes.error || "Requested version no longer available";
         return;
@@ -2374,7 +2438,9 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
     presetName: store.presetName || "",
   });
   _rememberSelection(state);
-  if (_syncActiveToolToSelection(state) && context && context.setPage) {
+  // Background initialization restores: the persisted shell survives (the
+  // explicit picker path in _runSelectionFlow keeps the old behavior).
+  if (_syncActiveToolToSelection(state, { background: true }) && context && context.setPage) {
     // Restored a cross-type workflow: remount strip + editors, not Shelf only.
     context.setPage("playground");
     return;
@@ -2417,6 +2483,34 @@ function _workflowRunnableForExecution(state, store, wf) {
   return { runnable: true, reasons: [] };
 }
 function _applyModernRunButtonState(state, context, actions, btn, reason) {
+  // Phase 1 shell gate: Post runs the local engine and later-phase
+  // placeholders have no execution path — the button stays disabled with
+  // an honest reason instead of submitting a workflow run. In-flight runs
+  // keep their busy UI (same condition as the topbar build path).
+  var _gatePg = (state && state.playground) || {};
+  var _gateBusy = !!_gatePg._batchApplying
+    || (_gatePg.runState && ["created", "submitted", "waiting", "queued", "in_progress", "running"].indexOf(_gatePg.runState.status) !== -1);
+  var _gate = _shellRunGate(state);
+  if (_gate && !_gateBusy) {
+    if (state && state.playground && state.playground.queueMode) {
+      btn.textContent = "Queue";
+    } else {
+      btn.textContent = "Run";
+    }
+    btn.disabled = true;
+    btn.title = _gate;
+    // Modern gating owns the primary button: never leave a stale legacy
+    // onclick on the visible Run button while a modern selection is active.
+    btn.onclick = null;
+    if (reason) {
+      while (reason.firstChild) reason.removeChild(reason.firstChild);
+      reason.appendChild(el("p", {
+        text: _gate,
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    }
+    return;
+  }
   // Queue mode owns the topbar primary button ("Queue" + enqueue handler).
   // Gating syncs fire on every seed/prompt edit — never let them rewrite the
   // Queue button back into a Run button in place.
@@ -4348,7 +4442,7 @@ function renderPostProcessShell(state, context, actions) {
   });
   var src = "";
   try {
-    src = _canvasImageUrl(state) || "";
+    src = _canvasImageUrl(state) || _editorBaseImageUrl(state) || "";
   } catch (_e) {
     src = "";
   }
@@ -4388,8 +4482,15 @@ function renderWorkspace(state, context) {
   var submenu = renderToolSubmenu(state, context, wsActions);
   if (submenu) workspace.appendChild(submenu);
 
-  if (activeToolOf(state) === "postprocess") {
-    workspace.appendChild(renderPostProcessShell(state, context, wsActions));
+  // Post Processing mounts the existing local engine; the Upscale category
+  // is an honest later-phase placeholder and falls through to the canvas.
+  if (activeModeOf(state) === "post" && activeSubtoolOf(state) !== "upscale") {
+    var _ppShell = renderPostProcessShell(state, context, wsActions);
+    workspace.appendChild(_ppShell);
+    // The engine resets its tool on every mount: apply the selected
+    // category to the fresh mount (groups expand, Crop/Heal arm). Scoped
+    // to the new subtree so it works pre-attach; no new editor state.
+    try { _focusPostCategory(activeSubtoolOf(state), _ppShell); } catch (_e) {}
     return workspace;
   }
 
@@ -4450,6 +4551,21 @@ function renderCanvas(state, context, actions) {
   }
 
   const outputUrl = _canvasImageUrl(state);
+  // Phase 1 shell placeholders (References/Layout/Guidance/Upscale): an
+  // honest disabled notice above the normal canvas, so the current image
+  // stays visible and no stale controls appear.
+  var _shellSub = activeSubtoolOf(state);
+  if (_isPlaceholderSubtool(_shellSub)) {
+    var _shellLabel = STUDIO_SUBTOOL_LABELS[_shellSub] || _shellSub;
+    canvas.appendChild(el("div", {
+      class: "comfymodal-studio-placeholder-notice",
+      "data-testid": "shell-placeholder",
+      style: "text-align:center;padding:24px 20px;",
+    }, [
+      el("p", { text: _shellLabel + " — available in a later phase", style: "font-weight:var(--font-weight-semibold);margin-bottom:8px;" }),
+      el("p", { text: "Execution is disabled for this view. Your workflow, values, and current image are preserved.", style: "font-size:var(--font-size-sm);color:var(--color-text-muted);" }),
+    ]));
+  }
   var _paintToolId = activeToolOf(state);
   var _isPaintTool = _paintToolId === "inpaint" || _paintToolId === "sketch";
   // Paint tools work on the main canvas: with no run output yet, show the
@@ -4465,26 +4581,6 @@ function renderCanvas(state, context, actions) {
       text: "Output from the previous Workflow — run to refresh.",
       style: "font-size:var(--font-size-xs);color:#d9a441;margin:0 0 6px;",
     }));
-  }
-  if (_paintToolId === "postprocess") {
-    // Post Processing workspace: full TinyLuma-based finishing editor.
-    // Mounts its own stage inside canvas-area; source resolves from the
-    // current run output, with upload fallback inside the workspace.
-    var _ppHost = el("div", {
-      class: "comfymodal-studio-postprocess-host",
-      "data-testid": "pp-workspace",
-      style: "width:100%;",
-    });
-    canvas.appendChild(_ppHost);
-    try {
-      mountPostprocessWorkspace(_ppHost, { sourceUrl: outputUrl || _paintBaseUrl || "" });
-    } catch (_ppErr) {
-      _ppHost.appendChild(el("p", {
-        text: "Post Processing failed to start: " + ((_ppErr && _ppErr.message) || "unknown error"),
-        style: "color:var(--color-danger, #f87171);font-size:var(--font-size-sm);",
-      }));
-    }
-    return canvas;
   }
   if (currentSpec && currentSpec.isPlaceholder) {
     // Honest disabled placeholder for image-edit features
@@ -4569,7 +4665,13 @@ function renderCanvas(state, context, actions) {
     }));
   }
 
-  var toolEditor = _renderToolEditor(state, context, actions || ((state.playground && state.playground._runActions) || null), canvas);
+  // Placeholder views keep the image but hide the previous workflow tool
+  // controls: a preserved inpaint/sketch/outpaint type must not mount its
+  // paint editor under the disabled notice.
+  var toolEditor = null;
+  if (!_isPlaceholderSubtool(_shellSub)) {
+    toolEditor = _renderToolEditor(state, context, actions || ((state.playground && state.playground._runActions) || null), canvas);
+  }
   if (toolEditor) canvas.appendChild(toolEditor);
 
   var lineageStrip = _renderLineageStrip(state, context, outputUrl);
@@ -6198,7 +6300,7 @@ export const STUDIO_TOOLS = Object.freeze([
   { id: "t2i", label: "Generate", icon: "✦", title: "Text to Image" },
   { id: "i2i", label: "Edit", icon: "◐", title: "Image to Image" },
   { id: "inpaint", label: "Mask", icon: "◍", title: "Inpaint" },
-  { id: "outpaint", label: "Crop", icon: "⛶", title: "Outpaint / Crop" },
+  { id: "outpaint", label: "Expand", icon: "⛶", title: "Expand" },
   { id: "sketch", label: "Draw", icon: "✎", title: "Sketch" },
   { id: "postprocess", label: "Post Processing", icon: "◑", title: "TinyLuma-based photo finishing" },
   { id: "upscale", label: "Upscale", icon: "⤢", title: "Upscale workflow (placeholder)", isPlaceholder: true },
@@ -6238,6 +6340,137 @@ export function activeToolOf(state) {
   var canonical = normalizeToolId(raw);
   var known = STUDIO_TOOLS.some(function (t) { return t.id === canonical; });
   return known ? canonical : "t2i";
+}
+
+// ── Phase 1 visible shell: Generate / Edit / Post Processing ─────────
+// UI organization only — internal execution types in STUDIO_TOOLS stay the
+// source of truth for filtering, queueing, and run contracts. Post
+// categories route to the existing local postprocess engine; subtools with
+// no execution type (null) and honest later-phase placeholders never run.
+// No generic mode engine or capability registry: one explicit table each way.
+
+// Top rail: exactly these three modes, in this order.
+var STUDIO_MODES = Object.freeze([
+  { id: "generate", label: "Generate", icon: "✦", title: "Generate" },
+  { id: "edit", label: "Edit", icon: "◐", title: "Edit" },
+  { id: "post", label: "Post Processing", icon: "◑", title: "Post Processing" },
+]);
+
+// Visible shell vocab is single-sourced in studio-playground-state.js
+// (SHELL_SUBTOOLS): this alias keeps existing call sites unchanged.
+var STUDIO_SUBMENUS = SHELL_SUBTOOLS;
+
+// Later-phase placeholders: honest disabled views, execution gated off.
+// (Outpaint entry is user-facing Expand here; real Crop lives under Post.)
+// Simple membership list — labels come from STUDIO_SUBTOOL_LABELS.
+var LATER_PHASE_SUBTOOLS = SHELL_PLACEHOLDERS;
+
+function _isPlaceholderSubtool(subtool) {
+  return LATER_PHASE_SUBTOOLS.indexOf(subtool) !== -1;
+}
+
+var STUDIO_SUBTOOL_LABELS = Object.freeze({
+  text: "Text",
+  references: "References",
+  layout: "Layout",
+  sketch: "Sketch",
+  guidance: "Guidance",
+  select: "Select",
+  expand: "Expand",
+  adjust: "Adjust",
+  color: "Color",
+  detail: "Detail",
+  effects: "Effects",
+  crop: "Crop",
+  heal: "Heal",
+  upscale: "Upscale",
+});
+
+// Visible subtool -> internal execution type. Post categories run through
+// the existing local postprocess engine, so they map to null (no workflow
+// type change, no selection reset when entering Post). Later-phase
+// placeholders (references/layout/guidance) have no execution type yet.
+function _subtoolExecutionType(mode, subtool) {
+  if (mode === "post") return null;
+  switch (subtool) {
+    case "text": return mode === "edit" ? "i2i" : "t2i";
+    case "select": return "inpaint";
+    case "expand": return "outpaint";
+    case "sketch": return "sketch";
+    default: return null;
+  }
+}
+
+// Sensible visible shell for an internal execution type. A sketch type
+// keeps the already-visible Generate/Edit Sketch choice when compatible.
+function _defaultShellForTool(toolId, currentMode, currentSubtool) {
+  var currentMapsSketch = _subtoolExecutionType(currentMode, currentSubtool) === "sketch";
+  if (toolId === "sketch" && currentMapsSketch) {
+    return { mode: currentMode, subtool: "sketch" };
+  }
+  if (toolId === "postprocess" && currentMode === "post" && currentSubtool !== "upscale") {
+    return { mode: "post", subtool: currentSubtool };
+  }
+  var defaults = {
+    t2i: { mode: "generate", subtool: "text" },
+    i2i: { mode: "edit", subtool: "text" },
+    inpaint: { mode: "edit", subtool: "select" },
+    outpaint: { mode: "edit", subtool: "expand" },
+    sketch: { mode: "generate", subtool: "sketch" },
+    postprocess: { mode: "post", subtool: "adjust" },
+    upscale: { mode: "post", subtool: "upscale" },
+  };
+  return defaults[toolId] || null;
+}
+
+function _validShell(mode, subtool) {
+  if (SHELL_MODES.indexOf(mode) === -1) return null;
+  var subs = STUDIO_SUBMENUS[mode];
+  if (!subs || subs.indexOf(subtool) === -1) return { mode: mode, subtool: subs ? subs[0] : "text" };
+  return { mode: mode, subtool: subtool };
+}
+
+function activeModeOf(state) {
+  var pg = state && state.playground;
+  var shell = _validShell(pg && pg.activeMode, pg && pg.activeSubtool);
+  return shell ? shell.mode : "generate";
+}
+
+function activeSubtoolOf(state) {
+  var pg = state && state.playground;
+  var shell = _validShell(pg && pg.activeMode, pg && pg.activeSubtool);
+  return shell ? shell.subtool : "text";
+}
+
+// Restore visible mode/subtool from the validated shell key, migrating once
+// from the existing tool key when no valid shell was saved yet. Storage
+// helpers never throw (best-effort internally), so no try/catch here.
+function _restoreShellState(state) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  var shell = loadShellSelection();
+  if (!shell) {
+    var rawTool = _storageGet("comfymodal.studio.playground.tool.v1") || "";
+    shell = _defaultShellForTool(normalizeToolId(rawTool || pg.featureId || "t2i"), null, null)
+      || { mode: "generate", subtool: "text" };
+    saveShellSelection(shell.mode, shell.subtool);
+  }
+  var valid = _validShell(shell.mode, shell.subtool) || { mode: "generate", subtool: "text" };
+  pg.activeMode = valid.mode;
+  pg.activeSubtool = valid.subtool;
+}
+
+function _persistShellState(state) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  saveShellSelection(pg.activeMode, pg.activeSubtool);
+}
+
+// Honest execution gate for views with no runnable workflow path: Post
+// (local engine) and later-phase placeholders. Single-sourced reason text
+// shared with experiment submission gating (see studio-playground-state.js).
+function _shellRunGate(state) {
+  return shellGateReason(activeModeOf(state), activeSubtoolOf(state));
 }
 
 var _CANVAS_BG_KEY = "comfymodal.studio.canvas-bg.v1";
@@ -6604,6 +6837,12 @@ function _setActiveTool(state, context, actions, toolId) {
     var currentType = current ? _workflowTypeOfRow(current) : "";
     if (current && currentType && currentType !== next) {
       _flushShelfSave(state);
+      // The clear below hands the store to the new tool: invalidate any
+      // in-flight selection first, so a slow loser (selectWorkflow /
+      // loadRunContext, guarded by _selGen / workflow-id in
+      // studio-workflow-run.js) returns superseded and its tail cannot
+      // restore the old workflow over the new tool.
+      try { store._selGen = (store._selGen || 0) + 1; } catch (_e) {}
       store.setWorkflowId("");
       store.setVersionId("");
       store.setRunContext(null);
@@ -6633,6 +6872,138 @@ function _setActiveTool(state, context, actions, toolId) {
   }
 }
 
+// ── Phase 1 shell switching ─────────────────────────────────────────
+// Same-type subtool switches (and all Post category views) are UI-only:
+// selection, values, drafts, output, and run state are preserved —
+// setFeature-style clears never run here. Only an actual execution-type
+// change goes through the existing _setActiveTool picker/filter flow.
+
+function _defaultSubtoolForMode(state, mode) {
+  var pg = state && state.playground;
+  if (mode === "post") {
+    if (pg && pg.activeMode === "post") return activeSubtoolOf(state);
+    return "adjust";
+  }
+  var subs = STUDIO_SUBMENUS[mode] || ["text"];
+  var currentTool = activeToolOf(state);
+  var currentSub = pg ? pg.activeSubtool : "";
+  if (currentSub && subs.indexOf(currentSub) !== -1
+    && _subtoolExecutionType(mode, currentSub) === currentTool) {
+    return currentSub;
+  }
+  for (var i = 0; i < subs.length; i++) {
+    if (_subtoolExecutionType(mode, subs[i]) === currentTool) return subs[i];
+  }
+  return subs[0];
+}
+
+function _setActiveSubtool(state, context, actions, mode, subtool) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  var valid = _validShell(mode, subtool);
+  if (!valid) valid = { mode: activeModeOf(state), subtool: activeSubtoolOf(state) };
+  if (pg.activeMode === valid.mode && pg.activeSubtool === valid.subtool) return;
+  var next = _subtoolExecutionType(valid.mode, valid.subtool);
+  pg.activeMode = valid.mode;
+  pg.activeSubtool = valid.subtool;
+  _persistShellState(state);
+  if (!next || valid.mode === "post" || next === activeToolOf(state)) {
+    if (context && context.setPage) context.setPage("playground");
+    return;
+  }
+  _setActiveTool(state, context, actions, next);
+}
+
+function _postSubmenuNote(subtool) {
+  if (subtool === "upscale") return "Upscale arrives in a later phase — execution is disabled.";
+  return "Finishing editor lives in the canvas below — pick the Studio image there, or upload your own. Shortcuts: \\ compare · C crop · J heal · W white balance · Ctrl+Z/Y undo/redo.";
+}
+
+// Post categories route to their honest existing anchors inside the live
+// engine: matching inspector groups expand, Crop/Heal press the real
+// toolbar tools. No engine rewrite, no fake controls.
+var _POST_CATEGORY_GROUPS = {
+  adjust: ["light"],
+  color: ["color", "curves", "mixer", "grading"],
+  detail: ["detail"],
+  effects: ["effects"],
+};
+
+function _focusPostCategory(subtool, root) {
+  try {
+    // Scoped lookup so the category applies both live (document) and
+    // synchronously right after mount (pp-shell subtree, pre-attach).
+    var scope = root && root.querySelector ? root : document;
+    var ws = scope.querySelector('[data-testid="pp-workspace"]');
+    if (!ws) return;
+    if (!root && !ws.isConnected) return;
+    if (subtool === "crop" || subtool === "heal") {
+      var toolBtn = ws.querySelector('[data-testid="pp-' + subtool + '"]');
+      if (toolBtn && !toolBtn.classList.contains("on")) toolBtn.click();
+      var stage = ws.querySelector('[data-testid="pp-canvas"]');
+      if (stage && stage.scrollIntoView) stage.scrollIntoView({ block: "nearest" });
+      return;
+    }
+    if (subtool === "upscale") return;
+    // Leaving a tool category must not leave its engine tool armed:
+    // toggle Crop/Heal off through the existing toolbar buttons.
+    ["crop", "heal"].forEach(function (t) {
+      var armed = ws.querySelector('[data-testid="pp-' + t + '"]');
+      if (armed && armed.classList.contains("on")) armed.click();
+    });
+    var groups = _POST_CATEGORY_GROUPS[subtool] || [];
+    var first = null;
+    groups.forEach(function (id) {
+      var g = ws.querySelector('[data-group="' + id + '"]');
+      if (!g) return;
+      if (!first) first = g;
+      var head = g.querySelector(".pp-grouphead");
+      if (head && head.getAttribute("aria-expanded") !== "true") head.click();
+    });
+    if (first && first.scrollIntoView) first.scrollIntoView({ block: "nearest" });
+  } catch (_e) { /* routing is best-effort */ }
+}
+
+// Post category switches stay in place: the mounted engine keeps its
+// recipe, canvas, undo/redo, and compare state instead of remounting.
+// Only crossing the Upscale boundary remounts (Upscale is a canvas
+// placeholder, not the finishing editor). Ordinary categories share one
+// gate, so no gate refresh is needed in place — the remount rebuilds it.
+function _selectPostCategory(state, context, subtool) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  if (STUDIO_SUBMENUS.post.indexOf(subtool) === -1) return;
+  if (pg.activeMode !== "post") return;
+  // Re-clicking the already-selected tool category re-applies it: the
+  // engine resets its tool on every mount, so this restores Crop/Heal
+  // after a reload without any new editor state.
+  if (pg.activeSubtool === subtool) {
+    _focusPostCategory(subtool);
+    return;
+  }
+  var crossed = (pg.activeSubtool === "upscale") !== (subtool === "upscale");
+  pg.activeSubtool = subtool;
+  _persistShellState(state);
+  if (crossed) {
+    if (context && context.setPage) context.setPage("playground");
+    return;
+  }
+  try {
+    var row = document.querySelector('[data-testid="tool-submenu-post"]');
+    if (row) {
+      Array.prototype.forEach.call(row.querySelectorAll("[data-subtool]"), function (btn) {
+        var on = btn.getAttribute("data-subtool") === subtool;
+        btn.classList.toggle("is-on", on);
+        btn.classList.toggle("active", on);
+        btn.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      var note = row.querySelector('[data-testid="submenu-post-note"]');
+      if (note) note.textContent = _postSubmenuNote(subtool);
+    }
+  } catch (_e) {}
+  _focusPostCategory(subtool);
+}
+
 async function _runSelectionFlow(state, context, actions, workflowId, prevValues) {
   // Shared select → saved-values → carry → chain flow for the dropdown,
   // tool-switch restore, and handoff paths. Callers snapshot prevValues
@@ -6649,7 +7020,17 @@ async function _runSelectionFlow(state, context, actions, workflowId, prevValues
   var apiBase = (context && context.apiBase) || "/comfymodal";
   store.handoffError = null;
   const result = await wf.selectWorkflow(apiBase, store, workflowId);
+  // A superseded rapid-switch loser leaves the store to the newer winner:
+  // no persistence, carry, chain, or paint from stale data.
+  if (result && result.superseded) return result;
+  var _flowGen = store._selGen;
   await _loadWorkflowModelLibrary(state, apiBase);
+  // A tool switch during the slow model-library fetch bumps _selGen (see
+  // _setActiveTool): the winner owns the store now, so this tail must not
+  // persist, sync, carry, or paint the stale selection back over it.
+  if (store._selGen !== _flowGen) {
+    return { ok: false, error: "superseded", reasons: ["superseded"], superseded: true };
+  }
   if (result && result.ok) {
     wf.saveWorkflowSelection({
       workflowId: store.workflowId,
@@ -6750,28 +7131,33 @@ async function _chainCurrentImageToSource(state, context, actions) {
 }
 
 export function renderToolStrip(state, context, actions) {
-  var current = activeToolOf(state);
+  // Phase 1 shell: exactly Generate | Edit | Post Processing. Internal
+  // execution types (STUDIO_TOOLS) are unchanged — this rail only selects
+  // the visible mode, reusing the existing rail button classes.
+  var current = activeModeOf(state);
   var strip = el("div", {
     class: "comfymodal-studio-tool-strip",
     "data-testid": "studio-tool-strip",
     role: "toolbar",
     "aria-label": "Studio tools",
   });
-  STUDIO_TOOLS.forEach(function (tool) {
-    var isActive = tool.id === current;
+  STUDIO_MODES.forEach(function (mode) {
+    var isActive = mode.id === current;
     var btn = el("button", {
       type: "button",
       class: "comfymodal-studio-tool-rail-btn" + (isActive ? " is-on active" : ""),
-      "data-testid": "studio-tool-" + tool.id,
-      "data-tool": tool.id,
-      title: tool.title || tool.label,
+      "data-testid": "studio-tool-" + mode.id,
+      "data-tool": mode.id,
+      title: mode.title || mode.label,
     });
     btn.setAttribute("aria-pressed", isActive ? "true" : "false");
-    var icon = el("span", { class: "tool-icon", "aria-hidden": "true", text: tool.icon || "○" });
-    var label = el("span", { class: "tool-label", text: tool.label });
+    var icon = el("span", { class: "tool-icon", "aria-hidden": "true", text: mode.icon || "○" });
+    var label = el("span", { class: "tool-label", text: mode.label });
     btn.appendChild(icon);
     btn.appendChild(label);
-    btn.addEventListener("click", function () { _setActiveTool(state, context, actions, tool.id); });
+    btn.addEventListener("click", function () {
+      _setActiveSubtool(state, context, actions, mode.id, _defaultSubtoolForMode(state, mode.id));
+    });
     strip.appendChild(btn);
   });
   return strip;
@@ -6831,24 +7217,21 @@ function _runNextQueued(state, context, actions, btn) {
   if (!q.length || _isRunActive(state)) return;
   var next = q.shift();
   _saveQueue(state);
-  // Restore the queued settings onto the live surface, then submit through
-  // the same single-run path the Run button uses.
-  try {
-    if (next.tool) {
-      pg.activeTool = next.tool;
-      pg.toolId = next.tool;
-    }
-    var store = pg._workflowRun;
-    if (store && next.controlValues) {
-      store.controlValues = Object.assign({}, next.controlValues);
-    }
-    if (pg.controls && next.controlValues) {
-      Object.keys(next.controlValues).forEach(function (k) {
-        if (next.controlValues[k] !== undefined) pg.controls[k] = next.controlValues[k];
-      });
-    }
-  } catch (_e) {}
-  if (context && context.setPage) context.setPage("playground");
+  // Background queue execution restores only the queued values onto the
+  // live store, then submits through the same single-run path. It never
+  // overwrites the visible UI: the user may be in Post or a placeholder
+  // while earlier-enqueued runs drain, and a same-type auto-drain must not
+  // jump the view back to Generate/Text. Shell reconciliation stays with
+  // explicit picker/mode actions only.
+  var store = pg._workflowRun;
+  if (store && next.controlValues) {
+    store.controlValues = Object.assign({}, next.controlValues);
+  }
+  if (pg.controls && next.controlValues) {
+    Object.keys(next.controlValues).forEach(function (k) {
+      if (next.controlValues[k] !== undefined) pg.controls[k] = next.controlValues[k];
+    });
+  }
   setTimeout(function () {
     var liveBtn = _resolvePrimaryRunButton();
     _modernRunSubmit(state, context, actions, liveBtn || btn);
@@ -7695,7 +8078,26 @@ function renderWorkspaceTopBar(state, context, actions) {
   primaryBtn.appendChild(el("span", { text: primaryLabel, "data-testid": "run-btn-label" }));
   var reason = el("div", { class: "comfymodal-studio-topbar-reason" });
   var batchApplying = !!pg._batchApplying;
-  if (batchApplying) {
+  // Phase 1 shell gate (Post local engine / later-phase placeholder): no
+  // workflow execution from this view. In-flight runs keep their busy UI.
+  var _shellGate = _shellRunGate(state);
+  var _runBusy = batchApplying
+    || (runState && (runState.status === "running" || runState.status === "submitted"
+    || runState.status === "waiting" || runState.status === "queued"
+    || runState.status === "in_progress"));
+  if (_shellGate && !_runBusy) {
+    // Disabled with an honest reason; queue/enqueue handlers below must
+    // not attach in this view.
+    primaryBtn.disabled = true;
+    primaryBtn.title = _shellGate;
+    if (reason) {
+      reason.appendChild(el("p", {
+        "data-testid": "shell-gate-reason",
+        text: _shellGate,
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    }
+  } else if (batchApplying) {
     // A container batch is in flight: lock the primary button on batch
     // progress so a second batch or single run cannot overlap it.
     primaryBtn.disabled = true;
@@ -7760,7 +8162,8 @@ function renderWorkspaceTopBar(state, context, actions) {
       title: queue.length ? "Run all queued items in order — same-workflow groups share one container (" + queue.length + " waiting)" : "Queue is empty — queue a run first",
     });
     runQueueBtn.textContent = "Run queue" + (queue.length ? " (" + queue.length + ")" : "");
-    runQueueBtn.disabled = queue.length === 0 || _isRunActive(state) || !!pg._batchApplying;
+    runQueueBtn.disabled = queue.length === 0 || _isRunActive(state) || !!pg._batchApplying || !!_shellGate;
+    if (_shellGate) runQueueBtn.title = _shellGate;
     runQueueBtn.addEventListener("click", function () {
       _drainNextGroup(state, context, actions);
     });
@@ -7843,24 +8246,15 @@ function renderWorkspaceTopBar(state, context, actions) {
   return bar;
 }
 
-// ── Per-tool submenu row ──────────────────────────────────────────
-// Radio-linked to the tool rail: exactly one submenu is visible, directly
-// above the canvas. Bodies are intentionally sparse placeholders —
-// fill them in later via [data-testid="submenu-body-{id}"].
-
-var _TOOL_SUBMENU_NOTES = {
-  t2i: "Generate controls live here.",
-  i2i: "Edit controls live here.",
-  inpaint: "Mask controls live here.",
-  outpaint: "Crop controls live here.",
-  sketch: "Draw controls live here.",
-  postprocess: "Finishing editor lives in the canvas below — pick the Studio image there, or upload your own.",
-  upscale: "Upscale workflow controls live here (coming soon).",
-};
+// ── Phase 1 mode submenu row ────────────────────────────────────────
+// Radio-linked to the mode rail: exactly one submenu is visible, directly
+// above the canvas. Buttons reuse the existing secondary-button classes;
+// later-phase entries stay visible with honest disabled-execution notes.
 
 function renderToolSubmenu(state, context, actions) {
-  var tool = activeToolOf(state);
-  var spec = STUDIO_TOOLS.find(function (t) { return t.id === tool; }) || STUDIO_TOOLS[0];
+  var mode = activeModeOf(state);
+  var sub = activeSubtoolOf(state);
+  var spec = STUDIO_MODES.find(function (m) { return m.id === mode; }) || STUDIO_MODES[0];
   var row = el("div", {
     class: "comfymodal-studio-tool-submenu",
     "data-testid": "tool-submenu-" + spec.id,
@@ -7877,7 +8271,26 @@ function renderToolSubmenu(state, context, actions) {
     "data-testid": "submenu-body-" + spec.id,
   });
 
-  if (spec.id === "t2i") {
+  (STUDIO_SUBMENUS[spec.id] || []).forEach(function (s) {
+    var isActive = s === sub;
+    var btn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn" + (isActive ? " is-on active" : ""),
+      "data-testid": "studio-subtool-" + s,
+      "data-subtool": s,
+      text: STUDIO_SUBTOOL_LABELS[s] || s,
+      title: (STUDIO_SUBTOOL_LABELS[s] || s)
+        + (_isPlaceholderSubtool(s) ? " (later phase — execution disabled)" : ""),
+    });
+    btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+    btn.addEventListener("click", function () {
+      if (spec.id === "post") _selectPostCategory(state, context, s);
+      else _setActiveSubtool(state, context, actions, spec.id, s);
+    });
+    body.appendChild(btn);
+  });
+
+  if (mode === "generate" && sub === "text") {
     // Background fill: paints the canvas background a user-picked color.
     var pg = state.playground || {};
     var current = pg.canvasBg || "";
@@ -7933,26 +8346,16 @@ function renderToolSubmenu(state, context, actions) {
         text: "Optional — fills the empty canvas background.",
       }));
     }
-  } else if (spec.id === "postprocess") {
+  } else if (spec.id === "post") {
     body.appendChild(el("span", {
       class: "comfymodal-studio-tool-submenu-note",
-      text: (_TOOL_SUBMENU_NOTES[spec.id] || "Finishing editor below."),
+      "data-testid": "submenu-post-note",
+      text: _postSubmenuNote(sub),
     }));
-    var _ppHint = el("span", {
-      class: "comfymodal-studio-tool-submenu-note",
-      text: "Shortcuts: \\ compare · C crop · J heal · W white balance · Ctrl+Z/Y undo/redo.",
-      style: "margin-left:8px;",
-    });
-    body.appendChild(_ppHint);
-  } else if (spec.isPlaceholder) {
+  } else if (_isPlaceholderSubtool(sub)) {
     body.appendChild(el("span", {
       class: "comfymodal-studio-tool-submenu-note",
-      text: (_TOOL_SUBMENU_NOTES[spec.id] || "Coming soon."),
-    }));
-  } else {
-    body.appendChild(el("span", {
-      class: "comfymodal-studio-tool-submenu-note",
-      text: (_TOOL_SUBMENU_NOTES[spec.id] || "Tool options live here."),
+      text: (STUDIO_SUBTOOL_LABELS[sub] || sub) + " arrives in a later phase — execution is disabled.",
     }));
   }
 
@@ -9483,6 +9886,9 @@ function _refreshShelfSection(state, context, actions) {
     return;
   }
   if (!_isModernRunSelected(state)) return;
+  // Phase 1 shell: Post and later-phase placeholders deliberately render no
+  // shelf — a late async refresh must not mount stale fields into them.
+  if (activeModeOf(state) === "post" || _isPlaceholderSubtool(activeSubtoolOf(state))) return;
   var panel = document.querySelector('[data-testid="control-panel"]');
   var anchor = panel && panel.querySelector('[data-testid="workflow-selector-section"]');
   if (!panel || !anchor) return;

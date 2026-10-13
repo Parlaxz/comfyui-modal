@@ -13,7 +13,7 @@
 import { CONTROL_DEFS, getRecommendedSteps, getRecommendedStepsStatus, getLastFiniteSeed, cryptoRandomSeed } from "./studio-feature-registry.js";
 import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
 import { renderWorkflowPicker } from "./studio-workflow-picker.js";
-import { loadShelfExperimentDraft, saveShelfExperimentDraft } from "./studio-playground-state.js";
+import { loadShelfExperimentDraft, saveShelfExperimentDraft, shellGateReason } from "./studio-playground-state.js";
 import {
   runExperimentV2,
   getExperimentV2Status,
@@ -744,6 +744,11 @@ export function buildModernExperimentDefinition(state, context) {
 }
 
 export function modernExperimentCanRun(state) {
+  // Phase 1 shell gate: Post and later-phase placeholders have no
+  // execution path, so no new experiment submission starts from them.
+  // Drafts, active-experiment monitoring, and cancel/resume are unaffected
+  // (only the submit paths consult this).
+  if (_shellExperimentGate(state)) return false;
   var selection = resolveModernWorkflowSelection(state);
   return !!(selection.workflowId && selection.workflowVersionId);
 }
@@ -764,10 +769,22 @@ export function experimentRunSurface(state) {
 }
 
 export function modernExperimentDisabledReason(state) {
+  var gate = _shellExperimentGate(state);
+  if (gate) return gate;
   var selection = resolveModernWorkflowSelection(state);
   if (!selection.workflowId) return "Select a Workflow and Version before running an experiment.";
   if (!selection.workflowVersionId) return "Select a Workflow Version before running an experiment.";
   return "";
+}
+
+// Visible shell gate reason for experiment submits: the same single-sourced
+// text the playground topbar shows. Reads the persisted shell only — never
+// blocks on unknown/not-yet-restored values. Monitoring, cancel, and resume
+// never consult this; only new submissions do.
+function _shellExperimentGate(state) {
+  var pg = state && state.playground;
+  if (!pg) return null;
+  return shellGateReason(pg.activeMode, pg.activeSubtool);
 }
 
 /** Canonical status label for chips; canceled/interrupted/failed distinct. */
@@ -1788,6 +1805,11 @@ function _shelfExpRandomFor(entry) {
 }
 
 function _shelfExpMatrix(state) {
+  // Phase 1 shell gate feeds submission eligibility: no new experiment from
+  // Post or later-phase placeholders. Drafts stay editable; the reason is
+  // the same text the topbar shows.
+  var gate = _shellExperimentGate(state);
+  if (gate) return { workflows: 0, axes: [], total: 0, runnable: false, reason: gate };
   var exp = _shelfExpGet(state);
   var contexts = (exp && exp.contexts) || {};
   var ids = _shelfExpReconcileIds(state);
