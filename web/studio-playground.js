@@ -5285,6 +5285,16 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   paint.style.width = "100%";
   paint.style.height = "100%";
   paint.style.cursor = "crosshair";
+  // Keep mask pixels opaque for saving and mask operations, then dim the
+  // whole overlay. This keeps overlapping strokes at a stable 10% instead of
+  // accumulating alpha toward opaque.
+  var maskVisualOpacity = isMask ? 0.1 : 1;
+  paint.style.opacity = String(maskVisualOpacity);
+  var ants = document.createElement("canvas");
+  ants.setAttribute("aria-hidden", "true");
+  ants.style.position = "absolute";
+  ants.style.pointerEvents = "none";
+  ants.style.inset = "0";
   var hostImg = canvasEl ? canvasEl.querySelector('[data-testid="canvas-output"]') : null;
   if (hostImg) {
     // Paint directly on the main canvas image: wrap it and overlay.
@@ -5302,6 +5312,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     if (hostImg.parentNode) hostImg.parentNode.insertBefore(hostWrap, hostImg);
     hostWrap.appendChild(hostImg);
     hostWrap.appendChild(paint);
+    hostWrap.appendChild(ants);
   } else {
     // No main-canvas image (nothing to paint on yet): keep the separate
     // editor base so an uploaded source is still paintable.
@@ -5311,6 +5322,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     if (baseUrl) base.src = baseUrl;
     wrap.appendChild(base);
     wrap.appendChild(paint);
+    wrap.appendChild(ants);
     box.appendChild(wrap);
   }
   var preview = el("p", {
@@ -5326,6 +5338,8 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     if (!w || !h) return;
     paint.width = w;
     paint.height = h;
+    ants.width = w;
+    ants.height = h;
     syncOverlayBox();
   }
   // The overlay must sit exactly over the base image: the wrap may be
@@ -5342,10 +5356,15 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
       paint.style.inset = "auto";
       paint.style.left = (br.left - wr.left) + "px";
       paint.style.top = (br.top - wr.top) + "px";
-      paint.style.width = br.width + "px";
-      paint.style.height = br.height + "px";
-    } catch (_e) {}
-  }
+       paint.style.width = br.width + "px";
+       paint.style.height = br.height + "px";
+       ants.style.inset = "auto";
+       ants.style.left = (br.left - wr.left) + "px";
+       ants.style.top = (br.top - wr.top) + "px";
+       ants.style.width = br.width + "px";
+       ants.style.height = br.height + "px";
+     } catch (_e) {}
+   }
   function onWinResizeOverlay() {
     if (!box.isConnected) { window.removeEventListener("resize", onWinResizeOverlay); return; }
     syncOverlayBox();
@@ -5353,6 +5372,44 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   window.addEventListener("resize", onWinResizeOverlay);
   base.addEventListener("load", fitCanvas);
   if (base.complete) setTimeout(fitCanvas, 0);
+
+  // The border is a separate, non-persistent canvas so marching ants never
+  // become part of the mask or its undo snapshots.
+  var antsFrame = 0;
+  function drawMarchingAnts(time) {
+    if (!box.isConnected || !ants.getClientRects().length || document.hidden) {
+      if (!box.isConnected) document.removeEventListener("visibilitychange", onVisibilityChange);
+      antsFrame = 0;
+      return;
+    }
+    var ctx = ants.getContext("2d");
+    ctx.clearRect(0, 0, ants.width, ants.height);
+    ctx.save();
+    ctx.lineWidth = Math.max(2, ants.width / Math.max(1, ants.clientWidth) * 2);
+    ctx.setLineDash([8, 6]);
+    ctx.lineDashOffset = -(time / 40);
+    ctx.strokeStyle = "rgba(0,0,0,0.9)";
+    ctx.strokeRect(ctx.lineWidth / 2, ctx.lineWidth / 2, ants.width - ctx.lineWidth, ants.height - ctx.lineWidth);
+    ctx.lineWidth = Math.max(1, ants.width / Math.max(1, ants.clientWidth));
+    ctx.lineDashOffset = -(time / 40) + 7;
+    ctx.strokeStyle = "rgba(255,255,255,0.95)";
+    ctx.strokeRect(ctx.lineWidth / 2, ctx.lineWidth / 2, ants.width - ctx.lineWidth, ants.height - ctx.lineWidth);
+    ctx.restore();
+    antsFrame = requestAnimationFrame(drawMarchingAnts);
+  }
+  function startMarchingAnts() {
+    if (isMask && !antsFrame) antsFrame = requestAnimationFrame(drawMarchingAnts);
+  }
+  function stopMarchingAnts() {
+    if (antsFrame) cancelAnimationFrame(antsFrame);
+    antsFrame = 0;
+  }
+  function onVisibilityChange() {
+    if (document.hidden) stopMarchingAnts();
+    else if (box.isConnected) startMarchingAnts();
+    else document.removeEventListener("visibilitychange", onVisibilityChange);
+  }
+  document.addEventListener("visibilitychange", onVisibilityChange);
 
   var undoStack = [];
   var redoStack = [];
@@ -5457,8 +5514,8 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
       ctx.fillStyle = "rgba(0,0,0,1)";
     } else {
       ctx.globalCompositeOperation = "source-over";
-      ctx.strokeStyle = isMask ? "rgba(255,255,255,0.95)" : "rgba(255,60,60,0.9)";
-      ctx.fillStyle = isMask ? "rgba(255,255,255,0.95)" : "rgba(255,60,60,0.9)";
+      ctx.strokeStyle = isMask ? "rgba(255,255,255,1)" : "rgba(255,60,60,0.9)";
+      ctx.fillStyle = isMask ? "rgba(255,255,255,1)" : "rgba(255,60,60,0.9)";
     }
   }
   function stroke(to) {
@@ -5489,7 +5546,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
       ctx.fillStyle = "rgba(0,0,0,1)";
     } else {
       ctx.globalCompositeOperation = "source-over";
-      ctx.fillStyle = isMask ? "rgba(255,255,255,0.95)" : "rgba(255,60,60,0.9)";
+      ctx.fillStyle = isMask ? "rgba(255,255,255,1)" : "rgba(255,60,60,0.9)";
     }
     ctx.fill();
     ctx.restore();
@@ -5860,6 +5917,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
       }
     } catch (_e) { preview.textContent = "Save failed — try again."; }
   });
+  startMarchingAnts();
   return box;
 }
 
