@@ -4578,6 +4578,340 @@ function renderFeatureTabs(state, context) {
   return tabs;
 }
 
+// -- Layout (Phase 7: visual prompt authoring) --------------------------
+// Boxes live in a localStorage draft; the deterministic serializer turns
+// them into one human-readable prompt string handed to the normal prompt
+// control via Send to Prompt. No Layout workflow, engine, or schema.
+var LAYOUT_STORE_KEY = "comfymodal.studio.layout.v1";
+var LAYOUT_ASPECTS = [["1:1", 1], ["3:4", 0.75], ["4:3", 4 / 3], ["16:9", 16 / 9], ["9:16", 9 / 16]];
+function loadLayoutDraft() {
+  var out = { boxes: [], globalDesc: "", aspect: "1:1", selectedId: "", seq: 0 };
+  try {
+    var raw = localStorage.getItem(LAYOUT_STORE_KEY);
+    if (!raw) return out;
+    var j = JSON.parse(raw);
+    if (j && Array.isArray(j.boxes)) {
+      out.boxes = j.boxes.filter(function (b) {
+        return b && (b.kind === "object" || b.kind === "text")
+          && isFinite(Number(b.x)) && isFinite(Number(b.y))
+          && isFinite(Number(b.w)) && isFinite(Number(b.h));
+      }).map(function (b) {
+        return {
+          id: String(b.id || ""), kind: b.kind,
+          x: Math.max(0, Math.min(100, Number(b.x))), y: Math.max(0, Math.min(100, Number(b.y))),
+          w: Math.max(1, Math.min(100, Number(b.w))), h: Math.max(1, Math.min(100, Number(b.h))),
+          label: String(b.label || ""), desc: String(b.desc || ""),
+          text: String(b.text || ""), color: String(b.color || "#e8b93e"),
+        };
+      });
+    }
+    if (j && typeof j.globalDesc === "string") out.globalDesc = j.globalDesc;
+    if (j && typeof j.aspect === "string") out.aspect = j.aspect;
+    if (j && typeof j.selectedId === "string") out.selectedId = j.selectedId;
+    if (j && isFinite(Number(j.seq))) out.seq = Number(j.seq);
+  } catch (_e) {}
+  return out;
+}
+function saveLayoutDraft(draft) {
+  try { localStorage.setItem(LAYOUT_STORE_KEY, JSON.stringify(draft || {})); } catch (_e) {}
+}
+function _layoutAspectRatio(aspect) {
+  for (var i = 0; i < LAYOUT_ASPECTS.length; i++) {
+    if (LAYOUT_ASPECTS[i][0] === aspect) return LAYOUT_ASPECTS[i][1];
+  }
+  return 1;
+}
+// Deterministic serializer: creation order, integer 0-100 geometry, fixed
+// line shapes. Human-readable and diffable; the exact string is what Send
+// to Prompt submits, so History stays auditable through prompt_text.
+function serializeLayout(draft) {
+  var d = draft || { boxes: [], globalDesc: "", aspect: "1:1" };
+  var lines = [];
+  var global = String(d.globalDesc || "").trim();
+  lines.push("Scene: " + (global || "unspecified scene") + ".");
+  var boxes = Array.isArray(d.boxes) ? d.boxes : [];
+  var oi = 0, ti = 0;
+  boxes.forEach(function (b) {
+    var x = Math.round(Number(b.x)), y = Math.round(Number(b.y));
+    var w = Math.round(Number(b.w)), h = Math.round(Number(b.h));
+    if (b.kind === "text") {
+      ti++;
+      var t = String(b.text || "").trim() || ("text " + ti);
+      lines.push("Text " + ti + ": \"" + t + "\" at x=" + x + ",y=" + y + " size " + w + "x" + h + ".");
+    } else {
+      oi++;
+      var label = String(b.label || "").trim() || ("object " + oi);
+      var desc = String(b.desc || "").trim();
+      var color = String(b.color || "").trim();
+      var line = "Object " + oi + " \"" + label + "\""
+        + (desc ? ": " + desc : "")
+        + " at x=" + x + ",y=" + y + " size " + w + "x" + h
+        + (color ? " color " + color : "") + ".";
+      lines.push(line);
+    }
+  });
+  lines.push("Canvas: " + String(d.aspect || "1:1") + ".");
+  return lines.join("\n");
+}
+function _renderLayoutEditor(state, context, actions) {
+  var wrap = el("div", {
+    class: "comfymodal-studio-layout",
+    "data-testid": "layout-editor",
+    style: "width:100%;display:flex;flex-direction:column;gap:8px;",
+  });
+  var draft = loadLayoutDraft();
+  function persist() { saveLayoutDraft(draft); paintPreview(); }
+  var toolbar = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;" });
+  var addObj = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "+ Object region", "data-testid": "layout-add-object" });
+  var addTxt = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "+ Text region", "data-testid": "layout-add-text" });
+  var aspectSel = el("select", { "data-testid": "layout-aspect", class: "comfymodal-input", title: "Stage aspect ratio" });
+  LAYOUT_ASPECTS.forEach(function (pair) {
+    var o = document.createElement("option");
+    o.value = pair[0];
+    o.textContent = pair[0];
+    if (draft.aspect === pair[0]) o.selected = true;
+    aspectSel.appendChild(o);
+  });
+  var clearBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Reset", "data-testid": "layout-reset", title: "Clear all regions" });
+  var sendBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Send to Prompt →", "data-testid": "layout-send", title: "Copy the serialization into the normal prompt and return to Text" });
+  toolbar.appendChild(addObj);
+  toolbar.appendChild(addTxt);
+  toolbar.appendChild(aspectSel);
+  toolbar.appendChild(clearBtn);
+  toolbar.appendChild(sendBtn);
+  wrap.appendChild(toolbar);
+  var stage = el("div", {
+    "data-testid": "layout-stage",
+    style: "position:relative;width:100%;aspect-ratio:" + String(draft.aspect || "1:1").replace(":", " / ")
+      + ";background:#141416;border:1px solid var(--color-border, #333);border-radius:8px;overflow:hidden;touch-action:none;",
+  });
+  wrap.appendChild(stage);
+  var insp = el("div", { "data-testid": "layout-inspector", style: "display:flex;flex-direction:column;gap:6px;" });
+  wrap.appendChild(insp);
+  var preview = el("pre", {
+    "data-testid": "layout-preview",
+    style: "font-size:11px;color:#888;white-space:pre-wrap;margin:0;overflow-wrap:anywhere;",
+  });
+  wrap.appendChild(preview);
+  function paintPreview() {
+    preview.textContent = serializeLayout(draft);
+  }
+  function selectedBox() {
+    for (var i = 0; i < draft.boxes.length; i++) {
+      if (draft.boxes[i].id === draft.selectedId) return draft.boxes[i];
+    }
+    return null;
+  }
+  function clampBox(b) {
+    b.x = Math.max(0, Math.min(100 - b.w, b.x));
+    b.y = Math.max(0, Math.min(100 - b.h, b.y));
+    b.w = Math.max(1, Math.min(100 - b.x, b.w));
+    b.h = Math.max(1, Math.min(100 - b.y, b.h));
+  }
+  function paintBoxes() {
+    while (stage.firstChild) stage.removeChild(stage.firstChild);
+    draft.boxes.forEach(function (b) {
+      var on = b.id === draft.selectedId;
+      var box = el("div", {
+        "data-testid": "layout-box-" + b.id,
+        "data-box-id": b.id,
+        title: (b.kind === "text" ? "Text: " + (b.text || "(empty)") : "Object: " + (b.label || "(unnamed)")),
+        style: "position:absolute;left:" + b.x + "%;top:" + b.y + "%;width:" + b.w + "%;height:" + b.h + "%;"
+          + "border:2px solid " + (on ? "#e8b93e" : (b.kind === "text" ? "#7ab8ff" : b.color || "#e8b93e"))
+          + ";border-radius:4px;background:" + (b.kind === "text" ? "rgba(122,184,255,.08)" : "rgba(232,185,62,.07)")
+          + ";cursor:move;box-sizing:border-box;",
+      });
+      var tag = el("span", {
+        text: b.kind === "text" ? ("T: " + String(b.text || "(text)").slice(0, 18)) : ("O: " + String(b.label || "(object)").slice(0, 18)),
+        style: "position:absolute;top:-18px;left:0;font-size:10px;color:#aaa;white-space:nowrap;",
+      });
+      box.appendChild(tag);
+      var grip = el("span", {
+        "data-testid": "layout-resize-" + b.id,
+        title: "Resize",
+        style: "position:absolute;right:-7px;bottom:-7px;width:14px;height:14px;border-radius:3px;background:#e8b93e;cursor:nwse-resize;",
+      });
+      box.appendChild(grip);
+      box.addEventListener("pointerdown", function (ev) {
+        ev.stopPropagation();
+        draft.selectedId = b.id;
+        persist();
+        paintBoxes();
+        paintInspector();
+        var r = stage.getBoundingClientRect();
+        var sx = ev.clientX, sy = ev.clientY, ox = b.x, oy = b.y;
+        function mv(e2) {
+          b.x = ox + ((e2.clientX - sx) / r.width) * 100;
+          b.y = oy + ((e2.clientY - sy) / r.height) * 100;
+          clampBox(b);
+          box.style.left = b.x + "%";
+          box.style.top = b.y + "%";
+        }
+        function up() {
+          document.removeEventListener("pointermove", mv);
+          document.removeEventListener("pointerup", up);
+          persist();
+          paintPreview();
+        }
+        document.addEventListener("pointermove", mv);
+        document.addEventListener("pointerup", up);
+      });
+      grip.addEventListener("pointerdown", function (ev) {
+        ev.stopPropagation();
+        ev.preventDefault();
+        draft.selectedId = b.id;
+        var r = stage.getBoundingClientRect();
+        var sx = ev.clientX, sy = ev.clientY, ow = b.w, oh = b.h;
+        function mv(e2) {
+          b.w = ow + ((e2.clientX - sx) / r.width) * 100;
+          b.h = oh + ((e2.clientY - sy) / r.height) * 100;
+          clampBox(b);
+          box.style.width = b.w + "%";
+          box.style.height = b.h + "%";
+        }
+        function up() {
+          document.removeEventListener("pointermove", mv);
+          document.removeEventListener("pointerup", up);
+          persist();
+          paintPreview();
+          paintBoxes();
+          paintInspector();
+        }
+        document.addEventListener("pointermove", mv);
+        document.addEventListener("pointerup", up);
+      });
+      stage.appendChild(box);
+    });
+  }
+  function paintInspector() {
+    while (insp.firstChild) insp.removeChild(insp.firstChild);
+    var gbox = el("div", { style: "display:flex;gap:8px;align-items:center;" });
+    gbox.appendChild(el("span", { text: "Background", style: "font-size:12px;color:#aaa;flex:none;" }));
+    var gdesc = el("input", {
+      type: "text", value: draft.globalDesc || "", placeholder: "Global / background description…",
+      "data-testid": "layout-global-desc", class: "comfymodal-input comfymodal-studio-text-input",
+      style: "flex:1;min-width:0;",
+    });
+    gdesc.addEventListener("input", function () { draft.globalDesc = gdesc.value; persist(); });
+    gbox.appendChild(gdesc);
+    insp.appendChild(gbox);
+    var b = selectedBox();
+    if (!b) {
+      insp.appendChild(el("p", {
+        text: "Select a region to edit it, or add one above.",
+        style: "font-size:11px;color:#888;margin:0;",
+      }));
+      return;
+    }
+    var grow = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;" });
+    grow.appendChild(el("span", { text: b.kind === "text" ? "Text region" : "Object region", style: "font-size:12px;color:#aaa;" }));
+    if (b.kind === "object") {
+      var lab = el("input", {
+        type: "text", value: b.label || "", placeholder: "Label, e.g. lighthouse",
+        "data-testid": "layout-box-label", class: "comfymodal-input comfymodal-studio-text-input",
+        style: "flex:1;min-width:0;",
+      });
+      lab.addEventListener("input", function () { b.label = lab.value; persist(); paintBoxes(); });
+      grow.appendChild(lab);
+      var col = el("input", {
+        type: "color", value: /^#[0-9a-fA-F]{6}$/.test(b.color || "") ? b.color : "#e8b93e",
+        "data-testid": "layout-box-color", title: "Region color",
+      });
+      col.addEventListener("input", function () { b.color = col.value; persist(); paintBoxes(); });
+      grow.appendChild(col);
+    } else {
+      var txt = el("input", {
+        type: "text", value: b.text || "", placeholder: "Exact text in the image",
+        "data-testid": "layout-box-text", class: "comfymodal-input comfymodal-studio-text-input",
+        style: "flex:1;min-width:0;",
+      });
+      txt.addEventListener("input", function () { b.text = txt.value; persist(); paintBoxes(); });
+      grow.appendChild(txt);
+    }
+    var del = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Delete", "data-testid": "layout-box-delete" });
+    del.addEventListener("click", function () {
+      draft.boxes = draft.boxes.filter(function (x) { return x.id !== b.id; });
+      if (draft.selectedId === b.id) draft.selectedId = "";
+      persist();
+      paintBoxes();
+      paintInspector();
+    });
+    grow.appendChild(del);
+    insp.appendChild(grow);
+    if (b.kind === "object") {
+      var desc = el("textarea", {
+        value: b.desc || "", placeholder: "Region description…", rows: "2",
+        "data-testid": "layout-box-desc", class: "comfymodal-input comfymodal-studio-textarea",
+        style: "width:100%;box-sizing:border-box;",
+      });
+      desc.addEventListener("input", function () { b.desc = desc.value; persist(); });
+      insp.appendChild(desc);
+    }
+  }
+  function addBox(kind) {
+    draft.seq = (draft.seq || 0) + 1;
+    var id = "r" + draft.seq + Date.now().toString(36);
+    var b = kind === "text"
+      ? { id: id, kind: "text", x: 10, y: 10, w: 40, h: 12, label: "", desc: "", text: "", color: "#7ab8ff" }
+      : { id: id, kind: "object", x: 20, y: 20, w: 30, h: 30, label: "", desc: "", text: "", color: "#e8b93e" };
+    draft.boxes.push(b);
+    draft.selectedId = id;
+    persist();
+    paintBoxes();
+    paintInspector();
+  }
+  addObj.addEventListener("click", function () { addBox("object"); });
+  addTxt.addEventListener("click", function () { addBox("text"); });
+  aspectSel.addEventListener("change", function () {
+    draft.aspect = aspectSel.value;
+    stage.style.aspectRatio = String(draft.aspect || "1:1").replace(":", " / ");
+    persist();
+  });
+  clearBtn.addEventListener("click", function () {
+    draft.boxes = [];
+    draft.selectedId = "";
+    persist();
+    paintBoxes();
+    paintInspector();
+  });
+  sendBtn.addEventListener("click", function () {
+    var text = serializeLayout(draft);
+    // Write through the Shelf commit seam (store + validation + DOM sync),
+    // not the draft-only setControl path, so the Text prompt field shows it.
+    try {
+      if (typeof commitShelfValue === "function") {
+        commitShelfValue(state, context, actions, "prompt", text);
+      } else if (actions && actions.setControl) {
+        actions.setControl("prompt", text);
+      }
+    } catch (_e) {}
+    // Return to the ordinary Text prompt so the next run is the normal
+    // T2I path with the serialization visible in its prompt field.
+    try {
+      var pg = state && state.playground;
+      if (pg) {
+        pg.activeSubtool = "text";
+        _persistShellState(state);
+      }
+    } catch (_e2) {}
+    try {
+      if (context && context.setPage) context.setPage("playground");
+    } catch (_e3) {}
+  });
+  stage.addEventListener("pointerdown", function () {
+    if (draft.selectedId) {
+      draft.selectedId = "";
+      persist();
+      paintBoxes();
+      paintInspector();
+    }
+  });
+  paintBoxes();
+  paintInspector();
+  paintPreview();
+  return wrap;
+}
+
 // -- Canvas ----------------------------------------------------------
 
 function renderCanvas(state, context, actions) {
@@ -4609,6 +4943,12 @@ function renderCanvas(state, context, actions) {
       el("p", { text: _shellLabel + " — available in a later phase", style: "font-weight:var(--font-weight-semibold);margin-bottom:8px;" }),
       el("p", { text: "Execution is disabled for this view. Your workflow, values, and current image are preserved.", style: "font-size:var(--font-size-sm);color:var(--color-text-muted);" }),
     ]));
+  }
+  // Phase 7: Layout is visual prompt authoring on Generate. The editor owns
+  // this view (the last output stays available in filmstrip/recent runs).
+  if (activeToolOf(state) === "t2i" && _shellSub === "layout") {
+    canvas.appendChild(_renderLayoutEditor(state, context, actions));
+    return canvas;
   }
   var _paintToolId = activeToolOf(state);
   var _isPaintTool = _paintToolId === "inpaint" || _paintToolId === "sketch" || _isSelectOnI2I(state);
