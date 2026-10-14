@@ -617,8 +617,10 @@ var CSS = [
   // touches the recipe/engine. Crop/Heal keep their focused tool views and
   // hide the cross-category Looks panel; the grid itself stays so any panel
   // is one click away (the click navigates subtools and disarms the tool).
-  ".pp-native-sidebar .pp-tabs{position:sticky;top:0;z-index:3;display:grid;gap:4px;padding:8px 0;background:var(--color-bg-primary,#17191f);border-bottom:1px solid var(--color-border,#2b2d35);grid-template-columns:repeat(3,minmax(0,1fr))}",
-  ".pp-native-sidebar .pp-tabs .pp-btn{min-height:28px;padding:4px 6px;font-size:var(--font-size-sm,12px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+  // The grid is the SOLE adjustment navigation (the top row keeps only
+  // Crop/Heal/Upscale modes), so it reads as a compact tool palette.
+  ".pp-native-sidebar .pp-tabs{position:sticky;top:0;z-index:3;display:grid;gap:3px;padding:6px 0;background:var(--color-bg-primary,#17191f);border-bottom:1px solid var(--color-border,#2b2d35);grid-template-columns:repeat(3,minmax(0,1fr))}",
+  ".pp-native-sidebar .pp-tabs .pp-btn{min-height:26px;padding:3px 6px;font-size:var(--font-size-sm,12px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
   ".pp-native-sidebar .pp-tabs .pp-btn.on{border-color:var(--color-accent,#5a7fdb);background:var(--color-accent-muted,rgba(90,127,219,.16));color:var(--color-text-primary,#fff);font-weight:600}",
   ".pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-insp .pp-group,.pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-insp [data-pp-section=histogram],.pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-looks{display:none}",
   ".pp-native-sidebar[data-post-category=adjust][data-pp-tab=light] .pp-insp .pp-group[data-group=light]{display:block}",
@@ -758,11 +760,9 @@ export function mountPostprocessWorkspace(host, opts) {
       var p = PP_PANELS[i];
       if (p.cat === cat && (p.tab || null) === tab) return p.id;
     }
-    // Fallback keeps one panel visibly active (never a blank grid).
-    for (var j = 0; j < PP_PANELS.length; j++) {
-      if (PP_PANELS[j].cat === cat) return PP_PANELS[j].id;
-    }
-    return "light";
+    // Tool categories (Crop/Heal) own no panel: press nothing rather than a
+    // misleading default. Tabbed categories always match above.
+    return null;
   }
   function ppRefreshPressed(activeId) {
     Object.keys(tabBtns).forEach(function (k) {

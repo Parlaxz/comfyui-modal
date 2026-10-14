@@ -9769,6 +9769,13 @@ function renderToolSubmenu(state, context, actions) {
   });
 
   (STUDIO_SUBMENUS[spec.id] || []).forEach(function (s) {
+    // Phase-4 dedup: the sidebar panel grid is the canonical navigation for
+    // passive adjustment panels, so the top Post row keeps only canvas
+    // interaction modes (Crop/Heal) and the Phase-11 operation (Upscale).
+    // Internal category semantics (adjust/color/detail/effects) are unchanged:
+    // STUDIO_SUBMENUS.post, _selectPostCategory validation, handoffs, and the
+    // engine data-post-category mapping all still use them.
+    if (spec.id === "post" && s !== "crop" && s !== "heal" && s !== "upscale") return;
     var isActive = s === sub;
     var btn = el("button", {
       type: "button",

@@ -83,6 +83,13 @@ async function groupVisible(page, id) {
 }
 
 async function clickPostSubtool(page, subtool) {
+  // Phase-4 dedup: passive categories navigate via the canonical sidebar
+  // grid (the top row keeps only Crop/Heal/Upscale modes).
+  const grid = { adjust: "light", color: "color", detail: "detail", effects: "effects" };
+  if (grid[subtool]) {
+    await clickPpTab(page, grid[subtool]);
+    return;
+  }
   const btn = page.locator(`[data-testid="studio-subtool-${subtool}"]`);
   await expect(btn).toBeVisible({ timeout: 10000 });
   await btn.click();
@@ -358,10 +365,9 @@ test.describe("Post Processing workspace (fake backend)", () => {
     expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
     await expect(page.locator('[data-testid="canvas-area"] [data-testid="pp-canvas"]')).toBeVisible();
 
-    // Back to Color: the Mixer tab (and its value) is remembered while resident.
-    await clickPostSubtool(page, "color");
-    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-tab-mixer"]'))
-      .toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
+    // Back to Mixer with ONE direct panel click (no Color parent first):
+    // explicit panel choice wins, value and recipe intact.
+    await clickPpTab(page, "mixer");
     await expect.poll(() => groupVisible(page, "mixer"), { timeout: 10000 }).toBe(true);
     await expect(page.locator('[data-testid="pp-slider-red-h"] input[type="number"]')).toHaveValue("20");
     expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
@@ -461,7 +467,7 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await fx.assertNoConsoleErrors(ALLOW);
   });
 
-  test("T10 — one panel click reaches any panel; top submenu follows; values hold", async ({ page }) => {
+  test("T10 — one panel click reaches any panel; modes stay separate; values hold", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await openPostprocess(page);
@@ -469,13 +475,21 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await page.locator('[data-testid="pp-slider-exposure"] input[type="range"]').fill("1.5");
     await expect.poll(() => page.evaluate(() => window.__ppRecipe && window.__ppRecipe.recipe.exposure),
       { timeout: 10000 }).toBe(1.5);
-    const subPressed = (sub) => page.locator(`[data-testid="studio-subtool-${sub}"]`);
+    // Dedup contract: the top row keeps ONLY interaction modes — no passive
+    // Adjust/Color/Detail/Effects buttons may exist there anymore.
+    for (const sub of ["crop", "heal", "upscale"]) {
+      await expect(page.locator(`[data-testid="studio-subtool-${sub}"]`)).toBeVisible({ timeout: 10000 });
+    }
+    for (const sub of ["adjust", "color", "detail", "effects"]) {
+      expect(await page.locator(`[data-testid="studio-subtool-${sub}"]`).count()).toBe(0);
+    }
+    const panelPressed = (tab) => page.locator(`[data-testid="pp-sidebar"] [data-testid="pp-tab-${tab}"]`);
 
     // Light → Histogram: same category, exactly one panel click.
     await clickPpTab(page, "histogram");
     await expect.poll(() => sectionVisible(page, '[data-testid="pp-histogram"]'), { timeout: 10000 }).toBe(true);
     await expect.poll(() => groupVisible(page, "light"), { timeout: 10000 }).toBe(false);
-    await expect(subPressed("adjust")).toHaveAttribute("aria-pressed", "true");
+    await expect(panelPressed("histogram")).toHaveAttribute("aria-pressed", "true");
 
     const before = await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe));
 
@@ -483,7 +497,7 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await clickPpTab(page, "curves");
     await expect.poll(() => groupVisible(page, "curves"), { timeout: 10000 }).toBe(true);
     await expect.poll(() => sectionVisible(page, '[data-testid="pp-histogram"]'), { timeout: 10000 }).toBe(false);
-    await expect(subPressed("color")).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
+    await expect(panelPressed("curves")).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
 
     // Curves → LUT → Light: hops across categories, recipe identical throughout.
     await clickPpTab(page, "lut");
@@ -492,7 +506,7 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await clickPpTab(page, "light");
     await expect.poll(() => groupVisible(page, "light"), { timeout: 10000 }).toBe(true);
     await expect.poll(() => sectionVisible(page, '[data-testid="pp-looks"]'), { timeout: 10000 }).toBe(false);
-    await expect(subPressed("adjust")).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
+    await expect(panelPressed("light")).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
     expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
 
     // The canvas stays central and no second workspace ever mounts.
