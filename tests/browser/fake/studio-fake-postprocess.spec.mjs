@@ -515,4 +515,68 @@ test.describe("Post Processing workspace (fake backend)", () => {
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
+
+  test("T11 — Crop/Heal are focused tool views; grid exits cleanly; histogram isolated", async ({ page }) => {
+    const fx = await setupFakeTest(page);
+    const bad = watch4xx(page);
+    await openPostprocess(page);
+    await uploadSource(page);
+    await page.locator('[data-testid="pp-slider-exposure"] input[type="range"]').fill("1.5");
+    await expect.poll(() => page.evaluate(() => window.__ppRecipe && window.__ppRecipe.recipe.exposure),
+      { timeout: 10000 }).toBe(1.5);
+    const before = await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe));
+    const topPressed = (sub) => page.locator(`[data-testid="studio-subtool-${sub}"]`);
+    const gridPressedCount = () => page.locator('[data-testid="pp-sidebar"] [data-testid="pp-tabs"] .on').count();
+
+    // Crop: top mode pressed, grid present with nothing selected, and NO
+    // passive content — no inspector groups, no filmstrip, no histogram,
+    // no Looks. Only the focused instruction + utility row remain.
+    await clickPostSubtool(page, "crop");
+    await expect(topPressed("crop")).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-tabs"]')).toBeVisible();
+    expect(await gridPressedCount()).toBe(0);
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-inspector"]')).toBeHidden();
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-filmstrip"]')).toBeHidden();
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-histogram"]')).toBeHidden();
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-looks"]')).toBeHidden();
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-status"]')).toContainText("crop rect");
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+
+    // One grid click exits Crop cleanly: mode inactive, Light panel active.
+    await clickPpTab(page, "light");
+    await expect(topPressed("crop")).toHaveAttribute("aria-pressed", "false", { timeout: 10000 });
+    await expect.poll(() => groupVisible(page, "light"), { timeout: 10000 }).toBe(true);
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+
+    // Heal: same focused contract with its own instruction.
+    await clickPostSubtool(page, "heal");
+    await expect(topPressed("heal")).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
+    expect(await gridPressedCount()).toBe(0);
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-inspector"]')).toBeHidden();
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-filmstrip"]')).toBeHidden();
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-histogram"]')).toBeHidden();
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-status"]')).toContainText("blemish");
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+
+    // Heal → Curves exits the mode into the passive panel, values intact.
+    await clickPpTab(page, "curves");
+    await expect(topPressed("heal")).toHaveAttribute("aria-pressed", "false", { timeout: 10000 });
+    await expect.poll(() => groupVisible(page, "curves"), { timeout: 10000 }).toBe(true);
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+
+    // Histogram isolation: Detail shows its group with NO histogram…
+    await clickPpTab(page, "detail");
+    await expect.poll(() => groupVisible(page, "detail"), { timeout: 10000 }).toBe(true);
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-histogram"]')).toBeHidden();
+    // …until explicitly requested: one click shows exactly the histogram.
+    await clickPpTab(page, "histogram");
+    await expect.poll(() => sectionVisible(page, '[data-testid="pp-histogram"]'), { timeout: 10000 }).toBe(true);
+    await expect.poll(() => groupVisible(page, "detail"), { timeout: 10000 }).toBe(false);
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+
+    await expect(page.locator('[data-testid="canvas-area"] [data-testid="pp-canvas"]')).toBeVisible();
+    await expect(page.locator('[data-testid="pp-shell"]')).toHaveCount(0);
+    expectOnlySync404(bad);
+    await fx.assertNoConsoleErrors(ALLOW);
+  });
 });

@@ -637,12 +637,30 @@ var CSS = [
   ".pp-native-sidebar[data-post-category=color][data-pp-tab=lut] .pp-looks{display:block}",
   ".pp-native-sidebar[data-post-category=color] .pp-looks [data-pp-section=looks]{display:none}",
   ".pp-native-sidebar[data-post-category=crop] .pp-looks,.pp-native-sidebar[data-post-category=heal] .pp-looks{display:none}",
+  // Phase-4 tool purity: Crop/Heal are canvas interaction modes, not
+  // adjustment views — no passive inspector groups, filmstrip, or histogram
+  // beneath the grid. What remains is the grid (one-click exit), the tool
+  // status line (concise instruction + live counts), and the utility toolbar.
+  // Histogram isolation: the histogram renders ONLY under an explicit
+  // Histogram panel click. The existing per-tab show rules re-enable it
+  // there (higher specificity); everywhere else it stays hidden, including
+  // Detail/Effects/Output/Crop/Heal views that have no histogram tab.
+  ".pp-native-sidebar[data-post-category=crop] .pp-insp,.pp-native-sidebar[data-post-category=heal] .pp-insp,.pp-native-sidebar[data-post-category=crop] .pp-film,.pp-native-sidebar[data-post-category=heal] .pp-film{display:none}",
+  ".pp-native-sidebar .pp-insp [data-pp-section=histogram]{display:none}",
   // ── Phase-4 FINAL POLISH: sticky utility action row ──
   // Compare stays: the Studio top-bar Compare is a History A/B picker, a
   // different system from the engine before/after. Crop/Heal/WB hide here
   // (still in DOM so the Post subtools + C/J/W shortcuts arm the same tools).
   ".pp-native-sidebar .pp-toolbar{position:sticky;bottom:0;z-index:3;background:var(--color-bg-primary,#17191f)}",
   ".pp-native-sidebar .pp-toolbar .pp-btn{min-height:28px;padding:4px 9px}",
+  // Active canvas mode in the top Post row (Crop/Heal/Upscale): the shared
+  // secondary-button .is-on has no visible treatment anywhere, so an active
+  // mode looked identical to idle ones. Scoped to the Post row so
+  // Generate/Edit submenu styling is untouched. Lives here (not
+  // studio-styles.js) because this array is the stylesheet guaranteed to be
+  // injected in every Post view — ensureStudioStyles is not loaded on the
+  // Studio path, which is why the rule had no effect there.
+  "[data-testid=tool-submenu-post] .comfymodal-secondary-btn.is-on,[data-testid=tool-submenu-post] .comfymodal-secondary-btn.active{border-color:var(--color-accent,#5a7fdb);background:var(--color-accent-muted,rgba(90,127,219,.16));color:var(--color-text-primary,#fff);font-weight:600}",
   ".pp-native-sidebar .pp-toolbar [data-testid=pp-crop],.pp-native-sidebar .pp-toolbar [data-testid=pp-heal],.pp-native-sidebar .pp-toolbar [data-testid=pp-wb]{display:none}",
   // ── Phase-4 FINAL POLISH: density (native only; standalone untouched) ──
   ".pp-native-sidebar .pp-row{grid-template-columns:88px minmax(0,1fr) 48px;gap:6px;padding:3px 0}",
