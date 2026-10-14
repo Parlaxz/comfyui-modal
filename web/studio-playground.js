@@ -7240,20 +7240,15 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
     function paintSelection() {
       var sel = loadStyleSelection();
       var st = sel.selectedId ? _styleById(sel.selectedId) : null;
-      var refOnly = !!(st && st.reference_only);
       selName.textContent = st
-        ? ("Selected: " + st.title + (refOnly ? " (reference-only)" : ""))
+        ? ("Selected: " + st.title)
         : "No style (plain prompt)";
       details.textContent = st
-        ? (refOnly
-          ? (st.title + " — reference-only gallery preview; no prompt fragment is bundled, so runs use your plain prompt. Overlaid style label unverified.")
-          : (st.title + " — " + (st.description || "") + (st.tags && st.tags.length ? " [" + st.tags.join(", ") + "]" : "")))
+        ? (st.title + " — " + (st.description || "") + (st.tags && st.tags.length ? " [" + st.tags.join(", ") + "]" : ""))
         : "Pick a style card to append its fragment to your prompt at run time.";
       var composed = st ? composeStylePrompt(currentPromptText(), st.prompt_fragment) : "";
       effLine.textContent = st
-        ? (composed
-          ? ("Effective prompt: " + composed + (refOnly ? " (prompt unchanged — reference-only)" : ""))
-          : (refOnly ? "Reference-only preview — no prompt fragment; run uses your plain prompt." : ""))
+        ? (composed ? ("Effective prompt: " + composed) : "")
         : "";
       Array.prototype.forEach.call(grid.querySelectorAll('[data-testid^="style-card-"]'), function (card) {
         var on = !!st && card.getAttribute("data-style-id") === st.id;
@@ -7286,21 +7281,33 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
         title: s.title + " — " + (s.description || ""),
         style: "display:flex;flex-direction:column;gap:4px;padding:6px;border:1px solid var(--color-border, #333);border-radius:8px;background:transparent;cursor:pointer;text-align:left;",
       });
-      // Remote-source previews render as actual <img> (lazy, no prefetch
-      // storm). A load failure renders an honest text fallback — never a
-      // generated-art, stock, or CSS-swatch substitute. Curated presets
-      // carry no preview_image and keep their hue swatches.
-      if (s.preview_image) {
+      // Remote-sheet previews render as deterministic client-side CSS crops
+      // of the square 3-col x 2-row reference sheet: the wrapper fixes one
+      // cell's 2/3 aspect with overflow hidden, and the <img> is scaled to
+      // 300% width with negative % margins selecting (row, col). Margin %
+      // resolves against the container width, so a row step is 150% of the
+      // width (cell height = 3/2 of cell width). Lazy, no prefetch storm; a
+      // load failure renders an honest text fallback — never a generated-art,
+      // stock, or CSS-swatch substitute. Curated presets carry no preview
+      // and keep their hue swatches.
+      var pv = s.preview;
+      if (pv && pv.sheet) {
+        var _row = Number(pv.row) === 2 ? 2 : 1;
+        var _col = Number(pv.col);
+        if (_col !== 1 && _col !== 2 && _col !== 3) _col = 1;
         var mediaWrap = el("span", {
           "data-testid": "style-media-" + s.id,
-          style: "display:block;height:44px;border-radius:6px;overflow:hidden;background:#1a1a1a;",
+          style: "display:block;aspect-ratio:2/3;overflow:hidden;border-radius:6px;background:#1a1a1a;",
         });
         var img = document.createElement("img");
-        img.setAttribute("src", s.preview_image);
-        img.setAttribute("alt", s.title + " (remote gallery preview)");
+        img.setAttribute("src", pv.sheet);
+        img.setAttribute("alt", s.title + " (remote reference-sheet crop, row " + _row + " col " + _col + ")");
         img.setAttribute("loading", "lazy");
         img.setAttribute("data-testid", "style-img-" + s.id);
-        img.style.cssText = "display:block;width:100%;height:44px;object-fit:cover;";
+        // NOTE: plain % margins only — calc((1-N)*100%) is rejected by the
+        // CSS parser (a calc sub-expression is not a valid <number> factor
+        // for *), so precompute the numbers in JS. Verified live 2026-10-14.
+        img.style.cssText = "display:block;width:300%;max-width:none;height:auto;margin-left:" + ((1 - _col) * 100) + "%;margin-top:" + ((1 - _row) * 150) + "%;";
         img.addEventListener("error", function () {
           try {
             while (mediaWrap.firstChild) mediaWrap.removeChild(mediaWrap.firstChild);
@@ -7381,12 +7388,9 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
           if (!effLine.isConnected) return;
           var sel = loadStyleSelection();
           var st = sel.selectedId ? _styleById(sel.selectedId) : null;
-          var refOnly = !!(st && st.reference_only);
           var composedLive = st ? composeStylePrompt(t.value, st.prompt_fragment) : "";
           effLine.textContent = st
-            ? (composedLive
-              ? ("Effective prompt: " + composedLive + (refOnly ? " (prompt unchanged — reference-only)" : ""))
-              : (refOnly ? "Reference-only preview — no prompt fragment; run uses your plain prompt." : ""))
+            ? (composedLive ? ("Effective prompt: " + composedLive) : "")
             : "";
         } catch (_e) {}
       });
