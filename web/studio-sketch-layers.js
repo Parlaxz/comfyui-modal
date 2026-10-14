@@ -19,8 +19,8 @@
  *
  * History snapshot contract (first available wins, all optional):
  *   opts.onSnapshot(layers) -> void
- *   engine.snapshot() / engine.pushHistory() / engine.saveSnapshot() /
- *   engine.historyPush() / engine.commitHistory()
+ *   engine.saveToHistory() / engine.snapshot() / engine.pushHistory() /
+ *   engine.saveSnapshot() / engine.historyPush() / engine.commitHistory()
  */
 
 (function (global) {
@@ -169,7 +169,7 @@
           options.onSnapshot(snapshot());
           return;
         }
-        var fns = ["snapshot", "pushHistory", "saveSnapshot", "historyPush", "commitHistory"];
+        var fns = ["saveToHistory", "snapshot", "pushHistory", "saveSnapshot", "historyPush", "commitHistory"];
         for (var i = 0; i < fns.length; i++) {
           if (typeof eng[fns[i]] === "function") {
             eng[fns[i]]();
@@ -244,6 +244,120 @@
       } catch (_e) { /* defensive */ }
     }
 
+    function applyEngineRecordMeta(target, rec) {
+      if (!target || !rec || typeof rec !== "object" || rec.id !== target.id) return;
+      try {
+        if (rec.name != null) target.name = String(rec.name);
+        if (rec.visible != null) target.visible = !!rec.visible;
+        if (rec.opacity != null && isFinite(Number(rec.opacity))) target.opacity = clamp01(rec.opacity);
+        if (rec.locked != null && target.id !== BASE_ID) target.locked = !!rec.locked;
+      } catch (_e) { /* metadata is best-effort */ }
+    }
+
+    function readEngineActiveRecord() {
+      if (typeof eng.getActiveLayer !== "function") return null;
+      try {
+        var rec = eng.getActiveLayer();
+        if (rec && typeof rec === "object" && rec.id) return rec;
+      } catch (_e) { /* optional hook */ }
+      return null;
+    }
+
+    // Re-adopt the engine's live layer canvases after an engine-side
+    // restore (undo/redo): match by id, update shared references in place,
+    // drop records the engine no longer has, adopt restored ones, then
+    // reconcile the active selection. Best-effort and fully guarded —
+    // no-ops when the engine exposes no layer list.
+    function reconcileFromEngine() {
+      if (typeof eng.getLayerCanvases !== "function") return false;
+      var live = null;
+      try { live = eng.getLayerCanvases(); } catch (_e) { return false; }
+      if (!live || !live.length) return false;
+      var byId = {};
+      var order = [];
+      for (var i = 0; i < live.length; i++) {
+        var c = live[i];
+        if (!c) continue;
+        var cid = null;
+        try { cid = c.dataset && c.dataset.layerId ? c.dataset.layerId : null; } catch (_e0) { cid = null; }
+        if (!cid && i === 0) cid = BASE_ID; // engine base always leads
+        if (!cid || byId[cid]) continue;
+        byId[cid] = c;
+        order.push(cid);
+      }
+      if (!order.length) return false;
+      var activeRec = readEngineActiveRecord();
+      var next = [];
+      for (var k = 0; k < order.length; k++) {
+        var id = order[k];
+        var known = find(id);
+        if (known) {
+          known.canvas = byId[id];
+          if (activeRec) applyEngineRecordMeta(known, activeRec);
+          next.push(known);
+        } else {
+          var created = {
+            id: id,
+            name: id === BASE_ID ? (options.baseName || "Base") : ("Layer " + (k + 1)),
+            canvas: byId[id],
+            visible: true,
+            opacity: 1,
+            locked: id === BASE_ID,
+          };
+          if (activeRec) applyEngineRecordMeta(created, activeRec);
+          try { if (created.canvas && created.canvas.dataset) created.canvas.dataset.layerId = id; } catch (_e1) {}
+          next.push(created);
+        }
+      }
+      layers.length = 0;
+      for (var m = 0; m < next.length; m++) layers.push(next[m]);
+      // Reconcile the active selection against the engine's live state.
+      var activeOk = false;
+      if (activeRec && find(activeRec.id)) {
+        activeId = activeRec.id;
+        activeOk = true;
+      }
+      if (!activeOk) {
+        try {
+          if (typeof eng.getState === "function") {
+            var st = eng.getState();
+            if (st && st.activeLayerIndex != null && live[st.activeLayerIndex]) {
+              var ac = live[st.activeLayerIndex];
+              var aid = null;
+              try { aid = ac.dataset && ac.dataset.layerId ? ac.dataset.layerId : null; } catch (_e2) { aid = null; }
+              if (aid && find(aid)) { activeId = aid; activeOk = true; }
+            }
+          }
+        } catch (_e3) { /* keep current selection */ }
+      }
+      if (!activeOk && !find(activeId)) {
+        var fb = baseLayer();
+        activeId = fb ? fb.id : (next.length ? next[next.length - 1].id : null);
+      }
+      return true;
+    }
+
+    // Propagate a rename into any engine-side record the engine exposes.
+    // The engine here offers no rename setter, so try common setter names
+    // first, then mutate a live record ref when one is exposed (guarded).
+    // If neither exists the engine history label goes stale (accepted).
+    function engineSetName(layer) {
+      if (!layer) return;
+      try {
+        var setters = ["setLayerName", "renameLayer", "rename", "updateLayerName", "setName"];
+        for (var i = 0; i < setters.length; i++) {
+          if (typeof eng[setters[i]] === "function") {
+            try { eng[setters[i]](layer.id, layer.name); return; } catch (_e0) {}
+          }
+        }
+        var rec = readEngineActiveRecord();
+        // readEngineActiveRecord takes no ref — only adopt when ids match.
+        if (rec && rec.id === layer.id) {
+          try { rec.name = layer.name; } catch (_e1) {}
+        }
+      } catch (_e) { /* defensive */ }
+    }
+
     function snapshot() {
       return {
         layers: layers.slice(),
@@ -300,6 +414,11 @@
         try {
           eng.onChange(function () {
             if (suppressEngineEcho) return;
+            // Engine-side restore (undo/redo): re-adopt live canvas
+            // references by id, drop stale ones, reconcile selection,
+            // re-render — then emit the reconciled snapshot.
+            reconcileFromEngine();
+            engineRender();
             emit();
           });
         } catch (_e) { /* optional hook */ }
@@ -369,6 +488,7 @@
         var next = String(name == null ? "" : name).trim().slice(0, 80);
         if (!next) return false;
         l.name = next;
+        engineSetName(l);
         commit();
         return true;
       },
@@ -454,7 +574,7 @@
         layers.splice(idx + 1, 0, layer);
         activeId = layer.id;
         suppressEngineEcho = true;
-        try { engineAdd(layer); engineSyncOrder(); engineSetActive(layer); } finally { suppressEngineEcho = false; }
+        try { engineAdd(layer); engineSetVisibility(layer); engineSetOpacity(layer); engineSyncOrder(); engineSetActive(layer); } finally { suppressEngineEcho = false; }
         commit();
         return layer;
       },
@@ -469,7 +589,28 @@
         var top = layers[idx];
         if (isBase(top)) return false;
         var below = layers[idx - 1];
-        drawOver(below.canvas, top.canvas);
+        // Respect visibility/opacity: a hidden top layer contributes
+        // nothing (drop it); otherwise composite at its own opacity.
+        if (top.visible !== false) {
+          var alpha = clamp01(top.opacity == null ? 1 : top.opacity);
+          if (alpha > 0) {
+            try {
+              if (!below.canvas._stub && top.canvas && alpha < 1) {
+                var mctx = below.canvas.getContext("2d");
+                if (mctx) {
+                  var prev = mctx.globalAlpha;
+                  mctx.globalAlpha = alpha;
+                  mctx.drawImage(top.canvas, 0, 0, below.canvas.width, below.canvas.height);
+                  mctx.globalAlpha = prev;
+                } else {
+                  drawOver(below.canvas, top.canvas);
+                }
+              } else {
+                drawOver(below.canvas, top.canvas);
+              }
+            } catch (_e) { /* best effort */ }
+          }
+        }
         layers.splice(idx, 1);
         suppressEngineEcho = true;
         try { engineRemove(top); } finally { suppressEngineEcho = false; }
@@ -518,6 +659,57 @@
         engineSetActive(base);
         commit();
         return true;
+      },
+
+      /**
+       * clearLayers — remove all non-base overlays (base survives, stays
+       * locked at index 0). Snapshots history and re-renders via commit().
+       * clear/reset are shell-compatible aliases (shell tries these names
+       * in order: clearLayers, clear, reset).
+       */
+      clearLayers: function () {
+        if (layers.length <= 1) return false;
+        var dropped = layers.splice(1);
+        suppressEngineEcho = true;
+        try {
+          for (var i = 0; i < dropped.length; i++) engineRemove(dropped[i]);
+        } finally { suppressEngineEcho = false; }
+        var base = baseLayer();
+        activeId = base ? base.id : null;
+        if (base) engineSetActive(base);
+        commit();
+        return true;
+      },
+
+      clear: function () { return store.clearLayers(); },
+
+      reset: function () { return store.clearLayers(); },
+
+      /**
+       * undo/redo — delegate to the engine first (its history owns pixel
+       * state), then re-adopt live canvases. Async restores reconcile via
+       * the onChange listener — no polling.
+       */
+      undo: function () {
+        var ok = false;
+        try {
+          if (typeof eng.undo === "function") ok = eng.undo() === true;
+        } catch (_e) { ok = false; }
+        reconcileFromEngine();
+        engineRender();
+        emit();
+        return ok;
+      },
+
+      redo: function () {
+        var ok = false;
+        try {
+          if (typeof eng.redo === "function") ok = eng.redo() === true;
+        } catch (_e) { ok = false; }
+        reconcileFromEngine();
+        engineRender();
+        emit();
+        return ok;
       },
 
       subscribe: function (cb) {

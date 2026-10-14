@@ -7,31 +7,26 @@
  * panels, no new global state architecture.
  *
  * This module OWNS the tool bar, brush settings, color swatches and canvas
- * zoom/undo controls, and DRIVES the sketch engine (tools state) exclusively
- * through its public setters. Clear/Save stay owned by the shell and are NOT
+ * zoom/undo controls, and DRIVES the sketch engine exclusively through its
+ * exact public setters. Clear/Save stay owned by the shell and are NOT
  * implemented here.
  *
- * Engine hook contract (ALL optional / defensive — never crashes when the
- * engine is absent or partial; first available setter wins):
- *   engine.setTool(name) | setCurrentTool(name) | selectTool(name)
- *   engine.setSize(px) | setBrushSize(px) | setLineWidth(px)
- *   engine.setOpacity(0..1) | setBrushOpacity(0..1)
- *   engine.setHardness(0..1) | setBrushHardness(0..1)
- *   engine.setColor(css) | setForeground(css) | setFgColor(css)
- *   engine.setBackground(css) | setBgColor(css)
- *   engine.swapColors() | swapFgBg()
- *   engine.resetColors() | resetFgBg()
- *   engine.setTolerance(n) | setFillTolerance(n)
- *   engine.undo() | historyUndo() | undoStroke()
- *   engine.redo() | historyRedo() | redoStroke()
- *   engine.zoomIn() | zoomBy(factor)
- *   engine.zoomOut() | zoomBy(factor)
- *   engine.fitToView() | zoomFit() | fit()
- *   engine.setZoom(1) | resetZoom() | zoomReset()
- *   engine.getState() -> { tool, size|brushSize, opacity, hardness,
- *     fg|foreground|color, bg|background, tolerance|fillTolerance, zoom }
- *   engine.onChange(cb) | subscribe(cb) | addChangeListener(cb)
- *     -> unsubscribe fn (optional)
+ * Exact known-engine contract (single-name calls with typeof guards; no
+ * setter-name guessing, no percent/fraction guessing):
+ *   engine.setTool(name)
+ *   engine.setSize(px)            // engine state key: brushSize (1..100)
+ *   engine.setOpacity(1..100)     // percent scale, NOT 0..1
+ *   engine.setHardness(1..100)    // percent scale, NOT 0..1
+ *   engine.setColor(css)          // primary slot  (engine state: color)
+ *   engine.setBgColor(css)        // secondary slot (engine state: bgColor;
+ *                                 // the composite backdrop is separate and
+ *                                 // is never driven from these panels)
+ *   engine.setFillTolerance(n)
+ *   engine.undo() / engine.redo()
+ *   engine.zoomIn() / engine.zoomOut() / engine.fit() / engine.setZoom(1)
+ *   engine.getState() -> { tool, brushSize, opacity, hardness, color,
+ *     bgColor, zoom, canUndo, canRedo }
+ *   engine.onChange(cb) -> unsubscribe fn (optional)
  *
  * Usage:
  *   var handle = ComfyModalSketchPanels.mountSketchPanels(container, engine, opts);
@@ -75,14 +70,6 @@
     return n;
   }
 
-  function firstDefined() {
-    for (var i = 0; i < arguments.length; i++) {
-      var v = arguments[i];
-      if (v !== undefined && v !== null && v !== "") return v;
-    }
-    return undefined;
-  }
-
   function normHex(v, fb) {
     var s = String(v == null ? "" : v).trim();
     if (!s) return fb;
@@ -106,34 +93,7 @@
     (doc.head || doc.documentElement).appendChild(style);
   }
 
-  /** Call the first available engine setter. Returns true when invoked. */
-  function callSetter(eng, names, args) {
-    if (!eng) return false;
-    for (var i = 0; i < names.length; i++) {
-      var fn = eng[names[i]];
-      if (typeof fn === "function") {
-        try {
-          fn.apply(eng, args);
-        } catch (_e) {
-          /* engine setter failure is non-fatal for the panel */
-        }
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function readEngineProp(eng, state, names) {
-    for (var i = 0; i < names.length; i++) {
-      var k = names[i];
-      if (state && state[k] !== undefined && state[k] !== null) return state[k];
-      if (eng && eng[k] !== undefined && eng[k] !== null && typeof eng[k] !== "function") return eng[k];
-      if (eng && eng.state && eng.state[k] !== undefined && eng.state[k] !== null) return eng.state[k];
-    }
-    return undefined;
-  }
-
-  /** Best-effort snapshot of engine state; never throws. */
+  /** Best-effort snapshot of the exact known-engine state; never throws. */
   function readState(eng) {
     var raw = {};
     if (eng && typeof eng.getState === "function") {
@@ -144,47 +104,44 @@
         raw = {};
       }
     }
+    // Exact keys only — no alias lists. Panel maps brushSize->size,
+    // color->fg, bgColor->bg. Tolerance is write-only (see setFillTolerance);
+    // sync keeps the panel-local value.
     return {
-      tool: readEngineProp(eng, raw, ["tool", "currentTool", "activeTool"]),
-      size: readEngineProp(eng, raw, ["size", "brushSize", "lineWidth"]),
-      opacity: readEngineProp(eng, raw, ["opacity", "brushOpacity"]),
-      hardness: readEngineProp(eng, raw, ["hardness", "brushHardness"]),
-      fg: readEngineProp(eng, raw, ["fg", "foreground", "color", "fgColor"]),
-      bg: readEngineProp(eng, raw, ["bg", "background", "bgColor"]),
-      tolerance: readEngineProp(eng, raw, ["tolerance", "fillTolerance"]),
-      zoom: readEngineProp(eng, raw, ["zoom", "zoomLevel"]),
-      canUndo: readEngineProp(eng, raw, ["canUndo"]),
-      canRedo: readEngineProp(eng, raw, ["canRedo"]),
+      tool: raw.tool,
+      size: raw.brushSize,
+      opacity: raw.opacity,
+      hardness: raw.hardness,
+      fg: raw.color,
+      bg: raw.bgColor,
+      tolerance: undefined,
+      zoom: raw.zoom,
+      canUndo: raw.canUndo,
+      canRedo: raw.canRedo,
     };
   }
 
+  // Exact engine scale is percent 1..100 (NOT 0..1), so slider and engine
+  // share one scale with no value-dependent branching. In particular an
+  // engine value of 1 means 1%, never a 1.0 fraction.
   function opacityToSlider(op) {
     var n = Number(op);
     if (!isFinite(n)) return 100;
-    if (n <= 1) return Math.round(n * 100);
     return Math.round(clampNum(n, 0, 100, 100));
   }
 
-  function sliderToOpacity(slider, eng) {
-    var v = clampNum(slider, 0, 100, 100);
-    var cur = Number(readState(eng).opacity);
-    // Engines storing 0..100 keep percent scale; 0..1 engines get a fraction.
-    if (isFinite(cur) && cur > 1) return v;
-    return v / 100;
+  function sliderToOpacity(slider) {
+    return Math.round(clampNum(slider, 0, 100, 100));
   }
 
   function hardnessToSlider(h) {
     var n = Number(h);
     if (!isFinite(n)) return 100;
-    if (n <= 1) return Math.round(n * 100);
     return Math.round(clampNum(n, 0, 100, 100));
   }
 
-  function sliderToHardness(slider, eng) {
-    var v = clampNum(slider, 0, 100, 100);
-    var cur = Number(readState(eng).hardness);
-    if (isFinite(cur) && cur > 1) return v;
-    return v / 100;
+  function sliderToHardness(slider) {
+    return Math.round(clampNum(slider, 0, 100, 100));
   }
 
   /**
@@ -207,12 +164,14 @@
     if (!container || typeof document === "undefined") return noopHandle();
 
     var doc = (container.ownerDocument || document);
+    var docAtMount = doc;
+    var mounted = true;
     installStyles(doc);
     var state = {
       tool: "brush",
       size: 12,
-      opacity: 100, // slider scale 0..100
-      hardness: 100, // slider scale 0..100
+      opacity: 100, // slider scale 0..100 == engine percent scale
+      hardness: 100, // slider scale 0..100 == engine percent scale
       fg: DEFAULT_FG,
       bg: DEFAULT_BG,
       slot: "fg", // which swatch the color picker edits
@@ -309,12 +268,33 @@
       if (!wheelCanvas || !svCanvas) return;
       var size=128, ctx=wheelCanvas.getContext("2d"), sctx=svCanvas.getContext("2d"), cx=64, cy=64;
       ctx.clearRect(0,0,size,size); for(var a=0;a<360;a++){var g=ctx.createLinearGradient(0,0,128,0);g.addColorStop(0,"hsl("+a+",100%,50%)");g.addColorStop(1,"hsl("+(a+1)+",100%,50%)");ctx.strokeStyle=g;ctx.lineWidth=12;ctx.beginPath();ctx.arc(cx,cy,51,(a-1)*Math.PI/180,a*Math.PI/180);ctx.stroke();}
-      ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(cx,cy,51,(hue-90)*Math.PI/180,(hue-89)*Math.PI/180);ctx.stroke();
+      // SAME angle convention as the segments above: hue a is drawn at canvas
+      // angle a (0 = east, increasing clockwise as canvas y grows downward).
+      ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(cx,cy,51,(hue-1)*Math.PI/180,hue*Math.PI/180);ctx.stroke();
       sctx.clearRect(0,0,size,size); var grad=sctx.createLinearGradient(20,0,108,0);grad.addColorStop(0,"#fff");grad.addColorStop(1,"hsl("+hue+",100%,50%)");sctx.fillStyle=grad;sctx.fillRect(22,22,84,84);var black=sctx.createLinearGradient(0,22,0,106);black.addColorStop(0,"transparent");black.addColorStop(1,"#000");sctx.fillStyle=black;sctx.fillRect(22,22,84,84);sctx.strokeStyle="#fff";sctx.lineWidth=2;sctx.beginPath();sctx.arc(22+sat*84,106-val*84,4,0,Math.PI*2);sctx.stroke();
     }
     function setColorFromHsv() { driveColor(hsvToHex(hue,sat,val), state.slot); drawColorCanvases(); }
-    function wheelPoint(ev, canvas) { var r=canvas.getBoundingClientRect(), x=ev.clientX-r.left-64, y=ev.clientY-r.top-64; return {x:x,y:y}; }
-    function bindColorCanvas(canvas, type) { canvas.addEventListener("pointerdown",function(ev){canvas.setPointerCapture && canvas.setPointerCapture(ev.pointerId); function move(e){var p=wheelPoint(e,canvas); if(type==="wheel"){hue=(Math.atan2(p.y,p.x)*180/Math.PI+90+360)%360;}else{sat=clampNum((p.x+42)/84,0,1,0);val=clampNum(1-(p.y+42)/84,0,1,1);} setColorFromHsv();} move(ev); canvas.addEventListener("pointermove",move); canvas.addEventListener("pointerup",function(){canvas.removeEventListener("pointermove",move);},{once:true});}); }
+    function colorPoint(ev, canvas) {
+      var r=canvas.getBoundingClientRect();
+      var w=(r.width && r.width > 0) ? r.width : 128;
+      var h=(r.height && r.height > 0) ? r.height : 128;
+      return { x:(ev.clientX-r.left)/w*128-64, y:(ev.clientY-r.top)/h*128-64 };
+    }
+    function hueFromPoint(p) {
+      // SAME convention as drawWheel: hue a lives at canvas angle a.
+      return ((Math.atan2(p.y,p.x)*180/Math.PI)+360)%360;
+    }
+    function handleColorPoint(ev, canvas) {
+      var p=colorPoint(ev,canvas);
+      // Ring-vs-square (upstream ComfySketch): the inner 84x84 square
+      // (canvas 22..106, i.e. dx,dy in [-42,42]) edits SV; anything outside
+      // it edits hue by angle. One shared handler is bound to BOTH stacked
+      // canvases, so ring clicks landing on the transparent part of the top
+      // SV canvas still resolve to hue instead of being swallowed as SV.
+      if(p.x>=-42&&p.x<=42&&p.y>=-42&&p.y<=42){sat=clampNum((p.x+42)/84,0,1,0);val=clampNum(1-(p.y+42)/84,0,1,1);}else{hue=hueFromPoint(p);}
+      setColorFromHsv();
+    }
+    function bindColorCanvas(canvas) { canvas.addEventListener("pointerdown",function(ev){ if(ev.preventDefault) ev.preventDefault(); try { if(canvas.setPointerCapture && ev.pointerId !== undefined) canvas.setPointerCapture(ev.pointerId); } catch(_e){} function move(e){handleColorPoint(e,canvas);} function up(){canvas.removeEventListener("pointermove",move);canvas.removeEventListener("pointerup",up);canvas.removeEventListener("pointercancel",up);} move(ev); canvas.addEventListener("pointermove",move); canvas.addEventListener("pointerup",up); canvas.addEventListener("pointercancel",up);}); }
 
     function paintZoom() {
       if (!zoomLabel) return;
@@ -322,10 +302,8 @@
         zoomLabel.textContent = "";
         return;
       }
-      var z = Number(state.zoom);
-      // Accept both scale (1 = 100%) and percent (100 = 100%) engines.
-      var pct = z > 0 && z <= 8 ? Math.round(z * 100) : Math.round(z);
-      zoomLabel.textContent = String(pct) + "%";
+      // Exact engine zoom is a scale factor (1 = 100%); no percent guessing.
+      zoomLabel.textContent = String(Math.round(Number(state.zoom) * 100)) + "%";
     }
 
     function paintUndoRedo() {
@@ -348,32 +326,40 @@
       }
     }
 
-    // ---- engine drivers (public setters only) ----
+    // ---- engine drivers (exact public setters only) ----
 
     function driveTool(id) {
       state.tool = id;
-      callSetter(eng, ["setTool", "setCurrentTool", "selectTool"], [id]);
+      if (typeof eng.setTool === "function") {
+        try { eng.setTool(id); } catch (_e) { /* engine setter failure is non-fatal */ }
+      }
       paintToolButtons();
       syncHardnessEnabled();
     }
 
     function driveSize(px) {
       state.size = clampNum(px, 1, 200, 12);
-      callSetter(eng, ["setSize", "setBrushSize", "setLineWidth"], [state.size]);
+      if (typeof eng.setSize === "function") {
+        try { eng.setSize(state.size); } catch (_e) { /* non-fatal */ }
+      }
       if (sizeSlider && sizeSlider.value !== String(state.size)) sizeSlider.value = String(state.size);
       if (sizeVal) sizeVal.textContent = String(state.size) + "px";
     }
 
     function driveOpacity(slider) {
-      state.opacity = clampNum(slider, 0, 100, 100);
-      callSetter(eng, ["setOpacity", "setBrushOpacity"], [sliderToOpacity(state.opacity, eng)]);
+      state.opacity = Math.round(clampNum(slider, 0, 100, 100));
+      if (typeof eng.setOpacity === "function") {
+        try { eng.setOpacity(sliderToOpacity(state.opacity)); } catch (_e) { /* non-fatal */ }
+      }
       if (opacitySlider && opacitySlider.value !== String(state.opacity)) opacitySlider.value = String(state.opacity);
       if (opacityVal) opacityVal.textContent = String(state.opacity) + "%";
     }
 
     function driveHardness(slider) {
-      state.hardness = clampNum(slider, 0, 100, 100);
-      callSetter(eng, ["setHardness", "setBrushHardness"], [sliderToHardness(state.hardness, eng)]);
+      state.hardness = Math.round(clampNum(slider, 0, 100, 100));
+      if (typeof eng.setHardness === "function") {
+        try { eng.setHardness(sliderToHardness(state.hardness)); } catch (_e) { /* non-fatal */ }
+      }
       if (hardnessSlider && hardnessSlider.value !== String(state.hardness)) hardnessSlider.value = String(state.hardness);
       if (hardnessVal) hardnessVal.textContent = String(state.hardness) + "%";
     }
@@ -384,13 +370,16 @@
       var target = slot || state.slot || "fg";
       if (target === "bg") {
         state.bg = hex;
-        if (!callSetter(eng, ["setBackground", "setBgColor"], [hex])) {
-          // Engine without a BG slot: keep it panel-local so swap still works.
+        // Secondary swatch only. The composite backdrop setter is separate
+        // and must never be driven here; without the exact slot setter the
+        // color stays panel-local so swap still works.
+        if (typeof eng.setBgColor === "function") {
+          try { eng.setBgColor(hex); } catch (_e) { /* non-fatal */ }
         }
       } else {
         state.fg = hex;
-        if (!callSetter(eng, ["setColor", "setForeground", "setFgColor"], [hex])) {
-          callSetter(eng, ["setBackground", "setBgColor"], [hex]);
+        if (typeof eng.setColor === "function") {
+          try { eng.setColor(hex); } catch (_e) { /* non-fatal */ }
         }
       }
       paintSwatches();
@@ -400,10 +389,12 @@
       var t = state.fg;
       state.fg = state.bg;
       state.bg = t;
-      if (!callSetter(eng, ["swapColors", "swapFgBg"], [])) {
-        // No engine swap hook: push both colors through the plain setters.
-        callSetter(eng, ["setColor", "setForeground", "setFgColor"], [state.fg]);
-        callSetter(eng, ["setBackground", "setBgColor"], [state.bg]);
+      // Push both slots through the exact setters (secondary via setBgColor).
+      if (typeof eng.setColor === "function") {
+        try { eng.setColor(state.fg); } catch (_e) { /* non-fatal */ }
+      }
+      if (typeof eng.setBgColor === "function") {
+        try { eng.setBgColor(state.bg); } catch (_e) { /* non-fatal */ }
       }
       paintSwatches();
     }
@@ -411,50 +402,56 @@
     function resetFgBg() {
       state.fg = DEFAULT_FG;
       state.bg = DEFAULT_BG;
-      if (!callSetter(eng, ["resetColors", "resetFgBg"], [])) {
-        callSetter(eng, ["setColor", "setForeground", "setFgColor"], [state.fg]);
-        callSetter(eng, ["setBackground", "setBgColor"], [state.bg]);
+      if (typeof eng.setColor === "function") {
+        try { eng.setColor(state.fg); } catch (_e) { /* non-fatal */ }
+      }
+      if (typeof eng.setBgColor === "function") {
+        try { eng.setBgColor(state.bg); } catch (_e) { /* non-fatal */ }
       }
       paintSwatches();
     }
 
     function driveTolerance(n) {
       state.tolerance = Math.round(clampNum(n, 0, 255, 32));
-      callSetter(eng, ["setTolerance", "setFillTolerance"], [state.tolerance]);
+      if (typeof eng.setFillTolerance === "function") {
+        try { eng.setFillTolerance(state.tolerance); } catch (_e) { /* non-fatal */ }
+      }
       if (tolInput && tolInput.value !== String(state.tolerance)) tolInput.value = String(state.tolerance);
     }
 
     function doUndo() {
-      callSetter(eng, ["undo", "historyUndo", "undoStroke"], []);
+      if (typeof eng.undo === "function") {
+        try { eng.undo(); } catch (_e) { /* non-fatal */ }
+      }
     }
 
     function doRedo() {
-      callSetter(eng, ["redo", "historyRedo", "redoStroke"], []);
+      if (typeof eng.redo === "function") {
+        try { eng.redo(); } catch (_e) { /* non-fatal */ }
+      }
     }
 
     function doZoomIn() {
-      if (!callSetter(eng, ["zoomIn"], [])) {
-        callSetter(eng, ["zoomBy"], [1.25]);
+      if (typeof eng.zoomIn === "function") {
+        try { eng.zoomIn(); } catch (_e) { /* non-fatal */ }
       }
     }
 
     function doZoomOut() {
-      if (!callSetter(eng, ["zoomOut"], [])) {
-        callSetter(eng, ["zoomBy"], [0.8]);
+      if (typeof eng.zoomOut === "function") {
+        try { eng.zoomOut(); } catch (_e) { /* non-fatal */ }
       }
     }
 
     function doZoomFit() {
-      if (!callSetter(eng, ["fitToView", "zoomFit", "fit"], [])) {
-        callSetter(eng, ["setZoom", "setZoomLevel"], ["fit"]);
+      if (typeof eng.fit === "function") {
+        try { eng.fit(); } catch (_e) { /* non-fatal */ }
       }
     }
 
     function doZoom100() {
-      if (!callSetter(eng, ["setZoom", "setZoomLevel"], [1])) {
-        if (!callSetter(eng, ["resetZoom", "zoomReset"], [])) {
-          callSetter(eng, ["setZoom", "setZoomLevel"], [100]);
-        }
+      if (typeof eng.setZoom === "function") {
+        try { eng.setZoom(1); } catch (_e) { /* non-fatal */ }
       }
     }
 
@@ -529,7 +526,7 @@
     wheelCanvas = doc.createElement("canvas"); wheelCanvas.width = 128; wheelCanvas.height = 128; wheelCanvas.setAttribute("aria-label", "Hue wheel");
     svCanvas = doc.createElement("canvas"); svCanvas.width = 128; svCanvas.height = 128; svCanvas.setAttribute("aria-label", "Saturation and value square");
     colorBox.appendChild(wheelCanvas); colorBox.appendChild(svCanvas); colSec.appendChild(colorBox);
-    bindColorCanvas(wheelCanvas, "wheel"); bindColorCanvas(svCanvas, "sv");
+    bindColorCanvas(wheelCanvas); bindColorCanvas(svCanvas);
     var swRow = el("div", "sketch-panels-swatches");
     fgSwatch = el("button", "sketch-panels-swatch is-fg", "FG");
     fgSwatch.type = "button";
@@ -679,13 +676,9 @@
       var bg = normHex(s.bg, null);
       if (bg) state.bg = bg;
       var activeHsv = rgbToHsv(hexToRgb(state.slot === "bg" ? state.bg : state.fg)); hue = activeHsv.h; sat = activeHsv.s; val = activeHsv.v;
-      var tol = Number(s.tolerance);
-      if (isFinite(tol)) state.tolerance = Math.round(clampNum(tol, 0, 255, state.tolerance));
-      if (s.zoom !== undefined && s.zoom !== null && s.zoom !== "fit") {
+      if (s.zoom !== undefined && s.zoom !== null) {
         var z = Number(s.zoom);
-        state.zoom = isFinite(z) ? z : state.zoom;
-      } else if (s.zoom === "fit") {
-        state.zoom = null;
+        if (isFinite(z)) state.zoom = z;
       }
 
       if (sizeSlider) sizeSlider.value = String(state.size);
@@ -703,20 +696,15 @@
       syncHardnessEnabled();
     }
 
-    // Subscribe for active-state sync (defensive: any of the known hooks).
-    var subNames = ["onChange", "subscribe", "addChangeListener"];
-    for (var si = 0; si < subNames.length; si++) {
-      var sub = eng[subNames[si]];
-      if (typeof sub === "function") {
-        try {
-          var r = sub.call(eng, function () {
-            syncFromEngine();
-          });
-          if (typeof r === "function") unsubscribe = r;
-          break;
-        } catch (_e) {
-          /* optional hook */
-        }
+    // Subscribe for active-state sync (exact hook only).
+    if (typeof eng.onChange === "function") {
+      try {
+        var r = eng.onChange.call(eng, function () {
+          syncFromEngine();
+        });
+        if (typeof r === "function") unsubscribe = r;
+      } catch (_e) {
+        /* optional hook */
       }
     }
 
@@ -735,7 +723,30 @@
     }
 
     function onKeyDown(ev) {
+      // Scoped handler: dead once destroyed/unmounted, and never leaks to a
+      // concurrent editor/panel. Removal in destroy() uses this same
+      // function reference and document, so it detaches fully.
+      if (!mounted) return;
+      try {
+        if (!container.isConnected) return;
+      } catch (_e) {
+        return;
+      }
+      try {
+        if (!root.isConnected) return;
+      } catch (_e) {
+        return;
+      }
       if (!ev || ev.defaultPrevented) return;
+      try {
+        var tgt = ev.target;
+        if (tgt && typeof tgt.closest === "function") {
+          var other = tgt.closest("[data-sketch-panels]");
+          if (other && other !== root) return;
+        }
+      } catch (_e) {
+        /* ignore */
+      }
       if (isEditableTarget(ev.target)) return;
       var key = String(ev.key || "").toLowerCase();
       var ctrl = !!(ev.ctrlKey || ev.metaKey);
@@ -801,13 +812,14 @@
       }
     }
 
-    if (keyboard && doc.addEventListener) {
-      doc.addEventListener("keydown", onKeyDown);
+    if (keyboard && docAtMount.addEventListener) {
+      docAtMount.addEventListener("keydown", onKeyDown);
     }
 
     function destroy() {
+      mounted = false;
       try {
-        if (keyboard && doc.removeEventListener) doc.removeEventListener("keydown", onKeyDown);
+        if (docAtMount.removeEventListener) docAtMount.removeEventListener("keydown", onKeyDown);
       } catch (_e) {
         /* ignore */
       }

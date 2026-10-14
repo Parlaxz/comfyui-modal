@@ -100,6 +100,7 @@
       history: [],
       historyIndex: -1,
       changeListeners: [],
+      historyRestoreListeners: [],
       destroyed: false,
     };
 
@@ -143,6 +144,8 @@
       if (state.layers.length && state.layers[0] && state.layers[0].canvas) baseCanvas = state.layers[0].canvas;
     }
 
+    // Live list: the engine owns layer records, so callers must re-read this
+    // after every history restore instead of caching canvas references.
     function getLayerCanvases() {
       return state.layers.map(function (l) { return l.canvas; });
     }
@@ -282,6 +285,20 @@
       if (i >= 0 && i < state.layers.length) state.activeLayerIndex = i;
     }
 
+    // Base-draw lock decision: AUTO-CREATE (preferred — matches user intent).
+    // The initial active layer is the locked base, so painting tools
+    // (brush/pencil/line/rectangle/circle/fill/eraser) must never mutate it.
+    // Rejected alternative: no-op returning false for the shell to surface —
+    // that drops the user's stroke and feels broken on a fresh canvas, so the
+    // engine instead creates + activates a fresh unlocked overlay and lets
+    // the stroke land where the user expects. Read-only tools (eyedropper,
+    // pan, zoom) bypass this guard.
+    function ensurePaintableLayer() {
+      var layer = getActiveLayer();
+      if (layer && !layer.locked) return layer;
+      return addLayerCanvas("Layer " + (state.layers.length + 1));
+    }
+
     function resizeAll(w, h) {
       state.width = Math.max(1, Math.round(w));
       state.height = Math.max(1, Math.round(h));
@@ -333,6 +350,31 @@
       });
     }
 
+    // Engine is the single owner of layer records: after a history restore
+    // the rebuilt canvases (reconciled by ID) are live here, so the store
+    // must re-adopt references via getLayerCanvases() / onHistoryRestore
+    // instead of caching canvas objects across undo()/redo().
+    function reconciledLayerList() {
+      return state.layers.map(function (l) {
+        return { id: l.id, canvas: l.canvas, name: l.name, visible: l.visible, opacity: l.opacity, locked: !!l.locked };
+      });
+    }
+
+    function notifyHistoryRestore() {
+      var list = reconciledLayerList();
+      state.historyRestoreListeners.forEach(function (cb) {
+        try { cb(list); } catch (_) { /* ignore */ }
+      });
+    }
+
+    function onHistoryRestore(cb) {
+      if (typeof cb === "function") state.historyRestoreListeners.push(cb);
+      return function () {
+        var i = state.historyRestoreListeners.indexOf(cb);
+        if (i >= 0) state.historyRestoreListeners.splice(i, 1);
+      };
+    }
+
     // ---- history (upstream saveToHistory/undo/redo/loadFromHistory, cap 30) ----
     function saveToHistory() {
       var snapshot = state.layers.map(function (l) {
@@ -350,29 +392,31 @@
       var pending = entry.layers.length;
       if (pending === 0) { renderLayers(); return; }
       var next = [];
+      function finishRestore() {
+        // Single-owner adopt: swap in the rebuilt canvases reconciled by ID,
+        // re-tag dataset ids so canvas-reference resolution keeps working,
+        // then hand the live list to the store via onHistoryRestore.
+        next.forEach(function (l) {
+          try { if (l.canvas && l.canvas.dataset) l.canvas.dataset.layerId = l.id; } catch (_) {}
+        });
+        state.layers = next;
+        restoreBaseInvariant();
+        state.activeLayerIndex = clamp(entry.activeIndex, 0, Math.max(0, next.length - 1));
+        renderLayers();
+        emitChange();
+        notifyHistoryRestore();
+      }
       entry.layers.forEach(function (ld) {
         var c = makeCanvas(state.width, state.height);
         var img = new Image();
         img.onload = function () {
           c.getContext("2d").drawImage(img, 0, 0);
           pending--;
-          if (pending === 0) {
-            state.layers = next;
-            restoreBaseInvariant();
-            state.activeLayerIndex = clamp(entry.activeIndex, 0, Math.max(0, next.length - 1));
-            renderLayers();
-            emitChange();
-          }
+          if (pending === 0) finishRestore();
         };
         img.onerror = function () {
           pending--;
-          if (pending === 0) {
-            state.layers = next;
-            restoreBaseInvariant();
-            state.activeLayerIndex = clamp(entry.activeIndex, 0, Math.max(0, next.length - 1));
-            renderLayers();
-            emitChange();
-          }
+          if (pending === 0) finishRestore();
         };
         img.src = ld.imageData;
         next.push({ id: ld.id, canvas: c, name: ld.name, visible: ld.visible, opacity: ld.opacity, locked: !!ld.locked });
@@ -393,14 +437,56 @@
       syncBaseAliasFromLayers();
     }
 
+    // NOTE: restore is async (Image decode), so the reconciled live layer
+    // list is delivered via onHistoryRestore() — the boolean return only
+    // reports whether a history step existed.
     function undo() {
       if (state.historyIndex > 0) { state.historyIndex--; loadFromHistory(); return true; }
       return false;
     }
 
+    // NOTE: see undo() — reconciled list arrives via onHistoryRestore().
     function redo() {
       if (state.historyIndex < state.history.length - 1) { state.historyIndex++; loadFromHistory(); return true; }
       return false;
+    }
+
+    // Reset path: drop every non-base layer. clearOverlays() preserves base
+    // pixels; resetToBase() additionally clears the base bitmap. Both reset
+    // the active layer to base, snapshot history, and emit change.
+    function clearOverlays() {
+      commitStrokeBuffer();
+      state.drawing = false;
+      state.snapshot = null;
+      state.strokeBuffer = null;
+      state.strokeCtx = null;
+      if (state.layers.length > 1) state.layers = state.layers.slice(0, 1);
+      restoreBaseInvariant();
+      state.activeLayerIndex = 0;
+      renderLayers();
+      saveToHistory();
+      emitChange();
+      return true;
+    }
+
+    function resetToBase() {
+      commitStrokeBuffer();
+      state.drawing = false;
+      state.snapshot = null;
+      state.strokeBuffer = null;
+      state.strokeCtx = null;
+      if (state.layers.length > 1) state.layers = state.layers.slice(0, 1);
+      restoreBaseInvariant();
+      var base = state.layers[0];
+      if (base && base.canvas) {
+        try { base.canvas.getContext("2d").clearRect(0, 0, state.width, state.height); } catch (_) {}
+        syncBaseAliasFromLayers();
+      }
+      state.activeLayerIndex = 0;
+      renderLayers();
+      saveToHistory();
+      emitChange();
+      return true;
     }
 
     // ---- zoom / pan (upstream adjustZoom/updateCanvasTransform/fitToView) ----
@@ -577,6 +663,7 @@
 
     // Upstream floodFill (scanline stack, tolerance) on the active layer.
     function floodFill(pos) {
+      ensurePaintableLayer();
       var layer = getActiveLayer();
       if (!layer) return;
       var ctx = layer.canvas.getContext("2d");
@@ -643,6 +730,7 @@
 
     // ---- pointer input (upstream onPointerDown/Move/Up) ----
     function beginStroke(pos, pressure) {
+      ensurePaintableLayer();
       state.drawing = true;
       state.lastPoint = pos;
       state.lastPressure = pressure;
@@ -992,6 +1080,7 @@
       document.removeEventListener("keyup", onKeyUp, true);
       document.removeEventListener("mousedown", onMouseDownCapture, true);
       state.changeListeners = [];
+      state.historyRestoreListeners = [];
       if (root.parentNode) root.parentNode.removeChild(root);
     }
 
@@ -1017,10 +1106,13 @@
       flattenToDataURL: flattenToDataURL,
       destroy: destroy,
       onChange: onChange,
+      onHistoryRestore: onHistoryRestore,
       // history
       undo: undo,
       redo: redo,
       saveToHistory: saveToHistory,
+      clearOverlays: clearOverlays,
+      resetToBase: resetToBase,
       // tools + settings
       setTool: setTool,
       getTool: function () { return state.tool; },

@@ -1951,6 +1951,9 @@ function _workflowSelectEl(state, actions, context) {
     if (t === tool) return true;
     if (_shellMode === "edit" && _shellSub === "select" && t === "inpaint") return true;
     if (_shellMode === "edit" && _shellSub === "expand" && t === "outpaint") return true;
+    // Phase 6 compatibility: Sketch shells list ordinary I2I (t === tool
+    // above) plus legacy dedicated sketch workflows as expert overrides.
+    if ((_shellMode === "generate" || _shellMode === "edit") && _shellSub === "sketch" && t === "sketch") return true;
     return false;
   });
   if (!rows.length) {
@@ -4592,7 +4595,7 @@ function renderCanvas(state, context, actions) {
     ]));
   }
   var _paintToolId = activeToolOf(state);
-  var _isPaintTool = _paintToolId === "inpaint" || _paintToolId === "sketch" || _isSelectOnI2I(state);
+  var _isPaintTool = _paintToolId === "inpaint" || _paintToolId === "sketch" || _isSelectOnI2I(state) || _isSketchOnI2I(state);
   // Paint tools work on the main canvas: with no run output yet, show the
   // paint base (usually the uploaded Source Image) there instead of a
   // second small canvas inside the editor box.
@@ -4769,11 +4772,49 @@ function _editorBaseImageUrl(state) {
   return "";
 }
 
+function _liveSketchBox() {
+  try {
+    var _b = document.querySelector('[data-testid="sketch-editor"]');
+    return (_b && _b.isConnected) ? _b : null;
+  } catch (_e) { return null; }
+}
+
+// Route a source change through the mounted sketch session (engine +
+// overlay store) so stale strokes can never survive a new base image. The
+// session owns the reset hook via its public API; when no live session
+// exists the caller falls back to the legacy DOM path. Returns true when
+// a session consumed the URL.
+function _routeSourceToSketchSession(url) {
+  var box = _liveSketchBox();
+  if (!box || !box._sketchSession) return false;
+  try {
+    var sess = box._sketchSession;
+    if (sess && typeof sess.setBaseImage === "function") {
+      var r = sess.setBaseImage(url || null);
+      if (r && typeof r.then === "function") {
+        r.then(function () {
+          try {
+            var ph = box._sketchPanels;
+            if (ph && typeof ph.syncFromEngine === "function") ph.syncFromEngine();
+          } catch (_e2) {}
+        }, function () {});
+      } else {
+        try {
+          var ph2 = box._sketchPanels;
+          if (ph2 && typeof ph2.syncFromEngine === "function") ph2.syncFromEngine();
+        } catch (_e3) {}
+      }
+      return true;
+    }
+  } catch (_e) {}
+  return false;
+}
+
 function _renderSketchEditor(state, context, actions, canvasEl) {
   var box = el("div", {
     class: "comfymodal-studio-paint-editor",
     "data-testid": "sketch-editor",
-    style: "margin-top:10px;padding:10px;border:1px solid #2a2a2a;border-radius:8px;background:#0a0a0a;",
+    style: "margin-top:10px;padding:10px;border:1px solid #2a2a2a;border-radius:8px;background:#0a0a0a;max-width:100%;overflow:hidden;",
   });
   box.appendChild(el("p", {
     text: "Sketch over the image. Save flattens strokes into the Source Image.",
@@ -4790,18 +4831,28 @@ function _renderSketchEditor(state, context, actions, canvasEl) {
     style: "font-size:12px;color:#888;margin:0 0 8px;",
     "data-testid": "sketch-loading",
   });
-  var engineHost = el("div", { style: "position:relative;min-height:360px;margin-bottom:8px;", "data-testid": "sketch-engine-host" });
+  // Bounded editor layout: definite-height canvas host plus an
+  // independently scrolling inspector column. The action row is sticky so
+  // Save/Clear/Undo stay reachable, and the box never overlaps the
+  // recent-runs rail (max-width + hidden overflow above).
+  var layout = el("div", { style: "display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;max-width:100%;" });
+  var engineHost = el("div", { style: "position:relative;height:420px;max-height:56vh;min-height:320px;overflow:auto;flex:1 1 320px;min-width:280px;background:#111;border-radius:6px;margin-bottom:8px;", "data-testid": "sketch-engine-host" });
+  var inspector = el("div", { style: "display:flex;flex-direction:column;gap:8px;flex:0 1 240px;min-width:200px;max-width:100%;max-height:420px;overflow-y:auto;margin-bottom:8px;" });
   var controlsHost = el("div", { style: "margin-bottom:8px;", "data-testid": "sketch-controls-host" });
   var layersHost = el("div", { style: "margin-bottom:8px;", "data-testid": "sketch-layers-host" });
-  var ops = el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;" });
+  inspector.appendChild(controlsHost);
+  inspector.appendChild(layersHost);
+  layout.appendChild(engineHost);
+  layout.appendChild(inspector);
+  var ops = el("div", { style: "position:sticky;bottom:0;display:flex;gap:6px;flex-wrap:wrap;margin:8px 0;padding:6px 0;background:#0a0a0a;align-items:center;z-index:2;" });
+  var undoBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Undo", "data-testid": "sketch-undo" });
   var clearBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Clear", "data-testid": "sketch-clear" });
   var saveBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: "Save sketch", "data-testid": "sketch-save" });
   saveBtn.disabled = true;
+  ops.appendChild(undoBtn);
   ops.appendChild(clearBtn);
   ops.appendChild(saveBtn);
-  box.appendChild(engineHost);
-  box.appendChild(controlsHost);
-  box.appendChild(layersHost);
+  box.appendChild(layout);
   box.appendChild(ops);
   box.appendChild(loading);
   box.appendChild(preview);
@@ -4812,16 +4863,41 @@ function _renderSketchEditor(state, context, actions, canvasEl) {
   var session = null;
   var pendingIdentity = null;
   var pendingBase = "";
+  var _sketchTornDown = false;
+  var _sketchObserver = null;
   function destroySketch() {
+    if (_sketchTornDown) return;
+    _sketchTornDown = true;
+    try { if (_sketchObserver && typeof _sketchObserver.disconnect === "function") _sketchObserver.disconnect(); } catch (_e) {}
+    _sketchObserver = null;
     try { if (panelsHandle && typeof panelsHandle.destroy === "function") panelsHandle.destroy(); } catch (_e) {}
     try {
       if (layersRoot && typeof layersRoot._destroyLayersPanel === "function") layersRoot._destroyLayersPanel();
       else if (layersRoot && layersRoot.parentNode) layersRoot.parentNode.removeChild(layersRoot);
     } catch (_e) {}
+    // engine.destroy() removes the document keydown/keyup/mousedown
+    // listeners the engine installs — this is the actual leak fix.
     try { if (engine && typeof engine.destroy === "function") engine.destroy(); } catch (_e) {}
     try { if (session && typeof session.destroy === "function") session.destroy(); } catch (_e) {}
     panelsHandle = null; layersRoot = null; layerStore = null; engine = null; session = null;
+    try {
+      box._sketchSession = null; box._sketchEngine = null;
+      box._sketchPanels = null; box._sketchStore = null;
+    } catch (_e2) {}
   }
+  // Actual-unmount teardown: a MutationObserver on box removal (not window
+  // resize) disposes panels/layers/engine/session so document keydown
+  // listeners never leak. The explicit destroy hook below wires the same
+  // path into the render lifecycle.
+  try {
+    if (typeof MutationObserver !== "undefined" && document && document.body) {
+      _sketchObserver = new MutationObserver(function () {
+        if (!box.isConnected) destroySketch();
+      });
+      _sketchObserver.observe(document.body, { childList: true, subtree: true });
+    }
+  } catch (_e) { _sketchObserver = null; }
+  try { box._destroySketchEditor = destroySketch; } catch (_e2) {}
   function fallbackToLegacy() {
     if (!box.isConnected || !box.parentNode) { destroySketch(); return; }
     destroySketch();
@@ -4829,10 +4905,15 @@ function _renderSketchEditor(state, context, actions, canvasEl) {
       box.parentNode.replaceChild(_renderPaintEditor(state, "sketch", context, actions, canvasEl), box);
     } catch (_e) {}
   }
-  function onWinResizeSketch() {
-    if (!box.isConnected) { window.removeEventListener("resize", onWinResizeSketch); destroySketch(); return; }
-  }
-  window.addEventListener("resize", onWinResizeSketch);
+  undoBtn.addEventListener("click", function () {
+    if (!engine) { preview.textContent = "Still loading…"; return; }
+    try {
+      var undone = false;
+      if (typeof engine.undo === "function") undone = !!engine.undo();
+      if (panelsHandle && typeof panelsHandle.syncFromEngine === "function") panelsHandle.syncFromEngine();
+      preview.textContent = undone ? "Undone." : "Nothing to undo.";
+    } catch (_e) { preview.textContent = "Undo failed — try again."; }
+  });
   clearBtn.addEventListener("click", function () {
     if (!session) { preview.textContent = "Still loading…"; return; }
     try {
@@ -4858,7 +4939,7 @@ function _renderSketchEditor(state, context, actions, canvasEl) {
       await import("./studio-sketch-engine.js");
       await import("./studio-sketch-layers.js");
       await import("./studio-sketch-panels.js");
-      if (!box.isConnected) { destroySketch(); window.removeEventListener("resize", onWinResizeSketch); return; }
+      if (!box.isConnected) { destroySketch(); return; }
       var createEngine = (window.ComfyStudioSketchEngine && window.ComfyStudioSketchEngine.createSketchEngine) || window.createSketchEngine;
       var createLayerStore = window.ComfyModalSketchLayers && window.ComfyModalSketchLayers.createLayerStore;
       var mountPanels = window.ComfyModalSketchPanels && window.ComfyModalSketchPanels.mountSketchPanels;
@@ -4874,7 +4955,7 @@ function _renderSketchEditor(state, context, actions, canvasEl) {
       engine = createEngine(engineHost, { width: 1024, height: 1024 });
       if (baseImageUrl) {
         try { await engine.setBaseImage(baseImageUrl); } catch (_e) {}
-        if (!box.isConnected) { destroySketch(); window.removeEventListener("resize", onWinResizeSketch); return; }
+        if (!box.isConnected) { destroySketch(); return; }
       }
       layerStore = createLayerStore(engine, { width: 1024, height: 1024 });
       panelsHandle = mountPanels(controlsHost, engine, {});
@@ -4902,7 +4983,13 @@ function _renderSketchEditor(state, context, actions, canvasEl) {
           } catch (_e) { preview.textContent = "Save failed — try again."; }
         },
       });
-      if (!box.isConnected) { destroySketch(); window.removeEventListener("resize", onWinResizeSketch); return; }
+      if (!box.isConnected) { destroySketch(); return; }
+      // Expose the live session for source-lifecycle routing
+      // (_syncEditorBaseImage / _setCanvasImage go through the session).
+      try {
+        box._sketchSession = session; box._sketchEngine = engine;
+        box._sketchPanels = panelsHandle; box._sketchStore = layerStore;
+      } catch (_e2) {}
       if (loading.parentNode) loading.parentNode.removeChild(loading);
       if (panelsHandle && typeof panelsHandle.syncFromEngine === "function") {
         try { panelsHandle.syncFromEngine(); } catch (_e) {}
@@ -4917,6 +5004,14 @@ function _renderSketchEditor(state, context, actions, canvasEl) {
 
 function _renderToolEditor(state, context, actions, canvasEl) {
   var tool = activeToolOf(state);
+  // Phase 6: Generate/Sketch and Edit/Sketch run the same sketch editor on
+  // the ordinary I2I engine. Legacy dedicated sketch workflows (tool ===
+  // "sketch", selected explicitly) mount the same editor as a compatibility
+  // override below.
+  if (_isSketchOnI2I(state)) {
+    try { return _renderSketchEditor(state, context, actions, canvasEl); }
+    catch (_e) { return _renderPaintEditor(state, "sketch", context, actions, canvasEl); }
+  }
   if (tool === "sketch") {
     try { return _renderSketchEditor(state, context, actions, canvasEl); }
     catch (_e) { return _renderPaintEditor(state, tool, context, actions, canvasEl); }
@@ -6692,13 +6787,22 @@ function _subtoolExecutionType(mode, subtool) {
     // one still opens Edit/Expand (see _defaultShellForTool) as a
     // compatibility override.
     case "expand": return "i2i";
-    case "sketch": return "sketch";
+    // Phase 6: Generate/Sketch and Edit/Sketch are I2I + sketch UI, not a
+    // separate workflow family — an ordinary I2I workflow stays selected
+    // while sketching, and RUN submits the normal I2I run with the
+    // flattened sketch as source_image. Dedicated legacy sketch workflows
+    // remain usable: selecting one still opens Sketch (see
+    // _defaultShellForTool) as a compatibility override. Method-less
+    // simple mapping: no Auto, no new workflow family.
+    case "sketch": return "i2i";
     default: return null;
   }
 }
 
 // Phase 2 selection context: Edit/Select on an ordinary I2I workflow.
 // Phase 3 selection context: Edit/Expand on an ordinary I2I workflow.
+// Phase 6 selection context: Generate/Sketch and Edit/Sketch on an
+// ordinary I2I workflow.
 // One explicit predicate each (not a framework) shared by editor dispatch,
 // canvas base routing, and workflow-picker scoping below.
 function _isSelectOnI2I(state) {
@@ -6711,6 +6815,11 @@ function _isExpandOnI2I(state) {
     && activeModeOf(state) === "edit"
     && activeSubtoolOf(state) === "expand";
 }
+function _isSketchOnI2I(state) {
+  return activeToolOf(state) === "i2i"
+    && (activeModeOf(state) === "generate" || activeModeOf(state) === "edit")
+    && activeSubtoolOf(state) === "sketch";
+}
 
 // Workflow-picker scope follows the visible shell (not the active tool), so
 // ordinary I2I plus the matching legacy override stay reachable together.
@@ -6719,6 +6828,7 @@ function _pickerTypesForShell(state) {
   var sub = activeSubtoolOf(state);
   if (mode === "edit" && sub === "select") return ["i2i", "inpaint"];
   if (mode === "edit" && sub === "expand") return ["i2i", "outpaint"];
+  if ((mode === "generate" || mode === "edit") && sub === "sketch") return ["i2i", "sketch"];
   return activeToolOf(state);
 }
 
@@ -7087,11 +7197,20 @@ function _methodSelectRow(state, context, actions, kind, noteText) {
   return row;
 }
 
-// Sensible visible shell for an internal execution type. A sketch type
-// keeps the already-visible Generate/Edit Sketch choice when compatible.
+// Sensible visible shell for an internal execution type. A sketch shell
+// keeps the already-visible Generate/Edit Sketch choice when compatible
+// (both the I2I sketch path and the legacy sketch compatibility override
+// mount the same editor).
 function _defaultShellForTool(toolId, currentMode, currentSubtool) {
-  var currentMapsSketch = _subtoolExecutionType(currentMode, currentSubtool) === "sketch";
-  if (toolId === "sketch" && currentMapsSketch) {
+  var _isSketchShell = currentSubtool === "sketch"
+    && (currentMode === "generate" || currentMode === "edit");
+  if (toolId === "sketch" && _isSketchShell) {
+    return { mode: currentMode, subtool: "sketch" };
+  }
+  // Phase 6: Generate/Edit Sketch run on I2I — switching between I2I
+  // workflows keeps the already-visible Sketch subtool instead of yanking
+  // the user back to Text (method-less simple mapping, no Auto).
+  if (toolId === "i2i" && _isSketchShell) {
     return { mode: currentMode, subtool: "sketch" };
   }
   if (toolId === "postprocess" && currentMode === "post" && currentSubtool !== "upscale") {
@@ -7591,6 +7710,9 @@ function _defaultSubtoolForMode(state, mode) {
     if (currentTool === "inpaint" && mode === "edit" && subs[i] === "select") return subs[i];
     // Phase 3: same for a legacy dedicated outpaint workflow in Edit/Expand.
     if (currentTool === "outpaint" && mode === "edit" && subs[i] === "expand") return subs[i];
+    // Phase 6: same for a legacy dedicated sketch workflow in
+    // Generate/Sketch or Edit/Sketch on top of the I2I family.
+    if (currentTool === "sketch" && (mode === "generate" || mode === "edit") && subs[i] === "sketch") return subs[i];
   }
   return subs[0];
 }
@@ -7758,6 +7880,25 @@ function _syncEditorBaseImage(state) {
   try {
     var url = _editorBaseImageUrl(state);
     if (!url) return;
+    // Phase 6: a mounted sketch session owns its base — route the source
+    // replacement through the session (engine.setBaseImage + overlay reset
+    // via its public API) so stale layer content never survives. The
+    // legacy DOM path below only serves the fallback paint editor.
+    try {
+      if (_routeSourceToSketchSession(url)) {
+        var _sessImg = document.querySelector('[data-testid="inpaint-base-image"]');
+        if (_sessImg && _sessImg.isConnected && _sessImg.getAttribute("src") !== url) {
+          _sessImg.setAttribute("src", url);
+          var _sessWrap = _sessImg.parentElement;
+          var _sessPaint = _sessWrap && _sessWrap.querySelector("canvas");
+          if (_sessPaint) {
+            var _sessCtx = _sessPaint.getContext("2d");
+            if (_sessCtx) _sessCtx.clearRect(0, 0, _sessPaint.width, _sessPaint.height);
+          }
+        }
+        return;
+      }
+    } catch (_e2) {}
     ["inpaint-base-image", "sketch-base-image"].forEach(function (testid) {
       var img = document.querySelector('[data-testid="' + testid + '"]');
       if (img && img.isConnected && img.getAttribute("src") !== url) {
@@ -9503,9 +9644,24 @@ function _setCanvasImage(state, url, context) {
     if (img && img.isConnected) {
       img.setAttribute("src", String(url));
       // A paint overlay belongs to the previous image — clear it so old
-      // strokes never corrupt the new base.
+      // strokes never corrupt the new base. The mounted sketch session
+      // owns its overlays: route through the session (engine.setBaseImage
+      // + layer reset via its public API) instead of touching legacy DOM.
       try {
-        ["inpaint-canvas", "sketch-canvas"].forEach(function (tid) {
+        var _routedSketch = false;
+        try {
+          var _liveBox = _liveSketchBox();
+          if (_liveBox && _liveBox._sketchSession) {
+            var _baseNow = "";
+            try { _baseNow = _editorBaseImageUrl(state) || ""; } catch (_eB) { _baseNow = ""; }
+            if (_baseNow) _routedSketch = _routeSourceToSketchSession(_baseNow);
+            else {
+              try { _liveBox._sketchSession.reset(); } catch (_eR) {}
+              _routedSketch = true;
+            }
+          }
+        } catch (_eR2) {}
+        ["inpaint-canvas"].concat(_routedSketch ? [] : ["sketch-canvas"]).forEach(function (tid) {
           var p = document.querySelector('[data-testid="' + tid + '"]');
           if (p && p.isConnected) {
             var c = p.getContext("2d");
@@ -9542,9 +9698,15 @@ function _clearBoundMask(state, context, actions) {
 
 // The editor base image is gone (source cleared): wipe paint overlays
 // directly. Same clearing _setCanvasImage applies when a new source replaces
-// the old one.
+// the old one. A mounted sketch session resets through its own public API.
 function _clearPaintOverlays() {
   try {
+    try {
+      var _clearBox = _liveSketchBox();
+      if (_clearBox && _clearBox._sketchSession) {
+        try { _clearBox._sketchSession.reset(); } catch (_eS) {}
+      }
+    } catch (_eS2) {}
     ["inpaint-canvas", "sketch-canvas"].forEach(function (tid) {
       var p = document.querySelector('[data-testid="' + tid + '"]');
       if (p && p.isConnected) {

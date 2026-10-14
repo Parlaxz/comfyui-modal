@@ -40,8 +40,9 @@ export const SKETCH_DEFAULT_SIZE = 1024;
 
 /**
  * @typedef {object} SketchLayerStore
- * Duck-typed overlay layer handle. Any of clearLayers/clear/reset is tried
- * in that order; a missing handle is a no-op (tool settings still persist).
+ * Duck-typed overlay layer handle. Overlay reset prefers the store's own
+ * delete() path (keeps store + engine in sync); engine.clearOverlays() is
+ * the fallback when no store is attached.
  */
 
 /**
@@ -74,15 +75,46 @@ export function openSketch(opts) {
     if (destroyed) throw new Error("Sketch session destroyed");
   }
 
-  function _clearLayers() {
-    if (!layerStore) return;
+  function _isBaseLayer(l) {
+    return !!l && (l.id === "base" || l.locked === true);
+  }
+
+  // Real overlay reset: drop every non-base layer through the store so the
+  // store list and the engine canvases stay reconciled, then snapshot
+  // engine history so Clear/Undo observe the cleared state. Base pixels
+  // are kept; tool settings are untouched.
+  function _clearOverlaysReal() {
+    let storeCleared = false;
     try {
-      if (typeof layerStore.clearLayers === "function") { layerStore.clearLayers(); return; }
-      if (typeof layerStore.clear === "function") { layerStore.clear(); return; }
-      if (typeof layerStore.reset === "function") { layerStore.reset(); return; }
+      if (layerStore && Array.isArray(layerStore.layers)
+        && typeof layerStore.delete === "function") {
+        const ids = layerStore.layers
+          .filter((l) => !_isBaseLayer(l))
+          .map((l) => l && l.id)
+          .filter(Boolean);
+        ids.forEach((id) => {
+          try { layerStore.delete(id); } catch (_e) { /* per-layer best-effort */ }
+        });
+        storeCleared = true;
+      }
     } catch (_e) {
-      // Overlay reset must never break tool settings or the handoff.
+      // Fall through to the engine fallback below.
     }
+    // The store commit path does not reach engine.saveToHistory (it probes
+    // snapshot/pushHistory/saveSnapshot/historyPush/commitHistory), so
+    // snapshot explicitly — Clear must be undoable and visible to panels.
+    try {
+      if (engine && typeof engine.saveToHistory === "function") engine.saveToHistory();
+    } catch (_e) { /* history is best-effort */ }
+    if (!storeCleared) {
+      try {
+        if (engine && typeof engine.clearOverlays === "function") engine.clearOverlays();
+      } catch (_e) { /* overlay reset must never break the handoff */ }
+    }
+  }
+
+  function _clearLayers() {
+    _clearOverlaysReal();
   }
 
   const session = {
@@ -106,10 +138,20 @@ export function openSketch(opts) {
       _clearLayers();
     },
 
-    setBaseImage(url) {
+    async setBaseImage(url) {
       _assertLive();
       baseImageUrl = typeof url === "string" && url ? url : null;
-      // Source/base change resets overlay layers but preserves tool settings.
+      // Passthrough to the engine: the new source becomes the locked base
+      // bitmap (blank canvas when null). Overlays are then reset so stale
+      // strokes from the previous source can never survive the change;
+      // tool settings persist.
+      try {
+        if (engine && typeof engine.setBaseImage === "function") {
+          await engine.setBaseImage(baseImageUrl || "blank");
+        }
+      } catch (_e) {
+        // A failed base load still clears stale overlays below.
+      }
       _clearLayers();
     },
 
