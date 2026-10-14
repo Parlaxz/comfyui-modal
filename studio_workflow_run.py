@@ -2465,7 +2465,7 @@ def _sanitize_studio_style(raw):
 
     Canonical shape:
       {"id": str, "title": str, "fragment": str, "user_prompt": str,
-       "catalog_version": int}
+       "catalog_version": int, "set": str (optional style-set id)}
     Provenance only: it never alters execution. Unknown keys are stripped;
     anything else fails loudly — never a silent drop of the record.
     """
@@ -2486,12 +2486,16 @@ def _sanitize_studio_style(raw):
     version = raw.get("catalog_version", 0)
     if isinstance(version, bool) or not isinstance(version, int):
         return None, "studio_style.catalog_version must be an int"
+    style_set = raw.get("set", "")
+    if not isinstance(style_set, str):
+        return None, "studio_style.set must be a string"
     return {
         "id": style_id.strip(),
         "title": title.strip(),
         "fragment": fragment.strip(),
         "user_prompt": user_prompt,
         "catalog_version": version,
+        "set": style_set.strip(),
     }, None
 
 
