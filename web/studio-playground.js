@@ -28,6 +28,7 @@ import {
   getGoldenProfileDeployStatus,
 } from "./studio-backend-api.js";
 import { loadModalOptions } from "./studio-output-preferences.js";
+import { createLayoutEditor, buildIdeogramCaption } from "./studio-layout-editor.js";
 import { goldenProgressResponseAction, progressSpanView } from "./studio-golden-progress.js";
 
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines, resolveSelectionResultKey, buildViewerRecordFromRun, resolveViewerInput, generationIdForLegacyRunId } from "./studio-run-normalizer.js";
@@ -4618,18 +4619,56 @@ function renderFeatureTabs(state, context) {
 }
 
 // -- Layout (Phase 7: visual prompt authoring) --------------------------
-// Boxes live in a localStorage draft; the deterministic serializer turns
-// them into one human-readable prompt string handed to the normal prompt
-// control via Send to Prompt. No Layout workflow, engine, or schema.
+// Boxes live in a localStorage draft; the serializer turns them into one
+// Ideogram-caption JSON string handed to the normal prompt control via
+// Send to Prompt. No Layout workflow, engine, or schema.
 var LAYOUT_STORE_KEY = "comfymodal.studio.layout.v1";
+var LAYOUT_KJ_STORE_KEY = "comfymodal.studio.layout.kj.v1";
 var LAYOUT_ASPECTS = [["1:1", 1], ["3:4", 0.75], ["4:3", 4 / 3], ["16:9", 16 / 9], ["9:16", 9 / 16]];
 function loadLayoutDraft() {
   var out = { boxes: [], globalDesc: "", aspect: "1:1", selectedId: "", seq: 0 };
   try {
-    var raw = localStorage.getItem(LAYOUT_STORE_KEY);
+    var raw = null;
+    try { raw = localStorage.getItem(LAYOUT_KJ_STORE_KEY); } catch (_e0) {}
+    if (!raw) {
+      try { raw = localStorage.getItem(LAYOUT_STORE_KEY); } catch (_e1) {}
+    }
     if (!raw) return out;
     var j = JSON.parse(raw);
     if (j && Array.isArray(j.boxes)) {
+      var kjShape = j.boxes.some(function (b) { return b && (b.type === "obj" || b.type === "text"); });
+      if (kjShape) {
+        // KJ-shape draft (fraction 0-1 geometry, type obj/text): pass through
+        // unclamped; the Studio layout editor normalizes on load. The legacy
+        // percent clamp below must NOT apply to fractions.
+        // Pass the KJ global/canvas fields through as well — without them
+        // every remount resets background/style/dims to blank (data loss:
+        // the editor persists the stripped draft back on next touch).
+        var kjFields = ["high_level_description", "background", "style_mode",
+          "aesthetics", "lighting", "photo", "medium", "art_style",
+          "width", "height", "bgBrightness"];
+        for (var fi = 0; fi < kjFields.length; fi++) {
+          var fk = kjFields[fi];
+          if (j[fk] !== undefined && j[fk] !== null) out[fk] = j[fk];
+        }
+        if (Array.isArray(j.color_palette)) out.color_palette = j.color_palette.slice(0);
+        out.boxes = j.boxes.filter(function (b) {
+          return b && (b.type === "obj" || b.type === "text" || b.kind === "object" || b.kind === "text")
+            && isFinite(Number(b.x)) && isFinite(Number(b.y))
+            && isFinite(Number(b.w)) && isFinite(Number(b.h));
+        }).map(function (b) {
+          var isText = (b.type === "text" || b.kind === "text");
+          return {
+            id: String(b.id || ""), type: isText ? "text" : "obj",
+            kind: isText ? "text" : "object",
+            x: Number(b.x), y: Number(b.y), w: Number(b.w), h: Number(b.h),
+            label: String(b.label || ""), desc: String(b.desc || ""),
+            text: String(b.text || ""), color: String(b.color || "#e8b93e"),
+            color_palette: Array.isArray(b.color_palette) ? b.color_palette.slice(0) : [],
+            nobbox: !!b.nobbox, locked: !!b.locked,
+          };
+        });
+      } else {
       out.boxes = j.boxes.filter(function (b) {
         return b && (b.kind === "object" || b.kind === "text")
           && isFinite(Number(b.x)) && isFinite(Number(b.y))
@@ -4643,6 +4682,7 @@ function loadLayoutDraft() {
           text: String(b.text || ""), color: String(b.color || "#e8b93e"),
         };
       });
+      }
     }
     if (j && typeof j.globalDesc === "string") out.globalDesc = j.globalDesc;
     if (j && typeof j.aspect === "string") out.aspect = j.aspect;
@@ -4652,7 +4692,7 @@ function loadLayoutDraft() {
   return out;
 }
 function saveLayoutDraft(draft) {
-  try { localStorage.setItem(LAYOUT_STORE_KEY, JSON.stringify(draft || {})); } catch (_e) {}
+  try { localStorage.setItem(LAYOUT_KJ_STORE_KEY, JSON.stringify(draft || {})); } catch (_e) {}
 }
 function _layoutAspectRatio(aspect) {
   for (var i = 0; i < LAYOUT_ASPECTS.length; i++) {
@@ -4660,39 +4700,161 @@ function _layoutAspectRatio(aspect) {
   }
   return 1;
 }
-// Deterministic serializer: creation order, integer 0-100 geometry, fixed
-// line shapes. Human-readable and diffable; the exact string is what Send
-// to Prompt submits, so History stays auditable through prompt_text.
-function serializeLayout(draft) {
-  var d = draft || { boxes: [], globalDesc: "", aspect: "1:1" };
-  var lines = [];
-  var global = String(d.globalDesc || "").trim();
-  lines.push("Scene: " + (global || "unspecified scene") + ".");
-  var boxes = Array.isArray(d.boxes) ? d.boxes : [];
-  var oi = 0, ti = 0;
-  boxes.forEach(function (b) {
-    var x = Math.round(Number(b.x)), y = Math.round(Number(b.y));
-    var w = Math.round(Number(b.w)), h = Math.round(Number(b.h));
-    if (b.kind === "text") {
-      ti++;
-      var t = String(b.text || "").trim() || ("text " + ti);
-      lines.push("Text " + ti + ": \"" + t + "\" at x=" + x + ",y=" + y + " size " + w + "x" + h + ".");
-    } else {
-      oi++;
-      var label = String(b.label || "").trim() || ("object " + oi);
-      var desc = String(b.desc || "").trim();
-      var color = String(b.color || "").trim();
-      var line = "Object " + oi + " \"" + label + "\""
-        + (desc ? ": " + desc : "")
-        + " at x=" + x + ",y=" + y + " size " + w + "x" + h
-        + (color ? " color " + color : "") + ".";
-      lines.push(line);
+// Primary serializer: Ideogram-caption JSON via the delegated editor
+// module (pretty for Send, compact when requested). The legacy prose shape
+// ("Scene: ..." / "Object N ..." / "Canvas: ...") survives only as this
+// debug comment -- it is never the primary output.
+function serializeLayout(draft, compact) {
+  var pretty = compact ? 0 : 2;
+  try {
+    if (typeof buildIdeogramCaption === "function") {
+      var cap = buildIdeogramCaption(draft || { boxes: [], globalDesc: "", aspect: "1:1" });
+      if (typeof cap === "string" && cap) return cap;
+      if (cap && typeof cap === "object") return JSON.stringify(cap, null, pretty);
     }
-  });
-  lines.push("Canvas: " + String(d.aspect || "1:1") + ".");
-  return lines.join("\n");
+  } catch (_e) {}
+  try {
+    return JSON.stringify(draft || { boxes: [], globalDesc: "", aspect: "1:1" }, null, pretty);
+  } catch (_e2) {}
+  return "{}";
+}
+// -- Layout seam (Phase 7 corrective: delegate to studio-layout-editor) --
+// Thin wiring only -- no editor logic here. Contract for
+// ./studio-layout-editor.js (core lane owns it):
+//   createLayoutEditor(container, { initialDraft, onDraftChange }) ->
+//   handle | void (mounts synchronously into container; optional
+//   handle.getDraft() / handle.destroy()). The delegated editor owns the
+//   stage/toolbar/inspector DOM (layout-stage, layout-add-object,
+//   layout-add-text, layout-aspect, layout-inspector, layout-box-*
+//   testids) but must NOT render layout-send or layout-preview: this seam
+//   owns Send-to-Prompt, preview, persistence keys, and teardown.
+function _sendLayoutToPrompt(state, context, actions, text) {
+  // Write through the Shelf commit seam (store + validation + DOM sync),
+  // not the draft-only setControl path, so the Text prompt field shows it.
+  try {
+    if (typeof commitShelfValue === "function") {
+      commitShelfValue(state, context, actions, "prompt", text);
+    } else if (actions && actions.setControl) {
+      actions.setControl("prompt", text);
+    }
+  } catch (_e) {}
+  // Return to the ordinary Text prompt so the next run is the normal T2I
+  // path with the serialization visible in its prompt field. The selected
+  // T2I workflow (workflowId/versionId/controlValues) is untouched: no
+  // workflow switching, no Layout workflow/backend.
+  try {
+    var pg = state && state.playground;
+    if (pg) {
+      pg.activeSubtool = "text";
+      _persistShellState(state);
+    }
+  } catch (_e2) {}
+  try {
+    if (context && context.setPage) context.setPage("playground");
+  } catch (_e3) {}
 }
 function _renderLayoutEditor(state, context, actions) {
+  var wrap = el("div", {
+    class: "comfymodal-studio-layout",
+    "data-testid": "layout-editor",
+    style: "width:100%;display:flex;flex-direction:column;gap:8px;",
+  });
+  var draft = loadLayoutDraft();
+  var handle = null;
+  function liveDraft() {
+    try {
+      if (handle && typeof handle.getDraft === "function") {
+        var g = handle.getDraft();
+        if (g) return g;
+      }
+    } catch (_e) {}
+    return draft;
+  }
+  var mount = el("div", { "data-testid": "layout-mount", style: "width:100%;" });
+  wrap.appendChild(mount);
+  // The delegated editor owns the canonical collapsible JSON viewer, so this
+  // seam dump stays rendered+updated (tests parse it) but hidden to avoid
+  // showing the same payload twice.
+  var preview = el("pre", {
+    "data-testid": "layout-preview",
+    style: "display:none;font-size:11px;color:#888;white-space:pre-wrap;margin:0;overflow-wrap:anywhere;",
+  });
+  function paintPreview() {
+    var text = "";
+    try { text = serializeLayout(liveDraft()); } catch (_e) { text = ""; }
+    preview.textContent = text;
+  }
+  // Oracle P0-2: the completion row is visually isolated from anything below
+  // it, and says what Send does (transfer — not generate).
+  var toolbar = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:4px 0 16px;" });
+  // Primary completion action: Studio primary styling so it is never hunted for.
+  var sendBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: "Send to Prompt →", "data-testid": "layout-send", title: "Copy the serialization into the normal prompt and return to Text" });
+  sendBtn.addEventListener("click", function () {
+    var text = "";
+    try { text = serializeLayout(liveDraft()); } catch (_e) { text = ""; }
+    _sendLayoutToPrompt(state, context, actions, text);
+  });
+  toolbar.appendChild(sendBtn);
+  var sendHint = el("span", { style: "font-size:11px;color:#888;", text: "Transfers this layout to the Text prompt. Does not generate yet." });
+  toolbar.appendChild(sendHint);
+  var delegated = false;
+  try {
+    if (typeof createLayoutEditor === "function") {
+      handle = createLayoutEditor(mount, {
+        initialDraft: draft,
+        onDraftChange: function (next) {
+          if (next) draft = next;
+          saveLayoutDraft(draft);
+          paintPreview();
+        },
+      }) || null;
+      delegated = true;
+    }
+  } catch (_e) {
+    handle = null;
+    delegated = false;
+  }
+  if (!delegated) {
+    // Graceful fallback while the core-lane module is absent: the legacy
+    // inline editor below owns the full UI (same signature).
+    return _renderLegacyLayoutEditor(state, context, actions);
+  }
+  // P0 bounded layout: the primary action lives sticky at the bottom of the
+  // delegated inspector (never over canvas, JSON, list, or Recent Runs).
+  // Without a slot (older editor build), keep the standalone toolbar row.
+  var slot = null;
+  try { slot = mount.querySelector(".stlay-send-slot"); } catch (_e) { slot = null; }
+  if (slot) {
+    slot.appendChild(sendBtn);
+    slot.appendChild(sendHint);
+  } else {
+    wrap.appendChild(toolbar);
+  }
+  wrap.appendChild(preview);
+  // Teardown-safe: no explicit unmount exists upstream, so destroy the
+  // delegated editor when this wrap leaves the DOM on re-render.
+  try {
+    var _destroyFn = (handle && typeof handle.destroy === "function") ? handle.destroy.bind(handle) : null;
+    wrap._layoutDestroy = _destroyFn;
+    if (typeof MutationObserver !== "undefined" && typeof document !== "undefined" && document.body) {
+      var _obs = new MutationObserver(function () {
+        try {
+          if (!wrap.isConnected) {
+            if (_destroyFn) _destroyFn();
+            _obs.disconnect();
+          }
+        } catch (_e2) {}
+      });
+      _obs.observe(document.body, { childList: true, subtree: true });
+    }
+  } catch (_e3) {}
+  paintPreview();
+  return wrap;
+}
+// Legacy inline editor -- fallback only (used when the delegated module is
+// unavailable). Persists via load/saveLayoutDraft and serializes via
+// serializeLayout above, so Send/preview stay JSON-primary here too.
+function _renderLegacyLayoutEditor(state, context, actions) {
   var wrap = el("div", {
     class: "comfymodal-studio-layout",
     "data-testid": "layout-editor",
@@ -4712,7 +4874,7 @@ function _renderLayoutEditor(state, context, actions) {
     aspectSel.appendChild(o);
   });
   var clearBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Reset", "data-testid": "layout-reset", title: "Clear all regions" });
-  var sendBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Send to Prompt →", "data-testid": "layout-send", title: "Copy the serialization into the normal prompt and return to Text" });
+  var sendBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: "Send to Prompt →", "data-testid": "layout-send", title: "Copy the serialization into the normal prompt and return to Text" });
   toolbar.appendChild(addObj);
   toolbar.appendChild(addTxt);
   toolbar.appendChild(aspectSel);
