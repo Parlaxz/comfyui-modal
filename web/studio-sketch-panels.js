@@ -2,9 +2,23 @@
 /**
  * studio-sketch-panels.js — Sketch tool/color/settings sidebar panels (Phase 6).
  *
- * Native dark Studio sidebar presentation of the sketch panels. Docked only:
- * plain stacked sidebar DOM, no floating/draggable panels, no new global
- * state architecture.
+ * Renders inside the ~333px LEFT Studio sidebar rail (mounted there by another
+ * lane). Compact stacked rail DOM only: no floating/draggable panels, no new
+ * global state architecture, no fixed widths over 300px, no giant canvases in
+ * the default view.
+ *
+ * Compact rail organization (not a moved tall inspector):
+ *   TOOLS   — 4-column grid x 2 rows (8 tools), Lucide icons, selected state.
+ *   BRUSH   — Size/Opacity/Hardness sliders only, tight rows; Hardness
+ *             disabled (not hidden) where N/A so layout stays stable.
+ *   COLOR   — SHORT by default: FG/BG swatches + swap/reset, picker + hex,
+ *             one compact preset row, fill tolerance. Full HSV wheel + SV +
+ *             HSL/RGB rows live behind a collapsed-by-default "Advanced Color"
+ *             disclosure.
+ *   CANVAS  — one mini-row: zoom out/label/in + Fit + 100%.
+ *   HISTORY — compact backup undo/redo row (testids kept); the sticky action
+ *             bar lives in the playground shelf footer (other lane), so a
+ *             one-line helper labels these as backup to avoid confusion.
  *
  * This module OWNS the tool bar, brush settings, color swatches and canvas
  * zoom/undo controls, and DRIVES the sketch engine exclusively through its
@@ -89,19 +103,22 @@
   function installStyles(doc) {
     if (!doc || doc.getElementById("sketch-panels-style")) return;
     var style = doc.createElement("style"); style.id = "sketch-panels-style";
-    // Native dark Studio sidebar treatment. Tokens mirror
-    // web/studio-styles.js: panel #111 on sidebar #0d0d0d, 1px #2a2a2a
-    // borders, 12px type, 11px uppercase section headers in #888, muted
-    // helper #888, secondary buttons (#1a1a1a / #333 / #aaa), accent
-    // var(--color-accent, #5a7fdb) for selected states, accent-color
-    // sliders. Docked only — no position:fixed/absolute, no floats.
+    // Native dark Studio sidebar treatment, sized for the ~333px LEFT rail.
+    // Tokens mirror web/studio-styles.js: panel #111 on sidebar #0d0d0d, 1px
+    // #2a2a2a borders, 12px type, 11px uppercase section headers in #888,
+    // muted helper #888, secondary buttons (#1a1a1a / #333 / #aaa), accent
+    // var(--color-accent, #5a7fdb) for selected states, accent-color sliders.
+    // Docked rail only — no position:fixed/absolute, no floats, no fixed
+    // widths over 300px, max-width:100% everywhere so nothing overflows the
+    // narrow sidebar. Wheel/SV canvases render small AND live inside the
+    // collapsed Advanced disclosure, so the default view stays short.
     style.textContent = [
-      ".sketch-panels{color:#d0d0d0;font:12px/1.45 system-ui,-apple-system,sans-serif;background:transparent;display:flex;flex-direction:column;gap:4px;padding:0;box-sizing:border-box;max-width:100%;}",
-      ".sketch-panels-section{background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:8px;margin-bottom:4px;box-sizing:border-box;max-width:100%;}",
+      ".sketch-panels{color:#d0d0d0;font:12px/1.45 system-ui,-apple-system,sans-serif;background:transparent;display:flex;flex-direction:column;gap:4px;padding:0;box-sizing:border-box;width:100%;max-width:100%;}",
+      ".sketch-panels-section{background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:8px;margin-bottom:4px;box-sizing:border-box;width:100%;max-width:100%;}",
       ".sketch-panels-heading{font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:.05em;margin:0 0 6px;padding:0;}",
-      ".sketch-panels-tools{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;}",
+      ".sketch-panels-tools{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;max-width:100%;}",
       ".sketch-panels-tool,.sketch-panels-btn,.sketch-panels-mini{background:#1a1a1a;color:#aaa;border:1px solid #333;border-radius:6px;min-height:28px;cursor:pointer;font:inherit;font-size:11px;display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:4px 6px;transition:background .15s,color .15s,border-color .15s;box-sizing:border-box;max-width:100%;}",
-      ".sketch-panels-tool{flex-direction:column;font-size:9px;padding:5px 2px;min-height:40px;}",
+      ".sketch-panels-tool{flex-direction:column;font-size:9px;padding:5px 2px;min-height:38px;}",
       ".sketch-panels-tool:hover,.sketch-panels-btn:hover,.sketch-panels-mini:hover{background:#222;color:#d0d0d0;}",
       ".sketch-panels-tool:focus-visible,.sketch-panels-btn:focus-visible,.sketch-panels-mini:focus-visible{outline:2px solid var(--color-accent,#5a7fdb);outline-offset:1px;}",
       ".sketch-panels-tool.is-active{background:var(--color-accent-muted,rgba(90,127,219,.16));border-color:var(--color-accent,#5a7fdb);color:#fff;}",
@@ -114,25 +131,25 @@
       ".sketch-panels-slider,.comfysketch-slider{flex:1;min-width:0;accent-color:var(--color-accent,#5a7fdb);height:16px;background:transparent;cursor:pointer;}",
       ".sketch-panels-slider:disabled,.comfysketch-slider:disabled{opacity:.4;cursor:default;}",
       ".sketch-panels-val{min-width:38px;text-align:right;color:#888;font-size:11px;font-variant-numeric:tabular-nums;}",
-      ".sketch-panels-swatches{display:flex;align-items:center;gap:4px;margin:6px 0;}",
+      ".sketch-panels-swatches{display:flex;align-items:center;gap:4px;margin:6px 0;max-width:100%;}",
       ".sketch-panels-swatch{width:30px;height:24px;border-radius:4px;border:1px solid #333;cursor:pointer;padding:0;font-size:0;flex-shrink:0;box-sizing:border-box;}",
       ".sketch-panels-swatch.is-active{outline:2px solid var(--color-accent,#5a7fdb);outline-offset:1px;}",
       ".sketch-panels-swatch:focus-visible{outline:2px solid var(--color-accent,#5a7fdb);outline-offset:1px;}",
       ".sketch-panels-mini{min-width:26px;}",
-      ".sketch-panels-colorbox{display:flex;gap:8px;align-items:flex-start;justify-content:flex-start;margin:4px 0;}",
-      ".sketch-panels-colorbox canvas{width:96px;height:96px;border:1px solid #333;border-radius:4px;background:#0a0a0a;cursor:crosshair;touch-action:none;}",
+      ".sketch-panels-colorbox{display:flex;gap:8px;align-items:flex-start;justify-content:flex-start;margin:4px 0;max-width:100%;}",
+      ".sketch-panels-colorbox canvas{width:84px;height:84px;border:1px solid #333;border-radius:4px;background:#0a0a0a;cursor:crosshair;touch-action:none;}",
       ".sketch-panels-color{width:28px;height:24px;padding:0;border:1px solid #333;border-radius:4px;background:#0a0a0a;cursor:pointer;flex-shrink:0;}",
       ".sketch-panels-hex{flex:1;min-width:0;background:#0a0a0a;border:1px solid #2a2a2a;color:#d0d0d0;border-radius:3px;padding:4px 6px;font-size:11px;font-family:ui-monospace,monospace;box-sizing:border-box;}",
       ".sketch-panels-hex:focus{border-color:var(--color-accent,#5a7fdb);outline:none;}",
-      ".sketch-panels-presets{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:3px;margin:6px 0 0;}",
+      ".sketch-panels-presets{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:3px;margin:6px 0 0;max-width:100%;}",
       ".sketch-panels-preset{aspect-ratio:1;border:1px solid #333;border-radius:3px;cursor:pointer;padding:0;min-width:0;}",
       ".sketch-panels-preset:hover{border-color:var(--color-accent,#5a7fdb);}",
       ".sketch-panels-preset:focus-visible{outline:2px solid var(--color-accent,#5a7fdb);outline-offset:1px;}",
       ".sketch-panels-number{width:52px;background:#0a0a0a;border:1px solid #2a2a2a;color:#d0d0d0;border-radius:3px;padding:3px 6px;font-size:11px;box-sizing:border-box;}",
       ".sketch-panels-number:focus{border-color:var(--color-accent,#5a7fdb);outline:none;}",
-      ".sketch-panels-zoomrow{display:flex;align-items:center;gap:4px;}",
+      ".sketch-panels-zoomrow{display:flex;align-items:center;gap:4px;max-width:100%;}",
       ".sketch-panels-zoomlabel{flex:1;text-align:center;color:#888;font-size:11px;font-variant-numeric:tabular-nums;min-width:40px;}",
-      ".sketch-panels-histrow{display:flex;gap:4px;margin-top:4px;}",
+      ".sketch-panels-histrow{display:flex;gap:4px;margin-top:4px;max-width:100%;}",
       ".sketch-panels-histrow .sketch-panels-btn{flex:1;}",
       ".sketch-panels-help{font-size:11px;color:#888;margin:2px 0 0;line-height:1.4;}",
       ".sketch-panels-advanced-toggle{display:flex;align-items:center;gap:4px;width:100%;margin-top:6px;padding:5px 8px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:3px;cursor:pointer;font:inherit;font-size:10px;font-weight:600;color:#a0a0a0;text-transform:uppercase;letter-spacing:.04em;text-align:left;box-sizing:border-box;}",
@@ -140,9 +157,9 @@
       ".sketch-panels-advanced-toggle:focus-visible{outline:2px solid var(--color-accent,#5a7fdb);outline-offset:1px;}",
       ".sketch-panels-advanced-toggle .arrow{font-size:8px;flex-shrink:0;transition:transform .2s;}",
       '.sketch-panels-advanced-toggle[aria-expanded="true"] .arrow{transform:rotate(90deg);}',
-      ".sketch-panels-advanced-body{display:flex;flex-direction:column;gap:4px;padding:6px 0 0 8px;margin:4px 0 0 4px;border-left:1px solid #2a2a2a;}",
+      ".sketch-panels-advanced-body{display:flex;flex-direction:column;gap:4px;padding:6px 0 0 8px;margin:4px 0 0 4px;border-left:1px solid #2a2a2a;max-width:100%;}",
       '.sketch-panels-advanced-body[hidden]{display:none;}',
-      ".sketch-panels-rgbrow{display:flex;align-items:center;gap:4px;}",
+      ".sketch-panels-rgbrow{display:flex;align-items:center;gap:4px;max-width:100%;}",
       ".sketch-panels-rgbrow .sketch-panels-number{width:44px;}",
       ".sketch-panels-rgbrow .sketch-panels-val{min-width:12px;}",
     ].join("");
@@ -571,7 +588,7 @@
       }
     }
 
-    // ---- build: tool bar ----
+    // ---- build: tool bar (compact 4-col grid, 2 rows in the narrow rail) ----
 
     var toolSec = section("TOOLS");
     var toolGrid = el("div", "sketch-panels-tools");
@@ -594,7 +611,7 @@
     }
     toolSec.appendChild(toolGrid);
 
-    // ---- build: brush settings ----
+    // ---- build: brush settings (sliders only, compact rows) ----
 
     var setSec = section("BRUSH");
     function sliderRow(labelText, min, max, step, testid, onInput) {
@@ -635,7 +652,7 @@
       hardnessSlider.title = applicable ? "Brush hardness" : "Hardness applies to Brush/Pencil only";
     }
 
-    // ---- build: color (compact; advanced HSV/HSL/RGB collapsible) ----
+    // ---- build: color (SHORT by default; wheel/SV/HSL/RGB collapsed) ----
 
     var colSec = section("COLOR");
     var swRow = el("div", "sketch-panels-swatches");
@@ -731,7 +748,7 @@
     colSec.appendChild(tolRow);
 
     // Advanced color: full HSV wheel + SV square + HSL/RGB inputs, collapsed
-    // by default so the COLOR section stays compact.
+    // by default so the COLOR section stays SHORT in the narrow rail.
     advToggle = doc.createElement("button");
     advToggle.type = "button";
     advToggle.className = "sketch-panels-advanced-toggle";
@@ -795,7 +812,7 @@
     colSec.appendChild(advToggle);
     colSec.appendChild(advBody);
 
-    // ---- build: canvas controls (zoom + history; Clear/Save owned by shell) ----
+    // ---- build: canvas controls (zoom mini-row + backup history; Clear/Save owned by shell) ----
 
     var cvSec = section("CANVAS");
     var zoomRow = el("div", "sketch-panels-zoomrow");
@@ -831,6 +848,10 @@
     histRow.appendChild(undoBtn);
     histRow.appendChild(redoBtn);
     cvSec.appendChild(histRow);
+    // Backup label so this compact row is not confused with the shelf footer
+    // sticky action bar (other lane owns the primary undo/redo there).
+    var histHint = el("div", "sketch-panels-help", "Backup — main undo/redo live in the shelf footer.");
+    cvSec.appendChild(histHint);
 
     container.appendChild(root);
 

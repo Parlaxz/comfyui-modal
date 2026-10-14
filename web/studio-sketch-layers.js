@@ -757,17 +757,46 @@
       },
 
       /**
-       * renderInto(container) — minimal sidebar panel. Re-renders the list
-       * on every store change. No floating/draggable behavior.
+       * renderInto(container) — compact sidebar panel for the ~333px LEFT
+       * Studio sidebar. Single-column rows (eye | name | opacity | tools),
+       * internal list scroll (max-height ~220px) so header actions never
+       * get pushed away. Native dark Studio styling.
        */
       renderInto: function (container) {
-      if (!container || typeof document === "undefined") return null;
-      if (!document.getElementById("sketch-layers-style")) {
-        var css = document.createElement("style"); css.id = "sketch-layers-style"; css.textContent = '.sketch-layers-panel{background:#202024;border:1px solid #33333a;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.45);padding:6px;color:#c9c9d1;font:10px/1.3 system-ui,sans-serif}.sketch-layers-head{display:flex;align-items:center;gap:5px;padding:2px 2px 6px;border-bottom:1px solid #33333a;margin-bottom:5px}.sketch-layers-title{font-size:11px;font-weight:600;flex:1;color:#e4e4ea}.sketch-layers-btn{background:#2a2a31;border:1px solid #3d3d46;border-radius:4px;color:#c9c9d1;cursor:pointer;font:10px system-ui;min-width:24px;min-height:22px}.sketch-layers-add{display:inline-flex;align-items:center;gap:3px}.sketch-layers-add:before{content:"";display:block;width:12px;height:12px;background:currentColor;mask:url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\'%3E%3Cpath d=\'M12 5v14M5 12h14\' stroke=\'black\' stroke-width=\'2\'/%3E%3C/svg%3E") center/contain no-repeat}.sketch-layers-list{display:flex;flex-direction:column;gap:4px}.sketch-layers-row{display:grid;grid-template-columns:22px minmax(0,1fr) 48px auto;align-items:center;gap:4px;padding:3px 2px;border:1px solid transparent;border-radius:4px}.sketch-layers-row.is-active{background:#2c3d52;border-color:#4a6a94}.sketch-layers-row.is-base{background:rgba(255,255,255,.03)}.sketch-layers-eye,.sketch-layers-tools button{border:0;background:transparent;color:#9a9aa3;padding:2px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}.sketch-layers-eye .sketch-icon,.sketch-layers-tools .sketch-icon{width:13px;height:13px}.sketch-layers-name{min-width:0;overflow:hidden}.sketch-layers-name-text{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:text}.sketch-layers-opacity{width:48px;height:3px;appearance:none;background:#3d3d46;border-radius:2px}.sketch-layers-opacity::-webkit-slider-thumb{appearance:none;width:8px;height:8px;border-radius:50%;background:#9a9aa3}.sketch-layers-tools{display:flex;gap:0}.sketch-layers-delete{color:#e06c75!important}.sketch-layers-lock{display:inline-flex;color:#77787f;padding:3px}.sketch-layers-panel button:focus-visible,.sketch-layers-panel input:focus-visible{outline:2px solid #5b8dd9;outline-offset:1px}'; (document.head || document.documentElement).appendChild(css);
-      }
+        if (!container || typeof document === "undefined") return null;
+        if (!document.getElementById("sketch-layers-style")) {
+          var css = document.createElement("style");
+          css.id = "sketch-layers-style";
+          css.textContent = [
+            ".sketch-layers-panel{background:#202024;border:1px solid #33333a;border-radius:6px;box-sizing:border-box;width:100%;max-width:100%;padding:6px;color:#c9c9d1;font:10px/1.3 system-ui,sans-serif}",
+            ".sketch-layers-head{display:flex;align-items:center;gap:4px;padding:2px 2px 6px;border-bottom:1px solid #33333a;margin-bottom:5px}",
+            ".sketch-layers-title{font-size:11px;font-weight:600;flex:1;min-width:0;color:#e4e4ea}",
+            ".sketch-layers-btn{background:#2a2a31;border:1px solid #3d3d46;border-radius:4px;color:#c9c9d1;cursor:pointer;font:10px system-ui,sans-serif;padding:2px 6px;min-height:20px;line-height:1.2;white-space:nowrap}",
+            ".sketch-layers-btn:hover{background:#34343d}",
+            ".sketch-layers-add,.sketch-layers-flatten{flex:none}",
+            ".sketch-layers-list{display:flex;flex-direction:column;gap:2px;max-height:220px;overflow-y:auto;overflow-x:hidden;padding-right:2px}",
+            ".sketch-layers-row{display:grid;grid-template-columns:18px minmax(0,1fr) 44px auto;align-items:center;gap:3px;min-height:24px;padding:1px 2px;border:1px solid transparent;border-radius:4px;box-sizing:border-box}",
+            ".sketch-layers-row:hover{background:rgba(255,255,255,.04)}",
+            ".sketch-layers-row.is-active{background:#2c3d52;border-color:#4a6a94}",
+            ".sketch-layers-row.is-base{background:rgba(255,255,255,.03)}",
+            ".sketch-layers-eye,.sketch-layers-tools button{border:0;background:transparent;color:#9a9aa3;padding:1px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;min-width:18px;border-radius:3px}",
+            ".sketch-layers-eye:hover,.sketch-layers-tools button:hover{color:#e4e4ea;background:rgba(255,255,255,.08)}",
+            ".sketch-layers-eye .sketch-icon,.sketch-layers-tools .sketch-icon{width:12px;height:12px}",
+            ".sketch-icon{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}",
+            ".sketch-layers-name{min-width:0;overflow:hidden}",
+            ".sketch-layers-name-text{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:text;font-size:10px}",
+            ".sketch-layers-opacity{width:44px;height:3px;appearance:none;-webkit-appearance:none;background:#3d3d46;border-radius:2px;outline:none;padding:0;margin:0}",
+            ".sketch-layers-opacity::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:8px;height:8px;border-radius:50%;background:#c9c9d1;cursor:pointer;border:0}",
+            ".sketch-layers-opacity::-moz-range-thumb{width:8px;height:8px;border-radius:50%;background:#c9c9d1;cursor:pointer;border:0}",
+            ".sketch-layers-tools{display:inline-flex;align-items:center;gap:0;flex:none}",
+            ".sketch-layers-lock{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;color:#6a6a73}",
+            ".sketch-layers-lock .sketch-icon{width:12px;height:12px}"
+          ].join("");
+        }
         var root = document.createElement("div");
         root.className = "sketch-layers-panel";
         root.setAttribute("data-sketch-layers", "1");
+        root.setAttribute("data-testid", "sketch-layers-panel");
         container.appendChild(root);
 
         function el(tag, cls, text) {
@@ -792,21 +821,27 @@
           while (root.firstChild) root.removeChild(root.firstChild);
 
           var head = el("div", "sketch-layers-head");
+          head.setAttribute("data-testid", "sketch-layers-head");
           head.appendChild(el("span", "sketch-layers-title", "Layers"));
           var addBtn = btn("+ Add", "Add layer", function () { store.add(); });
           addBtn.classList.add("sketch-layers-add");
+          addBtn.setAttribute("data-testid", "sketch-layers-add");
           head.appendChild(addBtn);
           var flatBtn = btn("Flatten", "Merge all layers onto base", function () { store.flatten(); });
           flatBtn.classList.add("sketch-layers-flatten");
+          flatBtn.setAttribute("data-testid", "sketch-layers-flatten");
           head.appendChild(flatBtn);
           root.appendChild(head);
 
           var list = el("div", "sketch-layers-list");
+          list.setAttribute("data-testid", "sketch-layers-list");
           // Top-most layer first in the UI.
           for (var i = layers.length - 1; i >= 0; i--) {
             (function (layer, index) {
               var row = el("div", "sketch-layers-row" + (layer.id === activeId ? " is-active" : "") + (isBase(layer) ? " is-base" : ""));
               row.setAttribute("data-layer-id", layer.id);
+              row.setAttribute("data-testid", "sketch-layers-row");
+              row.setAttribute("data-active", layer.id === activeId ? "true" : "false");
               row.addEventListener("click", function () { store.setActive(layer.id); });
 
               var eye = btn("", "Toggle visibility", function () {
@@ -816,11 +851,13 @@
               eye.innerHTML = icon(layer.visible === false ? "hidden" : "eye");
               eye.classList.add("sketch-layers-eye");
               eye.setAttribute("aria-pressed", layer.visible === false ? "false" : "true");
+              eye.setAttribute("data-testid", "sketch-layers-eye");
               row.appendChild(eye);
 
               var nameWrap = el("div", "sketch-layers-name");
               var name = el("span", "sketch-layers-name-text", layer.name + (isBase(layer) ? " (base)" : ""));
               name.title = isBase(layer) ? "Base image — locked, cannot delete" : "Double-click to rename";
+              name.setAttribute("data-testid", "sketch-layers-name");
               nameWrap.appendChild(name);
               nameWrap.addEventListener("dblclick", function () {
                 if (typeof window !== "undefined" && typeof window.prompt === "function") {
@@ -838,6 +875,8 @@
               slider.value = String(clamp01(layer.opacity == null ? 1 : layer.opacity));
               slider.title = "Opacity";
               slider.className = "sketch-layers-opacity";
+              slider.setAttribute("data-testid", "sketch-layers-opacity");
+              slider.setAttribute("aria-label", "Opacity for " + layer.name);
               slider.addEventListener("click", function (ev) { ev.stopPropagation(); });
               slider.addEventListener("input", function () {
                 store.setOpacity(layer.id, Number(slider.value));
@@ -849,17 +888,34 @@
               row.appendChild(slider);
 
               var tools = el("div", "sketch-layers-tools");
+              tools.setAttribute("data-testid", "sketch-layers-tools");
               if (!isBase(layer)) {
-                 var up = btn("", "Move up", function () { store.reorder(layer.id, "up"); }); up.innerHTML = icon("up"); tools.appendChild(up);
-                 var down = btn("", "Move down", function () { store.reorder(layer.id, "down"); }); down.innerHTML = icon("down"); tools.appendChild(down);
-                 var dup = btn("", "Duplicate", function () { store.duplicate(layer.id); }); dup.innerHTML = icon("duplicate"); tools.appendChild(dup);
-                 var merge = btn("", "Merge down", function () { store.mergeDown(layer.id); }); merge.innerHTML = icon("merge"); tools.appendChild(merge);
-                 var del = btn("", "Delete layer", function () { store.delete(layer.id); }); del.innerHTML = icon("delete");
+                var up = btn("", "Move up", function () { store.reorder(layer.id, "up"); });
+                up.innerHTML = icon("up");
+                up.setAttribute("data-testid", "sketch-layers-up");
+                tools.appendChild(up);
+                var down = btn("", "Move down", function () { store.reorder(layer.id, "down"); });
+                down.innerHTML = icon("down");
+                down.setAttribute("data-testid", "sketch-layers-down");
+                tools.appendChild(down);
+                var dup = btn("", "Duplicate", function () { store.duplicate(layer.id); });
+                dup.innerHTML = icon("duplicate");
+                dup.setAttribute("data-testid", "sketch-layers-dup");
+                tools.appendChild(dup);
+                var merge = btn("", "Merge down", function () { store.mergeDown(layer.id); });
+                merge.innerHTML = icon("merge");
+                merge.setAttribute("data-testid", "sketch-layers-merge");
+                tools.appendChild(merge);
+                var del = btn("", "Delete layer", function () { store.delete(layer.id); });
+                del.innerHTML = icon("delete");
                 del.classList.add("sketch-layers-delete");
+                del.setAttribute("data-testid", "sketch-layers-delete");
                 tools.appendChild(del);
               } else {
-                 var lock = el("span", "sketch-layers-lock"); lock.innerHTML = icon("lock");
+                var lock = el("span", "sketch-layers-lock");
+                lock.innerHTML = icon("lock");
                 lock.title = "Base is locked at the bottom";
+                lock.setAttribute("data-testid", "sketch-layers-lock");
                 tools.appendChild(lock);
               }
               row.appendChild(tools);
