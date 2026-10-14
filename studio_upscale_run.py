@@ -29,15 +29,13 @@ _log = logging.getLogger(__name__)
 
 UPSCALE_METHODS = ("vosr2", "seedvr2")
 
-# Remote entrypoint names looked up on the config-owned Modal app when a
-# Modal workspace is active.  Deployments are config-owned (v2ctl); this
-# module never deploys anything, it only calls an already-deployed
-# entrypoint and fails closed when it is absent.
+# Remote entrypoint looked up on the config-owned Modal app when a Modal
+# workspace is active.  Deployments are config-owned (v2ctl); this module
+# never deploys anything, it only calls the already-deployed single
+# ``studio_upscale`` entrypoint (method travels explicitly in the payload)
+# and fails closed when it is absent.
 UPSCALE_MODAL_APP_ENV = "COMFYMODAL_UPSCALE_APP_NAME"
-UPSCALE_REMOTE_FUNCTIONS = {
-    "vosr2": "studio_upscale_vosr2",
-    "seedvr2": "studio_upscale_seedvr2",
-}
+UPSCALE_REMOTE_FUNCTION = "studio_upscale"
 UPSCALE_MODAL_TIMEOUT_S = 1800.0
 
 
@@ -193,9 +191,11 @@ async def _run_on_modal(
 ) -> tuple[Any, str]:
     """Run heavy upscale inference on Modal via the config-owned app.
 
-    Looks up the already-deployed ``studio_upscale_<method>`` entrypoint
-    and calls it remotely.  Never deploys.  Raises ``UpscaleRunError``
-    (503) when the entrypoint is absent or the call fails.
+    Calls the already-deployed single ``studio_upscale`` entrypoint with
+    the explicit ``method`` in the payload (revalidated here before send;
+    the remote side revalidates again).  Never deploys.  Raises
+    ``UpscaleRunError`` (503) when the entrypoint is absent or the call
+    fails, and ``UpscaleRequestError`` (400) for an unknown method.
     """
     try:
         import modal
@@ -216,11 +216,18 @@ async def _run_on_modal(
             default_app = "comfyui"
     else:
         default_app = "comfyui"
+    if method not in UPSCALE_METHODS:
+        raise UpscaleRequestError(
+            "UPSCALE_UNKNOWN_METHOD",
+            f"unknown upscale method {method!r}: expected exactly "
+            "'vosr2' or 'seedvr2' (no Auto)",
+        )
     app_name = (os.environ.get(UPSCALE_MODAL_APP_ENV) or default_app).strip() or default_app
-    remote_name = UPSCALE_REMOTE_FUNCTIONS[method]
+    remote_name = UPSCALE_REMOTE_FUNCTION
     buf = io.BytesIO()
     rgb.save(buf, format="PNG")
     payload = {
+        "method": method,
         "image_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
         "scale": params["scale"],
         "seed": params["seed"],
@@ -251,7 +258,8 @@ async def _run_on_modal(
             detail = str(raw.get("message") or raw.get("error") or "")[:500]
         raise UpscaleRunError(
             "UPSCALE_MODAL_FAILED",
-            f"Modal upscale {method} failed: {detail or 'remote error'}",
+            f"Modal upscale {method} via {remote_name} failed: "
+            f"{detail or 'remote error'}",
             http_status=502,
         )
     try:
@@ -262,7 +270,8 @@ async def _run_on_modal(
     except Exception as exc:
         raise UpscaleRunError(
             "UPSCALE_MODAL_BAD_RESULT",
-            f"Modal upscale {method} returned an unreadable image: {exc}",
+            f"Modal upscale {method} via {remote_name} returned an "
+            f"unreadable image: {exc}",
             http_status=502,
         ) from exc
     return out, "modal"

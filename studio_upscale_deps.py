@@ -9,8 +9,8 @@ by construction instead of duplicating literals:
 * method literal ``vosr2`` | ``seedvr2`` — explicit only, never ``"auto"``;
 * weights bundles resolved from ``COMFYMODAL_VOSR2_WEIGHTS`` /
   ``COMFYMODAL_SEEDVR2_WEIGHTS`` or the ``upscale_models`` folder;
-* heavy inference on Modal via entrypoints ``studio_upscale_vosr2`` /
-  ``studio_upscale_seedvr2`` on the config-owned app
+* heavy inference on Modal via the single entrypoint ``studio_upscale``
+  (explicit ``method`` in the payload) on the config-owned app
   (``COMFYMODAL_UPSCALE_APP_NAME``); local adapters fail closed with
   explicit ``VOSR2_UNAVAILABLE*`` / ``SEEDVR2_UNAVAILABLE*`` errors.
 
@@ -30,7 +30,7 @@ from studio_upscale_run import (
     UPSCALE_METHODS,
     UPSCALE_MODAL_APP_ENV,
     UPSCALE_MODAL_TIMEOUT_S,
-    UPSCALE_REMOTE_FUNCTIONS,
+    UPSCALE_REMOTE_FUNCTION,
 )
 from studio_upscale_seedvr2 import ERROR_CODE as SEEDVR2_ERROR_CODE
 from studio_upscale_seedvr2 import SEEDVR2_METHOD

@@ -8072,6 +8072,37 @@ if _server:
                 ),
                 timeout=1800.0,
             )
+            # History provenance (additive, exception-isolated): record the
+            # derived upscale result through the shared registry so
+            # /comfymodal/run-history + the History V2 mirror carry
+            # method/scale/source/timings.  Never fails the upscale itself.
+            try:
+                from experiment_service import REGISTRY as _upscale_registry
+                _upscale_meta = dict(result.get("meta") or {})
+                _upscale_meta["upscale"] = {
+                    "method": _upscale_meta.get("upscale_method"),
+                    "upscale_method": _upscale_meta.get("upscale_method"),
+                    "scale": _upscale_meta.get("scale"),
+                    "seed": _upscale_meta.get("seed"),
+                    "source_asset": _upscale_meta.get("source_asset"),
+                    "source_size": _upscale_meta.get("source_size"),
+                    "output_size": _upscale_meta.get("output_size"),
+                    "backend": _upscale_meta.get("backend"),
+                    "timings": _upscale_meta.get("timings"),
+                }
+                _upscale_timings = _upscale_meta.get("timings")
+                _hist = _upscale_registry.history().record_run(
+                    kind="studio_upscale",
+                    prompt_id=str(result.get("runId") or ""),
+                    status="completed",
+                    meta=_upscale_meta,
+                    timings=_upscale_timings if isinstance(_upscale_timings, dict) else None,
+                    output_path=str(result.get("output_path") or ""),
+                )
+                if isinstance(_hist, dict) and _hist.get("history_generation_id"):
+                    result["history_generation_id"] = str(_hist["history_generation_id"])
+            except Exception:
+                _log.warning("Studio upscale history record failed", exc_info=True)
             return web.json_response(result, status=200)
         except UpscaleRequestError as exc:
             return web.json_response(

@@ -106,7 +106,9 @@ const DEFAULTS = { method: "vosr2", scale: 4, seed: 0, tileSize: 512 };
 {
   const run = readRoot("studio_upscale_run.py");
   assert.ok(run.includes('UPSCALE_METHODS = ("vosr2", "seedvr2")'), "py literals pinned");
-  assert.ok(run.includes('"studio_upscale_vosr2"') && run.includes('"studio_upscale_seedvr2"'), "remote entrypoints pinned");
+  assert.ok(run.includes('UPSCALE_REMOTE_FUNCTION = "studio_upscale"'), "single remote entrypoint pinned");
+  assert.ok(!run.includes('"studio_upscale_vosr2"') && !run.includes('"studio_upscale_seedvr2"'), "no per-method remote names");
+  assert.ok(run.includes('"method": method'), "method travels explicitly in remote payload");
   assert.ok(run.includes("COMFYMODAL_UPSCALE_APP_NAME"), "config-owned app env pinned");
   const vosr = readRoot("studio_upscale_vosr2.py");
   const seedvr = readRoot("studio_upscale_seedvr2.py");
@@ -118,10 +120,11 @@ const DEFAULTS = { method: "vosr2", scale: 4, seed: 0, tileSize: 512 };
     assert.equal(deps.includes(banned), false, `heavy import leaked into deps: ${banned}`);
   }
   const lock = readRoot("upscale_dependency_lock.txt");
-  for (const marker of ["vosr2", "seedvr2", "studio_upscale_vosr2", "studio_upscale_seedvr2",
+  for (const marker of ["vosr2", "seedvr2", "studio_upscale",
     "COMFYMODAL_VOSR2_WEIGHTS", "COMFYMODAL_SEEDVR2_WEIGHTS", "COMFYMODAL_UPSCALE_APP_NAME"]) {
     assert.ok(lock.includes(marker), `lock missing ${marker}`);
   }
+  assert.ok(!lock.includes('"studio_upscale_vosr2"') && !lock.includes('"studio_upscale_seedvr2"'), "no per-method remote names in lock");
   section("U4. JS/Python literals, dep codes, and lock manifest agree");
 }
 

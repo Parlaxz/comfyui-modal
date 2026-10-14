@@ -18,16 +18,19 @@
 #   weights (~7GB): COMFYMODAL_VOSR2_WEIGHTS or
 #                   <upscale_models>/VOSR {args.json, ema_model.safetensors,
 #                   bundled Qwen VAE + dinov2_vitl14}
-#   remote entry:   studio_upscale_vosr2
+#   local adapter:  studio_upscale_vosr2.py (upscale_vosr2)
 #
 # seedvr2 (SeedVR2 3B one-step restorer, https://github.com/ByteDance-Seed/SeedVR):
 #   package:        importable seedvr with the SeedVR2 one-step API
 #   weights (~28GB): COMFYMODAL_SEEDVR2_WEIGHTS or
 #                   <upscale_models>/SeedVR2 {seedvr2_ema_3b.pth, ema_vae.pth}
-#   remote entry:   studio_upscale_seedvr2
+#   local adapter:  studio_upscale_seedvr2.py (upscale_seedvr2)
 #   note:           target resolution derived from scale, sides snapped to /16
 #
 # Modal dispatch (config-owned; this repo never deploys):
+#   single remote entry: studio_upscale (method travels explicitly in the
+#                   payload as {method, image_b64, scale, seed, tile_size?,
+#                   tile_overlap?, vae_tile_size?}; server revalidates it)
 #   app env:        COMFYMODAL_UPSCALE_APP_NAME (default: config-owned app)
 #   route:          POST /comfymodal/studio/upscale
 #                   {method, source_image, scale, seed?,

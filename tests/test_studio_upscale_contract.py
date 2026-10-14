@@ -32,7 +32,7 @@ from studio_upscale_run import (
     UPSCALE_METHODS,
     UPSCALE_MODAL_APP_ENV,
     UPSCALE_MODAL_TIMEOUT_S,
-    UPSCALE_REMOTE_FUNCTIONS,
+    UPSCALE_REMOTE_FUNCTION,
     UpscaleRequestError,
     UpscaleRunError,
     _run_local,
@@ -234,20 +234,54 @@ def test_manifest_gate_uses_real_codes_and_stays_fast_safe():
 
 
 def test_remote_dispatch_table_is_config_owned_and_constant():
-    assert UPSCALE_REMOTE_FUNCTIONS == {
-        "vosr2": "studio_upscale_vosr2",
-        "seedvr2": "studio_upscale_seedvr2",
-    }
+    assert UPSCALE_REMOTE_FUNCTION == "studio_upscale"
     assert UPSCALE_MODAL_APP_ENV == "COMFYMODAL_UPSCALE_APP_NAME"
     assert UPSCALE_MODAL_TIMEOUT_S == 1800.0
+    assert deps.UPSCALE_REMOTE_FUNCTION == "studio_upscale"
+    # Single entrypoint: no per-method deployed names remain.
+    text = (ROOT / "studio_upscale_run.py").read_text(encoding="utf-8")
+    assert "UPSCALE_REMOTE_FUNCTIONS" not in text
+    assert '"studio_upscale_vosr2"' not in text
+    assert '"studio_upscale_seedvr2"' not in text
+    assert '"studio_upscale"' in text
+
+
+def test_single_remote_payload_carries_method_explicitly():
+    text = (ROOT / "studio_upscale_run.py").read_text(encoding="utf-8")
+    assert '"method": method' in text
+    assert '"image_b64"' in text
+    # The single Modal call looks up exactly one deployed name.
+    assert "UPSCALE_REMOTE_FUNCTION" in text
+    assert "modal.Function.from_name(app_name, remote_name" in text
+    # Error codes name the single function path, not per-method names.
+    assert "UPSCALE_MODAL_UNAVAILABLE" in text
+    assert "UPSCALE_MODAL_FAILED" in text
+    assert "UPSCALE_MODAL_BAD_RESULT" in text
+    assert "via {remote_name} failed" in text
+
+
+def test_modal_dispatch_revalidates_unknown_method_fast():
+    import asyncio
+
+    from studio_upscale_run import _run_on_modal
+
+    async def _call():
+        await _run_on_modal("auto", object(), {"scale": 4, "seed": 0}, {})
+
+    with pytest.raises(UpscaleRequestError) as caught:
+        asyncio.run(_call())
+    assert _code(caught.value) == "UPSCALE_UNKNOWN_METHOD"
 
 
 def test_manifest_lock_declares_real_dep_surface():
     text = (ROOT / "upscale_dependency_lock.txt").read_text(encoding="utf-8")
-    for marker in ("vosr2", "seedvr2", "studio_upscale_vosr2",
-                   "studio_upscale_seedvr2", "COMFYMODAL_VOSR2_WEIGHTS",
+    for marker in ("vosr2", "seedvr2", "studio_upscale",
+                   "COMFYMODAL_VOSR2_WEIGHTS",
                    "COMFYMODAL_SEEDVR2_WEIGHTS", "COMFYMODAL_UPSCALE_APP_NAME"):
         assert marker in text, f"lock missing {marker}"
+    assert '"studio_upscale_vosr2"' not in text
+    assert '"studio_upscale_seedvr2"' not in text
+    assert "single remote entry" in text
     assert "auto" in text.lower()  # documents the no-auto rule
 
 
@@ -346,3 +380,65 @@ def test_queue_fake_spec_still_lists_upscale_tool_mode():
         ROOT / "tests" / "browser" / "fake" / "studio-fake-queue-manager.spec.mjs"
     ).read_text(encoding="utf-8")
     assert "upscale" in text
+
+
+# ── History-registry hook (additive, exception-isolated) ───────────────────
+
+
+def _upscale_history_hook_block() -> str:
+    text = (ROOT / "__init__.py").read_text(encoding="utf-8")
+    start = text.index("# History provenance (additive, exception-isolated)")
+    end = text.index("return web.json_response(result, status=200)", start)
+    return text[start:end]
+
+
+def test_upscale_history_hook_is_additive_and_never_fails():
+    # The /comfymodal/studio/upscale route records provenance through the
+    # shared registry AFTER handle_upscale_async succeeds.  The hook must
+    # stay additive (copy meta, nest under one "upscale" key) and must never
+    # fail the upscale (broad except warns only; the 200 return follows).
+    block = _upscale_history_hook_block()
+    assert "REGISTRY as _upscale_registry" in block
+    assert ".history().record_run(" in block
+    assert 'kind="studio_upscale"' in block
+    assert 'status="completed"' in block
+    assert '_upscale_meta = dict(result.get("meta") or {})' in block
+    assert '_upscale_meta["upscale"] = {' in block
+    assert "except Exception:" in block
+    assert 'Studio upscale history record failed' in block
+    assert "\nraise" not in block and " raise " not in block
+    # history_generation_id stamped only when the registry returns one.
+    assert 'result["history_generation_id"]' in block
+    assert 'if isinstance(_hist, dict) and _hist.get("history_generation_id")' in block
+    # timings passed through only when dict (record_run treats None as absent).
+    assert "isinstance(_upscale_timings, dict) else None" in block
+
+
+def test_upscale_history_hook_kwargs_match_record_run_signature():
+    # The hook swallows ALL exceptions, so a signature drift in
+    # RunHistoryService.record_run would silently drop provenance.  Pin the
+    # kwargs the hook passes against the real signature via AST (stdlib
+    # only — no heavy experiment_service import at collection).
+    import ast
+
+    src = (ROOT / "experiment_service.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    sig = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "record_run"
+        ):
+            names = [a.arg for a in node.args.kwonlyargs]
+            if "kind" in names and "prompt_id" in names:
+                sig = node
+                break
+    assert sig is not None, "RunHistoryService.record_run not found"
+    params = {a.arg for a in sig.args.kwonlyargs}
+    for kw in ("kind", "prompt_id", "status", "meta", "timings", "output_path"):
+        assert kw in params, f"record_run missing kwarg {kw}"
+    kw_defaults = {
+        a.arg: d for a, d in zip(sig.args.kwonlyargs, sig.args.kw_defaults)
+    }
+    for kw in ("status", "meta", "timings", "output_path"):
+        assert kw_defaults.get(kw) is not None, f"{kw} must have a default"
