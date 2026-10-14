@@ -402,12 +402,15 @@ function injectStyle() {
     ".stlay-lrow{display:flex;align-items:center;gap:6px;padding:3px 5px;border-radius:4px;cursor:pointer;user-select:none;}",
     ".stlay-lrow:hover{background:#333;}",
     ".stlay-lrow.active{background:#2a3a42;box-shadow:inset 0 0 0 1px #46b4e6;}",
+    ".stlay-list{max-height:190px;overflow-y:auto;}",
     ".stlay-lsw{width:16px;height:16px;border-radius:3px;border:1px solid #666;flex:0 0 auto;}",
     ".stlay-lnum{font:bold 11px monospace;color:#888;flex:0 0 auto;width:20px;}",
     ".stlay-ltext{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}",
     ".stlay-ltext.empty{color:#777;font-style:italic;}",
     ".stlay-lbtn{background:none;border:none;color:#999;cursor:pointer;font:13px sans-serif;line-height:1;padding:2px 5px;border-radius:3px;flex:0 0 auto;}",
     ".stlay-lbtn:hover{color:#fff;background:#444;}",
+    ".stlay-lbtn:disabled{opacity:0.3;cursor:default;}",
+    ".stlay-lbtn:disabled:hover{color:#999;background:none;}",
     ".stlay-lbtn.del:hover{color:#fff;background:#a33;}",
     ".stlay-lbtn.on{background:#3a3320;}",
     ".stlay-sw{width:20px;height:20px;border:1px solid #666;border-radius:3px;cursor:pointer;flex-shrink:0;position:relative;touch-action:none;}",
@@ -417,6 +420,17 @@ function injectStyle() {
     ".stlay-pre{background:#141414;border:1px solid #333;border-radius:4px;color:#9dca9d;font:11px monospace;padding:6px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word;}",
     ".stlay-inline{position:absolute;box-sizing:border-box;background:rgba(18,18,18,0.95);border:2px solid #46b4e6;border-radius:3px;color:#fff;font:12px monospace;padding:3px 4px;resize:none;outline:none;z-index:10;}",
     ".stlay-grid2{display:grid;grid-template-columns:repeat(4,minmax(52px,1fr));gap:4px;}",
+    ".stlay-scene{background:#1c1c1e;border:1px solid #333;border-radius:6px;padding:8px;display:flex;flex-direction:column;gap:6px;}",
+    ".stlay-sect{color:#aaa;font:bold 11px sans-serif;letter-spacing:0.04em;text-transform:uppercase;}",
+    ".stlay-cv{flex:3 1 460px;}",
+    ".stlay-canvas{width:100%;height:auto;box-shadow:0 0 0 1px #2c2c2c;}",
+    ".stlay-side{flex:1 1 260px;max-width:360px;}",
+    ".stlay-lrow .stlay-lnum{color:#aaa;}",
+    ".stlay-disc{border:1px solid #333;border-radius:4px;padding:2px 6px 4px;background:#1a1a1c;}",
+    ".stlay-disc>summary{cursor:pointer;color:#9db8c6;font-size:11px;padding:2px 0;}",
+    ".stlay-disc>summary:hover{color:#fff;}",
+    ".stlay-geosum{color:#8a8a8a;font-size:11px;}",
+    ".stlay-util{display:flex;flex-direction:column;gap:6px;}",
   ].join("\n");
   document.head.appendChild(s);
 }
@@ -459,8 +473,11 @@ export function createLayoutEditor(container, opts) {
   container.innerHTML = "";
   container.appendChild(wrap);
 
-  // ---- toolbar: dims + actions ----
-  const bar = el("div", "stlay-bar");
+  // ---- Scene: overall image setup (dims + description + background + style).
+  // Kept visually separate from per-element editing below.
+  const scene = el("div", "stlay-scene");
+  scene.appendChild(el("div", "stlay-sect", "Scene — overall image setup"));
+  const dimsRow = el("div", "stlay-bar");
   const wInput = el("input", "stlay-field");
   wInput.type = "number"; wInput.min = String(DIM_MIN); wInput.step = String(DIM_STEP);
   wInput.style.width = "76px"; wInput.title = "Canvas width (multiples of 16)";
@@ -468,13 +485,20 @@ export function createLayoutEditor(container, opts) {
   hInput.type = "number"; hInput.min = String(DIM_MIN); hInput.step = String(DIM_STEP);
   hInput.style.width = "76px"; hInput.title = "Canvas height (multiples of 16)";
   const copyBtn = el("button", "stlay-btn", "Copy JSON");
-  const clearBtn = el("button", "stlay-btn", "Clear all");
+  // Oracle P1-10: honest destructive label — scene fields are kept, only
+  // regions go. (No confirm dialog: headless/automation dismissals would
+  // silently cancel the action, and suites + users need it to just work.)
+  const clearBtn = el("button", "stlay-btn", "Clear regions");
+  clearBtn.title = "Delete all regions (scene settings are kept)";
   const tokenSpan = el("span", "stlay-lbl", "");
   tokenSpan.title = "Rough token estimate (~chars/4)";
-  bar.appendChild(el("span", "stlay-lbl", "W"));
-  bar.appendChild(wInput);
-  bar.appendChild(el("span", "stlay-lbl", "H"));
-  bar.appendChild(hInput);
+  dimsRow.appendChild(el("span", "stlay-lbl", "W"));
+  dimsRow.appendChild(wInput);
+  dimsRow.appendChild(el("span", "stlay-lbl", "H"));
+  dimsRow.appendChild(hInput);
+  scene.appendChild(dimsRow);
+  // Canvas toolbar: actions that operate on the composition (not the scene).
+  const bar = el("div", "stlay-bar");
   bar.appendChild(copyBtn);
   bar.appendChild(clearBtn);
   bar.appendChild(tokenSpan);
@@ -495,28 +519,32 @@ export function createLayoutEditor(container, opts) {
   modeSel.title = "Style mode";
   globals.appendChild(hldInput);
   globals.appendChild(modeSel);
-  wrap.appendChild(globals);
+  scene.appendChild(globals);
 
   const bgArea = el("textarea", "stlay-area");
   bgArea.placeholder = "Background description (required scene background)";
   bgArea.rows = 2;
-  wrap.appendChild(bgArea);
+  scene.appendChild(bgArea);
 
   const styleRow = el("div", "stlay-bar");
   const aesInput = el("input", "stlay-field"); aesInput.placeholder = "aesthetics";
   const lightInput = el("input", "stlay-field"); lightInput.placeholder = "lighting";
   const photoInput = el("input", "stlay-field"); photoInput.placeholder = "photo";
   const mediumInput = el("input", "stlay-field"); mediumInput.placeholder = "medium";
-  const artInput = el("input", "stlay-field"); artInput.placeholder = "art_style";
+  const artInput = el("input", "stlay-field"); artInput.placeholder = "Art style";
   for (const inp of [aesInput, lightInput, photoInput, mediumInput, artInput]) {
     inp.style.flex = "1 1 90px";
     styleRow.appendChild(inp);
   }
-  wrap.appendChild(styleRow);
+  scene.appendChild(styleRow);
 
   const stylePalBar = el("div", "stlay-bar");
   stylePalBar.appendChild(el("span", "stlay-lbl", "Style colors:"));
-  wrap.appendChild(stylePalBar);
+  scene.appendChild(stylePalBar);
+  // Oracle P0-1: style detail controls must not look usable when they cannot
+  // contribute (mode none omits the whole style block from the caption).
+  const styleHint = el("div", "stlay-lbl", "Choose Photo or Art to include style settings.");
+  scene.appendChild(styleHint);
 
   // ---- background image (local file only) ----
   const bgBar = el("div", "stlay-bar");
@@ -528,18 +556,41 @@ export function createLayoutEditor(container, opts) {
   brightRange.style.width = "90px";
   brightRange.title = "Background brightness %";
   const brightLbl = el("span", "stlay-lbl", "");
-  bgBar.appendChild(el("span", "stlay-lbl", "BG image:"));
+  bgBar.appendChild(el("span", "stlay-lbl", "Tracing image (editor only):"));
+  bgBar.appendChild(bgFile);
+  bgBar.appendChild(bgClear);
+  // Oracle P1-7: the upload is a local tracing reference only — say so, and
+  // keep brightness/Clear parked until an image is actually loaded.
   bgBar.appendChild(bgFile);
   bgBar.appendChild(bgClear);
   bgBar.appendChild(el("span", "stlay-lbl", "Brightness"));
   bgBar.appendChild(brightRange);
   bgBar.appendChild(brightLbl);
-  wrap.appendChild(bgBar);
+  bgBar.appendChild(el("span", "stlay-lbl", "Reference only — not included in the prompt."));
+  scene.appendChild(bgBar);
+  wrap.appendChild(scene);
+  // Oracle P1-7: canvas size configures the layout surface, not the output.
+  const sizeNote = el("div", "stlay-lbl", "Canvas size is for layout only — output size is configured separately.");
+  scene.appendChild(sizeNote);
 
-  // ---- main: canvas + side ----
+  // Oracle P1-3: compact gesture hint under the canvas + expandable shortcut
+  // list (same gestures as the canvas tooltip, visible without hovering).
+  const hintBar = el("div", "stlay-lbl",
+    "Drag empty space to draw · Ctrl/Cmd-drag draws over a region");
+  const keysDetails = document.createElement("details");
+  keysDetails.className = "stlay-disc";
+  const keysSummary = document.createElement("summary");
+  keysSummary.textContent = "Canvas shortcuts";
+  keysDetails.appendChild(keysSummary);
+  keysDetails.appendChild(el("div", "stlay-lbl",
+    "Click select · Shift-click toggle / Shift-drag marquee multi-select · " +
+    "Alt-click cycles overlapping regions · double-click edits description · " +
+    "drag moves · corner/edge handles resize · Del removes · " +
+    "Ctrl+C / Ctrl+V / Ctrl+D copy, paste, duplicate · right-click a region for the layer list"));
+  // ---- main: large visual canvas (primary) + element side panel ----
   const main = el("div", "stlay-main");
   const cvBox = el("div", "stlay-cv");
-  cvBox.style.flex = "2 1 320px";
+  cvBox.style.flex = "3 1 460px";
   const canvas = document.createElement("canvas");
   canvas.className = "stlay-canvas";
   canvas.tabIndex = 0;
@@ -550,24 +601,37 @@ export function createLayoutEditor(container, opts) {
   main.appendChild(cvBox);
   main.appendChild(side);
   wrap.appendChild(main);
+  wrap.appendChild(hintBar);
+  wrap.appendChild(keysDetails);
 
-  const listBox = el("div", "");
-  const listHead = el("div", "stlay-lbl", "Regions (array order; last = front)");
+  const listBox = el("div", "stlay-list");
+  const listHead = el("div", "stlay-sect", "Regions — frontmost at top");
   side.appendChild(listHead);
   side.appendChild(listBox);
 
-  const edHead = el("div", "stlay-lbl", "Selected element");
+  const edHead = el("div", "stlay-sect", "Selected element");
   side.appendChild(edHead);
   const edBox = el("div", "");
   side.appendChild(edBox);
 
-  const jsonHead = el("div", "stlay-lbl", "Structured JSON preview");
+  // Canonical structured-JSON viewer: collapsed by default (advanced).
+  const jsonDetails = document.createElement("details");
+  jsonDetails.className = "stlay-disc";
+  const jsonSummary = document.createElement("summary");
+  jsonSummary.textContent = "Structured JSON preview (advanced)";
+  jsonDetails.appendChild(jsonSummary);
   const pre = el("pre", "stlay-pre", "");
-  side.appendChild(jsonHead);
-  side.appendChild(pre);
+  jsonDetails.appendChild(pre);
+  side.appendChild(jsonDetails);
 
+  // ---- utilities: import / export (localStorage only), collapsed ----
+  const utilHead = el("div", "stlay-sect", "Import / export");
+  wrap.appendChild(utilHead);
+  const util = el("div", "stlay-util");
+  wrap.appendChild(util);
   // ---- import / templates (localStorage only) ----
   const impDetails = document.createElement("details");
+  impDetails.className = "stlay-disc";
   const impSummary = document.createElement("summary");
   impSummary.textContent = "Import caption JSON";
   impSummary.style.cursor = "pointer";
@@ -582,13 +646,16 @@ export function createLayoutEditor(container, opts) {
   impRow.appendChild(impErr);
   impDetails.appendChild(impArea);
   impDetails.appendChild(impRow);
-  wrap.appendChild(impDetails);
+  impDetails.className = "stlay-disc";
+  util.appendChild(impDetails);
 
+  // Oracle P2-12: plain product language for the saved-layout store.
   const tplDetails = document.createElement("details");
+  tplDetails.className = "stlay-disc";
   const tplSummary = document.createElement("summary");
-  tplSummary.textContent = "Templates (localStorage)";
-  tplSummary.style.cursor = "pointer";
+  tplSummary.textContent = "Saved layouts";
   tplDetails.appendChild(tplSummary);
+  tplDetails.appendChild(el("div", "stlay-lbl", "Saved in this browser."));
   const tplRow = el("div", "stlay-bar");
   const tplName = el("input", "stlay-field");
   tplName.placeholder = "template name";
@@ -604,7 +671,8 @@ export function createLayoutEditor(container, opts) {
   tplRow.appendChild(tplLoad);
   tplRow.appendChild(tplDel);
   tplDetails.appendChild(tplRow);
-  wrap.appendChild(tplDetails);
+  // Templates are scene-level: keep them with the Scene setup.
+  scene.appendChild(tplDetails);
 
   function readTemplates() {
     try {
@@ -694,6 +762,18 @@ export function createLayoutEditor(container, opts) {
     } else {
       ctx.fillStyle = "#1a1a1a";
       ctx.fillRect(0, 0, cw, ch);
+    }
+    // Oracle P1-3: an empty canvas invites the first action in-canvas instead
+    // of leaving instructions to the side panel.
+    if (!draft.boxes.length) {
+      ctx.fillStyle = "rgba(200,200,200,0.75)";
+      ctx.font = "13px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Drag on the canvas to draw a region", cw / 2, ch / 2 - 10);
+      ctx.font = "11px sans-serif";
+      ctx.fillStyle = "rgba(160,160,160,0.75)";
+      ctx.fillText("New regions start as objects — switch to Text in the side panel", cw / 2, ch / 2 + 12);
+      ctx.textAlign = "start";
     }
     // Boxes in array order (later = front).
     draft.boxes.forEach((b, i) => {
@@ -1270,6 +1350,13 @@ export function createLayoutEditor(container, opts) {
   }
 
   // ---- region list + element editor (upstream region list 1900-2043, renderPanel 2421+) ----
+  // Oracle P1-9: the geometry disclosure is rebuilt with the panel, so its
+  // open state is preserved explicitly instead of snapping shut on every edit.
+  let geoOpen = false;
+  function rowLabel(b) {
+    return (b.desc || (b.type === "text" ? b.text : "") || ("(" + b.type + ")")) +
+      (b.nobbox ? " · unpositioned" : "");
+  }
   function renderPanel() {
     if (destroyed) return;
     // Region list (front-first display; array order is the source of truth).
@@ -1281,7 +1368,7 @@ export function createLayoutEditor(container, opts) {
       const chip = el("div", "stlay-lsw");
       chip.style.background = boxColor(b);
       const num = el("span", "stlay-lnum", String(i + 1).padStart(2, "0"));
-      const label = b.desc || (b.type === "text" ? b.text : "") || ("(" + b.type + ")");
+      const label = rowLabel(b);
       const txt = el("span", "stlay-ltext" + (label.startsWith("(") ? " empty" : ""), label);
       txt.title = label;
       r.appendChild(chip);
@@ -1296,6 +1383,8 @@ export function createLayoutEditor(container, opts) {
       });
       const frontBtn = el("button", "stlay-lbtn", "▲");
       frontBtn.title = "Bring toward front";
+      // Oracle P1-5: visually disable what cannot operate (same no-ops as before).
+      frontBtn.disabled = i >= draft.boxes.length - 1;
       frontBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         if (i < draft.boxes.length - 1) {
@@ -1308,6 +1397,7 @@ export function createLayoutEditor(container, opts) {
       });
       const backBtn = el("button", "stlay-lbtn", "▼");
       backBtn.title = "Send toward back";
+      backBtn.disabled = i <= 0;
       backBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         if (i > 0) {
@@ -1320,6 +1410,7 @@ export function createLayoutEditor(container, opts) {
       });
       const dupeBtn = el("button", "stlay-lbtn", "⧉");
       dupeBtn.title = "Duplicate";
+      dupeBtn.disabled = !!b.locked;
       dupeBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         if (b.locked) return;
@@ -1334,6 +1425,7 @@ export function createLayoutEditor(container, opts) {
       });
       const delBtn = el("button", "stlay-lbtn del", "✕");
       delBtn.title = "Delete";
+      delBtn.disabled = !!b.locked;
       delBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         if (b.locked) return;
@@ -1357,6 +1449,10 @@ export function createLayoutEditor(container, opts) {
     if (!draft.boxes.length) {
       listBox.appendChild(el("div", "stlay-lbl", "No regions — drag on the canvas to draw one."));
     }
+    // Oracle P1-5: tie the inspector to its canvas/list identity.
+    edHead.textContent = activeIdx >= 0 && draft.boxes[activeIdx]
+      ? "Selected region " + String(activeIdx + 1).padStart(2, "0")
+      : "Selected element";
     renderElementEditor();
   }
 
@@ -1397,7 +1493,9 @@ export function createLayoutEditor(container, opts) {
     });
     const placedLbl = document.createElement("label");
     placedLbl.style.cssText = "display:flex;align-items:center;gap:4px;cursor:pointer;";
-    placedLbl.title = "Unplaced elements omit bbox (upstream nobbox)";
+    // Oracle P1-8: plain creative language — unchecking keeps the element in
+    // the prompt without a fixed position (upstream nobbox), it is not a delete.
+    placedLbl.title = "Off: included in the prompt without a fixed position";
     const placedChk = document.createElement("input");
     placedChk.type = "checkbox";
     placedChk.checked = !b.nobbox;
@@ -1406,11 +1504,13 @@ export function createLayoutEditor(container, opts) {
       touch();
     });
     placedLbl.appendChild(placedChk);
-    placedLbl.appendChild(document.createTextNode("placed (bbox)"));
+    placedLbl.appendChild(document.createTextNode("Specify position"));
     typeRow.appendChild(typeSel);
     typeRow.appendChild(placedLbl);
     edBox.appendChild(typeRow);
 
+    // Oracle P1-4: persistent creative-language labels (placeholders vanish
+    // once filled) and literal text first for text regions.
     const descArea = el("textarea", "stlay-area");
     descArea.rows = 2;
     descArea.placeholder = "desc (always emitted)";
@@ -1420,10 +1520,11 @@ export function createLayoutEditor(container, opts) {
       touch(true);
     });
     descArea.addEventListener("keydown", (e) => e.stopPropagation());
-    edBox.appendChild(descArea);
+    const descHead = el("div", "stlay-lbl", "Appearance / description");
 
+    let textInput = null;
     if (b.type === "text") {
-      const textInput = el("input", "stlay-field");
+      textInput = el("input", "stlay-field");
       textInput.placeholder = "text (text elements only)";
       textInput.value = b.text || "";
       textInput.style.width = "100%";
@@ -1433,11 +1534,31 @@ export function createLayoutEditor(container, opts) {
         touch(true);
       });
       textInput.addEventListener("keydown", (e) => e.stopPropagation());
+      edBox.appendChild(el("div", "stlay-lbl", "Text to display"));
       edBox.appendChild(textInput);
     }
+    edBox.appendChild(descHead);
+    edBox.appendChild(descArea);
 
+    // Exact geometry lives under a collapsed disclosure (upstream
+    // boxToPx/commitPxEdit/commitGridEdit 2350-2418): same editors, not the
+    // default focus. A one-line visual summary stays visible.
+    const g = normBboxToGrid(b); // [ymin,xmin,ymax,xmax]
+    edBox.appendChild(el("div", "stlay-geosum",
+      "Box " + String(activeIdx + 1).padStart(2, "0") + " · " +
+      Math.round(b.x * 100) + "%, " + Math.round(b.y * 100) + "% · " +
+      Math.round(b.w * 100) + " × " + Math.round(b.h * 100) + "%" +
+      (b.nobbox ? " · unplaced" : "")));
+    const geoDetails = document.createElement("details");
+    geoDetails.className = "stlay-disc";
+    const geoSummary = document.createElement("summary");
+    geoSummary.textContent = "Advanced Geometry";
+    geoDetails.appendChild(geoSummary);
+    geoDetails.open = geoOpen;
+    geoDetails.addEventListener("toggle", () => { geoOpen = geoDetails.open; });
+    edBox.appendChild(geoDetails);
     // Editable px + 0-1000 grid fields (upstream boxToPx/commitPxEdit/commitGridEdit 2350-2418).
-    edBox.appendChild(el("div", "stlay-lbl", "bbox px (canvas " + draft.width + "×" + draft.height + ")"));
+    geoDetails.appendChild(el("div", "stlay-lbl", "bbox px (canvas " + draft.width + "×" + draft.height + ")"));
     const pxGrid = el("div", "stlay-grid2");
     const px = { x: Math.round(b.x * draft.width), y: Math.round(b.y * draft.height), w: Math.round(b.w * draft.width), h: Math.round(b.h * draft.height) };
     for (const k of ["x", "y", "w", "h"]) {
@@ -1452,8 +1573,8 @@ export function createLayoutEditor(container, opts) {
         touch();
       }, "bbox " + k + " in px"));
     }
-    edBox.appendChild(pxGrid);
-    edBox.appendChild(el("div", "stlay-lbl", "bbox 0-1000 grid"));
+    geoDetails.appendChild(pxGrid);
+    geoDetails.appendChild(el("div", "stlay-lbl", "bbox 0-1000 grid"));
     const gridRow = el("div", "stlay-grid2");
     const grid = normBboxToGrid(b); // [ymin,xmin,ymax,xmax]
     const keys = ["ymin", "xmin", "ymax", "xmax"];
@@ -1472,9 +1593,9 @@ export function createLayoutEditor(container, opts) {
         touch();
       }, "bbox " + keys[gi] + " (0-1000)"));
     });
-    edBox.appendChild(gridRow);
+    geoDetails.appendChild(gridRow);
 
-    edBox.appendChild(el("div", "stlay-lbl", "Element colors (max " + MAX_ELEM_COLORS + ", uppercase)"));
+    edBox.appendChild(el("div", "stlay-lbl", "Element colors · up to 5 — click a swatch to change it, right-click to remove it"));
     const palRow = makeSwatchRow(
       () => b.color_palette,
       (next) => {
@@ -1503,6 +1624,14 @@ export function createLayoutEditor(container, opts) {
     mediumInput.style.display = draft.style_mode === "none" ? "none" : "";
     artInput.value = draft.art_style || "";
     artInput.style.display = draft.style_mode === "art_style" ? "" : "none";
+    // Oracle P0-1: style block is omitted unless a style mode is chosen, so
+    // the detail controls go honestly inactive instead of silently dead.
+    const styleActive = draft.style_mode === "photo" || draft.style_mode === "art_style";
+    for (const inp of [aesInput, lightInput, photoInput, mediumInput, artInput]) inp.disabled = !styleActive;
+    styleRow.style.opacity = styleActive ? "" : "0.45";
+    stylePalBar.style.opacity = styleActive ? "" : "0.45";
+    for (const b of stylePalBar.querySelectorAll("button")) b.disabled = !styleActive;
+    styleHint.style.display = styleActive ? "none" : "";
     brightRange.value = String(draft.bgBrightness);
     brightLbl.textContent = String(draft.bgBrightness) + "%";
     syncing = false;
@@ -1537,11 +1666,24 @@ export function createLayoutEditor(container, opts) {
     drawCanvas();
     if (!light) renderPanel();
     else {
-      // Light touch (typing desc/text): refresh preview + list labels without
-      // rebuilding the focused editor.
+      // Light touch (typing desc/text): refresh preview + the active list
+      // label/chip without rebuilding the focused editor (Oracle P1-9).
       const built = buildIdeogramCaption(draft);
       pre.textContent = JSON.stringify(built.json, null, 2);
       tokenSpan.textContent = "~" + Math.round(built.text.length / 4) + " tok";
+      const ab = draft.boxes[activeIdx];
+      const row = ab ? listBox.childNodes[draft.boxes.length - 1 - activeIdx] : null;
+      if (ab && row && row.querySelector) {
+        const t = row.querySelector(".stlay-ltext");
+        if (t) {
+          const label = rowLabel(ab);
+          t.textContent = label;
+          t.title = label;
+          t.classList.toggle("empty", label.startsWith("("));
+        }
+        const chip = row.querySelector(".stlay-lsw");
+        if (chip) chip.style.background = boxColor(ab);
+      }
     }
     const built = buildIdeogramCaption(draft);
     if (!light) {
@@ -1602,6 +1744,12 @@ export function createLayoutEditor(container, opts) {
     persistDraft(draft);
   });
   brightRange.addEventListener("change", () => touch(true));
+  // Oracle P1-7: brightness/Clear only make sense with a tracing image.
+  function syncBgBar() {
+    const has = !!bgImg;
+    brightRange.style.display = has ? "" : "none";
+    bgClear.style.display = has ? "" : "none";
+  }
   bgFile.addEventListener("change", () => {
     const f = bgFile.files && bgFile.files[0];
     if (!f) return;
@@ -1610,6 +1758,7 @@ export function createLayoutEditor(container, opts) {
     const img = new Image();
     img.onload = () => {
       bgImg = img;
+      syncBgBar();
       drawCanvas();
     };
     img.src = bgUrl;
@@ -1621,8 +1770,10 @@ export function createLayoutEditor(container, opts) {
       bgUrl = "";
     }
     bgFile.value = "";
+    syncBgBar();
     drawCanvas();
   });
+  syncBgBar();
   copyBtn.addEventListener("click", () => {
     const built = buildIdeogramCaption(draft);
     try {

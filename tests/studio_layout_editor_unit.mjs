@@ -694,7 +694,7 @@ function canvasKey(container, key, extra = {}) {
   const tplRow = tplName.parentNode;
   const tplSave = q(tplRow, (n) => n.tagName === "BUTTON" && n.textContent === "Save");
   await fire(tplSave, "click");
-  const clearBtn = q(container, (n) => n.tagName === "BUTTON" && n.textContent === "Clear all");
+  const clearBtn = q(container, (n) => n.tagName === "BUTTON" && n.textContent === "Clear regions");
   await fire(clearBtn, "click");
   assert.equal(handle.getDraft().boxes.length, 0);
   const tplSel = q(tplRow, (n) => n.tagName === "SELECT");

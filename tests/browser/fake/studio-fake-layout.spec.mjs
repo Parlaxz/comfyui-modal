@@ -131,12 +131,12 @@ test.describe("Generate Layout editor (fake backend)", () => {
     await expect(page.locator(CANVAS)).toBeVisible();
     await expect(page.getByRole("spinbutton", { name: "Canvas width (multiples of 16)" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Copy JSON" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Clear all" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Clear regions" })).toBeVisible();
     await expect(page.getByRole("button", { name: /Send to Prompt/ })).toBeVisible();
     await expect(page.getByPlaceholder("High-level description (optional, blank = omitted)")).toBeVisible();
     await expect(page.getByPlaceholder("Background description (required scene background)")).toBeVisible();
-    await expect(page.getByText("Regions (array order; last = front)")).toBeVisible();
-    await expect(page.getByText("Structured JSON preview")).toBeVisible();
+    await expect(page.getByText("Regions — frontmost at top")).toBeVisible();
+    await expect(page.getByText("Structured JSON preview (advanced)")).toBeVisible();
     // Empty draft serializes to the Ideogram-caption JSON envelope.
     const preview = previewLocator(page);
     await expect(preview).toContainText('"elements"', { timeout: 10000 });
@@ -184,7 +184,7 @@ test.describe("Generate Layout editor (fake backend)", () => {
     await fx.assertNoConsoleErrors(ALLOW);
   });
 
-  test("T4 — duplicate/reorder/delete + Clear all", async ({ page }) => {
+  test("T4 — duplicate/reorder/delete + Clear regions", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await clearLayoutDraft(page);
@@ -215,7 +215,7 @@ test.describe("Generate Layout editor (fake backend)", () => {
     expect(after.slice().sort()).toEqual(before.slice().sort());
     await rowBtn(0, "Delete");
     await expect(page.locator(ROWS)).toHaveCount(1, { timeout: 10000 });
-    await page.getByRole("button", { name: "Clear all" }).click();
+    await page.getByRole("button", { name: "Clear regions" }).click();
     await expect(page.locator(ROWS)).toHaveCount(0, { timeout: 10000 });
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);

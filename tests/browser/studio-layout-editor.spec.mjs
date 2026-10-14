@@ -295,6 +295,8 @@ test.describe("KJNodes layout editor (mocked backend)", () => {
     await gotoGenerateLayout(page);
     await drawBox(page, 20, 20, 120, 80);
     await selectRow(page, 0);
+    // Exact geometry lives under the collapsed Advanced Geometry disclosure.
+    await page.getByText("Advanced Geometry", { exact: true }).click();
     await page.locator('.stlay-side input[title="bbox ymin (0-1000)"]').fill("100");
     let json = await previewJSON(page);
     expect(json.compositional_deconstruction.elements[0].bbox[0]).toBe(100);

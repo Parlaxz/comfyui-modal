@@ -4733,23 +4733,31 @@ function _renderLayoutEditor(state, context, actions) {
   }
   var mount = el("div", { "data-testid": "layout-mount", style: "width:100%;" });
   wrap.appendChild(mount);
+  // The delegated editor owns the canonical collapsible JSON viewer, so this
+  // seam dump stays rendered+updated (tests parse it) but hidden to avoid
+  // showing the same payload twice.
   var preview = el("pre", {
     "data-testid": "layout-preview",
-    style: "font-size:11px;color:#888;white-space:pre-wrap;margin:0;overflow-wrap:anywhere;",
+    style: "display:none;font-size:11px;color:#888;white-space:pre-wrap;margin:0;overflow-wrap:anywhere;",
   });
   function paintPreview() {
     var text = "";
     try { text = serializeLayout(liveDraft()); } catch (_e) { text = ""; }
     preview.textContent = text;
   }
-  var toolbar = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;" });
-  var sendBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Send to Prompt →", "data-testid": "layout-send", title: "Copy the serialization into the normal prompt and return to Text" });
+  // Oracle P0-2: the completion row is visually isolated from anything below
+  // it, and says what Send does (transfer — not generate).
+  var toolbar = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:4px 0 16px;" });
+  // Primary completion action: Studio primary styling so it is never hunted for.
+  var sendBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: "Send to Prompt →", "data-testid": "layout-send", title: "Copy the serialization into the normal prompt and return to Text" });
   sendBtn.addEventListener("click", function () {
     var text = "";
     try { text = serializeLayout(liveDraft()); } catch (_e) { text = ""; }
     _sendLayoutToPrompt(state, context, actions, text);
   });
   toolbar.appendChild(sendBtn);
+  var sendHint = el("span", { style: "font-size:11px;color:#888;", text: "Transfers this layout to the Text prompt. Does not generate yet." });
+  toolbar.appendChild(sendHint);
   var delegated = false;
   try {
     if (typeof createLayoutEditor === "function") {
@@ -4817,7 +4825,7 @@ function _renderLegacyLayoutEditor(state, context, actions) {
     aspectSel.appendChild(o);
   });
   var clearBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Reset", "data-testid": "layout-reset", title: "Clear all regions" });
-  var sendBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Send to Prompt →", "data-testid": "layout-send", title: "Copy the serialization into the normal prompt and return to Text" });
+  var sendBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: "Send to Prompt →", "data-testid": "layout-send", title: "Copy the serialization into the normal prompt and return to Text" });
   toolbar.appendChild(addObj);
   toolbar.appendChild(addTxt);
   toolbar.appendChild(aspectSel);
