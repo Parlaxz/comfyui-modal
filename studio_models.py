@@ -43,6 +43,7 @@ _WIZARD_BINDING_KINDS: set[str] = {"node", "widget", "input", "output"}
 _STATUS_PRIORITY: list[str] = [
     "archived",
     "invalid",
+    "blocked",
     "needs_bindings",
     "needs_api_prompt",
     "metadata_only",
@@ -116,6 +117,7 @@ def _derive_feature_status(
     node_bindings: dict[str, Any],
     output_node_id: str | None,
     api_prompt_json: Any,
+    guidance_state: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Return a ``{"status": …, "reason": …}`` dict for one feature.
 
@@ -123,9 +125,22 @@ def _derive_feature_status(
     In addition, ``txt2img`` requires prompt binding, and
     ``object_remove`` / ``object_replace`` require their image/mask bindings.
 
+    When Guidance is engaged but not ready (mapping refused, anchors stale,
+    identity unresolvable), the feature reports ``blocked`` so RUN is denied
+    honestly through this SAME gate -- never silently unguided.  ``None``
+    (or non-engaged) ``guidance_state`` leaves the existing gate untouched.
+
     Priority (most restrictive wins):
-        needs_bindings > needs_api_prompt > runnable
+        needs_bindings > needs_api_prompt > blocked > runnable
     """
+    if isinstance(guidance_state, dict) and guidance_state.get("engaged"):
+        if guidance_state.get("ready") is not True:
+            reason = str(
+                guidance_state.get("reason")
+                or guidance_state.get("refusal_reason")
+                or "guidance engaged but not ready"
+            )
+            return {"status": "blocked", "reason": reason[:300]}
     bindings = node_bindings if isinstance(node_bindings, dict) else {}
     required_keys = _FEATURE_BINDING_KEYS.get(feature_id, [])
 
@@ -188,6 +203,11 @@ def _derive_snapshot_disabled_reason(
     """Derive a human-readable ``disabledReason`` for a snapshot."""
     if status == "invalid":
         return "No compatible features configured"
+    if status == "blocked":
+        for fs in feature_statuses.values():
+            if fs.get("status") == "blocked" and fs.get("reason"):
+                return f"Guidance blocked: {fs['reason']}"[:300]
+        return "Guidance engaged but blocked"
     if status == "needs_bindings":
         return "Missing required node bindings"
     if status == "needs_api_prompt":
@@ -219,11 +239,15 @@ def normalize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
     node_bindings = result.get("nodeBindings", {}) or {}
     output_node_id = result.get("outputNodeId") or ""
     api_prompt_json = _extract_executable_prompt(result.get("apiPromptJson") or {})
+    guidance_state = result.get("guidance")
+    if not isinstance(guidance_state, dict):
+        guidance_state = None
 
     feature_statuses: dict[str, dict[str, str]] = {}
     for fid in features:
         feature_statuses[fid] = _derive_feature_status(
             fid, node_bindings, output_node_id, api_prompt_json,
+            guidance_state,
         )
 
     result["featureStatus"] = feature_statuses

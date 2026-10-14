@@ -1863,6 +1863,19 @@ async def _modern_save_history_success(
             meta["studio_style"] = _plain_copy(_ss)
     except Exception:
         pass
+    # Phase 9: generic guidance provenance rides in meta the same way
+    # (mode, model_sha256, mechanism, controller checkpoint+hash,
+    # preprocessor class_type, mapping revision, anchor/binding id,
+    # strength/start/end, refusal cause).  Provenance only; execution
+    # never reads it, and no provider-specific fields are carried.
+    try:
+        _gp = capture.get("guidance_provenance")
+        if isinstance(_gp, dict) and _gp:
+            from studio_guidance import attach_guidance_provenance
+
+            attach_guidance_provenance(meta, _plain_copy(_gp))
+    except Exception:
+        pass
 
     replay_meta = _build_plan_replay_meta(
         plan, modal_options=capture.get("modal_options")
@@ -2055,6 +2068,7 @@ async def _record_workflow_run_failure(
     mono_start: float | None = None,
     plan: Any = None,
     modal_options: dict[str, Any] | None = None,
+    guidance_provenance: dict[str, Any] | None = None,
 ) -> None:
     """Record the accepted-modern-boundary failure for a workflow run (best effort).
 
@@ -2143,6 +2157,15 @@ async def _record_workflow_run_failure(
             "workflow_json": workflow_json,
             "workflow_hash": workflow_hash,
         }
+        # Phase 9: generic guidance provenance on failure records too
+        # (including refusal cause); provenance only, never fabricated.
+        try:
+            if isinstance(guidance_provenance, dict) and guidance_provenance:
+                from studio_guidance import attach_guidance_provenance
+
+                attach_guidance_provenance(meta, dict(guidance_provenance))
+        except Exception:
+            pass
         meta.update(replay_meta)
         if replay_meta.get("model_stack"):
             meta["model_stack"] = replay_meta["model_stack"]

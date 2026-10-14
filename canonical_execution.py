@@ -1533,6 +1533,7 @@ def build_execution_plan(
     trace: RuntimeTrace | None = None,
     validate: bool = True,
     collect_validation_proof: bool = False,
+    guidance: dict | None = None,
 ) -> ExecutionPlan:
     """Normalize, validate, compile, and freeze one dispatch plan."""
     if trace:
@@ -1542,6 +1543,41 @@ def build_execution_plan(
     if validate:
         assert_valid_api_prompt_structure(source_workflow)
         _validate_class_types(source_workflow, production_report)
+    if guidance is not None:
+        # Phase 9 Guidance: adapt the execution COPY between deepcopy and
+        # validation so validation covers the guided graph.  Any refusal
+        # raises loudly -- the run is blocked, never silently unguided.
+        # ``guidance`` carries: mode, model_folder, model_filename,
+        # library_records, mapping_store_root, guide_image, object_info,
+        # and optional anchor_binding.
+        from studio_guidance import (
+            GuidanceMappingStore,
+            build_guided_execution_copy,
+            is_refusal,
+        )
+        _g_store_root = str((guidance or {}).get("mapping_store_root", "") or "")
+        if not _g_store_root:
+            raise RuntimeError("guidance blocked run: mapping_store_root is required")
+        _g_result = build_guided_execution_copy(
+            source_workflow,
+            mode=str(guidance.get("mode", "") or ""),
+            model_folder=str(guidance.get("model_folder", "") or ""),
+            model_filename=str(guidance.get("model_filename", "") or ""),
+            library_records=guidance.get("library_records") or [],
+            mapping_store=GuidanceMappingStore(_g_store_root),
+            guide_image=guidance.get("guide_image"),
+            object_info=guidance.get("object_info"),
+            anchor_binding=guidance.get("anchor_binding"),
+        )
+        if is_refusal(_g_result):
+            _g_reason = getattr(_g_result, "reason", "refused")
+            raise RuntimeError(f"guidance blocked run: {_g_reason}")
+        assert isinstance(_g_result, dict)
+        source_workflow = _g_result["workflow"]
+        source_hash = prompt_sha256(source_workflow)
+        if validate:
+            assert_valid_api_prompt_structure(source_workflow)
+            _validate_class_types(source_workflow, production_report)
 
     dispatch_workflow = source_workflow
     report = dict(production_report or {})

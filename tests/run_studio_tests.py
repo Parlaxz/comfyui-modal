@@ -69,6 +69,10 @@ STUDIO_PY_MODULES: list[str] = [
     "tests.test_model_library",
     "tests.test_model_library_routes",
     "tests.test_dependency_resolver",
+    # Phase 9 Guidance backend (mapping store, identity, anchors, adapter,
+    # execution-copy hook, RUN gate, hardcoding gate).  Pure dicts + tiny
+    # temp files; no weights, no browser, no torch.
+    "tests.test_studio_guidance",
     # Phase-G portability: G6 risk engine + G9 backend/roundtrip +
     # G11 cache integration (unittest suites).  G7 target rules, G8
     # fixtures and the G10 cache suite are pytest-style modules and are
@@ -231,6 +235,10 @@ NODE_UNIT_FILES: list[Path] = [
     # Phase 7 KJNodes layout editor: norm/caption/parse/migration/
     # persistence/canvas contracts (DOM-stubbed, no browser)
     ROOT / "tests" / "studio_layout_editor_unit.mjs",
+    # Phase 9 Guidance frontend: state machine, snapshot key, poison-proof
+    # mapping payload, structural anchors, installed-artifact listings,
+    # generic provenance projection, no-family gate (DOM-free, plain node)
+    ROOT / "tests" / "studio_guidance_unit.mjs",
 ]
 
 # Intentionally excluded (documented in STUDIO_TEST_GATE.md):

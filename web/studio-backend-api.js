@@ -423,6 +423,28 @@ export async function createMappingRevision(apiBase, versionId, payload) {
   });
 }
 
+// ── Studio Guidance Mappings API (Phase 9) ────────────────────────────────
+// Generic CRUD for confirmed guidance mapping records, keyed strictly by
+// (model_sha256, mode). No family/provider awareness by construction.
+
+export async function getGuidanceMapping(apiBase, modelSha256, mode) {
+  const qs = new URLSearchParams({ model_sha256: String(modelSha256 || ""), mode: String(mode || "") });
+  return apiFetch(apiBase, "/studio/guidance-mappings?" + qs.toString());
+}
+
+export async function saveGuidanceMapping(apiBase, record) {
+  return apiFetch(apiBase, "/studio/guidance-mappings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mapping: record }),
+  });
+}
+
+export async function deleteGuidanceMapping(apiBase, modelSha256, mode) {
+  const qs = new URLSearchParams({ model_sha256: String(modelSha256 || ""), mode: String(mode || "") });
+  return apiFetch(apiBase, "/studio/guidance-mappings?" + qs.toString(), { method: "DELETE" });
+}
+
 // ── Studio Model Library API ────────────────────────────────────────────
 
 export async function listModels(apiBase, opts = {}) {

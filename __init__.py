@@ -7156,6 +7156,13 @@ if _server:
     # Register all snapshot and preset routes (external studio output dir)
     register_studio_routes(_server, _NODE_DIR, studio_output_dir=get_studio_outputs_dir())
 
+    # Phase 9 Guidance: generic CRUD for confirmed guidance mapping records
+    # (studio_guidance_routes.py), keyed strictly by (model_sha256, mode).
+    # Route paths registered by register_guidance_routes:
+    #   GET|POST|DELETE  /comfymodal/studio/guidance-mappings
+    from studio_guidance_routes import register_guidance_routes
+    register_guidance_routes(_server, _NODE_DIR)
+
     # History V2 HTTP API (history_v2_routes.py) backed by the local
     # History V2 SQLite database under the default local data root.
     # F9: settings_provider injects the live canonical Output-settings

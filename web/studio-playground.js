@@ -62,7 +62,24 @@ import {
   projectRunToLegacy,
   LEGACY_TERMINAL_STATUSES,
 } from "./studio-playground-run.js";
-import { updateRunAnnotation, saveRunOutput, getMethodCompat } from "./studio-backend-api.js";
+import { updateRunAnnotation, saveRunOutput, getMethodCompat, getGuidanceMapping, saveGuidanceMapping } from "./studio-backend-api.js";
+import {
+  GUIDANCE_MODES,
+  GUIDANCE_MECHANISMS,
+  GUIDANCE_DEFAULT_CONDITIONING,
+  normalizeGuidanceMode,
+  isSupportedGuidanceMode,
+  formatModelIdentity,
+  listControllerCheckpoints,
+  listPreprocessorCandidates,
+  listLoaderCandidates,
+  listApplyCandidates,
+  discoverGuidanceAnchors,
+  validateConditioning,
+  buildMappingRecord,
+  resolveGuidanceState,
+  buildSnapshotGuidance,
+} from "./studio-guidance.js";
 import { createHistoryRepository } from "./history-v2-repository.js";
 import { requestHistoryRecordFocus } from "./studio-history-v2.js";
 
@@ -1783,6 +1800,10 @@ function workflowGatingInfo(store, wf, state) {
   var _refReason = null;
   try { _refReason = _studioReferenceGate(state); } catch (_e2) { _refReason = null; }
   if (_refReason) return { text: _refReason, color: "#d9a441" };
+  // Phase 9: engaged-but-unready Guidance gates the same line/button.
+  var _gzReason = null;
+  try { _gzReason = _studioGuidanceGate(state); } catch (_eG) { _gzReason = null; }
+  if (_gzReason) return { text: _gzReason, color: "#d9a441" };
   // Use the same local/remote decision as the Run button. A selected Golden
   // profile executes in the deployed container, so host-local dependency
   // reasons must not be shown as a reason that remote execution is blocked.
@@ -2595,6 +2616,9 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
   if (!_gate) {
     try { _gate = _studioReferenceGate(state); } catch (_eRef) { _gate = null; }
   }
+  if (!_gate) {
+    try { _gate = _studioGuidanceGate(state); } catch (_eG) { _gate = null; }
+  }
   if (_gate && !_gateBusy) {
     if (state && state.playground && state.playground.queueMode) {
       btn.textContent = "Queue";
@@ -2854,6 +2878,13 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
     var _refs = _studioReferencesForRun(state, store);
     if (_refs) payload.studio_references = _refs;
   } catch (_eRef) {}
+  // Phase 9: snapshot guidance key (engaged/ready/reason only — the exact
+  // shape studio_models.normalize_snapshot_payload consumes). Null/absent
+  // means a plain run; engaged-but-unready blocks via the shared gate.
+  try {
+    var _gz = _studioGuidanceForRun(state, store);
+    if (_gz) payload.guidance = _gz;
+  } catch (_eG) {}
   // Phase 5: prompt-style composition. The user's prompt stays first and
   // verbatim; the selected style fragment appends deterministically (see
   // composeStylePrompt). studio_style carries user_prompt + style identity
@@ -9301,6 +9332,983 @@ function _studioReferencesForRun(state, store) {
   } catch (_e) { return null; }
 }
 
+// ── Phase 9: Guidance ─────────────────────────────────────────────────────
+// One generic Guidance card in the shelf (Phase-8 References pattern): a
+// state-driven panel, a manual mapping flow over installed artifacts only,
+// and an engagement-gated RUN. No provider panels, no Auto option, no
+// silent fallback — an engaged-but-unready Guidance blocks RUN with the
+// concrete cause. Pure decisions live in web/studio-guidance.js (DOM-free,
+// unit-tested); this block is shelf composition + async data only.
+
+function _guidanceOf(state) {
+  var pg = state && state.playground;
+  if (!pg) return null;
+  if (!pg._guidance || typeof pg._guidance !== "object") {
+    pg._guidance = {
+      engaged: false,
+      mode: "canny",
+      draft: null,
+      mappings: {},
+      mappingInflight: {},
+      status: { state: "off", ready: false, runGateReason: null, snapshot: null },
+      objectInfo: null,
+      objectInfoInflight: false,
+      objectInfoFailed: false,
+      guideImages: {},
+      guideBusy: false,
+      guideError: "",
+      confirmError: "",
+    };
+  }
+  return pg._guidance;
+}
+
+function _guidanceSelectionKey(store) {
+  if (!store) return "";
+  return String(store.workflowId || "") + "::" + String(store.workflowVersionId || "");
+}
+
+// Model-role control values (filename strings) in schema order. Generic
+// role predicate only — never a model/family allow-list.
+function _guidanceModelRoles(store, wf) {
+  try {
+    var schema = wf.getControlSchema(store) || {};
+    var values = (store && store.controlValues && typeof store.controlValues === "object")
+      ? store.controlValues : {};
+    var out = [];
+    Object.keys(schema).forEach(function (role) {
+      var entry = schema[role];
+      if (!entry || typeof entry !== "object") return;
+      var dataType = String(entry.data_type || "").toUpperCase();
+      var isModel = entry.control_kind === "file"
+        || ["MODEL", "CHECKPOINT", "UNET", "VAE", "CLIP", "LORA", "CONTROLNET", "EMBEDDING"].indexOf(dataType) !== -1;
+      if (!isModel) return;
+      var v = values[role];
+      if (v === undefined || v === null || String(v) === "") return;
+      out.push({ role: role, filename: String(v) });
+    });
+    return out;
+  } catch (_e) { return []; }
+}
+
+function _guidanceLibraryHit(records, filename) {
+  if (!Array.isArray(records)) return null;
+  for (var i = 0; i < records.length; i++) {
+    var rec = records[i];
+    if (!rec || typeof rec !== "object") continue;
+    if (String(rec.filename || "") === String(filename)
+      || String(rec.display_name || "") === String(filename)) return rec;
+  }
+  return null;
+}
+
+// Exact model identity for the selected workflow: the first model-role
+// value resolving to a library record WITH a hash. Null while no workflow
+// is selected (resolving); unresolvable (never a filename guess) otherwise.
+function _guidanceIdentityOf(state) {
+  var ready = _shelfReady(state);
+  if (!ready) return null;
+  var roles = _guidanceModelRoles(ready.store, ready.wf);
+  if (!roles.length) return { status: "unresolvable", filename: "" };
+  var records = (state.playground && state.playground._workflowModelLibrary) || [];
+  for (var i = 0; i < roles.length; i++) {
+    var hit = _guidanceLibraryHit(records, roles[i].filename);
+    if (hit && hit.hash) {
+      return {
+        status: "resolved",
+        sha: String(hit.hash).toLowerCase(),
+        filename: roles[i].filename,
+        folder: String(hit.folder || ""),
+      };
+    }
+  }
+  return { status: "unresolvable", filename: roles[0].filename };
+}
+
+function _guidanceMappingKey(sha, mode) {
+  return String(sha || "").toLowerCase() + "::" + normalizeGuidanceMode(mode);
+}
+
+function _guidanceExecutablePrompt(state) {
+  try {
+    var store = _shelfStore(state);
+    var ctx = store && store.runContext;
+    var version = ctx && ctx.version;
+    var prompt = version && version.executable_prompt;
+    if (prompt && typeof prompt === "object" && Object.keys(prompt).length) return prompt;
+    var alt = version && (version.api_prompt_json || version.apiPromptJson);
+    if (alt && typeof alt === "object" && Object.keys(alt).length) return alt;
+  } catch (_e) {}
+  return null;
+}
+
+// Missing-dependency evidence, computed synchronously from installed lists:
+// the confirmed controller checkpoint gone from the controlnet folder, or
+// (once object_info loads) confirmed node classes no longer installed.
+function _guidanceMissingDeps(state, record) {
+  var missing = [];
+  if (!record) return missing;
+  try {
+    var controller = record.controller || {};
+    var checkpoint = String(controller.checkpoint || "");
+    if (checkpoint) {
+      var records = (state.playground && state.playground._workflowModelLibrary) || [];
+      var hits = listControllerCheckpoints(records);
+      var found = hits.some(function (c) { return c.checkpoint === checkpoint; });
+      if (!found) missing.push({ kind: "checkpoint", name: checkpoint });
+    }
+    var g = _guidanceOf(state);
+    if (g && g.objectInfo && !g.objectInfoFailed) {
+      var nodes = record.nodes || {};
+      ["loader", "apply", "preprocessor"].forEach(function (slot) {
+        var cls = String(nodes[slot] || "");
+        if (cls && !g.objectInfo[cls]) missing.push({ kind: slot === "preprocessor" ? "preprocessor" : "node", name: cls });
+      });
+    }
+  } catch (_e) {}
+  return missing;
+}
+
+// Stale evidence: the stored mapping's world changed (checkpoint gone or a
+// confirmed node class no longer installed). Never a silent replace — the
+// state machine forces re-review until the user reconfirms or keeps it.
+function _guidanceStaleInfo(state, record) {
+  if (!record) return null;
+  try {
+    var controller = record.controller || {};
+    var checkpoint = String(controller.checkpoint || "");
+    if (checkpoint) {
+      var records = (state.playground && state.playground._workflowModelLibrary) || [];
+      var hits = listControllerCheckpoints(records);
+      var found = hits.some(function (c) { return c.checkpoint === checkpoint; });
+      if (!found) return { stale: true, staleDetail: "controller checkpoint '" + checkpoint + "' is no longer installed" };
+    }
+    var g = _guidanceOf(state);
+    if (g && g.objectInfo && !g.objectInfoFailed) {
+      var nodes = record.nodes || {};
+      var gone = ["loader", "apply", "preprocessor"].filter(function (slot) {
+        var cls = String(nodes[slot] || "");
+        return cls && !g.objectInfo[cls];
+      });
+      if (gone.length) {
+        return { stale: true, staleDetail: "node class '" + String(nodes[gone[0]]) + "' is no longer installed" };
+      }
+    }
+  } catch (_e) {}
+  return null;
+}
+
+// Recompute the cached panel status from sync caches only (never fetches).
+// Async loaders re-run this after every completion; the gate reads the
+// cache, so RUN can never observe a half-updated panel.
+function _syncGuidanceStatus(state) {
+  var g = _guidanceOf(state);
+  if (!g) return;
+  try {
+    var store = _shelfStore(state);
+    var identity = _guidanceIdentityOf(state);
+    var key = identity && identity.status === "resolved"
+      ? _guidanceMappingKey(identity.sha, g.mode) : "";
+    var cached = (key && g.mappings[key] !== undefined) ? g.mappings[key] : undefined;
+    var mapping = null;
+    if (cached !== undefined && cached !== null) {
+      var staleInfo = _guidanceStaleInfo(state, cached);
+      mapping = {
+        record: cached,
+        stale: !!(staleInfo && staleInfo.stale),
+        staleDetail: staleInfo ? staleInfo.staleDetail : "",
+      };
+    }
+    var anchors = null;
+    var graph = _guidanceExecutablePrompt(state);
+    if (graph) {
+      try { anchors = discoverGuidanceAnchors(graph); } catch (_eA) { anchors = null; }
+    }
+    var draft = g.draft || {};
+    var guideKey = _guidanceSelectionKey(store) + "::" + normalizeGuidanceMode(g.mode);
+    var guideImage = String(draft.guideImage || g.guideImages[guideKey] || "");
+    var resolved = resolveGuidanceState({
+      engaged: g.engaged,
+      mode: g.mode,
+      identity: identity,
+      mapping: mapping,
+      mappingUnconfirmed: false,
+      missingDependencies: (mapping && mapping.record) ? _guidanceMissingDeps(state, mapping.record) : [],
+      anchors: anchors,
+      anchorPick: String(draft.anchorPick || ""),
+      guideImage: guideImage,
+      keepExisting: !!draft.keepExisting,
+    });
+    // No executable graph: anchors are unverifiable, so a would-be ready
+    // state stays honestly blocked instead of silently running unguided.
+    if (resolved && resolved.state === "ready" && !graph) {
+      resolved = {
+        state: "incompatible_workflow",
+        ready: false,
+        runGateReason: "Guidance anchor discovery needs the workflow graph",
+        snapshot: { engaged: true, ready: false, reason: "graph_unavailable" },
+        headline: "Required guidance anchor not found",
+        detail: "The workflow graph is unavailable for anchor discovery. No fallback method was selected.",
+        actions: [
+          { id: "choose_workflow", label: "Choose another workflow" },
+          { id: "cancel", label: "Cancel" },
+        ],
+        identity: resolved.identity,
+        candidates: [],
+      };
+    }
+    // Mapping fetch still in flight: stay in resolving, never guess.
+    if (resolved && g.engaged && identity && identity.status === "resolved"
+      && cached === undefined && g.mappingInflight[key]) {
+      resolved = {
+        state: "resolving",
+        ready: false,
+        runGateReason: "Checking compatibility…",
+        snapshot: { engaged: true, ready: false, reason: "identity_resolving" },
+        headline: "Checking compatibility…",
+        detail: "Resolving the loaded model identity…",
+        actions: [],
+        identity: formatModelIdentity({ sha: identity.sha, filename: identity.filename, folder: identity.folder }),
+      };
+    }
+    g.status = {
+      state: resolved.state,
+      ready: !!resolved.ready,
+      runGateReason: resolved.runGateReason || null,
+      snapshot: resolved.snapshot || null,
+      headline: resolved.headline,
+      detail: resolved.detail,
+      actions: resolved.actions || [],
+      identity: resolved.identity || null,
+      candidates: resolved.candidates || [],
+    };
+  } catch (_e) {
+    g.status = { state: "off", ready: false, runGateReason: null, snapshot: null };
+  }
+}
+
+// Fetch the confirmed mapping for the current (sha, mode); container-scoped
+// re-render only, never the whole page (same contract as the workflow
+// section async loads).
+function _refreshGuidanceMapping(state, context, actions) {
+  var g = _guidanceOf(state);
+  if (!g || !g.engaged) return;
+  var identity;
+  try { identity = _guidanceIdentityOf(state); } catch (_e) { return; }
+  if (!identity || identity.status !== "resolved") {
+    _syncGuidanceStatus(state);
+    return;
+  }
+  var key = _guidanceMappingKey(identity.sha, g.mode);
+  if (g.mappings[key] !== undefined || g.mappingInflight[key]) {
+    _syncGuidanceStatus(state);
+    return;
+  }
+  g.mappingInflight[key] = true;
+  _syncGuidanceStatus(state);
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  getGuidanceMapping(apiBase, identity.sha, normalizeGuidanceMode(g.mode)).then(function (res) {
+    delete g.mappingInflight[key];
+    if (!res || res.status === "error") {
+      // A catalogue miss never blocks: treat as no confirmed mapping.
+      if (g.mappings[key] === undefined) g.mappings[key] = null;
+    } else {
+      g.mappings[key] = (res.mapping && typeof res.mapping === "object") ? res.mapping : null;
+    }
+    _syncGuidanceStatus(state);
+    try { _syncWorkflowGating(state, context, actions); } catch (_e2) {}
+    try { _refreshShelfSection(state, context, actions); } catch (_e3) {}
+  }, function () {
+    delete g.mappingInflight[key];
+    if (g.mappings[key] === undefined) g.mappings[key] = null;
+    _syncGuidanceStatus(state);
+    try { _syncWorkflowGating(state, context, actions); } catch (_e2) {}
+    try { _refreshShelfSection(state, context, actions); } catch (_e3) {}
+  });
+}
+
+// Installed node classes (object_info) for the preprocessor/loader/apply
+// dropdowns. Fail-soft: an unavailable list shows an honest note and skips
+// node-installedness checks instead of blocking or guessing.
+function _refreshGuidanceObjectInfo(state, context, actions) {
+  var g = _guidanceOf(state);
+  if (!g || g.objectInfo || g.objectInfoInflight) return;
+  g.objectInfoInflight = true;
+  var done = function (info) {
+    g.objectInfoInflight = false;
+    if (info && typeof info === "object") {
+      g.objectInfo = info;
+      g.objectInfoFailed = false;
+    } else {
+      g.objectInfoFailed = true;
+    }
+    _syncGuidanceStatus(state);
+    try { _syncWorkflowGating(state, context, actions); } catch (_e) {}
+    try { _refreshShelfSection(state, context, actions); } catch (_e2) {}
+  };
+  try {
+    fetch("/object_info").then(function (res) {
+      if (!res || !res.ok) { done(null); return null; }
+      return res.json();
+    }).then(function (data) {
+      done(data && typeof data === "object" ? data : null);
+    }, function () { done(null); });
+  } catch (_e) { done(null); }
+}
+
+// Honest run gate for Guidance (reason string or null). Engagement-gated,
+// not view-gated: an engaged Guidance means every submit carries guidance
+// or blocks — no silent fallback to a plain run.
+function _studioGuidanceGate(state) {
+  try {
+    var g = _guidanceOf(state);
+    if (!g || !g.engaged) return null;
+    var store = _shelfStore(state);
+    if (!store || !store.workflowId || !store.workflowVersionId) return null;
+    _syncGuidanceStatus(state);
+    var st = g.status;
+    if (!st || st.ready) return null;
+    return st.runGateReason || "Guidance engaged but not ready";
+  } catch (_e) { return null; }
+}
+
+// Snapshot guidance key for the run payload: the exact shape
+// studio_models.normalize_snapshot_payload consumes. Null for plain runs.
+function _studioGuidanceForRun(state, store) {
+  try {
+    var g = state && state.playground && state.playground._guidance;
+    if (!g || !g.engaged) return null;
+    if (!store || !store.workflowId) return null;
+    _syncGuidanceStatus(state);
+    var st = g.status;
+    if (!st || !st.snapshot) return null;
+    return buildSnapshotGuidance({ engaged: true, ready: !!st.ready, reason: st.snapshot.reason });
+  } catch (_e) { return null; }
+}
+
+function _guidanceDraftOf(state) {
+  var g = _guidanceOf(state);
+  if (!g) return null;
+  if (!g.draft || typeof g.draft !== "object") {
+    g.draft = {
+      open: false,
+      mode: g.mode,
+      mechanism: GUIDANCE_MECHANISMS[0],
+      checkpoint: "",
+      loader: "",
+      apply: "",
+      preprocessor: "",
+      guideImage: "",
+      anchorPick: "",
+      strength: GUIDANCE_DEFAULT_CONDITIONING.strength,
+      start: GUIDANCE_DEFAULT_CONDITIONING.start,
+      end: GUIDANCE_DEFAULT_CONDITIONING.end,
+      keepExisting: false,
+    };
+  }
+  return g.draft;
+}
+
+function _guidancePrefillDraft(state, record, mode) {
+  var draft = _guidanceDraftOf(state);
+  if (!draft) return;
+  draft.open = true;
+  draft.keepExisting = false;
+  draft.mode = normalizeGuidanceMode(mode) || "canny";
+  draft.mechanism = (record && record.mechanism) || GUIDANCE_MECHANISMS[0];
+  var controller = (record && record.controller) || {};
+  var nodes = (record && record.nodes) || {};
+  var conditioning = (record && record.conditioning) || {};
+  draft.checkpoint = String(controller.checkpoint || "");
+  draft.loader = String(nodes.loader || "");
+  draft.apply = String(nodes.apply || "");
+  draft.preprocessor = String(nodes.preprocessor || "");
+  draft.strength = conditioning.strength !== undefined ? conditioning.strength : GUIDANCE_DEFAULT_CONDITIONING.strength;
+  draft.start = conditioning.start !== undefined ? conditioning.start : GUIDANCE_DEFAULT_CONDITIONING.start;
+  draft.end = conditioning.end !== undefined ? conditioning.end : GUIDANCE_DEFAULT_CONDITIONING.end;
+}
+
+function _commitGuidanceGuideImage(state, context, actions, name) {
+  var g = _guidanceOf(state);
+  if (!g) return;
+  var store = _shelfStore(state);
+  var guideKey = _guidanceSelectionKey(store) + "::" + normalizeGuidanceMode(g.mode);
+  g.guideImages[guideKey] = String(name || "");
+  var draft = _guidanceDraftOf(state);
+  if (draft) draft.guideImage = String(name || "");
+  g.guideError = "";
+  g.guideBusy = false;
+  _syncGuidanceStatus(state);
+  try { _syncWorkflowGating(state, context, actions); } catch (_e) {}
+  _refreshShelfSection(state, context, actions);
+}
+
+async function _linkUrlAsGuidanceGuide(state, context, actions, url, prefix) {
+  var g = _guidanceOf(state);
+  if (!g || !url) return;
+  var store = _shelfStore(state);
+  var identity = _selectionIdentity(store);
+  g.guideBusy = true;
+  g.guideError = "";
+  _refreshShelfSection(state, context, actions);
+  var name = "";
+  var err = "";
+  try {
+    name = await _materializeUrlToFile(state, url, prefix);
+    if (!name) throw new Error("the image could not be read");
+  } catch (_e2) {
+    err = "Could not use that image — " + ((_e2 && _e2.message) || "linking failed") + ".";
+  }
+  if (_selectionIdentity(_shelfStore(state)) !== identity) return;
+  if (err) {
+    g.guideBusy = false;
+    g.guideError = err;
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  _commitGuidanceGuideImage(state, context, actions, name);
+}
+
+function _guidanceSelectRow(label, testid, current, options, onPick) {
+  var row = el("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap;" });
+  row.appendChild(el("span", { text: label, style: "font-size:12px;color:#aaa;min-width:110px;" }));
+  var sel = el("select", { "data-testid": testid, "aria-label": label });
+  options.forEach(function (opt) {
+    var value = opt && typeof opt === "object" ? opt.value : opt;
+    var text = opt && typeof opt === "object" ? opt.label : opt;
+    var o = document.createElement("option");
+    o.value = value == null ? "" : String(value);
+    o.textContent = text == null ? "" : String(text);
+    if (String(value) === String(current)) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.addEventListener("change", function () { onPick(sel.value); });
+  row.appendChild(sel);
+  return row;
+}
+
+function _guidanceNumberRow(label, testid, current, onPick) {
+  var row = el("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap;" });
+  row.appendChild(el("span", { text: label, style: "font-size:12px;color:#aaa;min-width:110px;" }));
+  var input = el("input", {
+    type: "number", step: "0.05",
+    class: "comfymodal-input comfymodal-studio-text-input",
+    value: current !== undefined && current !== null ? String(current) : "",
+    "data-testid": testid,
+    "aria-label": label,
+    style: "width:110px;",
+  });
+  input.addEventListener("change", function () { onPick(input.value === "" ? "" : Number(input.value)); });
+  row.appendChild(input);
+  return row;
+}
+
+function _guidanceActionButton(state, context, actions, action) {
+  var b = el("button", {
+    type: "button", class: "comfymodal-secondary-btn",
+    text: action.label, "data-testid": "guidance-action-" + action.id,
+  });
+  b.addEventListener("click", function () { _guidanceHandleAction(state, context, actions, action.id); });
+  return b;
+}
+
+function _guidanceHandleAction(state, context, actions, actionId) {
+  var g = _guidanceOf(state);
+  if (!g) return;
+  var store = _shelfStore(state);
+  if (actionId === "enable") {
+    g.engaged = true;
+    if (!isSupportedGuidanceMode(g.mode)) g.mode = "canny";
+    _refreshGuidanceMapping(state, context, actions);
+    _refreshGuidanceObjectInfo(state, context, actions);
+    _syncGuidanceStatus(state);
+    try { _syncWorkflowGating(state, context, actions); } catch (_e) {}
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  if (actionId === "cancel") {
+    if (g.draft) g.draft.open = false;
+    else g.engaged = false;
+    g.confirmError = "";
+    _syncGuidanceStatus(state);
+    try { _syncWorkflowGating(state, context, actions); } catch (_e) {}
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  if (actionId === "choose_mapping" || actionId === "change" || actionId === "review_reconfirm") {
+    var identity = null;
+    try { identity = _guidanceIdentityOf(state); } catch (_e2) { identity = null; }
+    var key = identity && identity.status === "resolved" ? _guidanceMappingKey(identity.sha, g.mode) : "";
+    var record = (key && g.mappings[key] !== undefined) ? g.mappings[key] : null;
+    _guidancePrefillDraft(state, record, g.mode);
+    _refreshGuidanceObjectInfo(state, context, actions);
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  if (actionId === "confirm_mapping") {
+    // A stored-but-unconfirmed record becomes confirmed explicitly.
+    var id2 = null;
+    try { id2 = _guidanceIdentityOf(state); } catch (_e3) { id2 = null; }
+    var key2 = id2 && id2.status === "resolved" ? _guidanceMappingKey(id2.sha, g.mode) : "";
+    var rec2 = (key2 && g.mappings[key2] !== undefined) ? g.mappings[key2] : null;
+    if (id2 && id2.status === "resolved" && rec2) {
+      _guidanceConfirmRecord(state, context, actions, id2.sha, g.mode, rec2);
+    } else {
+      _guidancePrefillDraft(state, rec2, g.mode);
+      _refreshShelfSection(state, context, actions);
+    }
+    return;
+  }
+  if (actionId === "keep_existing") {
+    var draft = _guidanceDraftOf(state);
+    if (draft) { draft.open = false; draft.keepExisting = true; }
+    _syncGuidanceStatus(state);
+    try { _syncWorkflowGating(state, context, actions); } catch (_e) {}
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  if (actionId === "confirm_anchor") {
+    try { _syncWorkflowGating(state, context, actions); } catch (_e) {}
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  if (actionId === "find_in_library" || actionId === "resolve_dependency") {
+    _guidancePrefillDraft(state, null, g.mode);
+    _refreshGuidanceObjectInfo(state, context, actions);
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  if (actionId === "choose_workflow") {
+    try { _openShelfPickerDialog(state, context); } catch (_e) {}
+    return;
+  }
+  if (actionId === "choose_mode") {
+    var draft2 = _guidanceDraftOf(state);
+    if (draft2) { draft2.open = true; }
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  if (actionId === "change" || actionId === "reconfirm") {
+    var id3 = null;
+    try { id3 = _guidanceIdentityOf(state); } catch (_e4) { id3 = null; }
+    var key3 = id3 && id3.status === "resolved" ? _guidanceMappingKey(id3.sha, g.mode) : "";
+    var rec3 = (key3 && g.mappings[key3] !== undefined) ? g.mappings[key3] : null;
+    _guidancePrefillDraft(state, rec3, g.mode);
+    _refreshGuidanceObjectInfo(state, context, actions);
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+}
+
+function _guidanceConfirmRecord(state, context, actions, sha, mode, record) {
+  var g = _guidanceOf(state);
+  if (!g) return;
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  var key = _guidanceMappingKey(sha, mode);
+  g.confirmError = "";
+  _refreshShelfSection(state, context, actions);
+  var payload = record && typeof record === "object" ? record : {};
+  saveGuidanceMapping(apiBase, payload).then(function (res) {
+    if (!res || res.status === "error" || !res.mapping) {
+      g.confirmError = (res && res.message) || "Could not save the mapping.";
+      _refreshShelfSection(state, context, actions);
+      return;
+    }
+    g.mappings[key] = res.mapping;
+    var draft = _guidanceDraftOf(state);
+    if (draft) { draft.open = false; draft.keepExisting = false; }
+    _syncGuidanceStatus(state);
+    try { _syncWorkflowGating(state, context, actions); } catch (_e) {}
+    try { _refreshShelfSection(state, context, actions); } catch (_e2) {}
+  }, function (err) {
+    g.confirmError = (err && err.message) || "Could not save the mapping.";
+    _refreshShelfSection(state, context, actions);
+  });
+}
+
+function _guidanceConfirmDraft(state, context, actions) {
+  var g = _guidanceOf(state);
+  var draft = _guidanceDraftOf(state);
+  if (!g || !draft) return;
+  var identity = null;
+  try { identity = _guidanceIdentityOf(state); } catch (_e) { identity = null; }
+  if (!identity || identity.status !== "resolved") {
+    g.confirmError = "Studio cannot identify this model exactly and will not guess from its filename.";
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  var checkpointSha = "";
+  try {
+    var records = (state.playground && state.playground._workflowModelLibrary) || [];
+    var hits = listControllerCheckpoints(records);
+    for (var i = 0; i < hits.length; i++) {
+      if (hits[i].checkpoint === draft.checkpoint && hits[i].checkpoint_sha256) {
+        checkpointSha = hits[i].checkpoint_sha256;
+        break;
+      }
+    }
+  } catch (_e2) {}
+  var built = buildMappingRecord({
+    model_sha256: identity.sha,
+    mode: draft.mode,
+    mechanism: draft.mechanism,
+    checkpoint: draft.checkpoint,
+    checkpointFolder: "controlnet",
+    checkpointSha256: checkpointSha,
+    loaderClass: draft.loader,
+    applyClass: draft.apply,
+    preprocessorClass: draft.preprocessor,
+    strength: draft.strength,
+    start: draft.start,
+    end: draft.end,
+  });
+  if (!built.ok) {
+    g.confirmError = built.error || "The mapping is incomplete.";
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  _guidanceConfirmRecord(state, context, actions, identity.sha, normalizeGuidanceMode(draft.mode), built.record);
+}
+
+// Anchor discovery results for the manual flow: concrete node id /
+// class_type / input slot, or a bounded radio pick when several samplers
+// exist. Advisory only — the backend revalidates at execution time.
+function _guidanceAnchorBlock(state, draft) {
+  var wrap = el("div", { style: "margin:6px 0;" });
+  wrap.appendChild(el("p", {
+    text: "Anchors",
+    style: "font-size:12px;color:#aaa;margin:0 0 4px;",
+  }));
+  var graph = _guidanceExecutablePrompt(state);
+  if (!graph) {
+    wrap.appendChild(el("p", {
+      class: "comfymodal-studio-control-note",
+      text: "The workflow graph is unavailable for anchor discovery.",
+      "data-testid": "guidance-anchors-unavailable",
+      style: "font-size:11px;color:#888;margin:0;",
+    }));
+    return wrap;
+  }
+  var found = null;
+  try { found = discoverGuidanceAnchors(graph); } catch (_e) { found = null; }
+  if (!found) {
+    wrap.appendChild(el("p", {
+      class: "comfymodal-studio-control-note",
+      text: "Anchor discovery failed.",
+      style: "font-size:11px;color:#888;margin:0;",
+    }));
+    return wrap;
+  }
+  if (found.ok) {
+    var a = found.anchors;
+    wrap.appendChild(el("p", {
+      text: "Sampler " + a.sampler_id + " (" + a.sampler_class + ") · positive ← " +
+        a.positive.node_id + ":" + a.positive.output + " · negative ← " +
+        a.negative.node_id + ":" + a.negative.output,
+      "data-testid": "guidance-anchor-single",
+      style: "font-size:11px;color:#888;margin:0;",
+    }));
+    return wrap;
+  }
+  if (found.reason === "multiple_samplers" && found.candidates && found.candidates.length) {
+    wrap.appendChild(el("p", {
+      text: "More than one generation sampler is present; confirm which one to guide.",
+      style: "font-size:11px;color:#d9a441;margin:0 0 4px;",
+    }));
+    var list = el("div", { "data-testid": "guidance-anchor-candidates" });
+    found.candidates.slice(0, 6).forEach(function (c) {
+      var label = el("label", { style: "display:flex;gap:6px;align-items:center;font-size:12px;color:#ccc;margin-bottom:4px;" });
+      var radio = el("input", { type: "radio", name: "guidance-anchor-pick", value: c.node_id });
+      radio.checked = String(draft.anchorPick || "") === String(c.node_id);
+      if (!draft.anchorPick && found.candidates[0] === c) {
+        // No silent choice: the pick counts only after the user confirms it.
+        radio.checked = false;
+      }
+      radio.addEventListener("change", function () { draft.anchorPick = radio.value; });
+      label.appendChild(radio);
+      label.appendChild(el("span", { text: "Sampler " + c.node_id + " (" + (c.class_type || "?") + ")" }));
+      list.appendChild(label);
+    });
+    wrap.appendChild(list);
+    return wrap;
+  }
+  wrap.appendChild(el("p", {
+    text: String(found.detail || found.reason),
+    "data-testid": "guidance-anchor-refusal",
+    style: "font-size:11px;color:#d9a441;margin:0;",
+  }));
+  return wrap;
+}
+
+function _guidanceManualFlow(state, context, actions, g, draft, identity) {
+  var box = el("div", { "data-testid": "guidance-manual-flow", style: "margin-top:8px;border-top:1px solid #2a2a2a;padding-top:8px;" });
+  box.appendChild(el("p", {
+    text: "Choose a mapping — selection is not trust until confirmed.",
+    style: "font-size:11px;color:#888;margin:0 0 8px;",
+  }));
+  var records = (state.playground && state.playground._workflowModelLibrary) || [];
+  var checkpoints = [];
+  try { checkpoints = listControllerCheckpoints(records); } catch (_e) { checkpoints = []; }
+  var objectInfo = (g.objectInfo && !g.objectInfoFailed) ? g.objectInfo : null;
+  var preprocessors = objectInfo ? listPreprocessorCandidates(objectInfo) : [];
+  var loaders = objectInfo ? listLoaderCandidates(objectInfo) : [];
+  var applies = objectInfo ? listApplyCandidates(objectInfo) : [];
+  // Mode first: no Auto option anywhere.
+  box.appendChild(_guidanceSelectRow("Mode", "guidance-draft-mode",
+    normalizeGuidanceMode(draft.mode) || "canny",
+    GUIDANCE_MODES.map(function (m) { return { value: m, label: m }; }),
+    function (v) { draft.mode = v; _refreshShelfSection(state, context, actions); }));
+  // Mechanism from the implemented list only.
+  box.appendChild(_guidanceSelectRow("Mechanism", "guidance-draft-mechanism",
+    draft.mechanism || GUIDANCE_MECHANISMS[0],
+    GUIDANCE_MECHANISMS.map(function (m) { return { value: m, label: m }; }),
+    function (v) { draft.mechanism = v; _refreshShelfSection(state, context, actions); }));
+  // Installed controller checkpoint (controlnet folder).
+  if (!checkpoints.length) {
+    box.appendChild(el("p", {
+      text: "No installed controller checkpoint was found in the controlnet folder.",
+      style: "font-size:11px;color:#d9a441;margin:0 0 6px;",
+    }));
+  }
+  box.appendChild(_guidanceSelectRow("Controller", "guidance-draft-checkpoint",
+    draft.checkpoint,
+    [{ value: "", label: "Choose…" }].concat(checkpoints.map(function (c) { return { value: c.checkpoint, label: c.checkpoint }; })),
+    function (v) { draft.checkpoint = v; _refreshShelfSection(state, context, actions); }));
+  // Installed node classes (structural shapes from object_info).
+  if (!objectInfo) {
+    box.appendChild(el("p", {
+      text: g.objectInfoFailed
+        ? "Installed node list unavailable — node choices cannot be listed."
+        : "Loading installed node list…",
+      style: "font-size:11px;color:#888;margin:0 0 6px;",
+    }));
+  }
+  box.appendChild(_guidanceSelectRow("Loader node", "guidance-draft-loader",
+    draft.loader,
+    [{ value: "", label: "Choose…" }].concat(loaders.map(function (c) { return { value: c, label: c }; })),
+    function (v) { draft.loader = v; _refreshShelfSection(state, context, actions); }));
+  box.appendChild(_guidanceSelectRow("Apply node", "guidance-draft-apply",
+    draft.apply,
+    [{ value: "", label: "Choose…" }].concat(applies.map(function (c) { return { value: c, label: c }; })),
+    function (v) { draft.apply = v; _refreshShelfSection(state, context, actions); }));
+  box.appendChild(_guidanceSelectRow("Preprocessor", "guidance-draft-preprocessor",
+    draft.preprocessor,
+    [{ value: "", label: "Choose…" }].concat(preprocessors.map(function (c) { return { value: c, label: c }; })),
+    function (v) { draft.preprocessor = v; _refreshShelfSection(state, context, actions); }));
+  // Guide image: upload + Use current + shared Browse History primitives.
+  var guideProps = {
+    value: String(draft.guideImage || ""),
+    testid: "guidance-guide-image",
+    label: "Guide image",
+    uploadBusy: !!g.guideBusy,
+    uploadError: g.guideError || "",
+    onChange: function (next) { _commitGuidanceGuideImage(state, context, actions, next); },
+    onUploadState: function (s) {
+      g.guideBusy = !!(s && s.busy);
+      if (s && s.error) g.guideError = String(s.error);
+      _refreshShelfSection(state, context, actions);
+    },
+    onUseCurrent: function () {
+      var url = _shelfCurrentImageUrl(state);
+      if (!url) {
+        g.guideError = "No current image to use.";
+        _refreshShelfSection(state, context, actions);
+        return;
+      }
+      _linkUrlAsGuidanceGuide(state, context, actions, url, "studio-guidance");
+    },
+  };
+  var historyItems = [];
+  try { historyItems = _historyPickerItems(state); } catch (_e4) { historyItems = []; }
+  if (historyItems.length) {
+    guideProps.onPickHistory = function (url) {
+      _linkUrlAsGuidanceGuide(state, context, actions, url, "studio-guidance-history");
+    };
+    guideProps.historyItems = historyItems;
+  }
+  box.appendChild(FIELD_BLOCKS.image.render(guideProps));
+  // Anchor discovery results.
+  box.appendChild(_guidanceAnchorBlock(state, draft));
+  // Strength/start/end: numeric, user-adjustable pre-confirm.
+  var cond = validateConditioning({ strength: draft.strength, start: draft.start, end: draft.end });
+  var base = cond.ok ? cond.conditioning : GUIDANCE_DEFAULT_CONDITIONING;
+  box.appendChild(_guidanceNumberRow("Strength", "guidance-draft-strength", base.strength, function (v) {
+    draft.strength = v; _refreshShelfSection(state, context, actions);
+  }));
+  box.appendChild(_guidanceNumberRow("Start", "guidance-draft-start", base.start, function (v) {
+    draft.start = v; _refreshShelfSection(state, context, actions);
+  }));
+  box.appendChild(_guidanceNumberRow("End", "guidance-draft-end", base.end, function (v) {
+    draft.end = v; _refreshShelfSection(state, context, actions);
+  }));
+  // Review screen: all mapping fields, evidence as display.
+  var review = el("div", { "data-testid": "guidance-review", style: "margin:8px 0;font-size:12px;color:#ccc;" });
+  var idLabel = "unknown";
+  try {
+    var fmt = formatModelIdentity(identity || { sha: "", filename: "" });
+    idLabel = fmt.label || "unknown";
+  } catch (_e5) {}
+  var reviewRows = [
+    ["Model", idLabel],
+    ["Mode", normalizeGuidanceMode(draft.mode) || "canny"],
+    ["Mechanism", draft.mechanism || GUIDANCE_MECHANISMS[0]],
+    ["Controller", draft.checkpoint || "—"],
+    ["Loader", draft.loader || "—"],
+    ["Apply", draft.apply || "—"],
+    ["Preprocessor", draft.preprocessor || "—"],
+    ["Guide image", String(draft.guideImage || "—")],
+    ["Strength / start / end", base.strength + " / " + base.start + " / " + base.end],
+    ["Evidence", "manual mapping, user-confirmed"],
+  ];
+  reviewRows.forEach(function (pair) {
+    review.appendChild(el("div", { style: "display:flex;gap:8px;margin-bottom:2px;" }, [
+      el("span", { text: pair[0] + ":", style: "color:#888;min-width:110px;" }),
+      el("span", { text: String(pair[1]) }),
+    ]));
+  });
+  box.appendChild(review);
+  if (g.confirmError) {
+    box.appendChild(el("p", {
+      text: String(g.confirmError),
+      style: "font-size:11px;color:#f87171;margin:0 0 6px;",
+      "data-testid": "guidance-confirm-error",
+    }));
+  }
+  var foot = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;" });
+  var confirmBtn = el("button", {
+    type: "button", class: "comfymodal-secondary-btn",
+    text: "Confirm and remember for this model",
+    "data-testid": "guidance-confirm-remember",
+  });
+  confirmBtn.addEventListener("click", function () { _guidanceConfirmDraft(state, context, actions); });
+  foot.appendChild(confirmBtn);
+  var backBtn = el("button", {
+    type: "button", class: "comfymodal-secondary-btn",
+    text: "Back", "data-testid": "guidance-action-cancel",
+  });
+  backBtn.addEventListener("click", function () { _guidanceHandleAction(state, context, actions, "cancel"); });
+  foot.appendChild(backBtn);
+  box.appendChild(foot);
+  return box;
+}
+
+function _renderGuidanceSection(state, context, actions) {
+  var ready = _shelfReady(state);
+  if (!ready) return null;
+  var g = _guidanceOf(state);
+  if (!g) return null;
+  _syncGuidanceStatus(state);
+  var box = el("div", {
+    class: "comfymodal-studio-guidance",
+    "data-testid": "guidance-section",
+    style: "margin:8px 0;",
+  });
+  box.appendChild(el("h4", {
+    class: "comfymodal-studio-block-heading",
+    text: "Guidance",
+  }));
+  // Mode row: Off (disengaged) or one explicit mode. No Auto option.
+  var modeRow = el("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap;" });
+  modeRow.appendChild(el("span", { text: "Mode", style: "font-size:12px;color:#aaa;" }));
+  var sel = el("select", { "data-testid": "guidance-mode", "aria-label": "Guidance mode" });
+  [{ value: "", label: "Off" }].concat(GUIDANCE_MODES.map(function (m) {
+    return { value: m, label: m[0].toUpperCase() + m.slice(1) };
+  })).forEach(function (opt) {
+    var o = document.createElement("option");
+    o.value = opt.value;
+    o.textContent = opt.label;
+    if ((g.engaged && normalizeGuidanceMode(g.mode) === opt.value) || (!g.engaged && opt.value === "")) {
+      o.selected = true;
+    }
+    sel.appendChild(o);
+  });
+  sel.addEventListener("change", function () {
+    g.engaged = sel.value !== "";
+    if (g.engaged && isSupportedGuidanceMode(sel.value)) g.mode = normalizeGuidanceMode(sel.value);
+    var draft = _guidanceDraftOf(state);
+    if (draft) { draft.open = false; draft.keepExisting = false; draft.mode = g.mode; }
+    _refreshGuidanceMapping(state, context, actions);
+    _refreshGuidanceObjectInfo(state, context, actions);
+    _syncGuidanceStatus(state);
+    try { _syncWorkflowGating(state, context, actions); } catch (_e) {}
+    _refreshShelfSection(state, context, actions);
+  });
+  modeRow.appendChild(sel);
+  box.appendChild(modeRow);
+  if (!g.engaged) {
+    box.appendChild(el("p", {
+      class: "comfymodal-studio-control-note",
+      text: "Guidance off — runs execute without structural conditioning.",
+      "data-testid": "guidance-status",
+      style: "font-size:11px;color:#888;margin:0;",
+    }));
+    return box;
+  }
+  // Kick async data (mapping record, installed node list); each completion
+  // re-renders this container only.
+  _refreshGuidanceMapping(state, context, actions);
+  _refreshGuidanceObjectInfo(state, context, actions);
+  var st = g.status || {};
+  var status = el("div", { "data-testid": "guidance-status", style: "margin-bottom:6px;" });
+  status.appendChild(el("p", {
+    text: String(st.headline || "Guidance"),
+    style: "font-size:12px;color:#ddd;margin:0 0 2px;font-weight:var(--font-weight-semibold);",
+  }));
+  if (st.detail) {
+    status.appendChild(el("p", {
+      text: String(st.detail),
+      style: "font-size:11px;color:#888;margin:0 0 2px;",
+    }));
+  }
+  if (st.identity && (st.identity.shortHash || st.identity.filename)) {
+    status.appendChild(el("p", {
+      text: "Model: " + (st.identity.label || ""),
+      "data-testid": "guidance-identity",
+      style: "font-size:11px;color:#888;margin:0;",
+    }));
+  }
+  box.appendChild(status);
+  var ops = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;" });
+  (st.actions || []).forEach(function (action) {
+    if (!action || !action.id) return;
+    if (action.id === "confirm_anchor") return; // rendered with the anchor pick below
+    ops.appendChild(_guidanceActionButton(state, context, actions, action));
+  });
+  if (ops.childNodes.length) box.appendChild(ops);
+  var draft = _guidanceDraftOf(state);
+  if (draft && draft.open) {
+    var identity = null;
+    try { identity = _guidanceIdentityOf(state); } catch (_e2) { identity = null; }
+    box.appendChild(_guidanceManualFlow(state, context, actions, g, draft, identity));
+  } else if (st.state === "incompatible_workflow" && st.candidates && st.candidates.length) {
+    // Bounded anchor pick outside the manual flow (known mapping, ambiguous
+    // graph): concrete node id/class_type radio list, never a silent pick.
+    var pick = el("div", { "data-testid": "guidance-anchor-candidates", style: "margin:6px 0;" });
+    pick.appendChild(el("p", {
+      text: "Confirm which sampler to guide.",
+      style: "font-size:11px;color:#d9a441;margin:0 0 4px;",
+    }));
+    var current = draft ? String(draft.anchorPick || "") : "";
+    st.candidates.slice(0, 6).forEach(function (c) {
+      var label = el("label", { style: "display:flex;gap:6px;align-items:center;font-size:12px;color:#ccc;margin-bottom:4px;" });
+      var radio = el("input", { type: "radio", name: "guidance-anchor-pick", value: String(c.node_id) });
+      radio.checked = current === String(c.node_id);
+      radio.addEventListener("change", function () {
+        var d = _guidanceDraftOf(state);
+        if (d) d.anchorPick = radio.value;
+        _syncGuidanceStatus(state);
+        try { _syncWorkflowGating(state, context, actions); } catch (_e3) {}
+        _refreshShelfSection(state, context, actions);
+      });
+      label.appendChild(radio);
+      label.appendChild(el("span", { text: "Sampler " + c.node_id + " (" + (c.class_type || "?") + ")" }));
+      pick.appendChild(label);
+    });
+    box.appendChild(pick);
+  }
+  return box;
+}
+
 // Sensible visible shell for an internal execution type. A sketch shell
 // keeps the already-visible Generate/Edit Sketch choice when compatible
 // (both the I2I sketch path and the legacy sketch compatibility override
@@ -12951,6 +13959,16 @@ function _populateShelfSection(section, state, context, actions) {
       if (_refSection) section.appendChild(_refSection);
     }
   } catch (_eRef) {}
+
+  // Phase 9: one generic Guidance card beside the ordinary controls on
+  // Generate/Edit (never inside mapped fields, never a provider panel).
+  try {
+    var _modeG = activeModeOf(state);
+    if (_modeG === "generate" || _modeG === "edit") {
+      var _gzSection = _renderGuidanceSection(state, context, actions);
+      if (_gzSection) section.appendChild(_gzSection);
+    }
+  } catch (_eG) {}
 
   // Phase 5: visual prompt-style browser under Generate → Text only. The
   // user's prompt stays the source of truth; a selected style deterministically

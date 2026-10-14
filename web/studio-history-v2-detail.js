@@ -29,6 +29,7 @@ import {
 } from "./history-v2-repository.js";
 import { buildManagedAssetDownloadButton } from "./history-v2-browser-download.js";
 import { buildConfiguredExportButton, exportResultNote } from "./history-v2-export.js";
+import { summarizeGuidanceProvenance } from "./studio-guidance.js";
 
 // ── Constants / helpers ───────────────────────────────────────────────────
 
@@ -163,6 +164,51 @@ export function buildReferencesSection(record) {
   if (section) {
     section.setAttribute("data-testid", "history-v2-references");
   }
+  return section;
+}
+
+// ── Studio guidance (Phase 9) ─────────────────────────────────────────────
+//
+// Detail rendering for generic `guidance_provenance`: mode, exact model
+// identity (short hash), mechanism, controller checkpoint, preprocessor,
+// mapping revision, strength/start/end, refusal cause. Row projection lives
+// in studio-guidance.js (pure, unit-tested); this is thin el() glue that
+// renders whatever strings the data holds — no provider-specific display
+// branches. Legacy records (absent provenance) render nothing.
+
+function _guidanceProvenanceOf(record) {
+  const rec = record && typeof record === "object" ? record : {};
+  const direct = rec.guidance_provenance;
+  if (direct && typeof direct === "object" && !Array.isArray(direct)) return direct;
+  const meta = rec.meta;
+  if (meta && typeof meta === "object" && meta.guidance_provenance
+    && typeof meta.guidance_provenance === "object") return meta.guidance_provenance;
+  const camel = rec.guidanceProvenance;
+  if (camel && typeof camel === "object" && !Array.isArray(camel)) return camel;
+  return null;
+}
+
+export function buildGuidanceSection(record) {
+  let rows = null;
+  try {
+    rows = summarizeGuidanceProvenance(_guidanceProvenanceOf(record));
+  } catch (_e) {
+    rows = null;
+  }
+  if (!rows) return null;
+  // Self-contained el() rows (not the closure-scoped _row/_section below,
+  // which are unreachable from module scope).
+  const children = rows.map(function (pair) {
+    return el("div", { class: "comfymodal-studio-history-v2-row" }, [
+      el("span", { class: "comfymodal-studio-history-v2-row-key", text: pair[0] }),
+      el("span", { class: "comfymodal-studio-history-v2-row-value", text: pair[1] }),
+    ]);
+  });
+  if (children.length === 0) return null;
+  const section = el("div", { class: "comfymodal-studio-history-v2-section" }, [
+    el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Guidance" }),
+  ].concat(children));
+  section.setAttribute("data-testid", "history-v2-guidance");
   return section;
 }
 
@@ -1213,6 +1259,14 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
         sharedShell.contentEl.appendChild(referencesSection);
       }
     } catch (err) { /* references never break the detail surface */ }
+    // Phase 9: generic guidance provenance renders as its own section
+    // (legacy records without provenance render nothing — they stay valid).
+    try {
+      const guidanceSection = buildGuidanceSection(record);
+      if (guidanceSection && sharedShell.contentEl) {
+        sharedShell.contentEl.appendChild(guidanceSection);
+      }
+    } catch (err) { /* guidance never breaks the detail surface */ }
     _ensureDialogFocus();
   }
 
