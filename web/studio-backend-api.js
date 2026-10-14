@@ -351,6 +351,8 @@ export async function getWorkflowRunContext(apiBase, workflowId, versionId = "")
   return apiFetch(apiBase, path);
 }
 
+export async function getMethodCompat(apiBase, workflowId, versionId) { return apiFetch(apiBase, `/studio/method-compat?workflow_id=${encodeURIComponent(workflowId)}&version_id=${encodeURIComponent(versionId)}`); }
+
 // ── Studio Workflow Versions API ─────────────────────────────────────────
 
 export async function listWorkflowVersions(apiBase, workflowId) {

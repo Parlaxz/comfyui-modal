@@ -548,10 +548,11 @@ def _golden_history_meta(
     profile: GoldenProfile,
     controls: Mapping[str, Any] | None,
     method: str = "",
+    studio_method: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     controls_map = controls if isinstance(controls, Mapping) else {}
     actual_method = method or profile.target["method"]
-    return {
+    meta = {
         "source": "studio_golden",
         "golden_profile": profile.name,
         "golden_request_id": request_id,
@@ -566,6 +567,13 @@ def _golden_history_meta(
         "negative_prompt": str(controls_map.get("negative_prompt") or ""),
         "studio_workflow_id": str(controls_map.get("_workflow_id") or ""),
     }
+    # Phase 3: explicit generic-method provenance (plain JSON only).
+    if isinstance(studio_method, Mapping):
+        try:
+            meta["studio_method"] = json.loads(json.dumps(dict(studio_method)))
+        except Exception:
+            pass
+    return meta
 
 
 def _fail_golden_history(run_id: str, error: str) -> None:
@@ -596,6 +604,7 @@ def _begin_golden_history(
     profile: GoldenProfile,
     controls: Mapping[str, Any] | None,
     method: str = "",
+    studio_method: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Open the nonterminal History record BEFORE the run is dispatched.
 
@@ -619,7 +628,7 @@ def _begin_golden_history(
             kind="playground_run",
             prompt_id=request_id,
             status="running",
-            meta=_golden_history_meta(request_id, profile, controls, method),
+            meta=_golden_history_meta(request_id, profile, controls, method, studio_method),
         )
         if not isinstance(record, dict):
             return "", ""
@@ -732,6 +741,7 @@ async def run_golden_workflow(
     modal_options: Mapping[str, Any] | None = None,
     event_store: GoldenStageEventStore = EVENT_STORE,
     handle_factory: Callable[[GoldenProfile, Mapping[str, Any] | None], Any] | None = None,
+    studio_method: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve controls, submit the selected Golden method, and retain events."""
     request_id = validate_request_id(request_id)
@@ -760,14 +770,29 @@ async def run_golden_workflow(
     merged = merge_workflow_controls(
         bundle["defaults"], dict(controls or {}), bundle["control_schema"],
     )
-    if merged["errors"]:
+    # ── Phase 3: sanitize the explicit method BEFORE base validation (same
+    #    contract as handle_workflow_run_async): an inpaint method carries
+    #    its mask in params, so origin required-mask errors are tolerated;
+    #    the method pre-step / override merge re-validates authoritatively.
+    from studio_workflow_run import (
+        _prepare_studio_method,
+        _resolve_dedicated_override,
+        _sanitize_studio_method,
+        _tolerated_method_base_errors,
+        _transfer_values_with_method_mask,
+    )
+    _g_method, _g_method_error = _sanitize_studio_method(studio_method)
+    if _g_method_error:
+        return {"status": "error", "message": _g_method_error}
+    _g_base_errors = _tolerated_method_base_errors(merged["errors"], _g_method)
+    if _g_base_errors:
         return {
             "status": "error",
             "error_code": "WORKFLOW_CONTROL_VALIDATION",
             "message": "; ".join(
-                f"{error['field']}: {error['message']}" for error in merged["errors"]
+                f"{error['field']}: {error['message']}" for error in _g_base_errors
             ),
-            "errors": merged["errors"],
+            "errors": _g_base_errors,
         }
     if modal_options is not None and not isinstance(modal_options, Mapping):
         return {
@@ -775,10 +800,50 @@ async def run_golden_workflow(
             "error_code": "WORKFLOW_CONTROL_APPLICATION",
             "message": "modal_options must be an object",
         }
+    # ── Phase 3: explicit generic methods share the studio_workflow_run
+    #    helpers (sanitize/pre/dedicated-resolution). Plain runs (studio_method
+    #    None) take the exact historical path below.
+    #    (_g_method/_g_method_error were sanitized before base validation.)
+    _g_method_ctx = None
+    _g_prompt_mutator = None
+    _effective_values = merged["values"]
+    if _g_method is not None and _g_method["method"] != "dedicated":
+        _prep = _prepare_studio_method(bundle, merged["values"], _g_method)
+        if "error" in _prep:
+            return {"status": "error", "message": _prep["error"]}
+        _effective_values = _prep["merged_values"]
+        _g_method_ctx = _prep["ctx"]
+        # NOTE: _prep["ctx"] already carries kind + method NAME strings;
+        # overwriting method with the full dict would break post dispatch.
+        if _g_method["method"] == "conditioning":
+            def _g_prompt_mutator(workflow, _ctx=_g_method_ctx):
+                from studio_inpaint_expand import inject_inpaint_conditioning
+                new_workflow, diag = inject_inpaint_conditioning(
+                    workflow,
+                    source_file=_ctx["crop_source"],
+                    mask_file=_ctx["crop_mask"],
+                )
+                _ctx["injection"] = diag
+                return new_workflow
+    elif isinstance(_g_method, dict):
+        _resolved = _resolve_dedicated_override(
+            node_dir, workflow_id,
+            _transfer_values_with_method_mask(merged["values"], _g_method),
+            _g_method.get("override", ""),
+        )
+        if "error" in _resolved:
+            return {"status": "error", "message": _resolved["error"]}
+        bundle = _resolved["bundle"]
+        _effective_values = _resolved["merged"].get("values") or {}
+        _g_method_ctx = {
+            "kind": _g_method["kind"], "method": "dedicated",
+            "override": _g_method.get("override", ""),
+            "origin_workflow": str(workflow_id or ""),
+        }
     effective_options = dict(modal_options or {})
     try:
         applied, studio_meta, dropdown_repairs = _prepare_variant_prompt(
-            bundle, merged["values"], effective_options
+            bundle, _effective_values, effective_options
         )
     except GoldenRunError as exc:
         return {
@@ -787,6 +852,14 @@ async def run_golden_workflow(
             "message": str(exc),
         }
     use_generic_executor = not _canonical_golden_fast_path(applied["workflow"])
+    # Phase 3: conditioning insertion on the fast path mutates the prepared
+    # per-request copy (never the stored version); unknown node classes fail
+    # here loudly via ValueError, never silently.
+    if _g_prompt_mutator is not None and not use_generic_executor:
+        try:
+            applied["workflow"] = _g_prompt_mutator(applied["workflow"])
+        except ValueError as exc:
+            raise GoldenRunError(str(exc)[:300])
 
     event_store.start(request_id)
     event_store.append(request_id, {
@@ -812,7 +885,7 @@ async def run_golden_workflow(
             "client_id": request_id,
             "workflow_id": str(workflow_id or ""),
             "workflow_version_id": str(version_id or ""),
-            "studio_controls": copy.deepcopy(merged["values"]),
+            "studio_controls": copy.deepcopy(_effective_values),
             "repaired_empty_dropdowns": dropdown_repairs,
             "studio_meta": studio_meta,
         },
@@ -845,11 +918,21 @@ async def run_golden_workflow(
         history_run_id, history_generation_id = _begin_golden_history(
             request_id,
             profile,
-            merged["values"],
+            _effective_values,
             method=(
                 "run_plan_stream"
                 if use_generic_executor
                 else profile.target["method"]
+            ),
+            studio_method=(
+                {"kind": _g_method_ctx.get("kind"), "method": _g_method_ctx.get("method"),
+                 "box": _g_method_ctx.get("box"), "origin": _g_method_ctx.get("origin"),
+                 "pads": _g_method_ctx.get("pads"),
+                 "orig_size": _g_method_ctx.get("orig_size"),
+                 "wh_overridden": _g_method_ctx.get("wh_overridden", False),
+                 "injection": _g_method_ctx.get("injection"),
+                 "override": _g_method_ctx.get("override", "")}
+                if isinstance(_g_method_ctx, dict) else None
             ),
         )
         handle = (
@@ -860,9 +943,10 @@ async def run_golden_workflow(
         if use_generic_executor:
             plan, plan_error = build_workflow_execution_plan(
                 bundle,
-                merged["values"],
+                _effective_values,
                 modal_options=effective_options,
                 comfyui_root=str(node_dir),
+                prompt_mutator=_g_prompt_mutator,
             )
             if plan_error is not None or plan is None:
                 raise GoldenRunError(str(plan_error or "generic_execution_plan_failed"))
@@ -963,6 +1047,46 @@ async def run_golden_workflow(
                 "runId": request_id,
                 "profile": profile.name,
             }
+        # ── Phase 3: generic-method post step (stitch/preserve/output swap).
+        #    Runs on the materialized result before History completion, so the
+        #    record carries the FINAL image, never the working crop.
+        if isinstance(_g_method_ctx, dict) and str(_g_method_ctx.get("method") or "") != "dedicated":
+            try:
+                from studio_workflow_run import (
+                    _compose_method_final,
+                    _method_final_path,
+                )
+                from local_artifacts import get_studio_outputs_dir
+                _post_paths = materialized.get("output_paths")
+                _post_path = ""
+                if isinstance(_post_paths, (list, tuple)):
+                    for _cand in _post_paths:
+                        if isinstance(_cand, str) and _cand:
+                            _post_path = str(get_studio_outputs_dir() / _cand)
+                            if Path(_post_path).is_file():
+                                break
+                            _post_path = ""
+                if not _post_path:
+                    raise ValueError("method run produced no readable image")
+                from PIL import Image as _PILImage
+                _post_img = _PILImage.open(_post_path).convert("RGB")
+                _post_final, _post_diag = _compose_method_final(_g_method_ctx, _post_img)
+                _post_name = Path(_method_final_path()).name
+                _post_final.save(str(get_studio_outputs_dir() / _post_name))
+                materialized["output_paths"] = [_post_name]
+                _g_method_ctx["post"] = {
+                    "final": _post_name,
+                    "resized_result": bool(_post_diag.get("resized_result", False)),
+                }
+            except ValueError as exc:
+                _fail_golden_history(history_run_id, f"studio method post failed: {exc}"[:500])
+                return {
+                    "status": "error",
+                    "message": f"studio method post failed: {exc}"[:500],
+                    "request_id": request_id,
+                    "runId": request_id,
+                    "profile": profile.name,
+                }
         _complete_golden_history(
             history_run_id,
             materialized,

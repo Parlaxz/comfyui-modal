@@ -933,3 +933,176 @@ export function takePendingPlaygroundBase() {
   _pendingPlaygroundBase = null;
   return pending;
 }
+
+// ── Per-workflow explicit method preferences ────────────────────────────
+//
+// Explicit inpaint/expand method + override + expand-pad preferences,
+// keyed by workflow id so each workflow remembers its own selection.
+// Persists under one versioned localStorage key in the existing style.
+// Unknown/malformed payloads degrade to defaults; merge-patch ignores
+// unknown keys and invalid workflow ids. No UI, run, or backend logic.
+
+const WORKFLOW_METHODS_KEY = "comfymodal.studio.methods.v1";
+
+const WORKFLOW_INPAINT_METHODS = ["crop_stitch", "conditioning", "dedicated"];
+const WORKFLOW_EXPAND_METHODS = ["pad", "pad_preserve", "dedicated"];
+const WORKFLOW_METHOD_KEYS = [
+  "inpaintMethod",
+  "inpaintOverride",
+  "expandMethod",
+  "expandOverride",
+  "padTop",
+  "padRight",
+  "padBottom",
+  "padLeft",
+  "savedMask",
+  "savedMaskSource",
+];
+
+/**
+ * Fresh defaults for per-workflow method preferences.
+ * @returns {{inpaintMethod: string, inpaintOverride: string, expandMethod: string, expandOverride: string, padTop: number, padRight: number, padBottom: number, padLeft: number}}
+ */
+function _defaultWorkflowMethods() {
+  return {
+    inpaintMethod: "crop_stitch",
+    inpaintOverride: "",
+    expandMethod: "pad_preserve",
+    expandOverride: "",
+    padTop: 0,
+    padRight: 256,
+    padBottom: 0,
+    padLeft: 0,
+    savedMask: "",
+    savedMaskSource: "",
+  };
+}
+
+/**
+ * Sanitize a pad value to a non-negative int, falling back on mismatch.
+ * @param {*} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+function _sanitizePadInt(value, fallback) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value));
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const num = Number(value);
+    if (Number.isFinite(num)) return Math.max(0, Math.floor(num));
+  }
+  return fallback;
+}
+
+/**
+ * Sanitize a raw methods entry into the canonical shape with defaults.
+ * @param {*} raw
+ * @returns {{inpaintMethod: string, inpaintOverride: string, expandMethod: string, expandOverride: string, padTop: number, padRight: number, padBottom: number, padLeft: number}}
+ */
+function _sanitizeWorkflowMethods(raw) {
+  const defaults = _defaultWorkflowMethods();
+  if (!raw || typeof raw !== "object") return defaults;
+  return {
+    inpaintMethod: WORKFLOW_INPAINT_METHODS.indexOf(raw.inpaintMethod) !== -1
+      ? raw.inpaintMethod
+      : defaults.inpaintMethod,
+    inpaintOverride: typeof raw.inpaintOverride === "string" ? raw.inpaintOverride : "",
+    expandMethod: WORKFLOW_EXPAND_METHODS.indexOf(raw.expandMethod) !== -1
+      ? raw.expandMethod
+      : defaults.expandMethod,
+    expandOverride: typeof raw.expandOverride === "string" ? raw.expandOverride : "",
+    padTop: _sanitizePadInt(raw.padTop, defaults.padTop),
+    padRight: _sanitizePadInt(raw.padRight, defaults.padRight),
+    padBottom: _sanitizePadInt(raw.padBottom, defaults.padBottom),
+    padLeft: _sanitizePadInt(raw.padLeft, defaults.padLeft),
+    savedMask: typeof raw.savedMask === "string" ? raw.savedMask : "",
+    savedMaskSource: typeof raw.savedMaskSource === "string" ? raw.savedMaskSource : "",
+  };
+}
+
+/**
+ * Read the raw methods map ({[workflowId]: entry}) or {} on any failure.
+ * @returns {object}
+ */
+function _readWorkflowMethodsStore() {
+  try {
+    if (typeof localStorage === "undefined") return {};
+    const raw = localStorage.getItem(WORKFLOW_METHODS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    return parsed;
+  } catch (e) {
+    return {};
+  }
+}
+
+/**
+ * Load sanitized per-workflow method preferences.
+ * Unknown workflowId or malformed storage yields defaults.
+ * @param {string} workflowId
+ * @returns {{inpaintMethod: string, inpaintOverride: string, expandMethod: string, expandOverride: string, padTop: number, padRight: number, padBottom: number, padLeft: number}}
+ */
+export function loadWorkflowMethods(workflowId) {
+  if (typeof workflowId !== "string" || !workflowId) return _defaultWorkflowMethods();
+  const store = _readWorkflowMethodsStore();
+  return _sanitizeWorkflowMethods(store[workflowId]);
+}
+
+/**
+ * Merge-patch known method keys for one workflow id and persist.
+ * Unknown keys and invalid ids are ignored; values are sanitized.
+ * @param {string} workflowId
+ * @param {object} patch
+ */
+export function saveWorkflowMethods(workflowId, patch) {
+  if (typeof workflowId !== "string" || !workflowId) return;
+  if (!patch || typeof patch !== "object") return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    const store = _readWorkflowMethodsStore();
+    const next = _sanitizeWorkflowMethods(store[workflowId]);
+    if (Object.prototype.hasOwnProperty.call(patch, "inpaintMethod")
+      && WORKFLOW_INPAINT_METHODS.indexOf(patch.inpaintMethod) !== -1) {
+      next.inpaintMethod = patch.inpaintMethod;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "inpaintOverride")
+      && typeof patch.inpaintOverride === "string") {
+      next.inpaintOverride = patch.inpaintOverride;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "expandMethod")
+      && WORKFLOW_EXPAND_METHODS.indexOf(patch.expandMethod) !== -1) {
+      next.expandMethod = patch.expandMethod;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "expandOverride")
+      && typeof patch.expandOverride === "string") {
+      next.expandOverride = patch.expandOverride;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "padTop")) {
+      next.padTop = _sanitizePadInt(patch.padTop, next.padTop);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "padRight")) {
+      next.padRight = _sanitizePadInt(patch.padRight, next.padRight);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "padBottom")) {
+      next.padBottom = _sanitizePadInt(patch.padBottom, next.padBottom);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "padLeft")) {
+      next.padLeft = _sanitizePadInt(patch.padLeft, next.padLeft);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "savedMask")
+      && typeof patch.savedMask === "string") {
+      next.savedMask = patch.savedMask;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "savedMaskSource")
+      && typeof patch.savedMaskSource === "string") {
+      next.savedMaskSource = patch.savedMaskSource;
+    }
+    void WORKFLOW_METHOD_KEYS;
+    store[workflowId] = next;
+    localStorage.setItem(WORKFLOW_METHODS_KEY, JSON.stringify(store));
+  } catch (e) {
+    // Ignore
+  }
+}

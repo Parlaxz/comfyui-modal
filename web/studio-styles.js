@@ -2361,8 +2361,22 @@ button.comfymodal-studio-viewer-prompt-copy {
      of dotted background on wide workspaces. */
   max-width: min(100%, 640px);
   max-height: 100%;
+  height: auto;
   object-fit: contain;
   border-radius: var(--border-radius-sm, 4px);
+}
+/* Paint overlay wraps fill the canvas column height; the image beside
+   the paint canvas keeps its aspect with height auto. The paint overlay
+   itself stays inset:0 / 100% so strokes track the image exactly. */
+[data-testid="inpaint-canvas-wrap"],
+[data-testid="sketch-canvas-wrap"] {
+  height: 100%;
+}
+[data-testid="inpaint-canvas-wrap"] > .comfymodal-studio-canvas-output,
+[data-testid="sketch-canvas-wrap"] > .comfymodal-studio-canvas-output,
+[data-testid="inpaint-canvas-wrap"] > img,
+[data-testid="sketch-canvas-wrap"] > img {
+  height: auto;
 }
 
 @media (max-width: 640px) {

@@ -49,6 +49,8 @@ import {
   loadGoldenProfileSelection,
   saveShellSelection,
   loadShellSelection,
+  loadWorkflowMethods,
+  saveWorkflowMethods,
   SHELL_MODES,
   SHELL_SUBTOOLS,
   SHELL_PLACEHOLDERS,
@@ -59,7 +61,7 @@ import {
   projectRunToLegacy,
   LEGACY_TERMINAL_STATUSES,
 } from "./studio-playground-run.js";
-import { updateRunAnnotation, saveRunOutput } from "./studio-backend-api.js";
+import { updateRunAnnotation, saveRunOutput, getMethodCompat } from "./studio-backend-api.js";
 import { createHistoryRepository } from "./history-v2-repository.js";
 import { requestHistoryRecordFocus } from "./studio-history-v2.js";
 
@@ -1703,8 +1705,12 @@ function workflowGatingInfo(store, wf, state) {
   if (!store.workflowId) return { text: "Select a workflow", color: "" };
   if (!store.workflowVersionId) return { text: "Select a Workflow", color: "" };
   if (store.status === "loading" || !wf || !store.runContext) {
-    return { text: store.status === "loading" ? "Loading\u2026" : "Loading workflow\u2026", color: "" };
+    return { text: store.status === "loading" ? "Loading…" : "Loading workflow…", color: "" };
   }
+  // Phase 3: explicit method requirements gate the same line/button.
+  var _methodReason = null;
+  try { _methodReason = _studioMethodGate(state); } catch (_e) { _methodReason = null; }
+  if (_methodReason) return { text: _methodReason, color: "#d9a441" };
   // Use the same local/remote decision as the Run button. A selected Golden
   // profile executes in the deployed container, so host-local dependency
   // reasons must not be shown as a reason that remote execution is blocked.
@@ -1932,15 +1938,19 @@ function _workflowSelectEl(state, actions, context) {
   if (!store.workflowId) placeholder.selected = true;
   select.appendChild(placeholder);
   var tool = activeToolOf(state);
-  // Phase 2 compatibility: Edit/Select runs on ordinary I2I workflows, but
-  // the shelf dropdown still lists dedicated legacy inpaint workflows as an
-  // expert override — otherwise they would have no entry point.
-  var _selectListsLegacy = (tool === "i2i" && activeModeOf(state) === "edit" && activeSubtoolOf(state) === "select");
+  // Phase 2/3 compatibility: Edit/Select runs on ordinary I2I workflows but
+  // still lists dedicated legacy inpaint workflows (and Edit/Expand lists
+  // legacy outpaint) as expert overrides — otherwise they would have no
+  // entry point. Scoped by visible shell, not by active tool, so both
+  // directions stay reachable.
+  var _shellMode = activeModeOf(state);
+  var _shellSub = activeSubtoolOf(state);
   var rows = (store.library || []).filter(function (w) {
     var t = _workflowTypeOfRow(w);
     if (!t) return true;
     if (t === tool) return true;
-    if (_selectListsLegacy && t === "inpaint") return true;
+    if (_shellMode === "edit" && _shellSub === "select" && t === "inpaint") return true;
+    if (_shellMode === "edit" && _shellSub === "expand" && t === "outpaint") return true;
     return false;
   });
   if (!rows.length) {
@@ -2497,6 +2507,9 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
   var _gateBusy = !!_gatePg._batchApplying
     || (_gatePg.runState && ["created", "submitted", "waiting", "queued", "in_progress", "running"].indexOf(_gatePg.runState.status) !== -1);
   var _gate = _shellRunGate(state);
+  if (!_gate) {
+    try { _gate = _studioMethodGate(state); } catch (_e) { _gate = null; }
+  }
   if (_gate && !_gateBusy) {
     if (state && state.playground && state.playground.queueMode) {
       btn.textContent = "Queue";
@@ -2744,6 +2757,12 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   });
   payload.request_id = requestId;
   payload.profile_name = loadGoldenProfileSelection() || modalOptions.golden_profile || null;
+  // Phase 3: explicit generic method rides top-level (never inside controls,
+  // which are schema-validated). Null/absent means a plain run.
+  try {
+    var _sm = _studioMethodForRun(state, store);
+    if (_sm) payload.studio_method = _sm;
+  } catch (_e) {}
   ctrl.mark("build_end");
   // Lineage ownership: stash the submitted source with the request. Poll-path
   // completion must attribute the output to what was actually submitted, not
@@ -4758,6 +4777,10 @@ function _renderToolEditor(state, context, actions, canvasEl) {
   // stay stable; legacy dedicated inpaint workflows render through the branch
   // above. No Inpaint execution method is implemented here (Phase 3).
   if (_isSelectOnI2I(state)) return _renderPaintEditor(state, "inpaint", context, actions, canvasEl);
+  // Phase 3: the same expansion editor serves Edit/Expand on I2I. The editor
+  // keeps the "outpaint" id so testids and save paths stay stable; legacy
+  // dedicated outpaint workflows render through the branch above.
+  if (_isExpandOnI2I(state)) return _renderOutpaintEditor(state, context, actions);
   if (tool === "outpaint") return _renderOutpaintEditor(state, context, actions);
   return null;
 }
@@ -4846,6 +4869,12 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   ops.appendChild(saveBtn);
   box.appendChild(controls);
   box.appendChild(ops);
+  // Phase 3: explicit Inpaint Method lives with the selection tools, on the
+  // I2I engine only. Legacy dedicated inpaint workflows run natively.
+  if (_isSelectOnI2I(state)) {
+    box.appendChild(_methodSelectRow(state, context, actions, "inpaint", null));
+    _refreshMethodCompat(state, context);
+  }
   var samRow = el("div", { style: "display:none;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;", "data-testid": tool + "-sam-row" });
   var samText = el("input", { type: "text", placeholder: "person, hair, red car, shirt", "data-testid": tool + "-sam-text", "aria-label": "Describe what to select", style: "flex:1;min-width:140px;" });
   var samConf = el("input", { type: "number", min: "0.05", max: "0.95", step: "0.05", value: "0.3", "data-testid": tool + "-sam-conf", title: "Confidence", style: "width:64px;" });
@@ -4881,7 +4910,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     base = hostImg;
     // max-width keeps the shrink-to-fit wrap (and the image inside it)
     // capped at the canvas column, exactly as the bare image was before.
-    var hostWrap = el("div", { style: "position:relative;display:inline-block;max-width:100%;vertical-align:top;", "data-testid": tool + "-canvas-wrap" });
+    var hostWrap = el("div", { style: "position:relative;display:inline-block;max-width:100%;height:100%;vertical-align:top;", "data-testid": tool + "-canvas-wrap" });
     // Cap paint-mode display size (width to the column, height to the
     // viewport): full-res sources otherwise blow up the workspace. The
     // overlay maps coordinates, so any display size paints accurately.
@@ -4895,7 +4924,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   } else {
     // No main-canvas image (nothing to paint on yet): keep the separate
     // editor base so an uploaded source is still paintable.
-    var wrap = el("div", { style: "position:relative;display:inline-block;max-width:100%;", "data-testid": tool + "-canvas-wrap" });
+    var wrap = el("div", { style: "position:relative;display:inline-block;max-width:100%;height:100%;", "data-testid": tool + "-canvas-wrap" });
     base = el("img", { "data-testid": tool + "-base-image", alt: "Base image", style: "display:block;max-width:480px;max-height:360px;" });
     var baseUrl = _editorBaseImageUrl(state);
     if (baseUrl) base.src = baseUrl;
@@ -4916,7 +4945,31 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     if (!w || !h) return;
     paint.width = w;
     paint.height = h;
+    syncOverlayBox();
   }
+  // The overlay must sit exactly over the base image: the wrap may be
+  // taller than the image (column-fill layout), and inset:0/100% would then
+  // stretch strokes away from the image. Sync explicit geometry instead.
+  function syncOverlayBox() {
+    try {
+      if (!base || !base.isConnected || !paint.isConnected) return;
+      var wrapEl = paint.parentElement;
+      if (!wrapEl) return;
+      var wr = wrapEl.getBoundingClientRect();
+      var br = base.getBoundingClientRect();
+      if (!br.width || !br.height) return;
+      paint.style.inset = "auto";
+      paint.style.left = (br.left - wr.left) + "px";
+      paint.style.top = (br.top - wr.top) + "px";
+      paint.style.width = br.width + "px";
+      paint.style.height = br.height + "px";
+    } catch (_e) {}
+  }
+  function onWinResizeOverlay() {
+    if (!box.isConnected) { window.removeEventListener("resize", onWinResizeOverlay); return; }
+    syncOverlayBox();
+  }
+  window.addEventListener("resize", onWinResizeOverlay);
   base.addEventListener("load", fitCanvas);
   if (base.complete) setTimeout(fitCanvas, 0);
 
@@ -5396,6 +5449,22 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
       }
       var targetRole = isMask ? "mask" : "source_image";
       if (isMask && !_schemaHasRole(state, "mask")) {
+        // Phase 3: on the I2I engine the method mask needs no mapping — it
+        // travels in the run's method params, never as a mapped control (a
+        // filename written into a MASK socket would break plain runs).
+        // Remember it per-workflow next to the method choice instead.
+        if (activeToolOf(state) === "i2i") {
+          try {
+            var _sv = _shelfStore(state);
+            var _wid = _sv && _sv.workflowId ? String(_sv.workflowId) : "";
+            var _cur = (_sv && _sv.controlValues && _sv.controlValues.source_image) || "";
+            if (_wid) saveWorkflowMethods(_wid, { savedMask: name, savedMaskSource: String(_cur || "") });
+          } catch (_e2) {}
+          try { _recordImageEdge(state, name, liveBase); } catch (_e3) {}
+          try { _syncWorkflowGating(state, context, actions); } catch (_e4) {}
+          preview.textContent = "Mask saved: " + name;
+          return;
+        }
         preview.textContent = "This workflow has no Mask binding — mask not saved (map one in the Wizard to use it).";
         return;
       }
@@ -5426,13 +5495,31 @@ function _renderOutpaintEditor(state, context, actions) {
   }));
   var grid = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;" });
   var fields = {};
+  // Phase 3: pad amounts are per-workflow method inputs — they persist with
+  // the Expand Method choice and travel to the run as method params.
+  var _padPrefs = null;
+  try {
+    var _padStore = _shelfStore(state);
+    _padPrefs = loadWorkflowMethods(_padStore && _padStore.workflowId ? String(_padStore.workflowId) : "");
+  } catch (_e) { _padPrefs = null; }
+  if (!_padPrefs) _padPrefs = { padTop: 0, padRight: 256, padBottom: 0, padLeft: 0 };
+  var _padKeys = { top: "padTop", right: "padRight", bottom: "padBottom", left: "padLeft" };
   [["top", "Top"], ["right", "Right"], ["bottom", "Bottom"], ["left", "Left"]].forEach(function (pair) {
     var key = pair[0];
     var label = pair[1];
     var input = el("input", {
-      type: "number", min: "0", max: "1024", step: "8", value: key === "right" ? "256" : "0",
+      type: "number", min: "0", max: "4096", step: "8", value: String(_padPrefs[_padKeys[key]] || 0),
       class: "comfymodal-input", style: "width:90px;",
       "data-testid": "outpaint-" + key, "aria-label": "Expand " + label,
+    });
+    input.addEventListener("input", function () {
+      var patch = {};
+      patch[_padKeys[key]] = Math.max(0, Number(input.value) || 0);
+      try {
+        var _pst = _shelfStore(state);
+        saveWorkflowMethods(_pst && _pst.workflowId ? String(_pst.workflowId) : "", patch);
+      } catch (_e2) {}
+      try { _syncWorkflowGating(state, context, actions); } catch (_e3) {}
     });
     fields[key] = input;
     grid.appendChild(el("label", { text: label + " ", style: "font-size:11px;color:#888;" }, [input]));
@@ -5440,6 +5527,16 @@ function _renderOutpaintEditor(state, context, actions) {
   var saveBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: "Save expansion", "data-testid": "outpaint-save" });
   grid.appendChild(saveBtn);
   box.appendChild(grid);
+  // Phase 3: explicit Expand Method on the I2I engine. Legacy dedicated
+  // outpaint workflows run natively.
+  if (_isExpandOnI2I(state)) {
+    box.appendChild(_methodSelectRow(state, context, actions, "expand", function () {
+      var hasWH = false;
+      try { hasWH = _schemaHasRole(state, "width") && _schemaHasRole(state, "height"); } catch (_e4) { hasWH = false; }
+      if (hasWH) return "";
+      return "Output will be resampled to fit — map Width/Height in the Wizard for exact sizes.";
+    }));
+  }
   var status = el("p", { class: "comfymodal-studio-control-note", text: "Original stays centered; new area is masked.", "data-testid": "outpaint-preview-note" });
   box.appendChild(status);
   saveBtn.addEventListener("click", async function () {
@@ -6440,19 +6537,404 @@ function _subtoolExecutionType(mode, subtool) {
   switch (subtool) {
     case "text": return mode === "edit" ? "i2i" : "t2i";
     case "select": return "i2i";
-    case "expand": return "outpaint";
+    // Phase 3: Edit/Expand is I2I + Expand Method, not a separate workflow
+    // family. Dedicated legacy outpaint workflows remain usable: selecting
+    // one still opens Edit/Expand (see _defaultShellForTool) as a
+    // compatibility override.
+    case "expand": return "i2i";
     case "sketch": return "sketch";
     default: return null;
   }
 }
 
 // Phase 2 selection context: Edit/Select on an ordinary I2I workflow.
-// One explicit predicate (not a framework) shared by the editor dispatch,
+// Phase 3 selection context: Edit/Expand on an ordinary I2I workflow.
+// One explicit predicate each (not a framework) shared by editor dispatch,
 // canvas base routing, and workflow-picker scoping below.
 function _isSelectOnI2I(state) {
   return activeToolOf(state) === "i2i"
     && activeModeOf(state) === "edit"
     && activeSubtoolOf(state) === "select";
+}
+function _isExpandOnI2I(state) {
+  return activeToolOf(state) === "i2i"
+    && activeModeOf(state) === "edit"
+    && activeSubtoolOf(state) === "expand";
+}
+
+// Workflow-picker scope follows the visible shell (not the active tool), so
+// ordinary I2I plus the matching legacy override stay reachable together.
+function _pickerTypesForShell(state) {
+  var mode = activeModeOf(state);
+  var sub = activeSubtoolOf(state);
+  if (mode === "edit" && sub === "select") return ["i2i", "inpaint"];
+  if (mode === "edit" && sub === "expand") return ["i2i", "outpaint"];
+  return activeToolOf(state);
+}
+
+// ── Phase 3: explicit generic-method state ──────────────────────────────
+// The selected method is a per-workflow UI preference (localStorage, see
+// studio-playground-state.js); execution reads it at submit time. No Auto:
+// the dropdown always shows one explicit method, defaulting to Crop + Stitch
+// (inpaint) / Pad + Preserve (expand) until the user picks otherwise.
+
+// Latest conditioning-compatibility answer, keyed by workflow+version.
+// Advisory only: the backend revalidates anchors at execution time.
+var _methodCompatCache = { key: "", result: null };
+
+function _methodMaskFile(state, store, prefs) {
+  try {
+    var cv = (store && store.controlValues) || {};
+    if (cv.mask) return String(cv.mask);
+    var cur = cv.source_image || "";
+    if (prefs && prefs.savedMask && prefs.savedMaskSource && cur
+      && String(prefs.savedMaskSource) === String(cur)) {
+      return String(prefs.savedMask);
+    }
+  } catch (_e) {}
+  return "";
+}
+
+// Explicit method request for the current shell, or null for a plain run.
+// Generic methods only ever apply on the I2I engine; legacy tools run native.
+function _studioMethodForRun(state, store) {
+  try {
+    if (!state || !store || !store.workflowId) return null;
+    if (activeToolOf(state) !== "i2i") return null;
+    if (activeModeOf(state) !== "edit") return null;
+    var sub = activeSubtoolOf(state);
+    var prefs = loadWorkflowMethods(store.workflowId);
+    if (sub === "select") {
+      if (prefs.inpaintMethod === "dedicated") {
+        if (!prefs.inpaintOverride) return null;
+        // Dedicated inpaint still consumes the Select-subtool mask: it rides
+        // in params (like generic methods) and the backend feeds it to the
+        // override workflow's own mask role — never as a control here.
+        return {
+          kind: "inpaint", method: "dedicated",
+          params: { mask_file: _methodMaskFile(state, store, prefs) },
+          override: prefs.inpaintOverride,
+        };
+      }
+      return {
+        kind: "inpaint", method: prefs.inpaintMethod,
+        params: { mask_file: _methodMaskFile(state, store, prefs) },
+      };
+    }
+    if (sub === "expand") {
+      if (prefs.expandMethod === "dedicated") {
+        if (!prefs.expandOverride) return null;
+        return { kind: "expand", method: "dedicated", params: {}, override: prefs.expandOverride };
+      }
+      return {
+        kind: "expand", method: prefs.expandMethod,
+        params: { top: prefs.padTop, right: prefs.padRight, bottom: prefs.padBottom, left: prefs.padLeft },
+      };
+    }
+    return null;
+  } catch (_e) { return null; }
+}
+
+// Honest run gate for explicit methods (reason string or null). Runs after
+// the shell gate; the backend revalidates everything at execution.
+function _studioMethodGate(state) {
+  try {
+    var pg = state && state.playground;
+    var store = pg && pg._workflowRun;
+    if (!pg || !store || !store.workflowId) return null;
+    if (activeToolOf(state) !== "i2i") return null;
+    if (activeModeOf(state) !== "edit") return null;
+    var sub = activeSubtoolOf(state);
+    var prefs = loadWorkflowMethods(store.workflowId);
+    if (sub === "select") {
+      if (prefs.inpaintMethod === "dedicated" && !prefs.inpaintOverride) {
+        return "Choose a dedicated inpaint workflow";
+      }
+      if ((prefs.inpaintMethod === "crop_stitch" || prefs.inpaintMethod === "conditioning"
+        || prefs.inpaintMethod === "dedicated")
+        && !_methodMaskFile(state, store, prefs)) {
+        return "Save a mask in Edit → Select first";
+      }
+      if (prefs.inpaintMethod === "conditioning") {
+        var c = _methodCompatCache;
+        var key = String(store.workflowId) + "::" + String(store.workflowVersionId || "");
+        if (c && c.key === key && c.result && c.result.conditioning
+          && c.result.conditioning.compatible === false) {
+          var reasons = c.result.conditioning.reasons || [];
+          return "Conditioning incompatible: " + String(reasons[0] || "no anchor").slice(0, 140);
+        }
+      }
+      return null;
+    }
+    if (sub === "expand") {
+      if (prefs.expandMethod === "dedicated" && !prefs.expandOverride) {
+        return "Choose a dedicated expand workflow";
+      }
+      if ((prefs.expandMethod === "pad" || prefs.expandMethod === "pad_preserve")
+        && !(prefs.padTop + prefs.padRight + prefs.padBottom + prefs.padLeft > 0)) {
+        return "Set Top/Right/Bottom/Left expansion";
+      }
+      return null;
+    }
+    return null;
+  } catch (_e) { return null; }
+}
+
+// Refresh the conditioning-compatibility answer for the selected version,
+// then update the editor note + run gating. Best-effort; absence never blocks
+// (the backend is authoritative at execution).
+function _refreshMethodCompat(state, context) {
+  try {
+    var pg = state && state.playground;
+    var store = pg && pg._workflowRun;
+    if (!store || !store.workflowId || !store.workflowVersionId) return;
+    var key = String(store.workflowId) + "::" + String(store.workflowVersionId);
+    if (_methodCompatCache.key === key && _methodCompatCache.result) {
+      _paintCompatNote(state);
+      return;
+    }
+    _methodCompatCache.key = key;
+    _methodCompatCache.result = null;
+    var apiBase = (context && context.apiBase) || "/comfymodal";
+    getMethodCompat(apiBase, store.workflowId, store.workflowVersionId).then(function (res) {
+      if (!res || _methodCompatCache.key !== key) return;
+      _methodCompatCache.result = res;
+      _paintCompatNote(state);
+      try { _syncWorkflowGating(state, context, {}); } catch (_e) {}
+    }, function () {});
+  } catch (_e) {}
+}
+
+function _paintCompatNote(state) {
+  try {
+    var note = document.querySelector('[data-testid="inpaint-method-note"]');
+    if (!note || !note.isConnected) return;
+    var pg = state && state.playground;
+    var store = pg && pg._workflowRun;
+    var c = _methodCompatCache;
+    var key = store ? String(store.workflowId) + "::" + String(store.workflowVersionId || "") : "";
+    var res = (c && c.key === key) ? c.result : null;
+    var cond = res && res.conditioning;
+    if (!cond || cond.compatible !== true) {
+      note.textContent = (cond && cond.compatible === false)
+        ? "Conditioning unavailable here: " + String((cond.reasons || ["no anchor"])[0]).slice(0, 140)
+        : "";
+      return;
+    }
+    note.textContent = "Anchor: KSampler " + cond.sampler_id + " + VAE " + (cond.vae ? cond.vae[0] : "?");
+  } catch (_e) {}
+}
+
+// Dedicated-override picker: the shared workflow picker constrained to the
+// specialized family. Close without confirming leaves everything unchanged
+// (onClose) so Dedicated is never stranded without an override.
+function _openMethodOverridePicker(state, context, kind, currentId, onPick, onClose) {
+  try {
+    _closeShelfDialog();
+    var apiBase = (context && context.apiBase) || "/comfymodal";
+    var overlay = el("div", {
+      class: "comfymodal-studio-shelf-dialog-overlay",
+      "data-testid": "method-override-dialog",
+    });
+    var dialog = el("div", {
+      class: "comfymodal-studio-shelf-dialog",
+      role: "dialog",
+      "aria-label": "Choose dedicated workflow",
+    });
+    dialog.appendChild(el("h4", {
+      class: "comfymodal-studio-block-heading",
+      text: kind === "expand" ? "Dedicated Expand workflow" : "Dedicated Inpaint workflow",
+    }));
+    var closed = false;
+    function onKey(ev) {
+      if (ev.key === "Escape") {
+        // Self-cleaning: if our dialog node is already gone (e.g. ComfyUI
+        // closed the whole Studio modal underneath us), detach and do NOT
+        // fire the stale onClose, which would revert a newer choice.
+        if (!document.querySelector('[data-testid="method-override-dialog"]')) {
+          try { document.removeEventListener("keydown", onKey); } catch (_e) {}
+          return;
+        }
+        finish();
+        if (onClose) onClose();
+      }
+    }
+    function finish() {
+      // Our overlay has its own testid: _closeShelfDialog only removes the
+      // shelf dialogs. Detach the Esc listener too, or a later Escape would
+      // fire this dialog's stale onClose (e.g. reverting a newer choice).
+      if (closed) return;
+      closed = true;
+      try { document.removeEventListener("keydown", onKey); } catch (_e) {}
+      try {
+        var mine = document.querySelector('[data-testid="method-override-dialog"]');
+        if (mine && mine.parentNode) mine.parentNode.removeChild(mine);
+      } catch (_e2) {}
+      _closeShelfDialog();
+    }
+    var closeBtn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn",
+      "data-testid": "method-override-close",
+      text: "Close",
+    });
+    closeBtn.addEventListener("click", function () {
+      finish();
+      if (onClose) onClose();
+    });
+    dialog.appendChild(closeBtn);
+    dialog.appendChild(renderWorkflowPicker({
+      apiBase: apiBase,
+      mode: "single",
+      workflowTypes: kind === "expand" ? ["outpaint"] : ["inpaint"],
+      selectedIds: currentId ? [currentId] : [],
+      confirmLabel: "Use workflow",
+      onConfirm: function (ids) {
+        var next = ids && ids.length ? String(ids[0]) : "";
+        finish();
+        if (next && onPick) onPick(next);
+        else if (onClose) onClose();
+      },
+    }));
+    overlay.addEventListener("click", function (ev) {
+      if (ev.target === overlay) {
+        finish();
+        if (onClose) onClose();
+      }
+    });
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    try {
+      document.addEventListener("keydown", onKey);
+    } catch (e) { /* non-fatal */ }
+  } catch (_e) {}
+}
+
+function _overrideButtonLabel(state, store, id) {
+  try {
+    if (id && store && Array.isArray(store.library)) {
+      var row = store.library.find(function (w) { return String(w.workflow_id) === String(id); });
+      if (row) {
+        try { return _workflowOptionLabel(row); } catch (_e) { return String(row.name || id); }
+      }
+    }
+  } catch (_e) {}
+  return "Choose…";
+}
+
+// Shared explicit-method row for the Select/Expand editors (one concrete use
+// each). Fixed option sets, fixed testids, direct prefs — no framework.
+// noteText, when given, recomputes the note on every method change.
+function _methodSelectRow(state, context, actions, kind, noteText) {
+  var store = null;
+  try { store = _shelfStore(state); } catch (_e) { store = null; }
+  // The row may mount before a workflow finishes selecting: always resolve
+  // the workflow id live at event time so a choice is never saved nowhere.
+  function rowWfId() {
+    try {
+      var s = _shelfStore(state);
+      return (s && s.workflowId) ? String(s.workflowId) : "";
+    } catch (_e) { return ""; }
+  }
+  var wfId = rowWfId();
+  var prefs = loadWorkflowMethods(wfId);
+  var isInpaint = kind === "inpaint";
+  var methodKey = isInpaint ? "inpaintMethod" : "expandMethod";
+  var overrideKey = isInpaint ? "inpaintOverride" : "expandOverride";
+  var testid = isInpaint ? "inpaint" : "expand";
+  var options = isInpaint
+    ? [["crop_stitch", "Crop + Stitch"], ["conditioning", "Conditioning + Crop/Stitch"], ["dedicated", "Dedicated Workflow"]]
+    : [["pad", "Pad Canvas"], ["pad_preserve", "Pad + Preserve"], ["dedicated", "Dedicated Workflow"]];
+  var row = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center;" });
+  row.appendChild(el("span", {
+    text: isInpaint ? "Inpaint Method" : "Expand Method",
+    style: "font-size:12px;color:#aaa;",
+  }));
+  var sel = el("select", { "data-testid": testid + "-method", "aria-label": isInpaint ? "Inpaint Method" : "Expand Method" });
+  options.forEach(function (pair) {
+    var o = document.createElement("option");
+    o.value = pair[0];
+    o.textContent = pair[1];
+    if (prefs[methodKey] === pair[0]) o.selected = true;
+    sel.appendChild(o);
+  });
+  row.appendChild(sel);
+  var overBtn = el("button", {
+    type: "button", class: "comfymodal-secondary-btn",
+    text: _overrideButtonLabel(state, store, prefs[overrideKey]),
+    "data-testid": testid + "-override-btn",
+    title: "Choose a dedicated workflow",
+  });
+  overBtn.style.display = prefs[methodKey] === "dedicated" ? "" : "none";
+  function pickOverride() {
+    var cur = "";
+    try { cur = String(loadWorkflowMethods(rowWfId())[overrideKey] || ""); } catch (_e) {}
+    _openMethodOverridePicker(state, context, kind, cur, function (nextId) {
+      var patch = {};
+      patch[overrideKey] = nextId;
+      try { saveWorkflowMethods(rowWfId(), patch); } catch (_e2) {}
+      try { overBtn.textContent = _overrideButtonLabel(state, store, nextId); } catch (_e3) {}
+      try { _syncWorkflowGating(state, context, actions); } catch (_e4) {}
+    }, function () {
+      try { _syncWorkflowGating(state, context, actions); } catch (_e5) {}
+    });
+  }
+  overBtn.addEventListener("click", pickOverride);
+  row.appendChild(overBtn);
+  var note = el("p", {
+    class: "comfymodal-studio-control-note",
+    text: "",
+    style: "font-size:11px;color:#888;margin:0;flex-basis:100%;",
+    "data-testid": testid + "-method-note",
+  });
+  row.appendChild(note);
+  function paintNote() {
+    if (!note.isConnected) return;
+    if (typeof noteText === "function") {
+      try { note.textContent = noteText() || ""; } catch (_e) {}
+    }
+  }
+  paintNote();
+  sel.addEventListener("change", function () {
+    var prev = "";
+    try { prev = String(loadWorkflowMethods(rowWfId())[methodKey] || ""); } catch (_e) {}
+    var patch = {};
+    patch[methodKey] = sel.value;
+    try { saveWorkflowMethods(rowWfId(), patch); } catch (_e2) {}
+    var isDed = sel.value === "dedicated";
+    overBtn.style.display = isDed ? "" : "none";
+    paintNote();
+    if (!isInpaint || sel.value === "conditioning") {
+      try { _refreshMethodCompat(state, context); } catch (_e3) {}
+    }
+    if (isDed) {
+      var cur2 = "";
+      try { cur2 = String(loadWorkflowMethods(rowWfId())[overrideKey] || ""); } catch (_e4) {}
+      // Dedicated means nothing without an override: picking opens the
+      // picker now, and cancelling reverts instead of stranding the choice
+      // (the run gate would otherwise be the only guard).
+      if (!cur2) {
+        _openMethodOverridePicker(state, context, kind, "", function (nextId) {
+          var p2 = {};
+          p2[overrideKey] = nextId;
+          try { saveWorkflowMethods(rowWfId(), p2); } catch (_e5) {}
+          try { overBtn.textContent = _overrideButtonLabel(state, store, nextId); } catch (_e6) {}
+          try { _syncWorkflowGating(state, context, actions); } catch (_e7) {}
+        }, function () {
+          var pr = {};
+          pr[methodKey] = prev;
+          try { saveWorkflowMethods(rowWfId(), pr); } catch (_e8) {}
+          try { sel.value = prev; } catch (_e9) {}
+          overBtn.style.display = "none";
+          paintNote();
+          try { _syncWorkflowGating(state, context, actions); } catch (_e10) {}
+        });
+        return;
+      }
+    }
+    try { _syncWorkflowGating(state, context, actions); } catch (_e11) {}
+  });
+  return row;
 }
 
 // Sensible visible shell for an internal execution type. A sketch type
@@ -6464,6 +6946,13 @@ function _defaultShellForTool(toolId, currentMode, currentSubtool) {
   }
   if (toolId === "postprocess" && currentMode === "post" && currentSubtool !== "upscale") {
     return { mode: "post", subtool: currentSubtool };
+  }
+  // Phase 3: Text/Select/Expand all run on the I2I engine — switching between
+  // I2I workflows keeps the already-visible Edit subtool instead of yanking
+  // the user back to Text.
+  if (toolId === "i2i" && currentMode === "edit"
+    && (currentSubtool === "text" || currentSubtool === "select" || currentSubtool === "expand")) {
+    return { mode: "edit", subtool: currentSubtool };
   }
   var defaults = {
     t2i: { mode: "generate", subtool: "text" },
@@ -6950,6 +7439,8 @@ function _defaultSubtoolForMode(state, mode) {
     // Compatibility: a legacy dedicated inpaint workflow has no subtool of
     // its own anymore — it lives in Edit/Select on top of the I2I family.
     if (currentTool === "inpaint" && mode === "edit" && subs[i] === "select") return subs[i];
+    // Phase 3: same for a legacy dedicated outpaint workflow in Edit/Expand.
+    if (currentTool === "outpaint" && mode === "edit" && subs[i] === "expand") return subs[i];
   }
   return subs[0];
 }
@@ -8891,6 +9382,12 @@ function _clearBoundMask(state, context, actions) {
   try {
     if (_schemaHasRole(state, "mask")) commitShelfValue(state, context, actions, "mask", "");
   } catch (_e) { /* best-effort */ }
+  // Phase 3: a saved method mask is bound to its source image too.
+  try {
+    var _store = _shelfStore(state);
+    if (_store && _store.workflowId) saveWorkflowMethods(_store.workflowId, { savedMask: "", savedMaskSource: "" });
+  } catch (_e2) { /* best-effort */ }
+  try { _syncWorkflowGating(state, context, actions); } catch (_e3) { /* best-effort */ }
 }
 
 // The editor base image is gone (source cleared): wipe paint overlays
@@ -10076,7 +10573,7 @@ function _openShelfPickerDialog(state, context, actions) {
     mode: "single",
     // Same compatibility as the shelf dropdown: Edit/Select offers ordinary
     // I2I workflows plus legacy dedicated inpaint workflows.
-    workflowTypes: _isSelectOnI2I(state) ? ["i2i", "inpaint"] : activeToolOf(state),
+    workflowTypes: _pickerTypesForShell(state),
     selectedIds: currentId ? [currentId] : [],
     confirmLabel: "Use workflow",
     onConfirm: function (ids) {

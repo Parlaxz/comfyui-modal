@@ -7750,6 +7750,24 @@ if _server:
                 status=500,
             )
 
+    @_server.routes.get("/comfymodal/studio/method-compat")
+    async def studio_method_compat(request: web.Request) -> web.Response:
+        try:
+            from studio_workflow_run import method_compat_for_run
+            _compat_workflow_id = request.query.get("workflow_id", "")
+            _compat_version_id = request.query.get("version_id", "")
+            result = method_compat_for_run(
+                _compat_workflow_id, _compat_version_id, _NODE_DIR
+            )
+            status_code = 200 if result.get("status") == "ok" else 400
+            return web.json_response(result, status=status_code)
+        except Exception as exc:
+            _log.exception("Studio method compat error")
+            return web.json_response(
+                {"status": "error", "message": str(exc)},
+                status=500,
+            )
+
     @_server.routes.post("/comfymodal/studio/run")
     async def studio_run(request: web.Request) -> web.Response:
         """Execute a single Studio preset run.
@@ -7871,6 +7889,7 @@ if _server:
                             # build a client. Without this the run failed with
                             # "requires an active Modal workspace".
                             workspace=_golden_workspace(),
+                            studio_method=(body or {}).get("studio_method"),
                         ),
                         timeout=1800,
                     )
@@ -7914,6 +7933,7 @@ if _server:
         _studio_ws = _active_workspace() or {}
         _studio_gpu = (body or {}).get("gpu")
         _studio_mo = (body or {}).get("modal_options")
+        _studio_method = (body or {}).get("studio_method")
 
         # ── Modern Studio Workflow run branch ──────────────────────────
         # When the request carries a workflow_version_id, route through the
@@ -7948,6 +7968,7 @@ if _server:
                         gpu=_studio_gpu,
                         modal_options=_studio_mo,
                         workspace=_studio_ws,
+                        studio_method=_studio_method,
                     ),
                     timeout=600.0,
                 )

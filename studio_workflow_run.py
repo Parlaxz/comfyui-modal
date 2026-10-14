@@ -36,6 +36,7 @@ import copy
 import json
 import logging
 import os
+import random
 import time
 import uuid
 from collections.abc import Mapping
@@ -1323,6 +1324,7 @@ def build_workflow_execution_plan(
     trace_ctx: dict[str, Any] | None = None,
     comfyui_root: str = "",
     gpu: Any = None,
+    prompt_mutator: Any = None,
 ) -> tuple[Any, str | None]:
     """Build a frozen ``ExecutionPlan`` for a workflow run.
 
@@ -1379,6 +1381,15 @@ def build_workflow_execution_plan(
             return None, prepared["error"]
         workflow = prepared["workflow"]
         text_generate_meta = prepared.get("studio_meta") or {}
+        # Phase 3: optional explicit conditioning insertion for generic
+        # Inpaint. Runs on the already-copied prepared workflow, so the stored
+        # version is untouched; downstream validation/hashing then cover the
+        # adapted graph (unknown node classes fail loudly there, never silently).
+        if prompt_mutator is not None:
+            try:
+                workflow = prompt_mutator(workflow)
+            except ValueError as exc:
+                return None, str(exc)[:300]
         # Repair links fed by unconfigured dropdowns (same family as the
         # CLIP/VAE repairs below: complete wiring the graph left incomplete).
         dropdown_repairs = _repair_empty_dropdown_links(workflow)
@@ -1739,6 +1750,13 @@ async def _modern_save_history_success(
     meta["requested_controls"] = _plain_copy(plan.prompt_bundle)
     meta["experiment_id"] = run_history_id
     meta["workflow_hash"] = plan.workflow_hash
+    # Phase 3: generic-method provenance rides in meta (set by orchestration).
+    try:
+        _sm = capture.get("studio_method")
+        if isinstance(_sm, dict):
+            meta["studio_method"] = _plain_copy(_sm)
+    except Exception:
+        pass
 
     replay_meta = _build_plan_replay_meta(
         plan, modal_options=capture.get("modal_options")
@@ -2075,6 +2093,8 @@ async def _workflow_v2_run(
     gpu: Any,
     workspace: dict[str, Any] | None,
     trace_ctx: dict[str, Any] | None,
+    _method_ctx: dict[str, Any] | None = None,
+    _prompt_mutator: Any = None,
 ) -> dict[str, Any]:
     """V2 direct single-run via the PlaygroundService (injectable hooks).
 
@@ -2139,6 +2159,7 @@ async def _workflow_v2_run(
         return build_workflow_execution_plan(
             bundle, values, modal_options=modal_options, trace_ctx=trace_ctx,
             comfyui_root=str(node_dir or ""), gpu=gpu,
+            prompt_mutator=_prompt_mutator,
         )
 
     # ── Post-materialization success capture (capture-only, no History write
@@ -2267,6 +2288,46 @@ async def _workflow_v2_run(
         )
         return {"status": "error", "message": message}
 
+    # ── Phase 3: generic-method post step (stitch/preserve/output swap).
+    #    Runs before the first History write, so a post failure is recorded
+    #    truthfully and a success records the FINAL image, never the crop.
+    if _method_ctx is not None and str(_method_ctx.get("method") or "") != "dedicated":
+        try:
+            normalized, capture = _apply_studio_method_post(
+                normalized, capture, _method_ctx, bundle
+            )
+            json.dumps(normalized)
+        except ValueError as exc:
+            message = f"studio method post failed: {str(exc)[:300]}"
+            _log.warning("Workflow V2 method post failed: %s", message)
+            await _record_workflow_run_failure(
+                bundle,
+                values,
+                message,
+                started_at=started_at,
+                completed_at=_completed_at,
+                run_history_id=str(capture.get("run_history_id") or ""),
+                mono_start=mono_start,
+                plan=capture.get("plan"),
+                modal_options=modal_options,
+            )
+            return {"status": "error", "message": message}
+    elif isinstance(_method_ctx, dict):
+        # Dedicated (or plain routed) method: provenance stamp only.
+        try:
+            trace = normalized.get("trace")
+            if not isinstance(trace, dict):
+                trace = {}
+                normalized["trace"] = trace
+            trace["studio_method"] = {
+                "kind": _method_ctx.get("kind"),
+                "method": _method_ctx.get("method"),
+                "override": _method_ctx.get("override", ""),
+            }
+            capture["studio_method"] = dict(trace["studio_method"])
+        except Exception:
+            pass
+
     # ── Modern History success preparation/commit (the first history write
     #    happens only after every fallible metadata/output check passed) ──
     try:
@@ -2302,6 +2363,470 @@ async def _workflow_v2_run(
 # immutable V2 plan path via ``_workflow_v2_run``.
 
 
+# ── Phase 3: I2I-derived Inpaint + Expand (explicit generic methods) ──
+#
+# Contract (see V3 runbook §15):
+# - No Auto: the frontend sends an explicit studio_method; absent means a
+#   plain run through the unchanged path.
+# - Stored workflows are never mutated: pre/post operate on image files and
+#   per-request deep copies; the only graph touch (conditioning insertion)
+#   happens on the already-copied prepared workflow inside plan building.
+# - Crop/stitch/pad/preserve are deterministic Python image ops
+#   (studio_inpaint_expand); no model-name branches anywhere here.
+# - The mask travels in studio_method.params (never as a mapped control):
+#   writing a filename into a MASK socket would break plain runs.
+
+_STUDIO_METHOD_KINDS = {
+    "inpaint": ("crop_stitch", "conditioning", "dedicated"),
+    "expand": ("pad", "pad_preserve", "dedicated"),
+}
+
+
+def _sanitize_studio_method(raw):
+    """Validate a request studio_method. Returns (method|None, error|None).
+
+    Canonical shape:
+      {"kind": "inpaint"|"expand",
+       "method": "crop_stitch"|"conditioning"|"dedicated"|"pad"|"pad_preserve",
+       "params": {"mask_file": str, "top"|"right"|"bottom"|"left": int},
+       "override": "workflow-id"|""}
+    Unknown keys are stripped (forward-compatible); anything else fails
+    loudly — never a silent fallback to another method.
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, "studio_method must be an object"
+    kind = raw.get("kind")
+    if kind not in _STUDIO_METHOD_KINDS:
+        return None, f"unknown studio method kind {kind!r}"
+    method = raw.get("method")
+    if method not in _STUDIO_METHOD_KINDS[kind]:
+        return None, f"unknown {kind} method {method!r}"
+    params = raw.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    clean = {"kind": kind, "method": method, "params": {}, "override": ""}
+    if kind == "expand" and method != "dedicated":
+        pads = {}
+        for key in ("top", "right", "bottom", "left"):
+            value = params.get(key, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None, f"expand pad {key!r} must be a non-negative int"
+            pads[key] = value
+        if sum(pads.values()) == 0:
+            return None, "no expansion requested: set Top/Right/Bottom/Left"
+        clean["params"] = pads
+    elif method in ("crop_stitch", "conditioning"):
+        mask_file = params.get("mask_file", "")
+        if not isinstance(mask_file, str) or not mask_file.strip():
+            return None, "save a mask in Edit → Select first"
+        clean["params"] = {"mask_file": mask_file.strip()}
+    if method == "dedicated":
+        override = raw.get("override", "")
+        if not isinstance(override, str) or not override.strip():
+            return None, "choose a dedicated workflow first"
+        clean["override"] = override.strip()
+        if kind == "inpaint":
+            # Dedicated inpaint still consumes the Select-subtool mask: it is
+            # fed to the override workflow's own mask role at transfer time
+            # (never as a mapped control on the origin workflow).
+            mask_file = params.get("mask_file", "")
+            if not isinstance(mask_file, str) or not mask_file.strip():
+                return None, "save a mask in Edit → Select first"
+            clean["params"] = {"mask_file": mask_file.strip()}
+    return clean, None
+
+
+def _tolerated_method_base_errors(errors, method):
+    """Drop base-workflow 'mask' errors an inpaint method run bypasses.
+
+    The mask always travels in ``studio_method.params`` (never as a mapped
+    control on the origin workflow): generic methods consume it in
+    ``_prepare_studio_method`` (which re-validates the actual file), and
+    dedicated runs feed it to the override workflow's own mask role at
+    transfer time (the override merge re-validates it there).  Rejecting
+    the run on the origin workflow's required-mask mapping would make
+    every method run unrunnable, so those field errors — and only those —
+    are tolerated once sanitize has guaranteed a mask_file.
+    """
+    if not isinstance(method, dict) or method.get("kind") != "inpaint":
+        return errors
+    mask_file = (method.get("params") or {}).get("mask_file", "")
+    if not isinstance(mask_file, str) or not mask_file.strip():
+        return errors
+    return [
+        e for e in (errors or [])
+        if str((e or {}).get("field") or "") != "mask"
+    ]
+
+
+def _transfer_values_with_method_mask(merged_values, method):
+    """Prepare dedicated-transfer values: seed the method mask, defuse links.
+
+    ``_resolve_dedicated_override`` only transfers the four universal roles
+    from already-merged values; the mask lives in params, so without the
+    seeding below the override merge would see no mask and fail its own
+    required check.  Never overwrites an explicitly merged mask.
+
+    List-form values (``["node_id", slot]``) are node-link references that
+    are only meaningful inside their own graph: carrying one to another
+    graph silently rebinds it to whatever node shares the id there
+    (observed: origin PixaromaSeed node 8 vs override PixaromaPrompt node
+    8, feeding prompt text into an int slot).  At this boundary a
+    link-form seed is replaced with a fresh random seed — the origin seed
+    provider (e.g. PixaromaSeed) runs in random mode and has no scalar to
+    carry — and any other link-form role value is dropped so the override
+    default applies.  Returns a new dict.
+    """
+    values = dict(merged_values or {})
+    for role in ("prompt", "seed", "source_image", "mask"):
+        if isinstance(values.get(role), list):
+            if role == "seed":
+                values[role] = random.randint(0, 2**32 - 1)
+            else:
+                values.pop(role, None)
+    try:
+        if (
+            isinstance(method, dict)
+            and method.get("kind") == "inpaint"
+            and not str(values.get("mask") or "").strip()
+        ):
+            mask_file = str((method.get("params") or {}).get("mask_file") or "")
+            if mask_file.strip():
+                values["mask"] = mask_file.strip()
+    except Exception:
+        pass
+    return values
+
+
+def _method_wh_overrides(control_schema, w, h):
+    """Width/height control overrides for method working sizes, else {}.
+
+    Only when the workflow maps both roles; otherwise the caller falls back
+    to resampling the result (deterministic, recorded in diagnostics).
+    """
+    if not isinstance(control_schema, dict):
+        return {}
+    if "width" in control_schema and "height" in control_schema:
+        return {"width": int(w), "height": int(h)}
+    return {}
+
+
+def _method_input_path(filename):
+    """Resolve an uploaded image filename to a local path ( traversal-safe)."""
+    name = str(filename or "")
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise ValueError(f"refusing unsafe image reference {name!r}")
+    try:
+        import folder_paths
+        input_dir = str(folder_paths.get_input_directory())
+    except Exception as exc:
+        raise ValueError("ComfyUI input directory unavailable") from exc
+    path = os.path.join(input_dir, name)
+    if not os.path.isfile(path):
+        raise ValueError(f"image {name!r} not found on server — re-upload it")
+    return path
+
+
+def _method_temp_path(input_dir, tag):
+    return os.path.join(
+        str(input_dir), f"studio-method-{uuid.uuid4().hex[:8]}-{tag}.png"
+    )
+
+
+def _method_final_path():
+    from local_artifacts import get_studio_outputs_dir
+    return str(
+        get_studio_outputs_dir() / f"studio-method-{uuid.uuid4().hex[:8]}-final.png"
+    )
+
+
+def _method_pil():
+    from PIL import Image
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    return Image, resampling
+
+
+def _prepare_studio_method(bundle, values, method):
+    """Pre-execution file prep for generic methods.
+
+    Returns {"merged_values", "ctx"} or {"error"}.  Never mutates inputs or
+    the stored workflow; reads source/mask bytes, writes crop/pad temp files
+    into the ComfyUI input dir (so normal input collection picks them up).
+    """
+    from studio_inpaint_expand import (
+        crop_box_for_mask,
+        crop_image_and_mask,
+        mask_bbox,
+        pad_canvas,
+    )
+    from workflow_metadata import prompt_sha256
+    Image, _ = _method_pil()
+    schema = bundle.get("control_schema") or {}
+    controls = dict(values or {})
+    # Method runs consume the mask exclusively via params: a mapped mask role
+    # would otherwise write a filename into a MASK socket. Plain runs keep
+    # their existing mapping behavior untouched.
+    controls.pop("mask", None)
+    version = bundle.get("version") or {}
+    try:
+        stored_hash = prompt_sha256(version.get("executable_prompt") or {})
+    except Exception:
+        stored_hash = ""
+    try:
+        if method["kind"] == "inpaint":
+            source = str(controls.get("source_image") or "")
+            if not source:
+                raise ValueError("a source image is required")
+            mask_file = method["params"]["mask_file"]
+            src_path = _method_input_path(source)
+            msk_path = _method_input_path(mask_file)
+            src_img = Image.open(src_path).convert("RGB")
+            msk_img = Image.open(msk_path).convert("L")
+            resized_mask = False
+            if msk_img.size != src_img.size:
+                msk_img = msk_img.resize(src_img.size, _method_pil()[1])
+                resized_mask = True
+            bbox = mask_bbox(msk_img)
+            if bbox is None:
+                raise ValueError("mask is empty — paint a selection first")
+            box = crop_box_for_mask(src_img.width, src_img.height, bbox)
+            crop_rgb, crop_m = crop_image_and_mask(src_img, msk_img, box)
+            input_dir = os.path.dirname(src_path)
+            crop_source = os.path.basename(_method_temp_path(input_dir, "crop-source"))
+            crop_mask = os.path.basename(_method_temp_path(input_dir, "crop-mask"))
+            crop_rgb.save(os.path.join(input_dir, crop_source))
+            crop_m.save(os.path.join(input_dir, crop_mask))
+            merged2 = dict(controls)
+            merged2["source_image"] = crop_source
+            wh = _method_wh_overrides(schema, box[2] - box[0], box[3] - box[1])
+            merged2.update(wh)
+            ctx = {
+                "kind": method["kind"], "method": method["method"],
+                "box": list(box), "orig_size": [src_img.width, src_img.height],
+                "source_file": source, "mask_file": mask_file,
+                "crop_source": crop_source, "crop_mask": crop_mask,
+                "wh_overridden": bool(wh), "resized_mask": resized_mask,
+                "stored_hash": stored_hash,
+            }
+        else:
+            pads = method["params"]
+            source = str(controls.get("source_image") or "")
+            if not source:
+                raise ValueError("a source image is required")
+            src_path = _method_input_path(source)
+            src_img = Image.open(src_path).convert("RGB")
+            padded = pad_canvas(
+                src_img, pads["top"], pads["right"], pads["bottom"], pads["left"]
+            )
+            input_dir = os.path.dirname(src_path)
+            pad_name = os.path.basename(_method_temp_path(input_dir, "pad-source"))
+            padded.save(os.path.join(input_dir, pad_name))
+            merged2 = dict(controls)
+            merged2["source_image"] = pad_name
+            wh = _method_wh_overrides(schema, padded.width, padded.height)
+            merged2.update(wh)
+            ctx = {
+                "kind": method["kind"], "method": method["method"],
+                "pads": dict(pads),
+                "origin": [pads["left"], pads["top"]],
+                "orig_size": [src_img.width, src_img.height],
+                "padded_size": [padded.width, padded.height],
+                "source_file": source, "pad_source": pad_name,
+                "wh_overridden": bool(wh),
+                "stored_hash": stored_hash,
+            }
+    except ValueError as exc:
+        return {"error": str(exc)[:300]}
+    _log.info(
+        "Studio method pre: %s/%s box=%s pads=%s wh=%s",
+        method["kind"], method["method"],
+        ctx.get("box"), ctx.get("pads"), ctx.get("wh_overridden"),
+    )
+    return {"merged_values": merged2, "ctx": ctx}
+
+
+def _resolve_dedicated_override(node_dir, workflow_id, merged_values, override_id):
+    """Resolve + merge a dedicated override workflow. Shared by Modal/Golden.
+
+    Only the four universal Studio roles transfer (identical product meaning
+    everywhere); everything else comes from the override version's own
+    mapping/defaults, gated unchanged.  Returns {"bundle","merged"} or
+    {"error"}.  Never mutates inputs.
+    """
+    bundle = resolve_workflow_run_bundle(override_id, "", node_dir)
+    if not isinstance(bundle, dict) or bundle.get("status") != "ok":
+        message = ""
+        try:
+            message = str(bundle.get("message") or "")
+        except Exception:
+            message = ""
+        return {
+            "error": message or f"dedicated workflow {str(override_id)[:60]!r} is not runnable",
+        }
+    schema = bundle.get("control_schema") or {}
+    transfer = {}
+    for role in ("prompt", "seed", "source_image", "mask"):
+        value = (merged_values or {}).get(role)
+        if value is None or (isinstance(value, str) and value.strip() == ""):
+            continue
+        if role in schema:
+            transfer[role] = value
+    merged = merge_workflow_controls(
+        bundle.get("defaults") or {}, transfer, schema,
+    )
+    if merged["errors"]:
+        return {
+            "error": "; ".join(
+                f"{e['field']}: {e['message']}" for e in merged["errors"]
+            ),
+        }
+    return {"bundle": bundle, "merged": merged}
+
+
+def _compose_method_final(ctx, result_img):
+    """Composite the method final image. Shared by Modal/Golden post steps.
+
+    Takes ctx (from _prepare_studio_method) + the executed result as PIL RGB.
+    Returns (final PIL RGB, diag dict). Raises ValueError. No History, no
+    store access — callers swap recorded outputs themselves.
+    """
+    from studio_inpaint_expand import preserve_composite, stitch_composite
+    Image, lanczos = _method_pil()
+    method = str(ctx.get("method") or "")
+    resized_result = False
+    if method in ("crop_stitch", "conditioning"):
+        box = tuple(ctx["box"])
+        need = (box[2] - box[0], box[3] - box[1])
+        gen = result_img
+        if gen.size != need:
+            gen = gen.resize(need, lanczos)
+            resized_result = True
+        orig = Image.open(_method_input_path(ctx["source_file"])).convert("RGB")
+        full_mask = Image.open(_method_input_path(ctx["mask_file"])).convert("L")
+        if full_mask.size != orig.size:
+            full_mask = full_mask.resize(orig.size, lanczos)
+        final = stitch_composite(orig, gen, box, full_mask)
+    elif method == "pad_preserve":
+        need = tuple(ctx["padded_size"])
+        gen = result_img
+        if gen.size != need:
+            gen = gen.resize(need, lanczos)
+            resized_result = True
+        orig = Image.open(_method_input_path(ctx["source_file"])).convert("RGB")
+        final = preserve_composite(gen, orig, tuple(ctx["origin"]))
+    elif method == "pad":
+        need = tuple(ctx["padded_size"])
+        final = result_img
+        if final.size != need:
+            final = final.resize(need, lanczos)
+            resized_result = True
+    else:
+        raise ValueError(f"no post step for method {method!r}")
+    return final, {"resized_result": resized_result}
+
+
+def _apply_studio_method_post(normalized, capture, ctx, bundle):
+    """Composite the final image and swap recorded outputs.
+
+    Runs after a successful inner execution, before History commit.  Returns
+    (normalized, capture).  Raises ValueError on any failure (caller records
+    a truthful failure; no partial History write exists yet at this point).
+    """
+    from workflow_metadata import prompt_sha256
+    Image, _lanczos = _method_pil()
+    candidates = []
+    for path in (capture.get("materialized_paths") or []):
+        if path:
+            candidates.append(str(path))
+    primary = normalized.get("primary_output") or normalized.get("_local_primary_output")
+    if isinstance(primary, Mapping) and primary.get("path"):
+        candidates.append(str(primary["path"]))
+    result_img = None
+    for candidate in candidates:
+        try:
+            if os.path.isfile(candidate):
+                result_img = Image.open(candidate).convert("RGB")
+                break
+        except Exception:
+            continue
+    if result_img is None:
+        raise ValueError("method run produced no readable image")
+    method = str(ctx.get("method") or "")
+    final, composed = _compose_method_final(ctx, result_img)
+    resized_result = bool(composed.get("resized_result", False))
+    final_path = _method_final_path()
+    final.save(final_path)
+    capture["materialized_paths"] = [final_path]
+    try:
+        if isinstance(primary, dict) and primary.get("path"):
+            primary["path"] = final_path
+    except Exception:
+        pass
+    try:
+        after = prompt_sha256(((bundle or {}).get("version") or {}).get("executable_prompt") or {})
+        hash_unchanged = (after == ctx.get("stored_hash") and bool(after))
+    except Exception:
+        hash_unchanged = False
+    diag = {
+        "kind": ctx.get("kind"), "method": method,
+        "box": ctx.get("box"), "origin": ctx.get("origin"),
+        "pads": ctx.get("pads"),
+        "orig_size": ctx.get("orig_size"),
+        "wh_overridden": ctx.get("wh_overridden", False),
+        "resized_result": resized_result,
+        "stored_hash_unchanged": hash_unchanged,
+    }
+    if isinstance(ctx.get("injection"), dict):
+        diag["injection"] = ctx["injection"]
+    trace = normalized.get("trace")
+    if not isinstance(trace, dict):
+        trace = {}
+        normalized["trace"] = trace
+    trace["studio_method"] = diag
+    capture["studio_method"] = dict(diag)
+    _log.info(
+        "Studio method post: %s/%s final=%s hash_unchanged=%s",
+        ctx.get("kind"), method, final_path, hash_unchanged,
+    )
+    return normalized, capture
+
+
+def method_compat_for_run(workflow_id, version_id, node_dir):
+    """Method compatibility for a workflow version (Select/Expand gating).
+
+    Scans the STORED executable prompt (read-only) for Conditioning anchors.
+    Crop/stitch and pad methods are pure image ops and always compatible.
+    Returns a plain-JSON dict; never raises.
+    """
+    try:
+        bundle = resolve_workflow_run_bundle(workflow_id, version_id, node_dir)
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:200]}
+    if not isinstance(bundle, dict) or bundle.get("status") != "ok":
+        message = ""
+        try:
+            message = str((bundle or {}).get("message") or "bundle not runnable")
+        except Exception:
+            message = "bundle not runnable"
+        return {"status": "error", "message": message[:200]}
+    try:
+        from studio_inpaint_expand import find_conditioning_anchors
+        prompt = bundle.get("executable_prompt") or {}
+        anchors = find_conditioning_anchors(prompt)
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:200]}
+    return {
+        "status": "ok",
+        "workflow_id": str(workflow_id or ""),
+        "version_id": str(version_id or ""),
+        "conditioning": anchors,
+        "crop_stitch": {"compatible": True},
+        "pad": {"compatible": True},
+    }
+
+
 # ── Public entrypoint ────────────────────────────────────────────────────
 
 
@@ -2317,6 +2842,7 @@ async def handle_workflow_run_async(
     gpu: Any = None,
     modal_options: dict[str, Any] | None = None,
     workspace: dict[str, Any] | None = None,
+    studio_method: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Async handler for a single Studio Workflow run.
 
@@ -2339,14 +2865,23 @@ async def handle_workflow_run_async(
         merged = merge_workflow_controls(
             bundle.get("defaults") or {}, controls or {}, bundle["control_schema"]
         )
-        if merged["errors"]:
+        # ── Phase 3: sanitize the explicit method BEFORE base validation.
+        #    An inpaint method carries its mask in params (never as a mapped
+        #    control), so the origin workflow's required-mask errors are
+        #    tolerated here; the method pre-step / override merge below
+        #    re-validates the actual mask file authoritatively.
+        _method, _method_error = _sanitize_studio_method(studio_method)
+        if _method_error:
+            return {"status": "error", "message": _method_error}
+        _base_errors = _tolerated_method_base_errors(merged["errors"], _method)
+        if _base_errors:
             return {
                 "status": "error",
                 "error_code": "WORKFLOW_CONTROL_VALIDATION",
                 "message": "; ".join(
-                    f"{e['field']}: {e['message']}" for e in merged["errors"]
+                    f"{e['field']}: {e['message']}" for e in _base_errors
                 ),
-                "errors": merged["errors"],
+                "errors": _base_errors,
             }
 
         # ── Execution-mode resolution (mirrors handle_studio_run_async) ──
@@ -2396,10 +2931,63 @@ async def handle_workflow_run_async(
             trace_ctx["selected_gpu_source"] = _gpu_source
 
         _preset_id = str(preset_id or "")
+        # ── Phase 3: explicit generic-method orchestration. Plain runs
+        #    (studio_method None) take the exact historical path below.
+        #    (_method/_method_error were sanitized before base validation.)
+        _effective_merged = merged
+        _method_ctx = None
+        _prompt_mutator = None
+        if _method is not None and _method["method"] != "dedicated":
+            _prep = _prepare_studio_method(
+                bundle, merged.get("values") or {}, _method
+            )
+            if "error" in _prep:
+                return {"status": "error", "message": _prep["error"]}
+            _effective_merged = {"values": _prep["merged_values"], "errors": []}
+            _method_ctx = _prep["ctx"]
+            # NOTE: _prep["ctx"] already carries kind + method NAME strings.
+            # Do NOT overwrite ctx["method"] with the full method dict here:
+            # the post step dispatches on the name.
+            if _method["method"] == "conditioning":
+                def _prompt_mutator(workflow, _ctx=_method_ctx):
+                    from studio_inpaint_expand import inject_inpaint_conditioning
+                    new_workflow, diag = inject_inpaint_conditioning(
+                        workflow,
+                        source_file=_ctx["crop_source"],
+                        mask_file=_ctx["crop_mask"],
+                    )
+                    _ctx["injection"] = diag
+                    return new_workflow
+        elif isinstance(_method, dict):
+            # Dedicated override: execute the override workflow's own graph
+            # natively (no adaptation); shared helper so Modal and Golden
+            # resolve identically.
+            _over = _method.get("override", "")
+            _resolved = _resolve_dedicated_override(
+                node_dir, workflow_id,
+                _transfer_values_with_method_mask(
+                    merged.get("values") or {}, _method
+                ),
+                _over,
+            )
+            if "error" in _resolved:
+                return {"status": "error", "message": _resolved["error"]}
+            _log.info(
+                "Studio dedicated %s run: origin=%s override=%s version=%s",
+                _method["kind"], workflow_id, _over,
+                (_resolved["bundle"].get("version") or {}).get("workflow_version_id", ""),
+            )
+            bundle = _resolved["bundle"]
+            _effective_merged = _resolved["merged"]
+            _method_ctx = {
+                "kind": _method["kind"], "method": "dedicated",
+                "override": _over, "origin_workflow": str(workflow_id or ""),
+            }
         # H12: V2 is the only executable Workflow path.
         return await _workflow_v2_run(
-            bundle, merged, _preset_id, node_dir,
+            bundle, _effective_merged, _preset_id, node_dir,
             _effective_modal_options, _selected_gpu, workspace, trace_ctx,
+            _method_ctx=_method_ctx, _prompt_mutator=_prompt_mutator,
         )
     except Exception as exc:
         _log.warning("Workflow run failed: %s", exc)
