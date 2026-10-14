@@ -595,6 +595,9 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
           text: "Compare with Original",
           title: "Compare the displayed Data Saver with its retained Original",
           onclick: function () {
+            // One top-level modal at a time: dismiss the detail viewer
+            // through its existing close path before opening compare.
+            close();
             openComparePair({
               a: _compareDescriptor(displayed.url, displayed.kind === "thumbnail" ? "Thumbnail" : "Data Saver", displayed.kind, record),
               b: _compareDescriptor(feat.originalUrl, "Original", "original", record),
