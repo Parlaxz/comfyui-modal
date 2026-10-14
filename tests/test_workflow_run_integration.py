@@ -39,6 +39,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -2410,6 +2412,768 @@ def test_schema_defaults_are_hydrated_for_legacy_output_nodes(monkeypatch):
     assert {item["input"] for item in evidence["hydrated"]} == {
         "filename_prefix", "save_mode",
     }
+
+
+# ── Phase 8 Lane B: reference-image execution (ordinary lane) ─────────────
+#
+# Fast unit tests only: temp-dir domain service, fake input files, fake
+# PlaygroundService seam, real plan builder on the non-production path (no
+# Torch/Modal/heavy lifecycle). Every failure case asserts the run
+# dispatches nothing (the service is never constructed).
+
+
+def _ref_node_defs(class_type: str):
+    """Deterministic node schemas mirroring production discovery evidence."""
+    if class_type == "RefConditioner":
+        return (
+            {
+                "clip": ("CLIP",),
+                "text": ("STRING", {"multiline": True}),
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+            },
+            {},
+        )
+    if class_type == "LoadImage":
+        return ({"image": ("STRING",)}, {})
+    if class_type == "CLIPLoader":
+        return ({"clip_name": ("STRING",)}, {})
+    if class_type == "CLIPTextEncode":
+        return ({"text": ("STRING", {"multiline": True}), "clip": ("CLIP",)}, {})
+    return ({}, {})
+
+
+def _ref_m1_prompt(shared_loader=False) -> dict:
+    slot2 = ["7", 0] if shared_loader else ["8", 0]
+    nodes = {
+        "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat", "clip": ["1", 0]}},
+        "3": {"class_type": "RefConditioner", "inputs": {
+            "clip": ["1", 0], "text": "cat",
+            "image_1": ["7", 0], "image_2": slot2}},
+        "7": {"class_type": "LoadImage", "inputs": {"image": "base.png"}},
+        "9": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "m.safetensors"}},
+        "4": {"class_type": "KSampler", "inputs": {
+            "model": ["9", 0], "seed": 1, "steps": 5, "cfg": 7.0,
+            "sampler_name": "euler", "scheduler": "normal",
+            "positive": ["3", 0], "negative": ["2", 0],
+            "latent_image": ["5", 0], "denoise": 1.0}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 64, "height": 64, "batch_size": 1}},
+        "6": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]}},
+    }
+    if not shared_loader:
+        nodes["8"] = {"class_type": "LoadImage", "inputs": {"image": "other.png"}}
+    return nodes
+
+
+def _ref_m2_prompt() -> dict:
+    return {
+        "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat", "clip": ["1", 0]}},
+        "7": {"class_type": "LoadImage", "inputs": {"image": "r.png"}},
+        "8": {"class_type": "VAELoader", "inputs": {"vae_name": "v.safetensors"}},
+        "9": {"class_type": "VAEEncode", "inputs": {"pixels": ["7", 0], "vae": ["8", 0]}},
+        "10": {"class_type": "ReferenceLatent", "inputs": {"latent": ["9", 0], "conditioning": ["2", 0]}},
+        "11": {"class_type": "UNETLoader", "inputs": {"unet_name": "u.safetensors"}},
+        "4": {"class_type": "KSampler", "inputs": {
+            "model": ["11", 0], "seed": 1, "steps": 5, "cfg": 7.0,
+            "sampler_name": "euler", "scheduler": "normal",
+            "positive": ["2", 0], "negative": ["2", 0],
+            "latent_image": ["10", 0], "denoise": 1.0}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 64, "height": 64, "batch_size": 1}},
+        "6": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]}},
+    }
+
+
+def _ref_entry(role, node_id, input_name, control_kind="string"):
+    return {
+        "semantic_role": role, "node_id": node_id, "input_name": input_name,
+        "kind": "node_input", "control_kind": control_kind, "required": False,
+    }
+
+
+def _as_list(value):
+    """Frozen plans store links as tuples; normalize for assertions."""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return value
+
+
+def _m1_bindings():
+    return {
+        "candidate_id": "conditioning_slots:3",
+        "slots": [
+            {"node_id": "3", "socket": "image_1", "order": 0, "kind": "reference"},
+            {"node_id": "3", "socket": "image_2", "order": 1, "kind": "reference"},
+        ],
+    }
+
+
+def _m2_bindings():
+    return {
+        "candidate_id": "reference_latent_chain:10",
+        "chain": {
+            "loader_node_id": "7",
+            "vae_encode_node_id": "9",
+            "reference_latent_node_id": "10",
+            "consumer_node_id": "4",
+            "vae_node_id": "8",
+        },
+    }
+
+
+@pytest.mark.fast_unit
+class TestStudioReferenceRuns:
+    """Lane B execution: explicit method + ordered images + versioned bindings."""
+
+    def setup_method(self) -> None:
+        FakePlaygroundService.mode = "ok"
+        FakePlaygroundService.error_message = "deterministic fake execution failure"
+        FakePlaygroundService.call_history_on_ok = True
+        FakePlaygroundService.canned_result = None
+        FakePlaygroundService.materialized_paths = None
+        FakePlaygroundService.instances.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = str(Path(self._tmp.name))
+        self.input_dir = Path(self.root) / "input"
+        self.input_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("ref_a.png", "ref_b.png", "base.png", "other.png", "r.png"):
+            (self.input_dir / name).write_bytes(b"fake-" + name.encode())
+        self.service = WorkflowDomainService(self.root)
+        self.service._node_def_provider = _ref_node_defs
+        import canonical_execution as _ce
+
+        self._validation_patcher = patch.object(
+            _ce,
+            "_collect_plan_validation_proof",
+            return_value={
+                "schema_version": 1,
+                "validated": True,
+                "source": "host_validate_prompt",
+                "outputs_to_execute": ["3", "6"],
+                "node_errors": {"3": {"errors": []}},
+                "validated_workflow_hash": "vwh_fixed_0000000000",
+            },
+        )
+        self._validation_patcher.start()
+        set_writer_enabled(False)
+
+    def teardown_method(self) -> None:
+        try:
+            self._validation_patcher.stop()
+        except Exception:
+            pass
+        reset_writer_config()
+        self._tmp.cleanup()
+
+    # ── helpers ──────────────────────────────────────────────────────
+
+    def _folder_patch(self, monkeypatch):
+        monkeypatch.setitem(
+            sys.modules,
+            "folder_paths",
+            types.SimpleNamespace(get_input_directory=lambda: str(self.input_dir)),
+        )
+
+    def _svc_factory(self):
+        """Provider-pinned service factory mirroring production discovery."""
+        def _factory(node_dir):
+            svc = WorkflowDomainService(str(node_dir))
+            svc._node_def_provider = _ref_node_defs
+            return svc
+
+        return patch("studio_workflow_run._get_domain_service", new=_factory)
+
+    def _capture_mapped_ref(self, prompt, bindings, method, entries=None):
+        wf = self.service.create_workflow("Refs %s" % method)
+        version = self.service.create_version_from_capture(
+            wf["workflow_id"],
+            {"graph_json": {"id": "g", "nodes": []},
+             "api_prompt_json": {"workflow": {}, "output": prompt}},
+        )
+        entries = entries if entries is not None else {
+            "positive_prompt": _ref_entry("positive_prompt", "2", "text"),
+            "seed": _ref_entry("seed", "4", "seed", "integer"),
+            "steps": _ref_entry("steps", "4", "steps", "integer"),
+        }
+        self.service.set_mapping(
+            version["workflow_version_id"],
+            entries=entries, output_node_id="6",
+            reference_method=method, reference_bindings=bindings,
+        )
+        return wf, version
+
+    def _bundle(self, wf_id, version_id, ref=None):
+        with self._svc_factory():
+            return swr.resolve_workflow_run_bundle(
+                wf_id, version_id, self.root, reference_request=ref)
+
+    def _prepare(self, bundle, ref, values):
+        with self._svc_factory():
+            return swr._prepare_reference_run(bundle, ref, values, self.root)
+
+    def _ref_request(self, method, images, wf_id="", ver_id="", **extra):
+        body = {
+            "method": method, "images": list(images), "card_ids": [],
+            "dedicated_target": "", "origin_workflow_id": wf_id,
+            "origin_version_id": ver_id, "executing_workflow_id": "",
+            "executing_version_id": "",
+        }
+        body.update(extra)
+        ref, err = swr._sanitize_studio_references(body)
+        assert err is None, err
+        return ref
+
+    def _plan_for(self, bundle, values, mutator, companion):
+        plan, err = swr.build_workflow_execution_plan(
+            bundle, values,
+            modal_options={"production": {"enabled": False}},
+            comfyui_root=self.root,
+            prompt_mutator=mutator, studio_references=companion,
+        )
+        assert err is None, err
+        assert plan is not None
+        return plan
+
+    def _forbid_service(self):
+        def _forbid(*args, **kwargs):
+            raise AssertionError("reference rejection must dispatch nothing")
+
+        return patch(
+            "comfymodal_runtime.playground_service.PlaygroundService",
+            new=_forbid,
+        )
+
+    def _history_shim(self):
+        fake_exp_module = types.ModuleType("experiment_service")
+        fake_exp_module.REGISTRY = FakeRegistry()
+        return fake_exp_module
+
+    # ── sanitize ─────────────────────────────────────────────────────
+
+    def test_sanitize_rejects_unknown_method_and_shapes(self):
+        ref, err = swr._sanitize_studio_references({"method": "auto", "images": ["a.png"]})
+        assert ref is None and "unknown reference method" in err
+        ref, err = swr._sanitize_studio_references({"method": "conditioning_slots", "images": []})
+        assert ref is None and "non-empty ordered list" in err
+        ref, err = swr._sanitize_studio_references({"method": "conditioning_slots"})
+        assert ref is None and "non-empty ordered list" in err
+        ref, err = swr._sanitize_studio_references("nope")
+        assert ref is None and "must be an object" in err
+        ref, err = swr._sanitize_studio_references(None)
+        assert ref is None and err is None
+
+    # ── Method-1 wiring ──────────────────────────────────────────────
+
+    def test_m1_exact_wiring_and_order(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        assert bundle["status"] == "ok"
+        ref = self._ref_request(
+            "conditioning_slots", ["ref_a.png", "ref_b.png"],
+            wf["workflow_id"], version["workflow_version_id"],
+            card_ids=["c1", "c2"],
+        )
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" not in prep, prep.get("error")
+        plan = self._plan_for(bundle, prep["values"], swr._build_reference_prompt_mutator(prep["prep"]), prep["companion"])
+        work = plan.workflow
+        # Exact final wiring in card order through loader branches.
+        assert _as_list(work["3"]["inputs"]["image_1"]) == ["7", 0]
+        assert _as_list(work["3"]["inputs"]["image_2"]) == ["8", 0]
+        assert work["7"]["inputs"]["image"] == "ref_a.png"
+        assert work["8"]["inputs"]["image"] == "ref_b.png"
+        # No filename ever lands in an IMAGE socket.
+        assert isinstance(work["3"]["inputs"]["image_1"], (list, tuple))
+        assert isinstance(work["3"]["inputs"]["image_2"], (list, tuple))
+        # Companion frozen beside graph + payloads.
+        meta = dict(plan.request_metadata)["studio_references"]
+        assert meta["method"] == "conditioning_slots"
+        assert list(meta["images"]) == ["ref_a.png", "ref_b.png"]
+        assert list(meta["card_ids"]) == ["c1", "c2"]
+        assert meta["origin_version_id"] == version["workflow_version_id"]
+        assert meta["provenance"] == {"source": "mapping"}
+        assert set((plan.input_images or {}).keys()) >= {"ref_a.png", "ref_b.png"}
+
+    def test_m1_stored_graph_unchanged(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        before = prompt_sha256(version["executable_prompt"])
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        ref = self._ref_request("conditioning_slots", ["ref_a.png", "ref_b.png"],
+                                wf["workflow_id"], version["workflow_version_id"])
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" not in prep, prep.get("error")
+        self._plan_for(bundle, prep["values"], swr._build_reference_prompt_mutator(prep["prep"]), prep["companion"])
+        stored = self.service.get_version(version["workflow_version_id"])
+        assert prompt_sha256(stored["executable_prompt"]) == before
+        assert stored["graph_hash"] == version["graph_hash"]
+
+    def test_m1_shared_loader_isolation(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(
+            _ref_m1_prompt(shared_loader=True), _m1_bindings(), "conditioning_slots")
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        ref = self._ref_request("conditioning_slots", ["ref_a.png", "ref_b.png"],
+                                wf["workflow_id"], version["workflow_version_id"])
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" not in prep, prep.get("error")
+        plan = self._plan_for(bundle, prep["values"], swr._build_reference_prompt_mutator(prep["prep"]), prep["companion"])
+        work = plan.workflow
+        clones = [k for k in work if str(k).startswith("ref_")]
+        assert len(clones) == 1, clones
+        clone = clones[0]
+        # First slot isolated onto the branch; the shared loader keeps the
+        # second slot untouched (no unrelated input altered).
+        assert _as_list(work["3"]["inputs"]["image_1"]) == [clone, 0]
+        assert _as_list(work["3"]["inputs"]["image_2"]) == ["7", 0]
+        assert work[clone]["inputs"]["image"] == "ref_a.png"
+        assert work["7"]["inputs"]["image"] == "ref_b.png"
+
+    def test_m1_clone_ids_are_collision_free(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        prompt = _ref_m1_prompt(shared_loader=True)
+        prompt["ref_1"] = {"class_type": "EmptyLatentImage",
+                           "inputs": {"width": 64, "height": 64, "batch_size": 1}}
+        wf, version = self._capture_mapped_ref(prompt, _m1_bindings(), "conditioning_slots")
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        ref = self._ref_request("conditioning_slots", ["ref_a.png", "ref_b.png"],
+                                wf["workflow_id"], version["workflow_version_id"])
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" not in prep, prep.get("error")
+        plan = self._plan_for(bundle, prep["values"], swr._build_reference_prompt_mutator(prep["prep"]), prep["companion"])
+        work = plan.workflow
+        assert work["ref_1"]["class_type"] == "EmptyLatentImage"
+        assert _as_list(work["3"]["inputs"]["image_1"]) == ["ref_2", 0]
+        assert work["ref_2"]["inputs"]["image"] == "ref_a.png"
+
+    # ── Method-1 rejections dispatch nothing ─────────────────────────
+
+    def test_m1_overcapacity_rejected_without_dispatch(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        ref = self._ref_request("conditioning_slots",
+                                ["ref_a.png", "ref_b.png", "ref_a.png"],
+                                wf["workflow_id"], version["workflow_version_id"])
+        fake_exp_module = self._history_shim()
+        with self._svc_factory(), patch.dict(sys.modules, {"experiment_service": fake_exp_module}), self._forbid_service():
+            result = _run(swr.handle_workflow_run_async(
+                wf["workflow_id"], version["workflow_version_id"], "", "txt2img",
+                {}, self.root, modal_options={"execution_mode": "v2"},
+                studio_references={"method": "conditioning_slots",
+                                   "images": ["ref_a.png", "ref_b.png", "ref_a.png"]},
+            ))
+        assert result["status"] == "error"
+        assert "2 reference slot" in result["message"]
+        assert len(fake_exp_module.REGISTRY.history()._runs) == 0
+
+    def test_m1_stale_binding_rejected(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        bundle["executable_prompt"] = {
+            nid: node for nid, node in bundle["executable_prompt"].items() if str(nid) != "3"
+        }
+        ref = self._ref_request("conditioning_slots", ["ref_a.png", "ref_b.png"],
+                                wf["workflow_id"], version["workflow_version_id"])
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" in prep
+        assert "stale" in prep["error"]
+
+    def test_m1_unsafe_and_missing_images_rejected_without_dispatch(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        for images, fragment in (
+            (["../evil.png", "ref_b.png"], "unsafe"),
+            (["ref_a.png", "ghost.png"], "not found"),
+        ):
+            fake_exp_module = self._history_shim()
+            with self._svc_factory(), patch.dict(sys.modules, {"experiment_service": fake_exp_module}), self._forbid_service():
+                result = _run(swr.handle_workflow_run_async(
+                    wf["workflow_id"], version["workflow_version_id"], "", "txt2img",
+                    {}, self.root, modal_options={"execution_mode": "v2"},
+                    studio_references={"method": "conditioning_slots", "images": images},
+                ))
+            assert result["status"] == "error", images
+            assert fragment in result["message"], result["message"]
+            assert len(fake_exp_module.REGISTRY.history()._runs) == 0
+
+    def test_m1_unbound_method_mismatch_rejected(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        # Wrong method: no fallback to the bound one.
+        ref = self._ref_request("reference_latent_chain", ["ref_a.png"],
+                                wf["workflow_id"], version["workflow_version_id"])
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" in prep and "not bound" in prep["error"]
+        # Unbound version: references have nowhere to bind.
+        plain_wf = self.service.create_workflow("plain")
+        plain_ver = self.service.create_version_from_capture(
+            plain_wf["workflow_id"],
+            {"graph_json": {"id": "g", "nodes": []},
+             "api_prompt_json": {"workflow": {}, "output": _ref_m1_prompt()}},
+        )
+        self.service.set_mapping(
+            plain_ver["workflow_version_id"],
+            entries={"positive_prompt": _ref_entry("positive_prompt", "2", "text")},
+            output_node_id="6",
+        )
+        plain_bundle = self._bundle(plain_wf["workflow_id"], plain_ver["workflow_version_id"])
+        ref2 = self._ref_request("conditioning_slots", ["ref_a.png"],
+                                 plain_wf["workflow_id"], plain_ver["workflow_version_id"])
+        prep2 = swr._prepare_reference_run(plain_bundle, ref2, plain_bundle["defaults"], self.root)
+        assert "error" in prep2 and "no reference bindings" in prep2["error"]
+
+    def test_m1_missing_required_image_rejected(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        ref = self._ref_request("conditioning_slots", ["ref_a.png"],
+                                wf["workflow_id"], version["workflow_version_id"])
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" in prep and "missing required" in prep["error"]
+
+    def test_m1_origin_version_change_rejected(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        ref = self._ref_request("conditioning_slots", ["ref_a.png", "ref_b.png"],
+                                wf["workflow_id"], "wv_stale_version")
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" in prep and "rebound" in prep["error"]
+
+    # ── Method-2 chain ───────────────────────────────────────────────
+
+    def test_m2_chain_wiring_in_card_order(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m2_prompt(), _m2_bindings(), "reference_latent_chain")
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        assert bundle["status"] == "ok", bundle
+        ref = self._ref_request("reference_latent_chain", ["ref_a.png", "ref_b.png"],
+                                wf["workflow_id"], version["workflow_version_id"])
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" not in prep, prep.get("error")
+        plan = self._plan_for(bundle, prep["values"], swr._build_reference_prompt_mutator(prep["prep"]), prep["companion"])
+        work = plan.workflow
+        clones = sorted(k for k in work if str(k).startswith("ref_"))
+        assert len(clones) == 3, clones
+        loader2, encode2, ref2 = clones
+        # Link 1 reuses the segment; link 2 extends the evidenced chain in
+        # card order (its latent continues behind the confirmed latent).
+        assert work["7"]["inputs"]["image"] == "ref_a.png"
+        assert work[loader2] == {"class_type": "LoadImage", "inputs": {"image": "ref_b.png"}}
+        assert {k: _as_list(v) for k, v in work[encode2]["inputs"].items()} == {"pixels": [loader2, 0], "vae": ["8", 0]}
+        assert work[encode2]["class_type"] == "VAEEncode"
+        assert {k: _as_list(v) for k, v in work[ref2]["inputs"].items()} == {"latent": ["10", 0], "conditioning": ["2", 0]}
+        assert work[ref2]["class_type"] == "ReferenceLatent"
+        # The SAME VAE feeds the clone (never another), the evidenced links
+        # are preserved (nothing orphaned), and only the confirmed consumer
+        # edge is rewired to the final link.
+        assert {k: _as_list(v) for k, v in work["9"]["inputs"].items()} == {"pixels": ["7", 0], "vae": ["8", 0]}
+        assert {k: _as_list(v) for k, v in work["10"]["inputs"].items()} == {"latent": ["9", 0], "conditioning": ["2", 0]}
+        assert _as_list(work["4"]["inputs"]["latent_image"]) == [ref2, 0]
+        # Conditioning fan-out is untouched on the upstream node.
+        assert {k: _as_list(v) for k, v in work["2"]["inputs"].items()} == {"text": "cat", "clip": ["1", 0]}
+
+    def test_m2_single_image_reuses_segment(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m2_prompt(), _m2_bindings(), "reference_latent_chain")
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        ref = self._ref_request("reference_latent_chain", ["ref_a.png"],
+                                wf["workflow_id"], version["workflow_version_id"])
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" not in prep, prep.get("error")
+        plan = self._plan_for(bundle, prep["values"], swr._build_reference_prompt_mutator(prep["prep"]), prep["companion"])
+        work = plan.workflow
+        assert [k for k in work if str(k).startswith("ref_")] == []
+        assert work["7"]["inputs"]["image"] == "ref_a.png"
+        assert _as_list(work["4"]["inputs"]["latent_image"]) == ["10", 0]
+
+    def test_m2_stale_unsupported_ambiguous_rejected(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m2_prompt(), _m2_bindings(), "reference_latent_chain")
+
+        def _prep_on(prompt):
+            bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+            bundle["executable_prompt"] = prompt
+            ref = self._ref_request("reference_latent_chain", ["ref_a.png", "ref_b.png"],
+                                    wf["workflow_id"], version["workflow_version_id"])
+            return self._prepare(bundle, ref, bundle["defaults"])
+
+        base = self._bundle(wf["workflow_id"], version["workflow_version_id"])["executable_prompt"]
+        # Stale: latent node gone.
+        stale = {k: v for k, v in base.items() if str(k) != "10"}
+        assert "error" in _prep_on(stale)
+        # Unsupported: loader is not a LoadImage branch.
+        bad_loader = copy.deepcopy(base)
+        bad_loader["7"] = {"class_type": "KSampler", "inputs": {"image": "r.png"}}
+        assert "LoadImage" in _prep_on(bad_loader)["error"]
+        # Ambiguous: the latent feeds a second consumer with no confirmed edge.
+        two_cons = copy.deepcopy(base)
+        two_cons["12"] = {"class_type": "SaveImage", "inputs": {"images": ["10", 1]}}
+        two_cons_bindings = copy.deepcopy(_m2_bindings())
+        del two_cons_bindings["chain"]["consumer_node_id"]
+        wf2, ver2 = self._capture_mapped_ref(_ref_m2_prompt(), two_cons_bindings, "reference_latent_chain")
+        bundle2 = self._bundle(wf2["workflow_id"], ver2["workflow_version_id"])
+        bundle2["executable_prompt"] = two_cons
+        ref = self._ref_request("reference_latent_chain", ["ref_a.png", "ref_b.png"],
+                                wf2["workflow_id"], ver2["workflow_version_id"])
+        ambiguous = self._prepare(bundle2, ref, bundle2["defaults"])
+        assert "error" in ambiguous, ambiguous
+
+    def test_m2_allowlist_rejects_outside_change(self):
+        before = _ref_m2_prompt()
+        after = copy.deepcopy(before)
+        after["2"]["inputs"]["text"] = "rewritten outside the segment"
+        with pytest.raises(ValueError, match="outside the confirmed segment"):
+            swr._check_reference_mutation_allowlist(
+                before, after, allowed_added=set(),
+                allowed_modified={"7": {"image"}},
+            )
+        after2 = copy.deepcopy(before)
+        after2["99"] = {"class_type": "LoadImage", "inputs": {"image": "x.png"}}
+        with pytest.raises(ValueError, match="unexpected nodes"):
+            swr._check_reference_mutation_allowlist(
+                before, after2, allowed_added=set(),
+                allowed_modified={"7": {"image"}},
+            )
+
+    # ── collection gap ───────────────────────────────────────────────
+
+    def test_reference_collection_failure_fails_closed(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        bundle = self._bundle(wf["workflow_id"], version["workflow_version_id"])
+        ref = self._ref_request("conditioning_slots", ["ref_a.png", "ref_b.png"],
+                                wf["workflow_id"], version["workflow_version_id"])
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" not in prep, prep.get("error")
+        import canonical_execution as _ce
+
+        monkeypatch.setattr(_ce, "_collect_input_images", lambda *a, **k: {"ref_a.png": "qq"})
+        plan, err = swr.build_workflow_execution_plan(
+            bundle, prep["values"],
+            modal_options={"production": {"enabled": False}},
+            comfyui_root=self.root,
+            prompt_mutator=swr._build_reference_prompt_mutator(prep["prep"]),
+            studio_references=prep["companion"],
+        )
+        assert plan is None
+        assert "ref_b.png" in err
+
+    # ── handler success ──────────────────────────────────────────────
+
+    def test_handler_success_freezes_metadata(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        before = prompt_sha256(version["executable_prompt"])
+        fake_exp_module = self._history_shim()
+        out_file = Path(self.root) / "handler_output.png"
+        out_file.write_bytes(b"fake-png")
+        FakePlaygroundService.materialized_paths = [str(out_file)]
+        with self._svc_factory(), patch.dict(sys.modules, {"experiment_service": fake_exp_module}), patch(
+            "comfymodal_runtime.playground_service.PlaygroundService", FakePlaygroundService,
+        ):
+            result = _run(swr.handle_workflow_run_async(
+                wf["workflow_id"], version["workflow_version_id"], "", "txt2img",
+                {}, self.root, modal_options={"execution_mode": "v2"},
+                studio_references={
+                    "method": "conditioning_slots",
+                    "images": ["ref_a.png", "ref_b.png"],
+                    "card_ids": ["c1", "c2"],
+                    "origin_workflow_id": wf["workflow_id"],
+                    "origin_version_id": version["workflow_version_id"],
+                },
+            ))
+        assert result["status"] == "ok", result
+        json.dumps(result)
+        inst = FakePlaygroundService.instances[-1]
+        assert len(inst.calls) == 1
+        meta = dict(inst.plan.request_metadata)["studio_references"]
+        assert list(meta["images"]) == ["ref_a.png", "ref_b.png"]
+        assert list(meta["card_ids"]) == ["c1", "c2"]
+        assert inst.plan.workflow["7"]["inputs"]["image"] == "ref_a.png"
+        stamp = result["trace"]["studio_references"]
+        assert stamp["method"] == "conditioning_slots"
+        assert stamp["executing_version_id"] == version["workflow_version_id"]
+        stored = self.service.get_version(version["workflow_version_id"])
+        assert prompt_sha256(stored["executable_prompt"]) == before
+        records = list(fake_exp_module.REGISTRY.history()._runs.values())
+        assert len(records) == 1 and records[0]["status"] == "completed"
+
+    def test_plain_run_on_bound_version_unaffected(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        fake_exp_module = self._history_shim()
+        out_file = Path(self.root) / "plain_output.png"
+        out_file.write_bytes(b"fake-png")
+        FakePlaygroundService.materialized_paths = [str(out_file)]
+        with self._svc_factory(), patch.dict(sys.modules, {"experiment_service": fake_exp_module}), patch(
+            "comfymodal_runtime.playground_service.PlaygroundService", FakePlaygroundService,
+        ):
+            result = _run(swr.handle_workflow_run_async(
+                wf["workflow_id"], version["workflow_version_id"], "", "txt2img",
+                {}, self.root, modal_options={"execution_mode": "v2"},
+            ))
+        assert result["status"] == "ok", result
+        inst = FakePlaygroundService.instances[-1]
+        assert "studio_references" not in dict(inst.plan.request_metadata)
+        # No reference mutation: the stored loader filenames survive verbatim.
+        assert inst.plan.workflow["7"]["inputs"]["image"] == "base.png"
+
+    def test_method_and_references_cannot_combine(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        wf, version = self._capture_mapped_ref(_ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        fake_exp_module = self._history_shim()
+        with self._svc_factory(), patch.dict(sys.modules, {"experiment_service": fake_exp_module}), self._forbid_service():
+            result = _run(swr.handle_workflow_run_async(
+                wf["workflow_id"], version["workflow_version_id"], "", "txt2img",
+                {}, self.root, modal_options={"execution_mode": "v2"},
+                studio_method={"kind": "expand", "method": "pad",
+                               "params": {"top": 1, "right": 0, "bottom": 0, "left": 0}},
+                studio_references={"method": "conditioning_slots", "images": ["ref_a.png"]},
+            ))
+        assert result["status"] == "error" and "cannot be combined" in result["message"]
+        assert len(fake_exp_module.REGISTRY.history()._runs) == 0
+
+    # ── Method-3 dedicated ───────────────────────────────────────────
+
+    def _dedicated_pair(self, override=None):
+        """Origin (dedicated mapping) + override (reference mapping).
+
+        ``override`` selects the target: ``None`` builds the compatible
+        conditioning-slots override; pass ``("bare", wf, ver)`` to point at
+        a workflow with no reference bindings (incompatible target).
+        """
+        from studio_domain.models import Mapping, MappingEntry, make_mapping_id, now_iso
+
+        if override is None:
+            override_wf, override_ver = self._capture_mapped_ref(
+                _ref_m1_prompt(), _m1_bindings(), "conditioning_slots")
+        else:
+            _, override_wf, override_ver = override
+        origin_wf = self.service.create_workflow("origin")
+        origin_ver = self.service.create_version_from_capture(
+            origin_wf["workflow_id"],
+            {"graph_json": {"id": "g", "nodes": []},
+             "api_prompt_json": {"workflow": {}, "output": txt2img_prompt()}},
+        )
+        # Wizard-confirmed dedicated binding: target is the override workflow.
+        self.service.store.insert_mapping(Mapping(
+            mapping_id=make_mapping_id(),
+            workflow_version_id=origin_ver["workflow_version_id"],
+            created_at=now_iso(), updated_at=now_iso(),
+            output_node_id="6", text_generate_node_id=None,
+            entries={
+                "positive_prompt": MappingEntry.from_dict(
+                    _ref_entry("positive_prompt", "1", "text", "multiline")),
+                "seed": MappingEntry.from_dict(
+                    _ref_entry("seed", "3", "seed", "integer")),
+                "steps": MappingEntry.from_dict(
+                    _ref_entry("steps", "3", "steps", "integer")),
+            },
+            reference_method="dedicated",
+            reference_bindings={"dedicated_target": override_wf["workflow_id"], "card_ids": []},
+        ))
+        return (origin_wf, origin_ver), (override_wf, override_ver)
+
+    def test_dedicated_transfers_only_four_roles(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        (origin_wf, origin_ver), (override_wf, override_ver) = self._dedicated_pair()
+        fake_exp_module = self._history_shim()
+        out_file = Path(self.root) / "ded_output.png"
+        out_file.write_bytes(b"fake-png")
+        FakePlaygroundService.materialized_paths = [str(out_file)]
+        with self._svc_factory(), patch.dict(sys.modules, {"experiment_service": fake_exp_module}), patch(
+            "comfymodal_runtime.playground_service.PlaygroundService", FakePlaygroundService,
+        ):
+            result = _run(swr.handle_workflow_run_async(
+                origin_wf["workflow_id"], origin_ver["workflow_version_id"], "", "txt2img",
+                {"positive_prompt": "transferred prompt", "seed": 4242, "steps": 99},
+                self.root, modal_options={"execution_mode": "v2"},
+                studio_references={
+                    "method": "dedicated",
+                    "images": ["ref_a.png", "ref_b.png"],
+                    "card_ids": ["c1", "c2"],
+                    "dedicated_target": override_wf["workflow_id"],
+                    "origin_workflow_id": origin_wf["workflow_id"],
+                    "origin_version_id": origin_ver["workflow_version_id"],
+                },
+            ))
+        assert result["status"] == "ok", result
+        inst = FakePlaygroundService.instances[-1]
+        work = inst.plan.workflow
+        # positive_prompt alias normalized onto the prompt role and transferred.
+        assert work["2"]["inputs"]["text"] == "transferred prompt"
+        assert work["4"]["inputs"]["seed"] == 4242
+        # steps is NOT a transferred role: the override default survives.
+        assert work["4"]["inputs"]["steps"] == 5
+        # Cards bound against the dedicated target's confirmed inputs.
+        assert work["7"]["inputs"]["image"] == "ref_a.png"
+        assert work["8"]["inputs"]["image"] == "ref_b.png"
+        meta = dict(inst.plan.request_metadata)["studio_references"]
+        assert meta["method"] == "dedicated"
+        assert meta["origin_workflow_id"] == origin_wf["workflow_id"]
+        assert meta["executing_workflow_id"] == override_wf["workflow_id"]
+        assert meta["executing_version_id"] == override_ver["workflow_version_id"]
+        assert list(meta["images"]) == ["ref_a.png", "ref_b.png"]
+        stamp = result["trace"]["studio_references"]
+        assert stamp["origin_workflow_id"] == origin_wf["workflow_id"]
+        assert stamp["executing_workflow_id"] == override_wf["workflow_id"]
+
+    def test_dedicated_link_seed_concretized_and_captured(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        (origin_wf, origin_ver), (override_wf, override_ver) = self._dedicated_pair()
+        ref = self._ref_request("dedicated", ["ref_a.png", "ref_b.png"],
+                                origin_wf["workflow_id"], origin_ver["workflow_version_id"],
+                                dedicated_target=override_wf["workflow_id"])
+        bundle = self._bundle(origin_wf["workflow_id"], origin_ver["workflow_version_id"], ref)
+        assert bundle["status"] == "ok", bundle
+        values = {"prompt": "x", "seed": ["8", 0], "steps": 99}
+        prep = self._prepare(bundle, ref, values)
+        assert "error" not in prep, prep.get("error")
+        # Graph-local links never cross: the linked seed is concretized, the
+        # extra role never transfers, and the concretion is captured.
+        assert isinstance(prep["values"]["seed"], int)
+        assert "steps" not in prep["values"] or prep["values"]["steps"] == 5
+        assert prep["ctx"]["concretized_seed"] == prep["values"]["seed"]
+        assert prep["companion"]["concretized_seed"] == prep["values"]["seed"]
+
+    def test_dedicated_target_without_bindings_incompatible(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        bare_wf = self.service.create_workflow("bare target")
+        bare_ver = self.service.create_version_from_capture(
+            bare_wf["workflow_id"],
+            {"graph_json": {"id": "g", "nodes": []},
+             "api_prompt_json": {"workflow": {}, "output": txt2img_prompt()}},
+        )
+        self.service.set_mapping(
+            bare_ver["workflow_version_id"],
+            entries={"positive_prompt": _ref_entry("positive_prompt", "1", "text")},
+            output_node_id="6",
+        )
+        (origin_wf, origin_ver), _ = self._dedicated_pair(("bare", bare_wf, bare_ver))
+        ref = self._ref_request("dedicated", ["ref_a.png", "ref_b.png"],
+                                origin_wf["workflow_id"], origin_ver["workflow_version_id"],
+                                dedicated_target=bare_wf["workflow_id"])
+        bundle = self._bundle(origin_wf["workflow_id"], origin_ver["workflow_version_id"], ref)
+        assert bundle["status"] == "ok", bundle
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" in prep and "incompatible" in prep["error"]
+
+    def test_dedicated_target_change_requires_rebinding(self, monkeypatch):
+        self._folder_patch(monkeypatch)
+        (origin_wf, origin_ver), (override_wf, _) = self._dedicated_pair()
+        other_wf = self.service.create_workflow("other")
+        ref = self._ref_request("dedicated", ["ref_a.png", "ref_b.png"],
+                                origin_wf["workflow_id"], origin_ver["workflow_version_id"],
+                                dedicated_target=other_wf["workflow_id"])
+        bundle = self._bundle(origin_wf["workflow_id"], origin_ver["workflow_version_id"], ref)
+        assert bundle["status"] == "ok", bundle
+        prep = self._prepare(bundle, ref, bundle["defaults"])
+        assert "error" in prep and "rebind" in prep["error"]
 
 
 if __name__ == "__main__":

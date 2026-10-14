@@ -258,6 +258,22 @@ class CustomNodeDiscovery:
                                 break
                     elif fpath.is_relative_to(resolved_comfy_root):
                         core_classes.add(str(class_type))
+                    else:
+                        # Fallback for nonstandard layouts (isolated
+                        # --base-directory, junctions, worktrees): the passed
+                        # root is wrong so the containment checks above miss
+                        # first-party modules entirely, yielding an empty core
+                        # set. A class outside every discovered pack dir ships
+                        # with the environment, not with a user pack — count
+                        # it as core. Attribute to a pack first in case a
+                        # junction resolves a pack dir outside custom_dir.
+                        for candidate in (fpath.parent, *fpath.parents):
+                            record = by_path.get(candidate)
+                            if record is not None:
+                                record.classes.append(str(class_type))
+                                break
+                        else:
+                            core_classes.add(str(class_type))
         except Exception:
             pass
 

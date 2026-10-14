@@ -7891,6 +7891,7 @@ if _server:
                             workspace=_golden_workspace(),
                             studio_method=(body or {}).get("studio_method"),
                             studio_style=(body or {}).get("studio_style"),
+                            studio_references=(body or {}).get("studio_references"),
                         ),
                         timeout=1800,
                     )
@@ -7936,6 +7937,7 @@ if _server:
         _studio_mo = (body or {}).get("modal_options")
         _studio_method = (body or {}).get("studio_method")
         _studio_style = (body or {}).get("studio_style")
+        _studio_references = (body or {}).get("studio_references")
 
         # ── Modern Studio Workflow run branch ──────────────────────────
         # When the request carries a workflow_version_id, route through the
@@ -7972,6 +7974,7 @@ if _server:
                         workspace=_studio_ws,
                         studio_method=_studio_method,
                         studio_style=_studio_style,
+                        studio_references=_studio_references,
                     ),
                     timeout=600.0,
                 )

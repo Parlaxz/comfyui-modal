@@ -18,12 +18,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import hashlib
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -48,6 +51,7 @@ from history_v2_replay import (
 )
 from history_v2_routes import (
     _build_outputs,
+    _generation_feed_item,
     _original_projection,
     register_history_v2_routes,
 )
@@ -1040,6 +1044,254 @@ class ExperimentGenerateOriginalTests(unittest.IsolatedAsyncioTestCase):
         after = len(after_detail.attempts)
         self.assertEqual(after, before)
         self.assertEqual(len(self.scheduler.submitted), 0)
+
+
+@pytest.mark.fast_unit
+class StudioReferencesGenerateOriginalTests(unittest.IsolatedAsyncioTestCase):
+    """Lane D: Generate Original replays saved references, never ambient state.
+
+    - The dispatched plan carries the saved graph + reference-ordered image
+      bytes + bindings verbatim (ignores changed "current" prefs/files).
+    - Missing reference content refuses honestly (409, no orphan attempt),
+      never substituting current files.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.data_root = Path(self._tmp.name)
+        self.output_dir = self.data_root / "studio_outputs"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.store = HistoryV2Store(
+            self.data_root / ".studio_history_v2" / "history_v2.db"
+        )
+        self.repo = HistoryV2Repository(self.store)
+        self.reference_bytes = {
+            "ref_b.png": b"saved-reference-bytes-b",
+            "ref_a.png": b"saved-reference-bytes-a",
+        }
+        self.plan, self.raw_plan = _build_plan()
+        self.raw_plan["input_images"] = {
+            name: base64.b64encode(payload).decode("ascii")
+            for name, payload in self.reference_bytes.items()
+        }
+        self.plan = ExecutionPlan.from_dict(copy.deepcopy(self.raw_plan))
+        self.executor = FakeExecutor(error=None, output_dir=self.output_dir)
+
+    def _make_service(self) -> GenerateOriginalService:
+        return GenerateOriginalService(
+            self.repo,
+            data_root=self.data_root,
+            transport_factory=lambda: object(),
+            executor=self.executor,
+            materializer=_fake_materializer(self.output_dir),
+            scheduler_getter=lambda experiment_id: None,
+            scheduler_factory=lambda *args, **kwargs: None,
+        )
+
+    def _references_request(self, payload: dict) -> dict:
+        request = dict(payload["request"])
+        request["studio_references"] = {
+            "method": "conditioning_slots",
+            "origin_workflow_id": "wf_frozen",
+            "origin_version_id": "wv_frozen",
+            "executing_workflow_id": "wf_frozen",
+            "executing_version_id": "wv_frozen",
+            "card_ids": ["card_b", "card_a"],
+            "images": [
+                {
+                    "card_id": "card_b",
+                    "filename": "ref_b.png",
+                    "sha256": hashlib.sha256(
+                        self.reference_bytes["ref_b.png"]
+                    ).hexdigest(),
+                    "byte_size": len(self.reference_bytes["ref_b.png"]),
+                    "source": {"kind": "upload", "ref": "ref_b.png"},
+                },
+                {
+                    "card_id": "card_a",
+                    "filename": "ref_a.png",
+                    "sha256": hashlib.sha256(
+                        self.reference_bytes["ref_a.png"]
+                    ).hexdigest(),
+                    "source": {"kind": "library", "ref": "lib://a"},
+                },
+            ],
+            "slots": [
+                {
+                    "card_id": "card_b",
+                    "node_id": "7",
+                    "socket": "reference",
+                    "kind": "reference",
+                    "order": 0,
+                },
+                {
+                    "card_id": "card_a",
+                    "node_id": "7",
+                    "socket": "reference_2",
+                    "kind": "reference",
+                    "order": 1,
+                },
+            ],
+            "applied_order": ["card_b", "card_a"],
+            "graph_hash": self.raw_plan["workflow_hash"],
+            "workflow_version_id": "wv_frozen",
+            "provenance": {"source": "mapping"},
+        }
+        return request
+
+    def _referenced_generation(self, *, drop_image: str | None = None):
+        gen = self.repo.create_generation(
+            workflow_id="wf_frozen",
+            workflow_version_id="wv_frozen",
+            preset_id="preset_frozen",
+            preset_name="Frozen Preset",
+        )
+        payload = _snapshot_payload(self.raw_plan)
+        execution_plan = copy.deepcopy(self.raw_plan)
+        if drop_image is not None:
+            execution_plan["input_images"].pop(drop_image, None)
+        self.repo.create_request_snapshot(
+            generation_id=gen.generation_id,
+            workflow_json=payload["workflow"],
+            workflow_hash=payload["workflow_hash"],
+            workflow_version_id=payload["workflow_version_id"],
+            preset_snapshot=payload["preset_snapshot"],
+            generation_params=payload["generation_params"],
+            request=self._references_request(payload),
+            execution_plan=execution_plan,
+            deployment_identity=payload["deployment_identity"],
+        )
+        preview = self.repo.add_attempt(gen.generation_id, mode="preview")
+        self.repo.update_attempt_terminal(preview.run_id, status="completed")
+        return gen
+
+    async def _wait_for_terminal(self, run_id: str, timeout: float = 5.0) -> str:
+        deadline = time.time() + timeout
+        status = ""
+        while time.time() < deadline:
+            attempt = self.repo.get_attempt(run_id)
+            status = attempt.status if attempt else ""
+            if status in {"completed", "failed", "canceled", "interrupted"}:
+                return status
+            await asyncio.sleep(0.02)
+        return status
+
+    async def test_generate_original_replays_saved_reference_bytes(self):
+        gen = self._referenced_generation()
+        service = self._make_service()
+        result = await service.generate(gen.generation_id)
+        self.assertTrue(result.ok, result.payload)
+        self.assertEqual(result.payload.get("outcome"), CODE_ORIGINAL_CREATED)
+        run_id = str(result.payload.get("run_id") or "")
+        self.assertTrue(run_id)
+        self.assertEqual(await self._wait_for_terminal(run_id), "completed")
+        self.assertEqual(len(self.executor.plans), 1)
+        executed = self.executor.plans[0]
+        # Saved graph + saved image bytes replay verbatim, in order.
+        self.assertEqual(
+            dict(executed.input_images), self.raw_plan["input_images"]
+        )
+        for name, payload in self.reference_bytes.items():
+            self.assertEqual(base64.b64decode(executed.input_images[name]), payload)
+        self.assertEqual(executed.workflow_hash, self.raw_plan["workflow_hash"])
+
+    async def test_generate_original_ignores_changed_current_files(self):
+        gen = self._referenced_generation()
+        service = self._make_service()
+        first = await service.generate(gen.generation_id)
+        self.assertTrue(first.ok, first.payload)
+        first_run_id = str(first.payload.get("run_id") or "")
+        self.assertTrue(first_run_id)
+        self.assertEqual(
+            await self._wait_for_terminal(first_run_id), "completed"
+        )
+        # Ambient "current" state changes after the save: current files and
+        # prefs now disagree with the snapshot.  The rerender must still
+        # replay the SAVED bytes, never the current ones.
+        self.raw_plan["input_images"] = {
+            "ref_b.png": base64.b64encode(b"current-file").decode("ascii")
+        }
+        second = await service.generate(gen.generation_id, rerender=True)
+        self.assertTrue(second.ok, second.payload)
+        second_run_id = str(second.payload.get("run_id") or "")
+        self.assertTrue(second_run_id)
+        self.assertEqual(
+            await self._wait_for_terminal(second_run_id), "completed"
+        )
+        self.assertEqual(len(self.executor.plans), 2)
+        for executed in self.executor.plans:
+            for name, payload in self.reference_bytes.items():
+                self.assertEqual(
+                    base64.b64decode(executed.input_images[name]), payload
+                )
+
+    async def test_missing_reference_content_refuses_without_orphan(self):
+        gen = self._referenced_generation(drop_image="ref_a.png")
+        before_detail = self.repo.get_generation(gen.generation_id)
+        assert before_detail is not None
+        before = len(before_detail.attempts)
+        service = self._make_service()
+        result = await service.generate(gen.generation_id)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.http_status, 409)
+        self.assertEqual(
+            result.payload.get("code"), CODE_GENERATION_NOT_REPRODUCIBLE
+        )
+        self.assertEqual(result.payload.get("reason"), "reference_content_missing")
+        after_detail = self.repo.get_generation(gen.generation_id)
+        assert after_detail is not None
+        after = len(after_detail.attempts)
+        self.assertEqual(after, before, "no orphan attempt may be created")
+        self.assertEqual(self.executor.calls, 0, "nothing may execute")
+
+    async def test_feed_item_projects_saved_references(self):
+        gen = self._referenced_generation()
+        detail = self.repo.get_generation(gen.generation_id)
+        assert detail is not None
+        item = _generation_feed_item(
+            detail.generation.to_dict(),
+            detail.assets,
+            detail.attempts,
+            snapshot=detail.request_snapshot,
+        )
+        refs = item.get("studio_references")
+        assert refs is not None
+        self.assertEqual(refs["method"], "conditioning_slots")
+        self.assertEqual(refs["card_ids"], ["card_b", "card_a"])
+        self.assertEqual(refs["applied_order"], ["card_b", "card_a"])
+        self.assertEqual(
+            [img["filename"] for img in refs["images"]],
+            ["ref_b.png", "ref_a.png"],
+        )
+        self.assertEqual(
+            refs["images"][0]["source"], {"kind": "upload", "ref": "ref_b.png"}
+        )
+        self.assertTrue(item.get("replay_capable"))
+
+    async def test_feed_item_without_references_stays_legacy_clean(self):
+        gen = self.repo.create_generation(workflow_id="wf_frozen")
+        payload = _snapshot_payload(self.raw_plan)
+        self.repo.create_request_snapshot(
+            generation_id=gen.generation_id,
+            workflow_json=payload["workflow"],
+            workflow_hash=payload["workflow_hash"],
+            workflow_version_id=payload["workflow_version_id"],
+            preset_snapshot=payload["preset_snapshot"],
+            generation_params=payload["generation_params"],
+            request=payload["request"],
+            execution_plan=payload["execution_plan"],
+            deployment_identity=payload["deployment_identity"],
+        )
+        detail = self.repo.get_generation(gen.generation_id)
+        assert detail is not None
+        item = _generation_feed_item(
+            detail.generation.to_dict(),
+            detail.assets,
+            detail.attempts,
+            snapshot=detail.request_snapshot,
+        )
+        self.assertIsNone(item.get("studio_references"))
 
 
 if __name__ == "__main__":

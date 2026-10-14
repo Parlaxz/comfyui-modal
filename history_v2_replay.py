@@ -38,6 +38,8 @@ REASON_SNAPSHOT_DEPLOYMENT_MISMATCH = "snapshot_deployment_mismatch"
 REASON_NOT_ORIGINAL_FAILURE = "not_failed_original"
 REASON_GENERATION_MISMATCH = "generation_mismatch"
 REASON_SNAPSHOT_MISMATCH = "snapshot_mismatch"
+REASON_REFERENCE_CONTENT_MISSING = "reference_content_missing"
+REASON_REFERENCE_CONTENT_MISMATCH = "reference_content_mismatch"
 
 CURRENT_PLAN_SCHEMA_VERSION = int(ExecutionPlan().schema_version)
 REQUIRED_EXECUTION_OPTION_KEYS = frozenset(ExecutionOptions().to_dict().keys())
@@ -311,6 +313,13 @@ def validate_replay_capability(
     if request_source_hash not in (None, "") and str(request_source_hash) != source_workflow_hash:
         return _fail(REASON_IDENTITY_MISMATCH, field="source_workflow_hash")
 
+    # Lane D: saved reference images must resolve to verifiable saved bytes.
+    # Missing/unverifiable content fails closed (irreproducible); legacy
+    # records without the companion skip this gate unchanged.
+    reference_capability = validate_studio_reference_content(snapshot)
+    if not reference_capability.capable:
+        return reference_capability
+
     return ReplayCapability(
         True,
         details={
@@ -318,6 +327,107 @@ def validate_replay_capability(
             "source_workflow_hash": source_workflow_hash,
             "production_enabled": production_enabled,
             "snapshot_id": parts.get("snapshot_id") or "",
+        },
+    )
+
+
+# ── Studio reference content verification (Phase 8, Lane D) ─────────────
+#
+# Generate Original replays the SAVED graph + reference order + image bytes
+# + bindings: every image recorded in the saved ``studio_references``
+# companion must resolve to verifiable bytes already frozen in the saved
+# execution plan's ``input_images``.  Missing or unverifiable content is
+# reported as irreproducible (fail closed) — the replay never substitutes
+# current files, never reads ambient preference state, never rediscovers
+# sockets, and never re-mutates the plan.  Records without the companion
+# (legacy) stay valid and skip this gate.
+
+
+def _decode_plan_image_bytes(value: Any) -> bytes | None:
+    """Raw bytes for one frozen ``input_images`` payload, or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    import base64 as _base64
+    import binascii as _binascii
+
+    try:
+        return _base64.b64decode(value, validate=True)
+    except (_binascii.Error, ValueError):
+        pass
+    try:
+        return _base64.b64decode(value, validate=False)
+    except Exception:
+        return None
+
+
+def validate_studio_reference_content(snapshot: Any) -> ReplayCapability:
+    """Verify saved reference images against the saved plan's image bytes."""
+    parts = _snapshot_parts(snapshot)
+    if parts is None:
+        return _fail(REASON_MISSING_REQUEST_SNAPSHOT)
+    request = _mapping(parts.get("request"))
+    references = _mapping((request or {}).get("studio_references"))
+    if references is None:
+        references = _mapping(parts.get("preset_snapshot", {}).get("studio_references"))
+    if references is None:
+        return ReplayCapability(True, details={"studio_references": "absent"})
+    images = references.get("images", [])
+    if not isinstance(images, Sequence) or isinstance(images, (str, bytes)):
+        return _fail(REASON_INVALID_PLAN, field="studio_references.images")
+    raw_plan = _mapping(parts.get("execution_plan"))
+    if not raw_plan:
+        return _fail(REASON_MISSING_EXECUTION_PLAN)
+    frozen_images = _mapping(raw_plan.get("input_images")) or {}
+    import hashlib as _hashlib
+
+    for position, entry in enumerate(images):
+        if not isinstance(entry, Mapping):
+            return _fail(
+                REASON_INVALID_PLAN,
+                field=f"studio_references.images[{position}]",
+            )
+        filename = entry.get("filename")
+        if not isinstance(filename, str) or not filename:
+            return _fail(
+                REASON_INVALID_PLAN,
+                field=f"studio_references.images[{position}].filename",
+            )
+        payload = _decode_plan_image_bytes(frozen_images.get(filename))
+        if payload is None:
+            # Missing content is irreproducible — never substituted.
+            return _fail(
+                REASON_REFERENCE_CONTENT_MISSING,
+                filename=filename,
+                card_id=entry.get("card_id", ""),
+            )
+        expected_digest = entry.get("sha256")
+        if (
+            isinstance(expected_digest, str)
+            and expected_digest.strip()
+            and _hashlib.sha256(payload).hexdigest() != expected_digest.strip().lower()
+        ):
+            return _fail(
+                REASON_REFERENCE_CONTENT_MISMATCH,
+                filename=filename,
+                card_id=entry.get("card_id", ""),
+            )
+        expected_size = entry.get("byte_size", entry.get("byteSize"))
+        if (
+            isinstance(expected_size, int)
+            and not isinstance(expected_size, bool)
+            and expected_size != len(payload)
+        ):
+            return _fail(
+                REASON_REFERENCE_CONTENT_MISMATCH,
+                filename=filename,
+                card_id=entry.get("card_id", ""),
+                field="byte_size",
+            )
+    return ReplayCapability(
+        True,
+        details={
+            "studio_references": "verified",
+            "reference_image_count": len(images),
         },
     )
 
@@ -1668,6 +1778,8 @@ __all__ = [
     "REASON_MISSING_WORKFLOW",
     "REASON_MISSING_WORKFLOW_HASH",
     "REASON_NOT_ORIGINAL_FAILURE",
+    "REASON_REFERENCE_CONTENT_MISMATCH",
+    "REASON_REFERENCE_CONTENT_MISSING",
     "REASON_SNAPSHOT_DEPLOYMENT_MISMATCH",
     "REASON_SNAPSHOT_HASH_MISMATCH",
     "REASON_SNAPSHOT_MISMATCH",
@@ -1695,4 +1807,5 @@ __all__ = [
     "validate_original_retry",
     "validate_replay_capability",
     "validate_replay_delta",
+    "validate_studio_reference_content",
 ]

@@ -23,6 +23,8 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from studio_domain import derive_mapping_candidates
 from studio_domain.store import WorkflowDomainStore
 
@@ -729,6 +731,120 @@ for row in snapshot["mappings"]
         )
         self.assertEqual(response.status, 404)
         self.assertEqual(self._body(response).get("status"), "error")
+
+
+@pytest.mark.fast_unit
+class ReferenceRoutesTests(unittest.TestCase):
+    """Phase 8 Lane A: reference candidates + companion routes.
+
+    The reference endpoints translate HTTP <-> service calls only; all
+    discovery and validation rules live in the domain service. No Torch,
+    model, or Modal access.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.routes_mod = _load_repo_module(
+            "studio_workflow_routes_under_test", "studio_workflow_routes.py"
+        )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = str(Path(self._tmp.name))
+        stub = _StubServer()
+        self.routes_mod.register_workflow_routes(stub, node_dir=self.root)
+        self.mod = type("WorkflowRoutesModule", (), {"_server": stub})
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _call(self, method: str, path: str, **req_kwargs):
+        handler = _handler_for(self.mod, method, path)
+        self.assertIsNotNone(handler, f"no route registered for {method} {path}")
+        assert handler is not None
+        return _run(handler(_MockRequest(**req_kwargs)))
+
+    def _body(self, resp) -> dict:
+        return json.loads(resp.body)
+
+    def _create_workflow(self, **fields) -> dict:
+        body = {"name": "Test Workflow", **fields}
+        resp = self._call("POST", "/comfymodal/studio/workflows", json_body=body)
+        self.assertEqual(resp.status, 200, msg=f"create body={resp.body}")
+        return self._body(resp)["workflow"]
+
+    def _capture_version(self, workflow_id: str, prompt: dict | None = None) -> dict:
+        capture = make_capture(prompt if prompt is not None else txt2img_prompt())
+        resp = self._call(
+            "POST", "/comfymodal/studio/workflows/{workflow_id}/versions",
+            match_info={"workflow_id": workflow_id}, json_body=capture,
+        )
+        self.assertEqual(resp.status, 200, msg=f"capture body={resp.body}")
+        return self._body(resp)["version"]
+
+    def _mapping_payload(self, prompt: dict | None = None) -> dict:
+        capture = make_capture(prompt if prompt is not None else txt2img_prompt())
+        entries, output_node_id = derive_mapping_candidates(
+            capture, node_def_provider=fake_node_def
+        )
+        return {
+            "entries": {role: e.to_dict() for role, e in entries.items()},
+            "output_node_id": output_node_id,
+        }
+
+    def test_references_candidates_registered_and_empty_for_t2i(self):
+        workflow = self._create_workflow(name="Ref Routes")
+        version = self._capture_version(workflow["workflow_id"])
+        resp = self._call(
+            "GET",
+            "/comfymodal/studio/workflows/versions/{version_id}/references/candidates",
+            match_info={"version_id": version["workflow_version_id"]},
+        )
+        self.assertEqual(resp.status, 200, msg=resp.body)
+        body = self._body(resp)
+        self.assertEqual(body.get("status"), "ok")
+        self.assertIn("candidates", body)
+        self.assertIn("resolution", body)
+        self.assertEqual(body["candidates"], [])
+
+    def test_references_candidates_unknown_version_404(self):
+        resp = self._call(
+            "GET",
+            "/comfymodal/studio/workflows/versions/{version_id}/references/candidates",
+            match_info={"version_id": "wv_missing"},
+        )
+        self.assertEqual(resp.status, 404)
+
+    def test_references_companion_unbound_by_default(self):
+        workflow = self._create_workflow(name="Ref Companion")
+        version = self._capture_version(workflow["workflow_id"])
+        resp = self._call(
+            "GET",
+            "/comfymodal/studio/workflows/versions/{version_id}/references",
+            match_info={"version_id": version["workflow_version_id"]},
+        )
+        self.assertEqual(resp.status, 200, msg=resp.body)
+        companion = self._body(resp)["studio_references"]
+        self.assertEqual(companion["method"], "")
+        self.assertEqual(
+            companion["origin_version_id"], version["workflow_version_id"])
+        self.assertEqual(companion["origin_workflow_id"], workflow["workflow_id"])
+        self.assertNotIn("executable_prompt", companion)
+
+    def test_mapping_create_forwards_reference_fields(self):
+        workflow = self._create_workflow(name="Ref Forward")
+        version = self._capture_version(workflow["workflow_id"])
+        payload = self._mapping_payload()
+        payload["reference_method"] = "unknown_method_xyz"
+        payload["reference_bindings"] = {}
+        resp = self._call(
+            "POST",
+            "/comfymodal/studio/workflows/versions/{version_id}/mapping",
+            match_info={"version_id": version["workflow_version_id"]},
+            json_body=payload,
+        )
+        self.assertEqual(resp.status, 400, msg=resp.body)
+        self.assertIn("reference", self._body(resp).get("message", "").lower())
 
 
 if __name__ == "__main__":

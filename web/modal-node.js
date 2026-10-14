@@ -1,6 +1,11 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { initSharedTracker, getSharedTracker, setNodeLabelResolver } from "./comfymodal-progress.js";
+import {
+  readReferenceEngagement,
+  promptCarriesReferences,
+  referenceBlockMessage,
+} from "./studio-workflow-run.js";
 
 const MODAL_PREFIX = "/comfymodal";
 const BENCHMARK_WORKFLOW_PATH = "/comfymodal/benchmark/workflow";
@@ -679,6 +684,26 @@ app.registerExtension({
         if (!enabled) {
           return _originalFetchApi(route, options);
         }
+        // ── Studio References fail-closed gate ──────────────────────────
+        // The canvas topbar RUN posts the raw graph to /prompt, bypassing
+        // the Studio shelf RUN (which carries studio_references). When
+        // references are engaged for the selected workflow (method chosen
+        // or cards exist), a canvas /prompt without a reference payload
+        // must fail closed — never silently run without them. Any storage
+        // failure degrades to not-engaged (passthrough), so canvas users
+        // with no studio engagement see zero behavior change.
+        let _referenceEngagement = null;
+        try {
+          const _selRaw = localStorage.getItem("comfymodal.studio.playground.workflow.v1");
+          const _methodsRaw = localStorage.getItem("comfymodal.studio.methods.v1");
+          const _refsRaw = localStorage.getItem("comfymodal.studio.references.v1");
+          const _selection = _selRaw ? JSON.parse(_selRaw) : null;
+          const _methodsMap = _methodsRaw ? JSON.parse(_methodsRaw) : null;
+          const _referencesMap = _refsRaw ? JSON.parse(_refsRaw) : null;
+          _referenceEngagement = readReferenceEngagement(_selection, _methodsMap, _referencesMap);
+        } catch {
+          _referenceEngagement = null;
+        }
         // ── Queue-prompt pre-fetch timing capture ──────────────────────
         // Consume a pending queue capture (set by wrapped queuePrompt) so
         // the timestamps reflect the true invocation time, not the fetch
@@ -693,6 +718,13 @@ app.registerExtension({
           parsed = null;
         }
         if (parsed && typeof parsed === "object") {
+          // ── Studio References fail-closed block ───────────────────────
+          // Mirrors the production-gate throw below: engaged references
+          // with no reference payload in the outgoing body is an honest
+          // Error, never a silent plain run.
+          if (_referenceEngagement && !promptCarriesReferences(parsed)) {
+            throw new Error(referenceBlockMessage(_referenceEngagement));
+          }
           // ── Timing diagnostics ────────────────────────────────────────
           // True queue invocation time (user pressed Generate)
           if (queueCapture) {

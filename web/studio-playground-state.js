@@ -837,14 +837,14 @@ export const SHELL_MODES = Object.freeze(["generate", "edit", "post"]);
 
 export const SHELL_SUBTOOLS = Object.freeze({
   generate: Object.freeze(["text", "references", "layout", "sketch", "guidance"]),
-  edit: Object.freeze(["text", "select", "expand", "sketch"]),
+  edit: Object.freeze(["text", "references", "select", "expand", "sketch"]),
   post: Object.freeze(["adjust", "color", "detail", "effects", "crop", "heal", "upscale"]),
 });
 
 // Later-phase placeholders: visible but with no execution path. Simple
 // membership list — labels live with the caller. Single source for the
 // shell run gate shared by the playground topbar and experiment submits.
-export const SHELL_PLACEHOLDERS = Object.freeze(["references", "guidance", "upscale"]);
+export const SHELL_PLACEHOLDERS = Object.freeze(["guidance", "upscale"]);
 
 /**
  * Honest execution gate for views with no runnable workflow path: Post
@@ -982,6 +982,14 @@ const WORKFLOW_METHODS_KEY = "comfymodal.studio.methods.v1";
 
 const WORKFLOW_INPAINT_METHODS = ["crop_stitch", "conditioning", "dedicated"];
 const WORKFLOW_EXPAND_METHODS = ["pad", "pad_preserve", "dedicated"];
+// Phase 8 reference methods (Lane C). Frozen ids mirroring
+// studio_domain/models.py REFERENCE_METHOD_IDS. No Auto: "" means the user
+// has not chosen yet and the run gate requires an explicit choice.
+export const WORKFLOW_REFERENCE_METHODS = Object.freeze([
+  "conditioning_slots",
+  "reference_latent_chain",
+  "dedicated",
+]);
 const WORKFLOW_METHOD_KEYS = [
   "inpaintMethod",
   "inpaintOverride",
@@ -993,6 +1001,8 @@ const WORKFLOW_METHOD_KEYS = [
   "padLeft",
   "savedMask",
   "savedMaskSource",
+  "referenceMethod",
+  "referenceOverride",
 ];
 
 /**
@@ -1011,6 +1021,8 @@ function _defaultWorkflowMethods() {
     padLeft: 0,
     savedMask: "",
     savedMaskSource: "",
+    referenceMethod: "",
+    referenceOverride: "",
   };
 }
 
@@ -1054,6 +1066,13 @@ function _sanitizeWorkflowMethods(raw) {
     padLeft: _sanitizePadInt(raw.padLeft, defaults.padLeft),
     savedMask: typeof raw.savedMask === "string" ? raw.savedMask : "",
     savedMaskSource: typeof raw.savedMaskSource === "string" ? raw.savedMaskSource : "",
+    // Explicit-choice field: anything outside the frozen ids degrades to ""
+    // (not to a default method), so the run gate keeps requiring a choice
+    // instead of silently auto-selecting.
+    referenceMethod: WORKFLOW_REFERENCE_METHODS.indexOf(raw.referenceMethod) !== -1
+      ? raw.referenceMethod
+      : "",
+    referenceOverride: typeof raw.referenceOverride === "string" ? raw.referenceOverride : "",
   };
 }
 
@@ -1135,9 +1154,107 @@ export function saveWorkflowMethods(workflowId, patch) {
       && typeof patch.savedMaskSource === "string") {
       next.savedMaskSource = patch.savedMaskSource;
     }
+    if (Object.prototype.hasOwnProperty.call(patch, "referenceMethod")
+      && WORKFLOW_REFERENCE_METHODS.indexOf(patch.referenceMethod) !== -1) {
+      next.referenceMethod = patch.referenceMethod;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "referenceOverride")
+      && typeof patch.referenceOverride === "string") {
+      next.referenceOverride = patch.referenceOverride;
+    }
     void WORKFLOW_METHOD_KEYS;
     store[workflowId] = next;
     localStorage.setItem(WORKFLOW_METHODS_KEY, JSON.stringify(store));
+  } catch (e) {
+    // Ignore
+  }
+}
+
+// ── Per-workflow+version reference cards (Phase 8, Lane C) ─────────────
+// Ordered reference collection, separate from ordinary mapped controls:
+// never global reference_1..10 controls. Cards are {id, file, label} with a
+// stable internal id; display numbering follows submitted (array) order.
+// Keyed by workflow+version like the shelf values. Structural bindings live
+// in the Mapping (Lane A); this store keeps only the user's card values.
+// Shape normalization (id generation, ordering helpers) lives in
+// studio-workflow-run.js; here only structural filtering so malformed
+// storage degrades to [] and callers normalize after load.
+
+const REFERENCES_VALUES_KEY = "comfymodal.studio.references.v1";
+
+function _referenceCardsKey(workflowId, versionId) {
+  return String(workflowId || "") + "::" + String(versionId || "");
+}
+
+function _filterReferenceCards(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    out.push({
+      id: typeof item.id === "string" ? item.id.slice(0, 80) : "",
+      file: typeof item.file === "string" ? item.file.slice(0, 500) : "",
+      label: typeof item.label === "string" ? item.label.slice(0, 80) : "",
+    });
+  }
+  return out;
+}
+
+/**
+ * Load the reference cards for a workflow+version.
+ * @param {string} workflowId
+ * @param {string} versionId
+ * @returns {Array<{id: string, file: string, label: string}>} [] when nothing saved
+ */
+export function loadReferenceCards(workflowId, versionId) {
+  if (typeof workflowId !== "string" || !workflowId) return [];
+  try {
+    if (typeof localStorage === "undefined") return [];
+    const raw = localStorage.getItem(REFERENCES_VALUES_KEY);
+    if (!raw) return [];
+    const all = JSON.parse(raw);
+    if (!all || typeof all !== "object") return [];
+    return _filterReferenceCards(all[_referenceCardsKey(workflowId, versionId)]);
+  } catch (e) {
+    return [];
+  }
+}
+
+/**
+ * Persist the reference cards for a workflow+version.
+ * @param {string} workflowId
+ * @param {string} versionId
+ * @param {Array} cards ordered card list
+ */
+export function saveReferenceCards(workflowId, versionId, cards) {
+  if (typeof workflowId !== "string" || !workflowId) return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    const raw = localStorage.getItem(REFERENCES_VALUES_KEY);
+    const all = raw ? JSON.parse(raw) : {};
+    const store = all && typeof all === "object" ? all : {};
+    store[_referenceCardsKey(workflowId, versionId)] = _filterReferenceCards(cards);
+    localStorage.setItem(REFERENCES_VALUES_KEY, JSON.stringify(store));
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
+ * Remove the reference cards for a workflow+version.
+ * @param {string} workflowId
+ * @param {string} versionId
+ */
+export function clearReferenceCards(workflowId, versionId) {
+  if (typeof workflowId !== "string" || !workflowId) return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    const raw = localStorage.getItem(REFERENCES_VALUES_KEY);
+    if (!raw) return;
+    const all = JSON.parse(raw);
+    if (!all || typeof all !== "object") return;
+    delete all[_referenceCardsKey(workflowId, versionId)];
+    localStorage.setItem(REFERENCES_VALUES_KEY, JSON.stringify(all));
   } catch (e) {
     // Ignore
   }

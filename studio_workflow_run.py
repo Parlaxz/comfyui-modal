@@ -175,6 +175,7 @@ def resolve_workflow_run_bundle(
     node_dir: str | os.PathLike,
     *,
     remote_model_readiness: bool = False,
+    reference_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve and gate a workflow run: workflow + version + mapping.
 
@@ -186,6 +187,14 @@ def resolve_workflow_run_bundle(
     * Runnable gate: the version's derived state must be ``runnable``; an
       incomplete version returns ``WORKFLOW_VERSION_NOT_RUNNABLE`` with the
       derivation reasons (never guessed).
+    * Phase 8 dedicated tolerance: a dedicated origin whose target is a
+      workflow (not a graph node) is reported unrunnable by Lane A's node
+      check — correctly for the origin alone. When ``reference_request``
+      carries method ``"dedicated"`` and the ONLY reasons are that
+      dedicated-target staleness with a compatible (unconfirmed or matching)
+      target, the bundle still resolves so the request can proceed to its
+      executing target (which is gated runnable on its own). Anything else
+      stays rejected.
 
     There is no preset: control defaults are read from the version's own
     ``executable_prompt`` (see ``default_controls_from_version``).
@@ -231,12 +240,30 @@ def resolve_workflow_run_bundle(
             "status": "ready" if not reasons else "incomplete",
         }
     if not state.get("runnable"):
-        return {
-            "status": "error",
-            "error_code": "WORKFLOW_VERSION_NOT_RUNNABLE",
-            "message": "workflow version is not runnable",
-            "reasons": list(state.get("reasons") or []),
-        }
+        if (
+            isinstance(reference_request, dict)
+            and reference_request.get("method") == "dedicated"
+        ):
+            try:
+                _tol_mapping = service.get_mapping(version_id)
+            except Exception:
+                _tol_mapping = None
+            if _tolerated_dedicated_origin(state, _tol_mapping):
+                pass
+            else:
+                return {
+                    "status": "error",
+                    "error_code": "WORKFLOW_VERSION_NOT_RUNNABLE",
+                    "message": "workflow version is not runnable",
+                    "reasons": list(state.get("reasons") or []),
+                }
+        else:
+            return {
+                "status": "error",
+                "error_code": "WORKFLOW_VERSION_NOT_RUNNABLE",
+                "message": "workflow version is not runnable",
+                "reasons": list(state.get("reasons") or []),
+            }
 
     mapping = service.get_mapping(version_id)
     if mapping is None:
@@ -788,14 +815,18 @@ def _resolve_execution_target(
     ui_graph: Any,
     node_id: str,
     input_name: str,
+    node_def_provider: Any = None,
 ) -> tuple[str, str] | None:
     """Resolve a stored mapping target to its executable prompt key.
 
     Direct hits pass through. Subgraph UI ids resolve without guessing:
     outer containers via the subgraph ``inputNode`` mapping (needs
     ``ui_graph``) and inner-local ids via a unique ``":<id>"`` suffix match
-    against the executable prompt. Returns ``(node_id, input_name)`` or None.
-    Never raises.
+    against the executable prompt. Dotted expanded-autogrow children
+    (``"<container>.<slot>"``, e.g. Qwen ``images.image_1``) resolve when
+    the container is schema-declared: the mutator writes the dotted key,
+    which is exactly how ComfyUI serializes those inputs. Returns
+    ``(node_id, input_name)`` or None. Never raises.
     """
     try:
         if not node_id or not input_name:
@@ -805,6 +836,24 @@ def _resolve_execution_target(
             inputs = node.get("inputs")
             if isinstance(inputs, dict) and input_name in inputs:
                 return (node_id, input_name)
+            # Expanded-autogrow children ("<container>.<slot>") absent as
+            # executable keys are still valid targets when the container is
+            # schema-declared: the mutator writes the dotted key, exactly
+            # how ComfyUI serializes those inputs. Uses the same Lane-A
+            # slot derivation as discovery (single source of truth).
+            if isinstance(inputs, dict) and "." in str(input_name or ""):
+                try:
+                    from studio_domain.graph import _image_slots_from_schema as _phase8_slots
+                    from studio_domain.graph import _declared_input_types as _phase8_declared
+                    _decl = _phase8_declared(
+                        str((node.get("class_type", "") or "")),
+                        node_def_provider,
+                    )
+                    _known = {str(s.get("socket", "")) for s in _phase8_slots(_decl)[0]}
+                    if str(input_name) in _known:
+                        return (node_id, input_name)
+                except Exception:
+                    pass
         if ":" in node_id:
             return None
         if ui_graph is not None:
@@ -1325,6 +1374,7 @@ def build_workflow_execution_plan(
     comfyui_root: str = "",
     gpu: Any = None,
     prompt_mutator: Any = None,
+    studio_references: dict[str, Any] | None = None,
 ) -> tuple[Any, str | None]:
     """Build a frozen ``ExecutionPlan`` for a workflow run.
 
@@ -1346,6 +1396,18 @@ def build_workflow_execution_plan(
     ``trace_ctx`` is accepted for signature parity with the legacy adapter;
     it is not consumed by plan construction.
     """
+    # Root for local image collection: the caller's node dir resolves
+    # <ComfyUI>/input via parent walk in standard installs, but under
+    # isolated --base-directory / junction layouts that walk finds no
+    # input dir. Prefer the LIVE ComfyUI base (folder_paths honors the
+    # process's actual --base-directory) whenever it exposes one.
+    try:
+        import folder_paths as _live_fp  # type: ignore[import-not-found]
+        _live_base = os.path.dirname(os.path.abspath(_live_fp.__file__))
+        if os.path.isdir(os.path.join(_live_base, "input")):
+            comfyui_root = _live_base
+    except Exception:
+        pass
     try:
         from comfymodal_runtime.contracts import (
             ExecutionOptions,
@@ -1434,6 +1496,11 @@ def build_workflow_execution_plan(
         )
         studio_meta["selected_gpu"] = _selected_gpu
         studio_meta.update(text_generate_meta)
+        if studio_references is not None:
+            # Phase 8: freeze the validated studio_references companion into
+            # request metadata BEFORE the plan freeze, beside the effective
+            # graph + image payloads (History retains it via request_metadata).
+            studio_meta["studio_references"] = copy.deepcopy(studio_references)
         try:
             # Role transport for golden dispatch substitution: normalized
             # semantic-role -> node bindings travel in request metadata so
@@ -1535,15 +1602,46 @@ def build_workflow_execution_plan(
                 validation=plan.validation,
                 deployment_identity=plan.deployment_identity,
             )
+            if studio_references is not None:
+                # Phase 8: complete image collection is required before
+                # acceptance — every validated reference file must reach the
+                # payload, never a bare filename. A gap fails the plan (the
+                # reference mutator already ran explicit final-graph
+                # validation, since the production builder compiles with
+                # validate=False).
+                _ref_files = list((studio_references or {}).get("images") or [])
+                _collected = plan.input_images or {}
+                _missing = [f for f in _ref_files if f not in _collected]
+                if _missing:
+                    return None, (
+                        "reference images missing from execution payload: "
+                        + ", ".join(_missing[:5])
+                    )[:500]
         else:
             # Non-production direct plan: image Tool Inputs still need their
             # bytes collected — otherwise source/mask filenames travel without
             # payloads and the remote loader finds nothing.
-            try:
-                from canonical_execution import _collect_input_images as _direct_collect_images
-                _direct_images = _direct_collect_images(workflow, str(comfyui_root or ""))
-            except Exception:
-                _direct_images = {}
+            if studio_references is not None:
+                # Phase 8: collection failures fail the run (never swallowed
+                # to {}) and completeness is asserted, same as production.
+                try:
+                    from canonical_execution import _collect_input_images as _direct_collect_images
+                    _direct_images = _direct_collect_images(workflow, str(comfyui_root or ""))
+                except Exception as exc:
+                    return None, f"reference image collection failed: {exc}"[:500]
+                _ref_files = list(studio_references.get("images") or [])
+                _missing = [f for f in _ref_files if f not in _direct_images]
+                if _missing:
+                    return None, (
+                        "reference images missing from execution payload: "
+                        + ", ".join(_missing[:5])
+                    )[:500]
+            else:
+                try:
+                    from canonical_execution import _collect_input_images as _direct_collect_images
+                    _direct_images = _direct_collect_images(workflow, str(comfyui_root or ""))
+                except Exception:
+                    _direct_images = {}
             plan = ExecutionPlan(
                 workflow=workflow,
                 workflow_hash=workflow_hash,
@@ -2104,6 +2202,8 @@ async def _workflow_v2_run(
     _method_ctx: dict[str, Any] | None = None,
     _prompt_mutator: Any = None,
     _studio_style: dict[str, Any] | None = None,
+    _studio_references: dict[str, Any] | None = None,
+    _reference_ctx: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """V2 direct single-run via the PlaygroundService (injectable hooks).
 
@@ -2169,6 +2269,7 @@ async def _workflow_v2_run(
             bundle, values, modal_options=modal_options, trace_ctx=trace_ctx,
             comfyui_root=str(node_dir or ""), gpu=gpu,
             prompt_mutator=_prompt_mutator,
+            studio_references=_studio_references,
         )
 
     # ── Post-materialization success capture (capture-only, no History write
@@ -2349,6 +2450,28 @@ async def _workflow_v2_run(
                 capture["studio_style"] = dict(_studio_style)
             except Exception:
                 pass
+
+    # ── Phase 8: reference provenance stamp (origin + executing identities).
+    #    Independent of the method blocks above: a reference run carries its
+    #    frozen studio_references beside the plan-carried copy so the result
+    #    shows which method ran which images on which workflow/version.
+    if isinstance(_reference_ctx, dict):
+        try:
+            trace = normalized.get("trace")
+            if not isinstance(trace, dict):
+                trace = {}
+                normalized["trace"] = trace
+            trace["studio_references"] = {
+                "method": _reference_ctx.get("method"),
+                "origin_workflow_id": _reference_ctx.get("origin_workflow_id"),
+                "origin_version_id": _reference_ctx.get("origin_version_id"),
+                "executing_workflow_id": _reference_ctx.get("executing_workflow_id"),
+                "executing_version_id": _reference_ctx.get("executing_version_id"),
+                "image_count": _reference_ctx.get("image_count"),
+            }
+            capture["studio_references"] = dict(trace["studio_references"])
+        except Exception:
+            pass
 
     # ── Modern History success preparation/commit (the first history write
     #    happens only after every fallible metadata/output check passed) ──
@@ -2730,10 +2853,20 @@ def _resolve_dedicated_override(node_dir, workflow_id, merged_values, override_i
     transfer = {}
     for role in ("prompt", "seed", "source_image", "mask"):
         value = (merged_values or {}).get(role)
+        # The graph/domain layers historically use ``positive_prompt`` while
+        # the transfer reads the catalog ``prompt`` role: fall back to the
+        # alias (Phase 8 dedicated requires it; Phase 3 dedicated origins
+        # with the same schema shape were silently dropping the prompt).
+        if role == "prompt" and (
+            value is None or (isinstance(value, str) and value.strip() == "")
+        ):
+            value = (merged_values or {}).get("positive_prompt")
         if value is None or (isinstance(value, str) and value.strip() == ""):
             continue
         if role in schema:
             transfer[role] = value
+        elif role == "prompt" and "positive_prompt" in schema:
+            transfer["positive_prompt"] = value
     merged = merge_workflow_controls(
         bundle.get("defaults") or {}, transfer, schema,
     )
@@ -2888,6 +3021,1310 @@ def method_compat_for_run(workflow_id, version_id, node_dir):
     }
 
 
+# ── Phase 8: References (explicit reference-image runs) ──
+#
+# Lane A owns the mapping contract (frozen method ids, version-bound bindings,
+# candidates/discovery, fail-closed validators, the studio_references
+# companion builders). This lane owns EXECUTION only, shared by ordinary and
+# Golden runs (Golden imports these helpers exactly like the Phase 3
+# studio_method helpers — one implementation, never two).
+#
+# Contract:
+# - The request carries an explicit studio_references companion
+#   {method, images[], card_ids[], dedicated_target, origin_*, executing_*}.
+#   Absent means a plain run. No Auto, no fallback between methods.
+# - Stored workflows/versions are never mutated: every mutation runs on a
+#   request-local deepcopy of the prepared graph. The stored graph is never
+#   written; the execution copy is discarded after the run (History retains
+#   the frozen plan workflow + image payloads, never the live copy).
+# - Every rejection returns {"error": reason} before any dispatch: stale /
+#   ambiguous / unevidenced bindings, overcapacity, missing required images,
+#   unsafe or missing image files, and unsupported loader paths dispatch
+#   nothing.
+
+_REFERENCE_METHOD_IDS = frozenset({
+    "conditioning_slots",
+    "reference_latent_chain",
+    "dedicated",
+})
+
+# Loader/encode/reference classes the mutators may create or clone. A slot
+# whose current upstream is any other class is an unsupported image path
+# (its bytes are generated, not a file) and fails closed instead of being
+# rewired or guessed. Class names are exact on purpose: a renamed variant
+# with the same sockets is rejected explicitly rather than cloned blindly.
+_REFERENCE_LOADER_CLASS = "LoadImage"
+_REFERENCE_ENCODE_CLASS = "VAEEncode"
+_REFERENCE_LATENT_CLASS = "ReferenceLatent"
+
+# Prefix for request-local clone ids. Suffixes are dense integers skipping
+# every id already present, so clones are collision-free by construction.
+_REFERENCE_CLONE_PREFIX = "ref"
+
+
+def _sanitize_studio_references(raw):
+    """Validate a request studio_references companion. Returns (ref|None, error|None).
+
+    Canonical shape (mirrors the client builder in
+    web/studio-workflow-run.js ``buildStudioReferencesCompanion``):
+      {"method": "conditioning_slots" | "reference_latent_chain" | "dedicated",
+       "images": [ordered filenames],
+       "card_ids": [ordered card ids],
+       "dedicated_target": str, "origin_workflow_id": str,
+       "origin_version_id": str, "executing_workflow_id": str,
+       "executing_version_id": str}
+    Unknown keys are stripped (forward-compatible); anything else fails
+    loudly — never a silent fallback to another method or a partial submit.
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, "studio_references must be an object"
+    method = raw.get("method", "")
+    if not isinstance(method, str) or method not in _REFERENCE_METHOD_IDS:
+        return None, f"unknown reference method {method!r}"
+    images = raw.get("images", [])
+    if not isinstance(images, list) or not images:
+        return None, "reference images must be a non-empty ordered list"
+    clean_images = []
+    for index, name in enumerate(images):
+        if not isinstance(name, str) or not name.strip():
+            return None, f"reference image {index + 1} must be a non-empty filename"
+        clean_images.append(name.strip())
+    card_ids = raw.get("card_ids", [])
+    if not isinstance(card_ids, list):
+        return None, "reference card_ids must be a list"
+    clean_cards = []
+    for card in card_ids:
+        if not isinstance(card, str):
+            return None, "reference card_ids must be strings"
+        if card:
+            clean_cards.append(card)
+
+    def _str(key):
+        value = raw.get(key, "")
+        return str(value or "")
+
+    return {
+        "method": method,
+        "images": clean_images,
+        "card_ids": clean_cards,
+        "dedicated_target": _str("dedicated_target"),
+        "origin_workflow_id": _str("origin_workflow_id"),
+        "origin_version_id": _str("origin_version_id"),
+        "executing_workflow_id": _str("executing_workflow_id"),
+        "executing_version_id": _str("executing_version_id"),
+    }, None
+
+
+def _is_link(value):
+    """True for a ComfyUI connection spec like ``["7", 0]``."""
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and isinstance(value[0], str)
+        and isinstance(value[1], int)
+        and not isinstance(value[1], bool)
+    )
+
+
+def _resolve_reference_image_path(filename):
+    """Resolve an ordered reference image to a server-side path (fail-closed).
+
+    Traversal-safe and existence-checked exactly like the Phase 3 method seam
+    (``_method_input_path``), plus a non-empty bytes check: a reference that
+    cannot be read is rejected before acceptance, never submitted as a bare
+    filename. Raises ValueError; callers convert to an error dict so a bad
+    image dispatches nothing.
+    """
+    name = str(filename or "")
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise ValueError(f"refusing unsafe image reference {name!r}")
+    try:
+        import folder_paths
+        input_dir = str(folder_paths.get_input_directory())
+    except Exception as exc:
+        raise ValueError("ComfyUI input directory unavailable") from exc
+    path = os.path.join(input_dir, name)
+    if not os.path.isfile(path):
+        raise ValueError(f"reference image {name!r} not found on server — re-upload it")
+    try:
+        if os.path.getsize(path) <= 0:
+            raise ValueError(f"reference image {name!r} is empty — re-upload it")
+    except OSError as exc:
+        raise ValueError(f"reference image {name!r} is unreadable — re-upload it") from exc
+    return path
+
+
+def _revalidate_reference_bindings(bundle, method, bindings, node_dir):
+    """Revalidate version-bound bindings against the EFFECTIVE executable graph.
+
+    Uses Lane A's fail-closed validator (``_validate_reference_bindings``) on
+    the bundle's effective prompt (post UI-refresh regeneration), so a stale
+    node/socket, an ambiguous subgraph binding, or an unevidenced chain is
+    rejected with its reason. Returns an error string or None. Never raises.
+    """
+    if not isinstance(bindings, dict):
+        return "reference bindings must be an object"
+    try:
+        service = _get_domain_service(node_dir)
+    except Exception:
+        service = None
+    if service is not None:
+        validate = getattr(service, "_validate_reference_bindings", None)
+        if callable(validate):
+            effective_version = dict(bundle.get("version") or {})
+            effective_version["executable_prompt"] = bundle.get("executable_prompt") or {}
+            try:
+                validate(method, bindings, effective_version)
+            except Exception as exc:
+                message = str(exc) or type(exc).__name__
+                return f"stale reference bindings: {message}"[:500]
+            return None
+    return _fallback_reference_check(bundle, method, bindings)
+
+
+def _fallback_reference_check(bundle, method, bindings):
+    """Structural minimum when the domain service is unavailable (rare).
+
+    Never guesses: slots/chains must resolve on the effective graph or the
+    request fails. Returns an error string or None.
+    """
+    prompt = bundle.get("executable_prompt") or {}
+    ui_graph = (bundle.get("version") or {}).get("graph_json")
+    if method == "conditioning_slots":
+        slots = bindings.get("slots") or []
+        if not isinstance(slots, list) or not slots:
+            return "conditioning_slots requires at least one reference slot"
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            if str(slot.get("kind", "reference")) == "source":
+                continue
+            target = _resolve_execution_target(
+                prompt, prompt, ui_graph,
+                str(slot.get("node_id", "")), str(slot.get("socket", "")),
+            )
+            if target is None:
+                return (
+                    f"reference slot {str(slot.get('socket', ''))!r} on node "
+                    f"{str(slot.get('node_id', ''))} is not present in the executable graph"
+                )
+        return None
+    if method == "reference_latent_chain":
+        chain = bindings.get("chain") or {}
+        if not isinstance(chain, dict) or not chain.get("reference_latent_node_id"):
+            return "reference_latent_chain requires a chain boundary"
+        try:
+            _inspect_reference_chain(prompt, chain, ui_graph)
+        except ValueError as exc:
+            return str(exc)[:500]
+        return None
+    if method == "dedicated":
+        if not str(bindings.get("dedicated_target", "") or ""):
+            return "dedicated reference method requires a dedicated target"
+        return None
+    return f"unknown reference method {method!r}"
+
+
+def _reference_slot_entries(bindings):
+    """Ordered confirmed reference slots (source sockets excluded)."""
+    slots = bindings.get("slots") or []
+    if not isinstance(slots, list):
+        return []
+
+    def _order(slot):
+        try:
+            return int(slot.get("order", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    ordered = []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        node_id = str(slot.get("node_id", slot.get("nodeId", "")) or "")
+        socket = str(slot.get("socket", slot.get("socket_name", slot.get("input_name", ""))) or "")
+        if not node_id or not socket:
+            continue
+        if str(slot.get("kind", "reference")) == "source":
+            continue
+        ordered.append({"node_id": node_id, "socket": socket, "order": _order(slot)})
+    ordered.sort(key=lambda s: (s["order"], s["node_id"], s["socket"]))
+    for index, slot in enumerate(ordered):
+        slot["order"] = index
+    return ordered
+
+
+def _reference_required_map(bundle, bindings, node_def_provider=None):
+    """Map (node_id, socket) → required for the confirmed candidate.
+
+    Read from Lane A discovery evidence on the effective graph (schema
+    required flags, via the domain service's node-def provider when
+    available — the same provider the revalidation validator uses). When
+    the candidate is undiscoverable here (no local node schemas), required
+    is unknown and the caller treats uncovered slots as missing —
+    fail-closed exact coverage, never an invented default. Returns {}
+    when unknown. Never raises.
+    """
+    try:
+        from studio_domain.graph import discover_reference_candidates
+    except Exception:
+        return {}
+    try:
+        prompt = bundle.get("executable_prompt") or {}
+        ui_graph = (bundle.get("version") or {}).get("graph_json")
+        mapping = bundle.get("mapping") or {}
+        out = discover_reference_candidates(
+            prompt,
+            ui_graph=ui_graph,
+            node_def_provider=node_def_provider,
+            output_node_id=str(mapping.get("output_node_id", "") or ""),
+        )
+        candidates = out.get("candidates") or []
+        wanted = str(bindings.get("candidate_id", "") or "")
+        picked = None
+        if wanted:
+            for cand in candidates:
+                if isinstance(cand, dict) and str(cand.get("candidate_id", "")) == wanted:
+                    picked = cand
+                    break
+        elif len(candidates) == 1:
+            picked = candidates[0]
+        if not isinstance(picked, dict):
+            return {}
+        required = {}
+        for slot in picked.get("slots") or []:
+            if not isinstance(slot, dict):
+                continue
+            nid = str(slot.get("node_id", "") or "")
+            sock = str(slot.get("socket", "") or "")
+            if nid and sock:
+                required[(nid, sock)] = bool(slot.get("required", False))
+        return required
+    except Exception:
+        return {}
+
+
+def _chain_edges(workflow):
+    """All executable connection edges as {src, slot, dst, socket}. Never raises."""
+    edges = []
+    try:
+        for dst_id, node in (workflow or {}).items():
+            inputs = node.get("inputs") if isinstance(node, dict) else None
+            if not isinstance(inputs, dict):
+                continue
+            for socket, value in inputs.items():
+                if _is_link(value):
+                    edges.append({
+                        "src": str(value[0]), "slot": int(value[1]),
+                        "dst": str(dst_id), "socket": str(socket),
+                    })
+    except Exception:
+        pass
+    return edges
+
+
+def _inspect_reference_chain(workflow, chain, ui_graph=None):
+    """Revalidate a confirmed Method-2 boundary against a request-local graph.
+
+    Checks the editable segment explicitly: a LoadImage loader holding a
+    server-resolvable image template, a VAEEncode with pixels from that
+    loader and a connected VAE, a ReferenceLatent with latent from the
+    encode and connected conditioning, and exactly the confirmed consumer
+    boundary edge. Returns the resolved boundary dict. Raises ValueError
+    (stale/unsafe/unsupported/ambiguous) — never guesses a replacement.
+    """
+    if not isinstance(chain, dict):
+        raise ValueError("reference_latent_chain requires a chain boundary")
+    loader_id = str(chain.get("loader_node_id", "") or "")
+    encode_id = str(chain.get("vae_encode_node_id", "") or "")
+    ref_id = str(chain.get("reference_latent_node_id", "") or "")
+    if not loader_id or not encode_id or not ref_id:
+        raise ValueError("reference_latent_chain boundary is missing its loader, encode, or latent node")
+    work = workflow if isinstance(workflow, dict) else {}
+    loader = work.get(loader_id)
+    if not isinstance(loader, dict):
+        raise ValueError(f"reference chain loader node {loader_id} is not present in the executable graph")
+    if str(loader.get("class_type", "")) != _REFERENCE_LOADER_CLASS:
+        raise ValueError(
+            f"reference chain loader node {loader_id} is "
+            f"{str(loader.get('class_type', ''))!r}; only {_REFERENCE_LOADER_CLASS} branches can carry reference images"
+        )
+    loader_inputs = loader.get("inputs") if isinstance(loader.get("inputs"), dict) else {}
+    template = loader_inputs.get("image", "")
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError(f"reference chain loader node {loader_id} has no resolvable image")
+    try:
+        _resolve_reference_image_path(template.strip())
+    except ValueError as exc:
+        raise ValueError(f"reference chain loader node {loader_id}: {exc}") from exc
+    encode = work.get(encode_id)
+    if not isinstance(encode, dict):
+        raise ValueError(f"reference chain encode node {encode_id} is not present in the executable graph")
+    if str(encode.get("class_type", "")) != _REFERENCE_ENCODE_CLASS:
+        raise ValueError(
+            f"reference chain encode node {encode_id} is "
+            f"{str(encode.get('class_type', ''))!r}; only {_REFERENCE_ENCODE_CLASS} branches can carry reference images"
+        )
+    encode_inputs = encode.get("inputs") if isinstance(encode.get("inputs"), dict) else {}
+    pixels = encode_inputs.get("pixels")
+    vae = encode_inputs.get("vae")
+    if not _is_link(pixels) or str(pixels[0]) != loader_id:
+        raise ValueError(f"reference chain encode node {encode_id} pixels are not connected to loader {loader_id}")
+    if not _is_link(vae):
+        raise ValueError(f"reference chain encode node {encode_id} has no connected VAE")
+    vae_src, vae_slot = str(vae[0]), int(vae[1])
+    want_vae = str(chain.get("vae_node_id", "") or "")
+    if want_vae and want_vae != vae_src:
+        raise ValueError(
+            f"reference chain VAE {vae_src!r} does not match the confirmed {want_vae!r}; refusing to pick another VAE"
+        )
+    ref = work.get(ref_id)
+    if not isinstance(ref, dict):
+        raise ValueError(f"reference latent node {ref_id} is not present in the executable graph")
+    if str(ref.get("class_type", "")) != _REFERENCE_LATENT_CLASS:
+        raise ValueError(
+            f"reference latent node {ref_id} is "
+            f"{str(ref.get('class_type', ''))!r}; only {_REFERENCE_LATENT_CLASS} branches can carry reference images"
+        )
+    ref_inputs = ref.get("inputs") if isinstance(ref.get("inputs"), dict) else {}
+    latent = ref_inputs.get("latent")
+    cond = ref_inputs.get("conditioning")
+    if not _is_link(latent) or str(latent[0]) != encode_id:
+        raise ValueError(f"reference latent node {ref_id} latent is not connected to encode {encode_id}")
+    if not _is_link(cond):
+        raise ValueError(f"reference latent node {ref_id} has no connected conditioning")
+    cond_src, cond_slot = str(cond[0]), int(cond[1])
+    edges = _chain_edges(work)
+    outs = [e for e in edges if e["src"] == ref_id]
+    if not outs:
+        raise ValueError(f"reference latent node {ref_id} has no downstream consumer")
+    want_consumer = str(chain.get("consumer_node_id", "") or "")
+    if want_consumer:
+        boundary = [e for e in outs if e["dst"] == want_consumer]
+        if not boundary:
+            raise ValueError(
+                f"reference chain consumer {want_consumer} is not connected to latent node {ref_id}"
+            )
+    else:
+        consumers = {e["dst"] for e in outs}
+        if len(consumers) != 1:
+            raise ValueError(
+                f"reference latent node {ref_id} feeds {len(consumers)} consumers "
+                "with no confirmed boundary; refusing to guess which edge to rewire"
+            )
+        boundary = outs
+    return {
+        "loader_id": loader_id,
+        "loader_slot": int(pixels[1]),
+        "encode_id": encode_id,
+        "ref_id": ref_id,
+        "vae_src": vae_src,
+        "vae_slot": vae_slot,
+        "cond_src": cond_src,
+        "cond_slot": cond_slot,
+        "boundary": [dict(e) for e in boundary],
+    }
+
+
+def _fresh_node_id(workflow, prefix=_REFERENCE_CLONE_PREFIX):
+    """Collision-free request-local node id (dense ``ref_1..n``)."""
+    taken = set()
+    try:
+        taken = {str(k) for k in (workflow or {}).keys()}
+    except Exception:
+        taken = set()
+    index = 1
+    while f"{prefix}_{index}" in taken:
+        index += 1
+    return f"{prefix}_{index}"
+
+
+def _workflow_has_cycle(workflow):
+    """True when connection-spec links form a cycle. Never raises."""
+    try:
+        order = [str(k) for k in (workflow or {}).keys()]
+        state = {}
+
+        def _visit(node_id, stack):
+            state[node_id] = 1
+            stack.add(node_id)
+            node = workflow.get(node_id)
+            inputs = node.get("inputs") if isinstance(node, dict) else None
+            if isinstance(inputs, dict):
+                for value in inputs.values():
+                    if _is_link(value):
+                        upstream = str(value[0])
+                        if upstream not in workflow:
+                            continue
+                        if upstream in stack:
+                            return True
+                        if state.get(upstream) is None and _visit(upstream, stack):
+                            return True
+            stack.discard(node_id)
+            state[node_id] = 2
+            return False
+
+        for node_id in order:
+            if state.get(node_id) is None and _visit(node_id, set()):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def _upstream_closure(workflow, output_node_id):
+    """Node ids upstream of (and including) the output, following links."""
+    seen = set()
+    try:
+        stack = [str(output_node_id or "")]
+        while stack:
+            node_id = stack.pop()
+            if not node_id or node_id in seen:
+                continue
+            node = (workflow or {}).get(node_id)
+            if not isinstance(node, dict):
+                continue
+            seen.add(node_id)
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict):
+                continue
+            for value in inputs.values():
+                if _is_link(value):
+                    stack.append(str(value[0]))
+    except Exception:
+        pass
+    return seen
+
+
+def _validate_reference_final_graph(workflow, output_node_id):
+    """Explicit final-graph validation for reference requests.
+
+    Runs for every reference mutation before hashing/dispatch (the
+    production builder is invoked with ``validate=False`` because unknown
+    custom-node classes resolve remotely — a local registry check would
+    false-reject them — so reference requests carry their own
+    registry-independent proof instead): API structure, link integrity
+    (every link names an existing node/slot), acyclicity, and output
+    presence. Raises ValueError; never warns-and-continues.
+    """
+    if not isinstance(workflow, dict) or not workflow:
+        raise ValueError("reference final graph is empty")
+    try:
+        from api_prompt_validator import assert_valid_api_prompt_structure
+        assert_valid_api_prompt_structure(workflow)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"reference final graph validator unavailable: {exc}"[:300]) from exc
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            raise ValueError(f"reference final graph node {node_id!r} is not an object")
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            raise ValueError(f"reference final graph node {node_id!r} has no inputs")
+        for socket, value in inputs.items():
+            if _is_link(value):
+                if str(value[0]) not in workflow:
+                    raise ValueError(
+                        f"reference final graph link {value[0]!r}:{value[1]} "
+                        f"into node {node_id} input {socket!r} names a missing node"
+                    )
+                if int(value[1]) < 0:
+                    raise ValueError(
+                        f"reference final graph link into node {node_id} "
+                        f"input {socket!r} has a negative slot"
+                    )
+    if _workflow_has_cycle(workflow):
+        raise ValueError("reference final graph has a dependency cycle")
+    if str(output_node_id or "") and str(output_node_id) not in workflow:
+        raise ValueError(f"reference final graph lost output node {output_node_id!r}")
+
+
+def _check_reference_mutation_allowlist(before, after, *, allowed_added, allowed_modified):
+    """Fail-closed diff gate for Method-2 chain mutations.
+
+    ``allowed_added`` is the exact set of clone ids; ``allowed_modified``
+    maps node id → permitted changed input keys (loader ``image`` sets and
+    the confirmed consumer rewire). Added/removed nodes or any change
+    outside the confirmed segment raises ValueError — nothing outside the
+    editable segment apart from normal mapped controls (which are applied
+    before the mutator runs, so the ``before`` snapshot already holds them).
+    """
+    before_ids = set(str(k) for k in (before or {}).keys())
+    after_ids = set(str(k) for k in (after or {}).keys())
+    added = after_ids - before_ids
+    extra_added = set(added) - set(allowed_added or set())
+    if extra_added:
+        raise ValueError(
+            "reference mutation added unexpected nodes: "
+            + ", ".join(sorted(extra_added))[:200]
+        )
+    removed = before_ids - after_ids
+    if removed:
+        raise ValueError(
+            "reference mutation removed nodes: " + ", ".join(sorted(removed))[:200]
+        )
+    allowed_modified = allowed_modified or {}
+    for node_id in before_ids & after_ids:
+        if _values_identical(before.get(node_id), after.get(node_id)):
+            continue
+        permitted = allowed_modified.get(str(node_id))
+        if permitted is None:
+            raise ValueError(
+                f"reference mutation touched node {node_id} outside the confirmed segment"
+            )
+        old_node = before.get(node_id) or {}
+        new_node = after.get(node_id) or {}
+        if not isinstance(old_node, dict) or not isinstance(new_node, dict):
+            raise ValueError(f"reference mutation changed node {node_id} shape")
+        if str(old_node.get("class_type", "")) != str(new_node.get("class_type", "")):
+            raise ValueError(f"reference mutation changed node {node_id} class")
+        old_inputs = old_node.get("inputs") if isinstance(old_node.get("inputs"), dict) else {}
+        new_inputs = new_node.get("inputs") if isinstance(new_node.get("inputs"), dict) else {}
+        changed = {
+            key for key in set(old_inputs) | set(new_inputs)
+            if not _values_identical(old_inputs.get(key), new_inputs.get(key))
+        }
+        outside = set(changed) - set(permitted)
+        if outside:
+            raise ValueError(
+                f"reference mutation changed node {node_id} inputs "
+                + ", ".join(sorted(str(k) for k in outside))[:200]
+            )
+
+
+def _apply_reference_slots_mutation(workflow, prep):
+    """Method-1: assign ordered images through supported loader paths only.
+
+    Operates on the request-local prepared graph (already a deepcopy).
+    Each confirmed slot takes ``images[order]``: an exclusive LoadImage
+    upstream is reused in place; a shared fan-out upstream is isolated by
+    cloning the loader branch (other consumers keep the original); an
+    unlinked slot gains a LoadImage. Only confirmed optional links are ever
+    retargeted (the slot's own link); required infrastructure and shared
+    branches are never severed — shared ones are isolated instead, and a
+    non-loader upstream is an unsupported-image-path rejection. A filename
+    is never written into an IMAGE socket (only ``LoadImage.image`` holds
+    filenames); overcapacity, missing required images, stale bindings, and
+    unsafe/missing files raise ValueError. Dispatch nothing on failure.
+    """
+    slots = prep.get("ref_slots") or []
+    images = prep.get("images") or []
+    ui_graph = prep.get("ui_graph")
+    if len(images) > len(slots):
+        raise ValueError(
+            f"this version exposes {len(slots)} reference slot"
+            f"{'' if len(slots) == 1 else 's'} for Conditioning slots — "
+            f"remove {len(images) - len(slots)} image"
+            f"{'' if len(images) - len(slots) == 1 else 's'}"
+        )
+    required = prep.get("required") or {}
+    reserved = prep.get("reserved")
+    touched = []
+    for index, slot in enumerate(slots):
+        node_id = str(slot.get("node_id", ""))
+        socket = str(slot.get("socket", ""))
+        if reserved and (node_id, socket) == (str(reserved[0]), str(reserved[1])):
+            raise ValueError(
+                f"reference slot {socket!r} on node {node_id} is the reserved "
+                "source-image socket and can never take a reference"
+            )
+        if index >= len(images):
+            if required.get((node_id, socket), True):
+                raise ValueError(
+                    f"missing required reference image for slot {socket!r} on node {node_id}"
+                )
+            continue
+        filename = images[index]
+        try:
+            _resolve_reference_image_path(filename)
+        except ValueError as exc:
+            raise ValueError(str(exc)[:300]) from exc
+        target = _resolve_execution_target(workflow, workflow, ui_graph, node_id, socket)
+        if target is None:
+            raise ValueError(
+                f"reference slot {socket!r} on node {node_id} is not present "
+                "in the executable graph; rebind references for the current version"
+            )
+        exec_id, exec_socket = target
+        node = workflow.get(exec_id)
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(inputs, dict) or exec_socket not in inputs:
+            raise ValueError(
+                f"reference slot {socket!r} on node {node_id} is not present "
+                "in the executable graph; rebind references for the current version"
+            )
+        current = inputs[exec_socket]
+        if _is_link(current):
+            upstream_id = str(current[0])
+            upstream_slot = int(current[1])
+            consumers = [
+                (dst_id, sock)
+                for dst_id, cand in workflow.items()
+                if isinstance(cand, dict) and isinstance(cand.get("inputs"), dict)
+                for sock, val in cand["inputs"].items()
+                if _is_link(val) and str(val[0]) == upstream_id
+            ]
+            others = [
+                (dst_id, sock) for (dst_id, sock) in consumers
+                if not (str(dst_id) == str(exec_id) and str(sock) == str(exec_socket))
+            ]
+            upstream = workflow.get(upstream_id)
+            if not isinstance(upstream, dict) or str(upstream.get("class_type", "")) != _REFERENCE_LOADER_CLASS:
+                raise ValueError(
+                    f"reference slot {socket!r} on node {node_id} is fed by "
+                    f"{str((upstream or {}).get('class_type', 'a missing node'))!r}; "
+                    f"only {_REFERENCE_LOADER_CLASS} branches can carry reference images"
+                )
+            if others:
+                clone_id = _fresh_node_id(workflow)
+                clone = copy.deepcopy(upstream)
+                clone_inputs = clone.get("inputs")
+                if not isinstance(clone_inputs, dict):
+                    raise ValueError(f"reference loader node {upstream_id} has no inputs")
+                clone_inputs["image"] = filename
+                workflow[clone_id] = clone
+                inputs[exec_socket] = [clone_id, upstream_slot]
+                touched.append(clone_id)
+            else:
+                upstream_inputs = upstream.get("inputs")
+                if not isinstance(upstream_inputs, dict):
+                    raise ValueError(f"reference loader node {upstream_id} has no inputs")
+                upstream_inputs["image"] = filename
+                touched.append(upstream_id)
+        else:
+            loader_id = _fresh_node_id(workflow)
+            workflow[loader_id] = {
+                "class_type": _REFERENCE_LOADER_CLASS,
+                "inputs": {"image": filename},
+            }
+            inputs[exec_socket] = [loader_id, 0]
+            touched.append(loader_id)
+        settled = workflow.get(exec_id, {}).get("inputs", {}).get(exec_socket)
+        if not _is_link(settled):
+            raise ValueError(
+                f"reference slot {socket!r} on node {node_id} did not settle on "
+                "a loader link; refusing to write a filename into an IMAGE socket"
+            )
+    output_id = str(prep.get("output_node_id", "") or "")
+    if output_id:
+        reachable = _upstream_closure(workflow, output_id)
+        for slot in slots[:len(images)]:
+            if str(slot.get("node_id", "")) not in reachable:
+                raise ValueError(
+                    f"reference slot {slot.get('socket', '')!r} on node "
+                    f"{slot.get('node_id', '')} no longer reaches the output"
+                )
+    return {"touched": touched}
+
+
+def _apply_reference_chain_mutation(workflow, prep):
+    """Method-2: build a ReferenceLatent chain in card order.
+
+    The editable segment is explicit (loader → encode → latent + the
+    confirmed consumer edge). Link 1 reuses the segment in place; links
+    2..N clone ONLY the supported loader/encode/reference branch with
+    collision-free ids and extend the chain behind the previous link in
+    card order, fanning out the SAME conditioning and VAE links (never
+    another VAE, never an undisclosed extra link). Only the confirmed
+    boundary edges are rewired to the final link; the allowlist diff then
+    proves nothing outside the segment changed; final validation covers
+    node availability, sockets, types, cycles, image bytes, and output
+    reachability. Raises ValueError — dispatch nothing.
+    """
+    images = prep.get("images") or []
+    if not images:
+        raise ValueError("reference_latent_chain requires at least one reference image")
+    chain = prep.get("chain") or {}
+    ui_graph = prep.get("ui_graph")
+    info = _inspect_reference_chain(workflow, chain, ui_graph)
+    before = copy.deepcopy(workflow)
+    loader_id = info["loader_id"]
+    workflow[loader_id]["inputs"]["image"] = images[0]
+    allowed_added: set[str] = set()
+    allowed_modified: dict[str, set[str]] = {loader_id: {"image"}}
+    # Extend the evidenced chain in card order: link 1 is the confirmed
+    # segment itself (loader image set above); each further card clones the
+    # branch and chains its latent behind the previous link's output, so no
+    # evidenced node is orphaned and every link is disclosed by card order.
+    out_slots = {int(e["slot"]) for e in info["boundary"]}
+    if len(out_slots) != 1:
+        raise ValueError(
+            "reference chain boundary uses multiple output slots; "
+            "refusing to guess the chain order"
+        )
+    prev_ref = info["ref_id"]
+    prev_slot = next(iter(out_slots))
+    for extra in images[1:]:
+        try:
+            _resolve_reference_image_path(extra)
+        except ValueError as exc:
+            raise ValueError(str(exc)[:300]) from exc
+        new_loader = _fresh_node_id(workflow)
+        workflow[new_loader] = {
+            "class_type": _REFERENCE_LOADER_CLASS,
+            "inputs": {"image": extra},
+        }
+        allowed_added.add(new_loader)
+        new_encode = _fresh_node_id(workflow)
+        workflow[new_encode] = {
+            "class_type": _REFERENCE_ENCODE_CLASS,
+            "inputs": {
+                "pixels": [new_loader, info["loader_slot"]],
+                "vae": [info["vae_src"], info["vae_slot"]],
+            },
+        }
+        allowed_added.add(new_encode)
+        new_ref = _fresh_node_id(workflow)
+        workflow[new_ref] = {
+            "class_type": _REFERENCE_LATENT_CLASS,
+            "inputs": {
+                "latent": [prev_ref, prev_slot],
+                "conditioning": [info["cond_src"], info["cond_slot"]],
+            },
+        }
+        allowed_added.add(new_ref)
+        prev_ref = new_ref
+    if len(images) > 1:
+        for edge in info["boundary"]:
+            consumer = workflow.get(edge["dst"])
+            if not isinstance(consumer, dict) or not isinstance(consumer.get("inputs"), dict):
+                raise ValueError(
+                    f"reference chain consumer {edge['dst']} is not present in the executable graph"
+                )
+            consumer["inputs"][edge["socket"]] = [prev_ref, int(edge["slot"])]
+            allowed_modified.setdefault(edge["dst"], set()).add(edge["socket"])
+    else:
+        edge = info["boundary"][0]
+        consumer = workflow.get(edge["dst"])
+        if not isinstance(consumer, dict) or not isinstance(consumer.get("inputs"), dict):
+            raise ValueError(
+                f"reference chain consumer {edge['dst']} is not present in the executable graph"
+            )
+    _check_reference_mutation_allowlist(
+        before, workflow,
+        allowed_added=allowed_added, allowed_modified=allowed_modified,
+    )
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("class_type", "")) in (_REFERENCE_ENCODE_CLASS, _REFERENCE_LATENT_CLASS):
+            inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+            for key in ("pixels", "vae", "latent", "conditioning"):
+                if key in inputs and not _is_link(inputs[key]):
+                    raise ValueError(
+                        f"reference chain node {node_id} input {key!r} is not a link; "
+                        "filenames travel only in loader image inputs"
+                    )
+    output_id = str(prep.get("output_node_id", "") or "")
+    if output_id:
+        reachable = _upstream_closure(workflow, output_id)
+        for need in (info["loader_id"], info["encode_id"], info["ref_id"], prev_ref):
+            if str(need) not in reachable:
+                raise ValueError(
+                    f"reference chain node {need} no longer reaches the output"
+                )
+        for edge in info["boundary"]:
+            if str(edge["dst"]) not in reachable:
+                raise ValueError(
+                    f"reference chain consumer {edge['dst']} no longer reaches the output"
+                )
+    return {"links": len(images), "final_ref": prev_ref}
+
+
+def _build_reference_prompt_mutator(prep):
+    """Build the shared prompt_mutator for a prepared reference run.
+
+    One implementation for ordinary + Golden runs: the mutator deepcopies
+    the prepared graph first, applies the confirmed method, runs explicit
+    final-graph validation, and returns the mutated copy. Anything invalid
+    raises ValueError (the plan seam converts it to ``(None, error)`` so a
+    bad reference run dispatches nothing). Request-local state lives only
+    in locals and is released on every outcome — success or raise.
+    """
+    method = (prep or {}).get("method", "")
+
+    def _mutator(workflow):
+        try:
+            work = copy.deepcopy(workflow)
+            if method == "conditioning_slots":
+                _apply_reference_slots_mutation(work, prep)
+            elif method == "reference_latent_chain":
+                _apply_reference_chain_mutation(work, prep)
+            else:
+                raise ValueError(f"unknown reference method {method!r}")
+            _validate_reference_final_graph(work, prep.get("output_node_id", ""))
+            return work
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(str(exc)[:500]) from exc
+
+    return _mutator
+
+
+def _normalize_prompt_alias_for_transfer(values):
+    """Copy ``positive_prompt`` onto ``prompt`` for dedicated transfer.
+
+    Merged values are keyed by the mapping's stored roles
+    (``positive_prompt``), while the dedicated transfer reads the catalog
+    ``prompt`` role. Never mutates the input; returns a new dict.
+    """
+    copied = dict(values or {})
+    try:
+        prompt = copied.get("prompt")
+        if (prompt is None or (isinstance(prompt, str) and not prompt.strip())) and isinstance(
+            copied.get("positive_prompt"), str
+        ):
+            copied["prompt"] = copied["positive_prompt"]
+    except Exception:
+        pass
+    return copied
+
+
+def _dedicated_target_is_workflow(target, node_dir):
+    """True when a dedicated target resolves to a stored workflow. Never raises."""
+    try:
+        service = _get_domain_service(node_dir)
+        return service.store.get_workflow(str(target or "")) is not None
+    except Exception:
+        return False
+
+
+def _tolerated_dedicated_origin(state, mapping):
+    """Whether an unrunnable dedicated origin may proceed to acceptance.
+
+    A dedicated origin whose target is a workflow (not a graph node) is
+    reported unrunnable by Lane A's node check — correctly, for the origin
+    alone. The request may still proceed to acceptance when the ONLY reasons
+    are that dedicated-target staleness; acceptance then re-checks the
+    confirmed target (changed targets require rebinding, missing targets
+    stay stale, incompatible targets are rejected). Anything else stays
+    rejected at the gate. Never raises.
+    """
+    try:
+        if not isinstance(mapping, dict):
+            return False
+        if str(mapping.get("reference_method", "") or "") != "dedicated":
+            return False
+        reasons = list((state or {}).get("reasons") or [])
+        if not reasons:
+            return False
+        return all(
+            str(r).startswith("stale reference bindings: dedicated") for r in reasons
+        )
+    except Exception:
+        return False
+
+
+def _prepare_method_prep(bundle, method, bindings, images, node_dir):
+    """Build the mutator inputs for one method on its executing bundle.
+
+    Shared by direct runs and dedicated-override runs (the override's own
+    confirmed bindings drive its own mutation). Returns ``{"prep": ...}``
+    or ``{"error": ...}``. Never mutates inputs. Never dispatches.
+    """
+    prompt = bundle.get("executable_prompt") or {}
+    ui_graph = (bundle.get("version") or {}).get("graph_json")
+    mapping = bundle.get("mapping") or {}
+    output_node_id = str(mapping.get("output_node_id", "") or "")
+    control_schema = bundle.get("control_schema") or {}
+    if method == "conditioning_slots":
+        ref_slots = _reference_slot_entries(bindings)
+        if not ref_slots:
+            return {"error": "Conditioning slots is bound but exposes no reference slots in this version"}
+        reserved = bindings.get("reserved_source_socket") if isinstance(bindings, dict) else None
+        reserved_pair = None
+        if isinstance(reserved, dict) and reserved.get("node_id") and reserved.get("socket"):
+            reserved_pair = (str(reserved["node_id"]), str(reserved["socket"]))
+        for slot in ref_slots:
+            if reserved_pair == (slot["node_id"], slot["socket"]):
+                return {
+                    "error": (
+                        f"reference slot {slot['socket']!r} on node {slot['node_id']} "
+                        "is the reserved source-image socket and can never take a reference"
+                    )
+                }
+        if len(images) > len(ref_slots):
+            return {
+                "error": (
+                    f"this version exposes {len(ref_slots)} reference slot"
+                    f"{'' if len(ref_slots) == 1 else 's'} for Conditioning slots — "
+                    f"remove {len(images) - len(ref_slots)} image"
+                    f"{'' if len(images) - len(ref_slots) == 1 else 's'}"
+                )
+            }
+        targets = {}
+        try:
+            _req_service = _get_domain_service(node_dir)
+            _req_provider = getattr(_req_service, "_node_def_provider", None)
+        except Exception:
+            _req_provider = None
+        for slot in ref_slots:
+            target = _resolve_execution_target(
+                prompt, prompt, ui_graph, slot["node_id"], slot["socket"],
+                node_def_provider=_req_provider,
+            )
+            if target is None:
+                return {
+                    "error": (
+                        f"reference slot {slot['socket']!r} on node {slot['node_id']} "
+                        "is not present in the executable graph; "
+                        "rebind references for the current version"
+                    )
+                }
+            targets[(slot["node_id"], slot["socket"])] = target
+        try:
+            control_targets = {
+                (str(entry.get("node_id", "") or ""), str(entry.get("input_name", "") or ""))
+                for entry in (control_schema or {}).values()
+                if isinstance(entry, dict)
+            }
+        except Exception:
+            control_targets = set()
+        for key, target in targets.items():
+            if target in control_targets:
+                return {
+                    "error": (
+                        f"reference slot {key[1]!r} on node {key[0]} is both a mapped "
+                        "control and a confirmed reference slot; unmap the control "
+                        "so filenames never reach an IMAGE socket"
+                    )
+                }
+        required = _reference_required_map(bundle, bindings, _req_provider)
+        for index, slot in enumerate(ref_slots):
+            if index < len(images):
+                continue
+            if required.get((slot["node_id"], slot["socket"]), True):
+                return {
+                    "error": (
+                        f"missing required reference image for slot {slot['socket']!r} "
+                        f"on node {slot['node_id']}"
+                    )
+                }
+        return {
+            "prep": {
+                "method": method,
+                "images": list(images),
+                "ref_slots": ref_slots,
+                "required": dict(required),
+                "reserved": reserved_pair,
+                "ui_graph": ui_graph,
+                "output_node_id": output_node_id,
+            }
+        }
+    if method == "reference_latent_chain":
+        chain = bindings.get("chain") if isinstance(bindings, dict) else None
+        if not isinstance(chain, dict) or not str(chain.get("reference_latent_node_id", "") or ""):
+            return {"error": "reference_latent_chain requires a chain boundary"}
+        try:
+            _inspect_reference_chain(prompt, chain, ui_graph)
+        except ValueError as exc:
+            return {"error": str(exc)[:500]}
+        return {
+            "prep": {
+                "method": method,
+                "images": list(images),
+                "chain": copy.deepcopy(chain),
+                "ui_graph": ui_graph,
+                "output_node_id": output_node_id,
+            }
+        }
+    return {"error": f"unknown reference method {method!r}"}
+
+
+def _prepare_dedicated_reference_run(bundle, ref, values, node_dir, bindings, images, wf_id, ver_id):
+    """Accept a Method-3 dedicated run: transfer + bind on the target.
+
+    Reuses ``_transfer_values_with_method_mask`` (link safety: graph-local
+    links never cross graphs; a linked seed is concretized to a fresh random
+    seed and captured) and ``_resolve_dedicated_override``. Only the four
+    universal roles (prompt/seed/source_image/mask, with the
+    positive_prompt/prompt alias normalized) transfer — reference cards do
+    NOT implicitly transfer; they bind explicitly against the dedicated
+    target's own confirmed inputs via the shared method prep. The target
+    version is resolved and frozen at acceptance; a target with no valid
+    reference bindings is incompatible; a changed target requires
+    rebinding. Returns the run dict or ``{"error": ...}``.
+    """
+    req_target = ref.get("dedicated_target", "") or ref.get("executing_workflow_id", "")
+    if not req_target:
+        return {"error": "choose a dedicated reference workflow first"}
+    map_target = str(bindings.get("dedicated_target", "") or "") if isinstance(bindings, dict) else ""
+    if map_target and map_target != req_target:
+        return {"error": "dedicated target changed; rebind references in the Workflow Setup Wizard"}
+    effective = dict(bindings) if isinstance(bindings, dict) else {}
+    if not str(effective.get("dedicated_target", "") or ""):
+        effective["dedicated_target"] = req_target
+    err = _revalidate_reference_bindings(bundle, "dedicated", effective, node_dir)
+    if err and not _dedicated_target_is_workflow(req_target, node_dir):
+        return {"error": err}
+    transfer_src = _normalize_prompt_alias_for_transfer(values)
+    seed_was_linked = isinstance(transfer_src.get("seed"), list)
+    defused = _transfer_values_with_method_mask(
+        transfer_src, {"kind": "references", "params": {}}
+    )
+    resolved = _resolve_dedicated_override(node_dir, wf_id, defused, req_target)
+    if not isinstance(resolved, dict) or "error" in resolved:
+        message = ""
+        try:
+            message = str(resolved.get("error") or "")
+        except Exception:
+            message = ""
+        return {"error": message or f"dedicated workflow {req_target[:60]!r} is not runnable"}
+    exec_bundle = resolved["bundle"]
+    exec_merged = resolved["merged"]
+    exec_values = dict(exec_merged.get("values") or {})
+    exec_mapping = exec_bundle.get("mapping") or {}
+    exec_method = str(exec_mapping.get("reference_method", "") or "")
+    exec_bindings = exec_mapping.get("reference_bindings")
+    if not isinstance(exec_bindings, dict):
+        exec_bindings = {}
+    if not exec_method or exec_method == "dedicated":
+        return {
+            "error": (
+                f"dedicated target {req_target!r} has no valid reference bindings; "
+                "it is incompatible with reference runs"
+            )
+        }
+    err2 = _revalidate_reference_bindings(exec_bundle, exec_method, exec_bindings, node_dir)
+    if err2:
+        return {"error": f"dedicated target {req_target!r} is incompatible: {err2}"[:500]}
+    exec_ver = str((exec_bundle.get("version") or {}).get("workflow_version_id", "") or "")
+    exec_wf = str((exec_bundle.get("workflow") or {}).get("workflow_id", "") or req_target)
+    if ref.get("executing_version_id", "") and ref["executing_version_id"] != exec_ver:
+        return {"error": "dedicated target version changed; reselect the dedicated workflow"}
+    sub = _prepare_method_prep(exec_bundle, exec_method, exec_bindings, images, node_dir)
+    if "error" in sub:
+        return sub
+    concretized_seed = None
+    if seed_was_linked and isinstance(defused.get("seed"), int):
+        concretized_seed = defused["seed"]
+    ctx = {
+        "kind": "references",
+        "method": "dedicated",
+        "executing_method": exec_method,
+        "origin_workflow_id": wf_id,
+        "origin_version_id": ver_id,
+        "executing_workflow_id": exec_wf,
+        "executing_version_id": exec_ver,
+        "dedicated_target": req_target,
+        "image_count": len(images),
+        "card_ids": list(ref.get("card_ids", [])),
+    }
+    if concretized_seed is not None:
+        ctx["concretized_seed"] = concretized_seed
+    companion = _build_reference_run_companion(
+        method="dedicated",
+        origin_workflow_id=wf_id,
+        origin_version_id=ver_id,
+        bindings=effective,
+        images=images,
+        card_ids=ref.get("card_ids", []),
+        executing_workflow_id=exec_wf,
+        executing_version_id=exec_ver,
+        concretized_seed=concretized_seed,
+    )
+    return {
+        "ctx": ctx,
+        "bundle": exec_bundle,
+        "values": exec_values,
+        "prep": sub["prep"],
+        "companion": companion,
+    }
+
+
+def _build_reference_run_companion(
+    *,
+    method,
+    origin_workflow_id,
+    origin_version_id,
+    bindings,
+    images,
+    card_ids,
+    executing_workflow_id="",
+    executing_version_id="",
+    concretized_seed=None,
+):
+    """Freeze the ``studio_references`` run metadata before the plan freeze.
+
+    Built with Lane A's ``build_studio_references_companion`` (method,
+    origin, dedicated target, card ids, mapping provenance — never client
+    graph patches) plus the server-validated ordered image refs and, for
+    dedicated runs, the frozen executing identities. Captured beside the
+    effective graph + image payloads in request metadata.
+    """
+    try:
+        from studio_domain.models import build_studio_references_companion
+        companion = build_studio_references_companion(
+            method=method,
+            origin_workflow_id=str(origin_workflow_id or ""),
+            origin_version_id=str(origin_version_id or ""),
+            bindings=bindings if isinstance(bindings, dict) else {},
+        )
+    except Exception:
+        companion = {
+            "method": str(method or ""),
+            "origin_workflow_id": str(origin_workflow_id or ""),
+            "origin_version_id": str(origin_version_id or ""),
+            "dedicated_target": str((bindings or {}).get("dedicated_target", "") or ""),
+            "card_ids": [],
+            "images": [],
+            "provenance": {"source": "mapping"},
+        }
+    try:
+        ordered_images = list(images or [])
+        ordered_cards = list(card_ids or [])
+        companion["images"] = list(ordered_images)
+        if ordered_cards:
+            companion["card_ids"] = list(ordered_cards)
+        # History-grade entries: filename + positional card linkage + source
+        # provenance per applied image (the normalizer skips bare strings).
+        # Slots mirror the applied order (position = order).
+        try:
+            _bound = bindings if isinstance(bindings, dict) else {}
+            _all_slots = [s for s in (_bound.get("slots") or []) if isinstance(s, dict)]
+            def _skey(s):
+                try:
+                    return int(s.get("order", 0))
+                except (TypeError, ValueError):
+                    return 0
+            _all_slots.sort(key=lambda s: (_skey(s), str(s.get("node_id", "")), str(s.get("socket", ""))))
+            _applied = _all_slots[:len(ordered_images)] if ordered_images else []
+            _entries = []
+            _slot_out = []
+            for _idx, _name in enumerate(ordered_images):
+                _entry = {"filename": str(_name)}
+                _cid = ordered_cards[_idx] if _idx < len(ordered_cards) else ""
+                if _cid:
+                    _entry["card_id"] = str(_cid)
+                _entry["source"] = {"ref": "studio"}
+                _entries.append(_entry)
+                if _idx < len(_applied):
+                    _s = _applied[_idx]
+                    _slot_out.append({
+                        "node_id": str(_s.get("node_id", "") or ""),
+                        "socket": str(_s.get("socket", "") or ""),
+                        "order": _idx,
+                        "card_id": str(_cid or ""),
+                    })
+            companion["image_entries"] = _entries
+            if _slot_out:
+                companion["slots"] = _slot_out
+            _chain = _bound.get("chain")
+            if isinstance(_chain, dict) and _chain:
+                companion["chain"] = {k: _chain.get(k) for k in (
+                    "loader_node_id", "vae_encode_node_id",
+                    "reference_latent_node_id", "consumer_node_id") if _chain.get(k)}
+        except Exception:
+            pass
+        if executing_workflow_id:
+            companion["executing_workflow_id"] = str(executing_workflow_id)
+            companion["executing_version_id"] = str(executing_version_id or "")
+        if concretized_seed is not None:
+            companion["concretized_seed"] = concretized_seed
+    except Exception:
+        pass
+    return companion
+
+
+def _prepare_reference_run(bundle, ref, values, node_dir):
+    """Acceptance for an explicit reference request.
+
+    Resolves the exact version (already in the bundle), revalidates the
+    versioned bindings against the effective executable graph via Lane A's
+    validators, and prepares the shared mutator inputs. Rejects
+    stale/ambiguous/unevidenced bindings, overcapacity, missing required
+    images, and unsafe/missing files with reasons — no Auto, no fallback
+    between methods. Returns ``{"ctx","bundle","values","prep","companion"}``
+    or ``{"error": ...}``. Never mutates inputs or stored graphs. Never
+    dispatches.
+    """
+    mapping = bundle.get("mapping") or {}
+    bound = str(mapping.get("reference_method", "") or "")
+    bindings = mapping.get("reference_bindings")
+    if not isinstance(bindings, dict):
+        bindings = {}
+    if not bound:
+        return {
+            "error": (
+                "this workflow version has no reference bindings — "
+                "bind a Reference Method in the Workflow Setup Wizard"
+            )
+        }
+    if ref.get("method", "") != bound:
+        return {
+            "error": (
+                f"reference method '{ref.get('method', '')}' is not bound in this "
+                f"workflow version (bound: '{bound}'). Switch the Reference "
+                "Method or rebind in the Workflow Setup Wizard."
+            )
+        }
+    wf_id = str((bundle.get("workflow") or {}).get("workflow_id", "") or "")
+    ver_id = str((bundle.get("version") or {}).get("workflow_version_id", "") or "")
+    if ref.get("origin_workflow_id", "") and ref["origin_workflow_id"] != wf_id:
+        return {
+            "error": (
+                f"reference origin workflow {ref['origin_workflow_id']!r} does not "
+                f"match executing workflow {wf_id!r}; rebind references for this workflow"
+            )
+        }
+    if ref.get("origin_version_id", "") and ref["origin_version_id"] != ver_id:
+        return {
+            "error": (
+                f"reference origin version {ref['origin_version_id']!r} does not "
+                f"match executing version {ver_id!r}; references must be rebound "
+                "for the current version"
+            )
+        }
+    images = []
+    for name in ref.get("images", []):
+        try:
+            _resolve_reference_image_path(name)
+        except ValueError as exc:
+            return {"error": str(exc)[:300]}
+        images.append(str(name))
+    if not images:
+        return {"error": "reference images must be a non-empty ordered list"}
+    if bound == "dedicated":
+        return _prepare_dedicated_reference_run(
+            bundle, ref, values, node_dir, bindings, images, wf_id, ver_id
+        )
+    err = _revalidate_reference_bindings(bundle, bound, bindings, node_dir)
+    if err:
+        return {"error": err}
+    sub = _prepare_method_prep(bundle, bound, bindings, images, node_dir)
+    if "error" in sub:
+        return sub
+    ctx = {
+        "kind": "references",
+        "method": bound,
+        "origin_workflow_id": wf_id,
+        "origin_version_id": ver_id,
+        "executing_workflow_id": wf_id,
+        "executing_version_id": ver_id,
+        "image_count": len(images),
+        "card_ids": list(ref.get("card_ids", [])),
+    }
+    companion = _build_reference_run_companion(
+        method=bound,
+        origin_workflow_id=wf_id,
+        origin_version_id=ver_id,
+        bindings=bindings,
+        images=images,
+        card_ids=ref.get("card_ids", []),
+    )
+    return {
+        "ctx": ctx,
+        "bundle": bundle,
+        "values": dict(values or {}),
+        "prep": sub["prep"],
+        "companion": companion,
+    }
+
+
 # ── Public entrypoint ────────────────────────────────────────────────────
 
 
@@ -2905,6 +4342,7 @@ async def handle_workflow_run_async(
     workspace: dict[str, Any] | None = None,
     studio_method: dict[str, Any] | None = None,
     studio_style: dict[str, Any] | None = None,
+    studio_references: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Async handler for a single Studio Workflow run.
 
@@ -2920,7 +4358,15 @@ async def handle_workflow_run_async(
     Returns the same result dict shapes as the legacy adapter.
     """
     try:
-        bundle = resolve_workflow_run_bundle(workflow_id, version_id, node_dir)
+        # ── Phase 8: sanitize the explicit reference companion first: a
+        #    malformed companion fails before any bundle/control work, and the
+        #    sanitized form feeds dedicated-target bundle tolerance below.
+        _refs, _refs_error = _sanitize_studio_references(studio_references)
+        if _refs_error:
+            return {"status": "error", "message": _refs_error}
+        bundle = resolve_workflow_run_bundle(
+            workflow_id, version_id, node_dir, reference_request=_refs,
+        )
         if bundle.get("status") != "ok":
             return bundle
 
@@ -2940,6 +4386,16 @@ async def handle_workflow_run_async(
         _style, _style_error = _sanitize_studio_style(studio_style)
         if _style_error:
             return {"status": "error", "message": _style_error}
+        # ── Phase 8: an explicit reference run never combines with a generic
+        #    method — the interaction is untested, so it fails loudly instead
+        #    of silently altering either mechanism. Plain runs take the exact
+        #    historical path below. (_refs/_refs_error were sanitized before
+        #    bundle resolution.)
+        if _refs is not None and _method is not None:
+            return {
+                "status": "error",
+                "message": "studio_method and studio_references cannot be combined in one run",
+            }
         _base_errors = _tolerated_method_base_errors(merged["errors"], _method)
         if _base_errors:
             return {
@@ -3050,12 +4506,41 @@ async def handle_workflow_run_async(
                 "kind": _method["kind"], "method": "dedicated",
                 "override": _over, "origin_workflow": str(workflow_id or ""),
             }
+        # ── Phase 8: explicit reference orchestration. Plain runs
+        #    (_refs None) take the exact historical path below. A reference
+        #    run replaces the executing bundle/values for dedicated targets
+        #    and always carries the shared reference mutator into the plan
+        #    seam (ordinary + Golden share it — one implementation).
+        _reference_ctx = None
+        _reference_companion = None
+        if _refs is not None:
+            _ref_prep = _prepare_reference_run(
+                bundle, _refs, _effective_merged.get("values") or {}, node_dir
+            )
+            if "error" in _ref_prep:
+                return {"status": "error", "message": _ref_prep["error"]}
+            if _ref_prep["bundle"] is not bundle:
+                _log.info(
+                    "Studio dedicated references run: origin=%s override bundle version=%s",
+                    workflow_id,
+                    (_ref_prep["bundle"].get("version") or {}).get("workflow_version_id", ""),
+                )
+            bundle = _ref_prep["bundle"]
+            _effective_merged = {"values": _ref_prep["values"], "errors": []}
+            _reference_ctx = _ref_prep["ctx"]
+            _reference_companion = _ref_prep["companion"]
+            try:
+                _prompt_mutator = _build_reference_prompt_mutator(_ref_prep["prep"])
+            except ValueError as exc:
+                return {"status": "error", "message": str(exc)[:500]}
         # H12: V2 is the only executable Workflow path.
         return await _workflow_v2_run(
             bundle, _effective_merged, _preset_id, node_dir,
             _effective_modal_options, _selected_gpu, workspace, trace_ctx,
             _method_ctx=_method_ctx, _prompt_mutator=_prompt_mutator,
             _studio_style=_style,
+            _studio_references=_reference_companion,
+            _reference_ctx=_reference_ctx,
         )
     except Exception as exc:
         _log.warning("Workflow run failed: %s", exc)

@@ -27,7 +27,23 @@ import {
   takeWorkflowHandoff,
   resolveHandoffSelection,
   getControlSchema,
+  REFERENCE_METHODS,
+  REFERENCE_METHOD_LABELS,
+  sanitizeReferenceCards,
+  addReferenceCard,
+  removeReferenceCard,
+  moveReferenceCard,
+  resolveReferenceCapability,
+  resolveReferenceMethodState,
+  referenceCapacityFor,
+  referenceSlotLabel,
+  validateReferenceCards,
+  buildStudioReferencesCompanion,
+  readReferenceEngagement,
+  promptCarriesReferences,
+  referenceBlockMessage,
 } from "../web/studio-workflow-run.js";
+import { createUploadGuard } from "../web/studio-field-blocks.js";
 import {
   PORTABILITY_TARGET_ORDER,
   TARGET_LABELS,
@@ -384,13 +400,14 @@ function makeSelectedStore(ctx = makeRunContext()) {
   // Exact top-level keys.
   assert.deepEqual(
     Object.keys(payload).sort(),
-    ["controls", "featureId", "metadata", "modal_options", "trace", "workflow_id", "workflow_version_id"],
-    "payload carries exactly the 7 contract keys"
+    ["controls", "featureId", "metadata", "modal_options", "trace", "workflow_id", "workflow_type", "workflow_version_id"],
+    "payload carries exactly the 8 contract keys"
   );
   assert.equal(payload.workflow_id, "wf_text2img");
   assert.equal(payload.workflow_version_id, "wv1_latest");
   assert.equal(payload.featureId, "txt2img");
-  assert.deepEqual(payload.modal_options, { execution_mode: "v2" });
+  assert.equal(payload.workflow_type, "t2i");
+  assert.deepEqual(payload.modal_options, { execution_mode: "v2", skip_text_generate: false });
   assert.deepEqual(payload.trace, { t0_perf_ms: 1 });
 
   // Controls contain ONLY schema roles.
@@ -712,6 +729,422 @@ function g12Report() {
   assert.equal(importManifestQuery(true), "?dry_run=1");
   assert.equal(importManifestQuery(false), "?dry_run=0");
   section("12. endpoint construction");
+}
+
+// ── 13. Reference cards: sanitize / add / remove / reorder ─────────────
+
+function makeRefStore(mapping) {
+  const store = createWorkflowRunStore();
+  store.setWorkflowId("wf_ref");
+  store.setVersionId("wv_ref");
+  store.setRunContext({ mapping: mapping || null });
+  return store;
+}
+
+function slotsMapping(slots, method) {
+  return {
+    reference_method: method || "conditioning_slots",
+    reference_bindings: { slots },
+  };
+}
+
+{
+  // Frozen ids: the three methods, no Auto.
+  assert.deepEqual([...REFERENCE_METHODS], [
+    "conditioning_slots",
+    "reference_latent_chain",
+    "dedicated",
+  ]);
+  assert.equal(REFERENCE_METHOD_LABELS.conditioning_slots, "Conditioning slots");
+  assert.equal(REFERENCE_METHOD_LABELS.reference_latent_chain, "Reference latent chain");
+  assert.equal(REFERENCE_METHOD_LABELS.dedicated, "Dedicated reference workflow");
+
+  // Sanitize drops non-objects, keeps files verbatim, generates stable ids.
+  const sanitized = sanitizeReferenceCards([
+    { id: "a", file: "a.png", label: "Logo" },
+    null,
+    "nope",
+    { file: "b.png" },
+  ]);
+  assert.equal(sanitized.length, 2);
+  assert.deepEqual(sanitized[0], { id: "a", file: "a.png", label: "Logo" });
+  assert.ok(sanitized[1].id && typeof sanitized[1].id === "string");
+  assert.equal(sanitized[1].file, "b.png");
+  assert.notEqual(sanitized[1].id, "a");
+  assert.deepEqual(sanitizeReferenceCards(null), []);
+  assert.deepEqual(sanitizeReferenceCards("junk"), []);
+
+  // Add appends in order without mutating; remove drops by stable id.
+  const base = [{ id: "a", file: "a.png", label: "" }];
+  const added = addReferenceCard(base, { file: "b.png", label: "B" });
+  assert.equal(base.length, 1, "add never mutates the input");
+  assert.equal(added.length, 2);
+  assert.equal(added[1].file, "b.png");
+  assert.ok(added[1].id);
+  const removed = removeReferenceCard(added, "a");
+  assert.equal(removed.length, 1);
+  assert.equal(removed[0].file, "b.png");
+  assert.equal(removeReferenceCard(added, "ghost").length, 2, "unknown id leaves order unchanged");
+
+  // Reorder maps to payload order: earlier/later swap neighbors, clamps.
+  const three = [
+    { id: "a", file: "a.png", label: "" },
+    { id: "b", file: "b.png", label: "" },
+    { id: "c", file: "c.png", label: "" },
+  ];
+  assert.deepEqual(moveReferenceCard(three, "b", -1).map((c) => c.id), ["b", "a", "c"]);
+  assert.deepEqual(moveReferenceCard(three, "b", 1).map((c) => c.id), ["a", "c", "b"]);
+  assert.deepEqual(moveReferenceCard(three, "a", -1).map((c) => c.id), ["a", "b", "c"],
+    "first card moving earlier stays put");
+  assert.deepEqual(moveReferenceCard(three, "c", 5).map((c) => c.id), ["a", "b", "c"],
+    "last card moving later stays put");
+  assert.deepEqual(moveReferenceCard(three, "ghost", 1).map((c) => c.id), ["a", "b", "c"],
+    "unknown id leaves order unchanged");
+  assert.deepEqual(three.map((c) => c.id), ["a", "b", "c"], "move never mutates the input");
+  section("13. reference cards add/remove/reorder");
+}
+
+// ── 14. Reference capability (Lane A contract reads) ───────────────────
+
+{
+  // Conditioning slots: reference-kind slots count, source-kind reserved
+  // socket excluded, order normalized densely.
+  const store = makeRefStore(slotsMapping([
+    { node_id: "12", socket: "image_2", kind: "reference", order: 5 },
+    { node_id: "9", socket: "src", kind: "source", order: 0 },
+    { node_id: "12", socket: "image_1", kind: "reference", order: 2 },
+    { node_id: "", socket: "bogus" },
+    null,
+  ]));
+  const cap = resolveReferenceCapability(store);
+  assert.equal(cap.hasMapping, true);
+  assert.equal(cap.boundMethod, "conditioning_slots");
+  assert.equal(cap.slots.length, 3);
+  assert.deepEqual(cap.slots.map((s) => s.order), [0, 1, 2], "orders re-numbered densely");
+  assert.deepEqual(cap.refSlots.map((s) => s.socket), ["src", "image_1", "image_2"].filter((s) => s !== "src"),
+    "reserved source socket excluded from reference slots");
+  assert.equal(cap.refSlots.length, 2);
+
+  // Chain + dedicated target surface for their methods.
+  const chainStore = makeRefStore({
+    reference_method: "reference_latent_chain",
+    reference_bindings: { chain: { reference_latent_node_id: "44" } },
+  });
+  const chainCap = resolveReferenceCapability(chainStore);
+  assert.equal(chainCap.boundMethod, "reference_latent_chain");
+  assert.deepEqual(chainCap.chain, { reference_latent_node_id: "44" });
+  const dedStore = makeRefStore({
+    reference_method: "dedicated",
+    reference_bindings: { dedicated_target: "wf_special" },
+  });
+  assert.equal(resolveReferenceCapability(dedStore).dedicatedTarget, "wf_special");
+
+  // Unbound versions: boundMethod "" (callers block, never infer).
+  const unbound = makeRefStore({ reference_method: "", reference_bindings: {} });
+  const unboundCap = resolveReferenceCapability(unbound);
+  assert.equal(unboundCap.hasMapping, true);
+  assert.equal(unboundCap.boundMethod, "");
+  const unknown = makeRefStore({ reference_method: "auto", reference_bindings: {} });
+  assert.equal(resolveReferenceCapability(unknown).boundMethod, "");
+
+  // Missing mapping / run context: hasMapping false, never throws.
+  assert.equal(resolveReferenceCapability(makeRefStore(null)).hasMapping, false);
+  assert.equal(resolveReferenceCapability(createWorkflowRunStore()).hasMapping, false);
+  assert.equal(resolveReferenceCapability(null).hasMapping, false);
+  section("14. reference capability reads");
+}
+
+// ── 15. Remembered method vs bound method (no auto-switch) ────────────
+
+{
+  const store = makeRefStore(slotsMapping([
+    { node_id: "12", socket: "image_1" },
+    { node_id: "12", socket: "image_2" },
+  ]));
+
+  // Match: supported, no reason.
+  const ok = resolveReferenceMethodState(store, { referenceMethod: "conditioning_slots" });
+  assert.equal(ok.supported, true);
+  assert.equal(ok.reason, "");
+  assert.equal(ok.method, "conditioning_slots");
+
+  // Mismatch: remembered selection stays visible AND blocked with a reason
+  // naming both methods — never auto-switched or truncated.
+  const mismatch = resolveReferenceMethodState(store, { referenceMethod: "reference_latent_chain" });
+  assert.equal(mismatch.method, "reference_latent_chain", "remembered choice preserved verbatim");
+  assert.equal(mismatch.supported, false);
+  assert.ok(mismatch.reason.includes("Reference latent chain"), "reason names the remembered method");
+  assert.ok(mismatch.reason.includes("Conditioning slots"), "reason names the bound method");
+
+  // Unbound version with a remembered method: blocked, specific reason.
+  const unboundStore = makeRefStore({ reference_method: "", reference_bindings: {} });
+  const stale = resolveReferenceMethodState(unboundStore, { referenceMethod: "conditioning_slots" });
+  assert.equal(stale.method, "conditioning_slots", "selection stays visible after the version stops binding it");
+  assert.equal(stale.supported, false);
+  assert.ok(stale.reason.includes("no reference bindings"));
+
+  // Nothing chosen on a bound version: unsupported without a reason (the
+  // gate phrases "Choose a Reference Method" itself).
+  const noch = resolveReferenceMethodState(store, { referenceMethod: "" });
+  assert.equal(noch.supported, false);
+  assert.equal(noch.reason, "");
+
+  // Unknown method ids in prefs degrade to unchosen, never to a guess.
+  const weird = resolveReferenceMethodState(store, { referenceMethod: "auto" });
+  assert.equal(weird.method, "");
+  assert.equal(weird.supported, false);
+  section("15. remembered reference method compatibility");
+}
+
+// ── 16. Card validation: completeness, capacity, order ────────────────
+
+{
+  const store = makeRefStore(slotsMapping([
+    { node_id: "12", socket: "image_1" },
+    { node_id: "12", socket: "image_2" },
+  ]));
+  const st = resolveReferenceMethodState(store, { referenceMethod: "conditioning_slots" });
+
+  // Capacity is the bound slot count; slot labels are concrete.
+  assert.equal(referenceCapacityFor(st), 2);
+  assert.equal(referenceSlotLabel(st, 0), "Slot 1 · 12:image_1");
+  assert.equal(referenceSlotLabel(st, 1), "Slot 2 · 12:image_2");
+  assert.equal(referenceSlotLabel(st, 2), "Beyond capacity");
+  // Repeatable/server-ruled methods report no client capacity, honest labels.
+  const chainSt = resolveReferenceMethodState(
+    makeRefStore({
+      reference_method: "reference_latent_chain",
+      reference_bindings: { chain: { reference_latent_node_id: "44" } },
+    }),
+    { referenceMethod: "reference_latent_chain" }
+  );
+  assert.equal(referenceCapacityFor(chainSt), null);
+  assert.equal(referenceSlotLabel(chainSt, 0), "Chain link 1");
+  const dedSt = resolveReferenceMethodState(
+    makeRefStore({ reference_method: "dedicated", reference_bindings: {} }),
+    { referenceMethod: "dedicated" }
+  );
+  assert.equal(referenceCapacityFor(dedSt), null);
+  assert.equal(referenceSlotLabel(dedSt, 0), "Input 1");
+
+  // Happy path: images follow card order.
+  const good = validateReferenceCards([
+    { id: "b", file: "b.png", label: "" },
+    { id: "a", file: "a.png", label: "Logo" },
+  ], st);
+  assert.deepEqual(good.images, ["b.png", "a.png"], "payload order = card order");
+  assert.deepEqual(good.errors, []);
+
+  // A card without an image is a specific error, never a silent omission.
+  const empty = validateReferenceCards([{ id: "a", file: "", label: "" }], st);
+  assert.equal(empty.images.length, 0);
+  assert.ok(empty.errors.some((m) => /Reference 1 has no image/.test(m)));
+
+  // Overcapacity names the slot count and the overflow.
+  const over = validateReferenceCards([
+    { id: "a", file: "a.png", label: "" },
+    { id: "b", file: "b.png", label: "" },
+    { id: "c", file: "c.png", label: "" },
+  ], st);
+  assert.ok(over.errors.some((m) => /2 reference slots/.test(m) && /remove 1/.test(m)),
+    "overcapacity error names capacity and overflow, got: " + over.errors.join("; "));
+  section("16. reference card validation");
+}
+
+// ── 17. studio_references payload (fail-closed companion) ─────────────
+
+{
+  const store = makeRefStore(slotsMapping([
+    { node_id: "12", socket: "image_1" },
+    { node_id: "12", socket: "image_2" },
+  ]));
+  const cards = [
+    { id: "ref_2", file: "second.png", label: "" },
+    { id: "ref_1", file: "first.png", label: "Logo" },
+  ];
+
+  const payload = buildStudioReferencesCompanion(store, cards, { referenceMethod: "conditioning_slots" });
+  assert.deepEqual(Object.keys(payload).sort(), [
+    "card_ids", "dedicated_target", "executing_version_id", "executing_workflow_id",
+    "images", "method", "origin_version_id", "origin_workflow_id", "provenance",
+  ]);
+  assert.equal(payload.method, "conditioning_slots");
+  assert.equal(payload.origin_workflow_id, "wf_ref");
+  assert.equal(payload.origin_version_id, "wv_ref");
+  assert.equal(payload.executing_workflow_id, "wf_ref", "generic methods execute the origin workflow");
+  assert.equal(payload.executing_version_id, "wv_ref");
+  assert.equal(payload.dedicated_target, "");
+  assert.deepEqual(payload.card_ids, ["ref_2", "ref_1"], "card ids follow submitted order");
+  assert.deepEqual(payload.images, ["second.png", "first.png"], "images follow submitted order");
+  assert.deepEqual(payload.provenance, { source: "studio" });
+
+  // Dedicated carries the explicit override as its target.
+  const dedStore = makeRefStore({ reference_method: "dedicated", reference_bindings: {} });
+  const ded = buildStudioReferencesCompanion(dedStore, [{ id: "x", file: "x.png", label: "" }],
+    { referenceMethod: "dedicated", referenceOverride: "wf_special" });
+  assert.equal(ded.method, "dedicated");
+  assert.equal(ded.dedicated_target, "wf_special");
+  assert.equal(ded.executing_workflow_id, "wf_special", "dedicated executes the override workflow");
+  assert.equal(ded.executing_version_id, "", "override version resolves server-side, never guessed");
+  assert.equal(ded.origin_workflow_id, "wf_ref");
+
+  // Fail-closed: every one of these yields null, never a partial submit.
+  assert.equal(buildStudioReferencesCompanion(store, [], { referenceMethod: "conditioning_slots" }), null,
+    "no cards → no companion");
+  assert.equal(buildStudioReferencesCompanion(store, cards, { referenceMethod: "" }), null,
+    "no method → no companion");
+  assert.equal(buildStudioReferencesCompanion(store, cards, { referenceMethod: "reference_latent_chain" }), null,
+    "incompatible remembered method → no companion (gate shows the reason)");
+  assert.equal(buildStudioReferencesCompanion(store, [{ id: "x", file: "", label: "" }],
+    { referenceMethod: "conditioning_slots" }), null,
+    "card without a file → no companion (no silent omission)");
+  assert.equal(buildStudioReferencesCompanion(store,
+    [cards[0], cards[1], { id: "z", file: "z.png", label: "" }],
+    { referenceMethod: "conditioning_slots" }), null,
+    "overcapacity → no companion");
+  assert.equal(buildStudioReferencesCompanion(dedStore, [{ id: "x", file: "x.png", label: "" }],
+    { referenceMethod: "dedicated", referenceOverride: "" }), null,
+    "dedicated without override → no companion");
+  section("17. studio_references payload");
+}
+
+// ── 18. Upload guard (stale/late completion semantics) ────────────────
+
+{
+  // Only the latest begun ingest is current: older replacements completing
+  // late must not overwrite the newer value.
+  const guard = createUploadGuard();
+  const first = guard.begin();
+  assert.equal(guard.isCurrent(first), true);
+  const second = guard.begin();
+  assert.equal(guard.isCurrent(first), false, "older token goes stale on a newer begin");
+  assert.equal(guard.isCurrent(second), true);
+  // Independent guards never cross-talk (per-card instances).
+  const other = createUploadGuard();
+  const otherToken = other.begin();
+  assert.equal(other.isCurrent(otherToken), true);
+  assert.equal(guard.isCurrent(otherToken), false, "tokens are per-guard");
+  section("18. upload guard staleness");
+}
+
+// ── 19. Canvas /prompt reference engagement reads ──────────────────────
+
+{
+  const sel = { workflowId: "wf_ref", workflowVersionId: "wv_ref" };
+
+  // Engaged via method alone (no cards).
+  const viaMethod = readReferenceEngagement(
+    sel,
+    { wf_ref: { referenceMethod: "conditioning_slots" } },
+    {}
+  );
+  assert.ok(viaMethod, "method chosen → engaged");
+  assert.equal(viaMethod.workflowId, "wf_ref");
+  assert.equal(viaMethod.versionId, "wv_ref");
+  assert.equal(viaMethod.method, "conditioning_slots");
+  assert.equal(viaMethod.cardCount, 0);
+  assert.deepEqual(viaMethod.files, []);
+
+  // Engaged via cards alone (no method chosen).
+  const viaCards = readReferenceEngagement(
+    sel,
+    { wf_ref: { referenceMethod: "" } },
+    { "wf_ref::wv_ref": [{ id: "a", file: "a.png", label: "" }] }
+  );
+  assert.ok(viaCards, "card present → engaged");
+  assert.equal(viaCards.method, "");
+  assert.equal(viaCards.cardCount, 1);
+  assert.deepEqual(viaCards.files, ["a.png"]);
+
+  // Cards under a different version do not engage this selection.
+  assert.equal(
+    readReferenceEngagement(sel, {}, { "wf_ref::wv_other": [{ id: "a", file: "a.png", label: "" }] }),
+    null,
+    "other-version cards do not engage"
+  );
+
+  // Empty: no method, no cards → null.
+  assert.equal(readReferenceEngagement(sel, {}, {}), null, "nothing engaged → null");
+  assert.equal(
+    readReferenceEngagement(sel, { wf_ref: { referenceMethod: "" } }, { "wf_ref::wv_ref": [] }),
+    null,
+    "empty method + empty cards → null"
+  );
+  assert.equal(readReferenceEngagement(null, {}, {}), null, "null selection → null");
+  assert.equal(
+    readReferenceEngagement({ workflowId: "", workflowVersionId: "wv_ref" }, {}, {}),
+    null,
+    "missing workflow id → null"
+  );
+
+  // Malformed blobs degrade to null and never throw.
+  assert.equal(readReferenceEngagement(sel, "junk", "junk"), null, "string blobs → null");
+  assert.equal(readReferenceEngagement(sel, null, null), null, "null blobs → null");
+  assert.equal(readReferenceEngagement(sel, { wf_ref: "junk" }, { "wf_ref::wv_ref": "junk" }), null,
+    "malformed entries → null");
+  assert.equal(readReferenceEngagement("junk", "junk", "junk"), null, "junk selection → null");
+  assert.equal(readReferenceEngagement(undefined, undefined, undefined), null, "undefined → null");
+  section("19. canvas reference engagement reads");
+}
+
+// ── 20. Canvas /prompt reference payload detection ──────────────────────
+
+{
+  assert.equal(
+    promptCarriesReferences({ extra_data: { studio_references: { method: "conditioning_slots" } } }),
+    true,
+    "extra_data.studio_references object → carries"
+  );
+  assert.equal(
+    promptCarriesReferences({ studio_references: { method: "dedicated" } }),
+    true,
+    "top-level studio_references object → carries"
+  );
+  assert.equal(promptCarriesReferences({ prompt: {} }), false, "plain body → absent");
+  assert.equal(promptCarriesReferences({}), false, "empty body → absent");
+  assert.equal(
+    promptCarriesReferences({ extra_data: { studio_references: null } }),
+    false,
+    "null reference payload → absent"
+  );
+  assert.equal(
+    promptCarriesReferences({ studio_references: null }),
+    false,
+    "null top-level payload → absent"
+  );
+  assert.equal(promptCarriesReferences(null), false, "null body → absent");
+  assert.equal(promptCarriesReferences("junk"), false, "string body → absent");
+  section("20. canvas reference payload detection");
+}
+
+// ── 21. Canvas reference block message ──────────────────────────────────
+
+{
+  const methodMsg = referenceBlockMessage({
+    workflowId: "wf_ref", versionId: "wv_ref",
+    method: "conditioning_slots", cardCount: 2, files: ["a.png", "b.png"],
+  });
+  assert.ok(methodMsg.includes("wf_ref"), "message names the workflow id");
+  assert.ok(methodMsg.includes("conditioning_slots"), "message names the method");
+  assert.ok(methodMsg.includes("2"), "message names the card count");
+  assert.ok(methodMsg.includes("Run from Studio References"), "message offers the Studio run remedy");
+  assert.ok(methodMsg.includes("clear the reference method/cards"), "message offers the clear remedy");
+
+  // No method chosen: message falls back to cards, still names id + remedies.
+  const cardsMsg = referenceBlockMessage({
+    workflowId: "wf_ref", versionId: "wv_ref", method: "", cardCount: 1, files: ["a.png"],
+  });
+  assert.ok(cardsMsg.includes("wf_ref"), "cards message names the workflow id");
+  assert.ok(cardsMsg.includes("1 reference card"), "singular card count reads honestly");
+  assert.ok(cardsMsg.includes("Run from Studio References"));
+  assert.ok(cardsMsg.includes("clear the reference method/cards"));
+  assert.equal(cardsMsg.includes("conditioning_slots"), false, "no method invented");
+
+  // Null engagement never throws and still offers both remedies.
+  const fallbackMsg = referenceBlockMessage(null);
+  assert.ok(fallbackMsg.includes("Run from Studio References"));
+  assert.ok(fallbackMsg.includes("clear the reference method/cards"));
+  section("21. canvas reference block message");
 }
 
 console.log("PASS: studio workflow run unit tests");

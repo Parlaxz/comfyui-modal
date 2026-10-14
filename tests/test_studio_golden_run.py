@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -690,3 +691,415 @@ async def test_generic_run_marks_cursor_and_hides_plan_received(monkeypatch, tmp
         phase == "plan_received" for _type, phase in phases
     ), "generic plan_received must not reach the polled cursor"
     assert page["terminal"] is True
+
+
+# ── Phase 8 Lane B: reference-image execution (Golden lane) ──────────────
+#
+# Fast unit tests only: temp-dir domain service, fake input files, fake
+# Modal handles, real shared prep/mutation from studio_workflow_run (one
+# implementation for both lanes). The canonical fast-path classifier is
+# monkeypatched (it would otherwise import the heavy golden runtime); no
+# Torch/Modal/heavy lifecycle.
+
+
+def _g_ref_defs(class_type: str):
+    if class_type == "RefConditioner":
+        return (
+            {
+                "clip": ("CLIP",),
+                "text": ("STRING", {"multiline": True}),
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+            },
+            {},
+        )
+    if class_type == "LoadImage":
+        return ({"image": ("STRING",)}, {})
+    if class_type == "CLIPLoader":
+        return ({"clip_name": ("STRING",)}, {})
+    if class_type == "CLIPTextEncode":
+        return ({"text": ("STRING", {"multiline": True}), "clip": ("CLIP",)}, {})
+    return ({}, {})
+
+
+def _g_m1_prompt() -> dict:
+    return {
+        "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c.safetensors"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "cat", "clip": ["1", 0]}},
+        "3": {"class_type": "RefConditioner", "inputs": {
+            "clip": ["1", 0], "text": "cat",
+            "image_1": ["7", 0], "image_2": ["8", 0]}},
+        "7": {"class_type": "LoadImage", "inputs": {"image": "base.png"}},
+        "8": {"class_type": "LoadImage", "inputs": {"image": "other.png"}},
+        "9": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "m.safetensors"}},
+        "4": {"class_type": "KSampler", "inputs": {
+            "model": ["9", 0], "seed": 1, "steps": 5, "cfg": 7.0,
+            "sampler_name": "euler", "scheduler": "normal",
+            "positive": ["3", 0], "negative": ["2", 0],
+            "latent_image": ["5", 0], "denoise": 1.0}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 64, "height": 64, "batch_size": 1}},
+        "6": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]}},
+    }
+
+
+def _g_entry(role, node_id, input_name, control_kind="string"):
+    return {
+        "semantic_role": role, "node_id": node_id, "input_name": input_name,
+        "kind": "node_input", "control_kind": control_kind, "required": False,
+    }
+
+
+def _g_m1_bindings():
+    return {
+        "candidate_id": "conditioning_slots:3",
+        "slots": [
+            {"node_id": "3", "socket": "image_1", "order": 0, "kind": "reference"},
+            {"node_id": "3", "socket": "image_2", "order": 1, "kind": "reference"},
+        ],
+    }
+
+
+def _g_setup_service(root):
+    from studio_domain import WorkflowDomainService
+
+    svc = WorkflowDomainService(str(root))
+    svc._node_def_provider = _g_ref_defs
+    (root / "input").mkdir(parents=True, exist_ok=True)
+    for name in ("ref_a.png", "ref_b.png", "base.png", "other.png"):
+        (root / "input" / name).write_bytes(b"fake-" + name.encode())
+    wf = svc.create_workflow("golden refs")
+    version = svc.create_version_from_capture(
+        wf["workflow_id"],
+        {"graph_json": {"id": "g", "nodes": []},
+         "api_prompt_json": {"workflow": {}, "output": _g_m1_prompt()}},
+    )
+    svc.set_mapping(
+        version["workflow_version_id"],
+        entries={
+            "positive_prompt": _g_entry("positive_prompt", "2", "text"),
+            "seed": _g_entry("seed", "4", "seed", "integer"),
+            "steps": _g_entry("steps", "4", "steps", "integer"),
+        },
+        output_node_id="6",
+        reference_method="conditioning_slots",
+        reference_bindings=_g_m1_bindings(),
+    )
+    return svc, wf, version
+
+
+def _g_patch_service(monkeypatch, root):
+    import studio_workflow_run
+
+    def _factory(node_dir):
+        from studio_domain import WorkflowDomainService
+
+        svc = WorkflowDomainService(str(node_dir))
+        svc._node_def_provider = _g_ref_defs
+        return svc
+
+    monkeypatch.setattr(studio_workflow_run, "_get_domain_service", _factory)
+    monkeypatch.setitem(
+        sys.modules,
+        "folder_paths",
+        SimpleNamespace(get_input_directory=lambda: str(root / "input")),
+    )
+
+
+def _g_profile():
+    return profile_catalog.GoldenProfile(
+        name="golden-test",
+        owner="test",
+        target={
+            "app": "configured-app",
+            "class": "ModalRuntimeEntrypointV2",
+            "method": "run_golden_parallel_stream",
+        },
+        resources={"gpu": "H100", "cpu": 12, "memory_mb": 24576},
+        config=SimpleNamespace(),  # type: ignore[arg-type]
+        receipt=SimpleNamespace(deploy_fingerprint="deploy-test"),  # type: ignore[arg-type]
+    )
+
+
+def _g_handle(captured, raw=b"fakepng-bytes"):
+    import base64
+
+    class RemoteGenerator:
+        def aio(self, payload, **kwargs):
+            captured["payload"] = payload
+            captured["kwargs"] = kwargs
+
+            async def events():
+                yield {"type": "stage", "sequence": 8, "name": "decode"}
+                yield {"type": "result", "sequence": 9, "data": {
+                    "images": [{
+                        "byte_count": len(raw),
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }],
+                }}
+
+            return events()
+
+    return SimpleNamespace(
+        run_golden_studio_stream=SimpleNamespace(remote_gen=RemoteGenerator()),
+        run_plan_stream=SimpleNamespace(remote_gen=RemoteGenerator()),
+    )
+
+
+def _g_ref_companion(wf_id, ver_id, images, target=""):
+    return {
+        "method": "conditioning_slots" if not target else "dedicated",
+        "images": list(images),
+        "card_ids": [],
+        "dedicated_target": target,
+        "origin_workflow_id": wf_id,
+        "origin_version_id": ver_id,
+        "executing_workflow_id": "",
+        "executing_version_id": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_golden_generic_agrees_with_ordinary(monkeypatch, tmp_path) -> None:
+    """Ordinary + Golden run the same shared mutation: byte-identical graphs."""
+    import studio_workflow_run
+
+    root = tmp_path / "svc"
+    root.mkdir()
+    _, wf, version = _g_setup_service(root)
+    _g_patch_service(monkeypatch, root)
+    monkeypatch.setattr(studio_golden_run, "resolve_golden_profile", lambda name: _g_profile())
+    monkeypatch.setattr(studio_golden_run, "_canonical_golden_fast_path", lambda workflow: False)
+    import local_artifacts
+
+    monkeypatch.setattr(local_artifacts, "get_studio_outputs_dir", lambda: tmp_path / "outputs")
+
+    # Ordinary lane through the real shared prep + plan builder.
+    bundle = studio_workflow_run.resolve_workflow_run_bundle(
+        wf["workflow_id"], version["workflow_version_id"], str(root))
+    assert bundle["status"] == "ok"
+    merged = studio_workflow_run.merge_workflow_controls(
+        bundle["defaults"], {}, bundle["control_schema"])
+    ref, err = studio_workflow_run._sanitize_studio_references(
+        _g_ref_companion(wf["workflow_id"], version["workflow_version_id"], ["ref_a.png", "ref_b.png"]))
+    assert err is None
+    prep = studio_workflow_run._prepare_reference_run(
+        bundle, ref, merged["values"], str(root))
+    assert "error" not in prep, prep.get("error")
+    ordinary, ordinary_err = studio_workflow_run.build_workflow_execution_plan(
+        bundle, prep["values"],
+        modal_options={"production": {"enabled": False}},
+        comfyui_root=str(root),
+        prompt_mutator=studio_workflow_run._build_reference_prompt_mutator(prep["prep"]),
+        studio_references=prep["companion"],
+    )
+    assert ordinary_err is None
+
+    captured: dict = {}
+    store = GoldenStageEventStore(max_events=16, max_runs=2, ttl_seconds=60)
+    result = await studio_golden_run.run_golden_workflow(
+        workflow_id=wf["workflow_id"],
+        version_id=version["workflow_version_id"],
+        controls={},
+        request_id="golden-refs-agree",
+        node_dir=str(root),
+        profile_name="golden-test",
+        modal_options={"production": {"enabled": False}},
+        event_store=store,
+        handle_factory=lambda *_args: _g_handle(captured),
+        studio_references=_g_ref_companion(
+            wf["workflow_id"], version["workflow_version_id"], ["ref_a.png", "ref_b.png"]),
+    )
+    assert result["status"] == "ok", result
+    submitted = captured["payload"]
+    assert submitted["workflow"] == ordinary.to_dict()["workflow"]
+    assert submitted["workflow_hash"] == ordinary.to_dict()["workflow_hash"]
+    companion = submitted["request_metadata"]["studio_references"]
+    assert list(companion["images"]) == ["ref_a.png", "ref_b.png"]
+    assert companion["method"] == "conditioning_slots"
+
+
+@pytest.mark.asyncio
+async def test_golden_fast_path_submits_final_mutated_graph(monkeypatch, tmp_path) -> None:
+    """Classification runs on the FINAL graph; the fast path never submits stripped graphs."""
+    root = tmp_path / "svc"
+    root.mkdir()
+    _, wf, version = _g_setup_service(root)
+    _g_patch_service(monkeypatch, root)
+    monkeypatch.setattr(studio_golden_run, "resolve_golden_profile", lambda name: _g_profile())
+    seen = {}
+
+    def _classifier(workflow):
+        seen["graph"] = copy.deepcopy(dict(workflow))
+        return True
+
+    monkeypatch.setattr(studio_golden_run, "_canonical_golden_fast_path", _classifier)
+    import local_artifacts
+
+    monkeypatch.setattr(local_artifacts, "get_studio_outputs_dir", lambda: tmp_path / "outputs")
+
+    captured: dict = {}
+    store = GoldenStageEventStore(max_events=16, max_runs=2, ttl_seconds=60)
+    result = await studio_golden_run.run_golden_workflow(
+        workflow_id=wf["workflow_id"],
+        version_id=version["workflow_version_id"],
+        controls={},
+        request_id="golden-refs-fast",
+        node_dir=str(root),
+        profile_name="golden-test",
+        event_store=store,
+        handle_factory=lambda *_args: _g_handle(captured),
+        studio_references=_g_ref_companion(
+            wf["workflow_id"], version["workflow_version_id"], ["ref_a.png", "ref_b.png"]),
+    )
+    assert result["status"] == "ok", result
+    # The classifier saw the mutated graph (references included)...
+    assert seen["graph"]["7"]["inputs"]["image"] == "ref_a.png"
+    assert seen["graph"]["8"]["inputs"]["image"] == "ref_b.png"
+    # ...and the fast path submitted exactly that final graph, never the
+    # pre-mutation copy, with the frozen companion beside it.
+    assert captured["payload"]["prompt"] == seen["graph"]
+    extra = captured["payload"]["extra_data"]
+    assert list(extra["studio_references"]["images"]) == ["ref_a.png", "ref_b.png"]
+
+
+@pytest.mark.asyncio
+async def test_golden_reference_failure_dispatches_nothing(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "svc"
+    root.mkdir()
+    _, wf, version = _g_setup_service(root)
+    _g_patch_service(monkeypatch, root)
+    monkeypatch.setattr(studio_golden_run, "resolve_golden_profile", lambda name: _g_profile())
+    monkeypatch.setattr(studio_golden_run, "_canonical_golden_fast_path", lambda workflow: False)
+
+    def _forbid(*args, **kwargs):
+        raise AssertionError("reference rejection must dispatch nothing")
+
+    store = GoldenStageEventStore(max_events=16, max_runs=2, ttl_seconds=60)
+    result = await studio_golden_run.run_golden_workflow(
+        workflow_id=wf["workflow_id"],
+        version_id=version["workflow_version_id"],
+        controls={},
+        request_id="golden-refs-fail",
+        node_dir=str(root),
+        profile_name="golden-test",
+        event_store=store,
+        handle_factory=_forbid,
+        studio_references=_g_ref_companion(
+            wf["workflow_id"], version["workflow_version_id"], ["ghost.png", "ref_b.png"]),
+    )
+    assert result["status"] == "error"
+    assert "ghost.png" in result["message"]
+    assert store.active_count == 0
+
+
+@pytest.mark.asyncio
+async def test_golden_dedicated_transfers_only_four_roles(monkeypatch, tmp_path) -> None:
+    """Golden dedicated shares the ordinary transfer: 4 roles + card binding."""
+    import studio_workflow_run
+    from studio_domain import WorkflowDomainService
+    from studio_domain.models import Mapping, MappingEntry, make_mapping_id, now_iso
+    from tests.test_workflow_run_integration import txt2img_prompt
+
+    root = tmp_path / "svc"
+    root.mkdir()
+    _, override_wf, _ = _g_setup_service(root)
+    svc = WorkflowDomainService(str(root))
+    svc._node_def_provider = _g_ref_defs
+    origin_wf = svc.create_workflow("origin")
+    origin_ver = svc.create_version_from_capture(
+        origin_wf["workflow_id"],
+        {"graph_json": {"id": "g", "nodes": []},
+         "api_prompt_json": {"workflow": {}, "output": txt2img_prompt()}},
+    )
+    svc.store.insert_mapping(Mapping(
+        mapping_id=make_mapping_id(),
+        workflow_version_id=origin_ver["workflow_version_id"],
+        created_at=now_iso(), updated_at=now_iso(),
+        output_node_id="6", text_generate_node_id=None,
+        entries={
+            "positive_prompt": MappingEntry.from_dict({
+                "semantic_role": "positive_prompt", "node_id": "1",
+                "input_name": "text", "kind": "node_input",
+                "control_kind": "multiline", "required": False}),
+            "seed": MappingEntry.from_dict({
+                "semantic_role": "seed", "node_id": "3",
+                "input_name": "seed", "kind": "node_input",
+                "control_kind": "integer", "required": False}),
+            "steps": MappingEntry.from_dict({
+                "semantic_role": "steps", "node_id": "3",
+                "input_name": "steps", "kind": "node_input",
+                "control_kind": "integer", "required": False}),
+        },
+        reference_method="dedicated",
+        reference_bindings={"dedicated_target": override_wf["workflow_id"], "card_ids": []},
+    ))
+    _g_patch_service(monkeypatch, root)
+    monkeypatch.setattr(studio_golden_run, "resolve_golden_profile", lambda name: _g_profile())
+    monkeypatch.setattr(studio_golden_run, "_canonical_golden_fast_path", lambda workflow: False)
+    import local_artifacts
+
+    monkeypatch.setattr(local_artifacts, "get_studio_outputs_dir", lambda: tmp_path / "outputs")
+
+    captured: dict = {}
+    store = GoldenStageEventStore(max_events=16, max_runs=2, ttl_seconds=60)
+    result = await studio_golden_run.run_golden_workflow(
+        workflow_id=origin_wf["workflow_id"],
+        version_id=origin_ver["workflow_version_id"],
+        controls={"positive_prompt": "transferred prompt", "seed": 4242, "steps": 99},
+        request_id="golden-refs-dedicated",
+        node_dir=str(root),
+        profile_name="golden-test",
+        modal_options={"production": {"enabled": False}},
+        event_store=store,
+        handle_factory=lambda *_args: _g_handle(captured),
+        studio_references={
+            "method": "dedicated",
+            "images": ["ref_a.png", "ref_b.png"],
+            "card_ids": [],
+            "dedicated_target": override_wf["workflow_id"],
+            "origin_workflow_id": origin_wf["workflow_id"],
+            "origin_version_id": origin_ver["workflow_version_id"],
+            "executing_workflow_id": "",
+            "executing_version_id": "",
+        },
+    )
+    assert result["status"] == "ok", result
+    submitted = captured["payload"]["workflow"]
+    assert submitted["2"]["inputs"]["text"] == "transferred prompt"
+    assert submitted["4"]["inputs"]["seed"] == 4242
+    assert submitted["4"]["inputs"]["steps"] == 5
+    assert submitted["7"]["inputs"]["image"] == "ref_a.png"
+    companion = captured["payload"]["request_metadata"]["studio_references"]
+    assert companion["executing_workflow_id"] == override_wf["workflow_id"]
+
+
+def test_golden_rejects_method_combination(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    root = tmp_path / "svc"
+    root.mkdir()
+    _, wf, version = _g_setup_service(root)
+    _g_patch_service(monkeypatch, root)
+    monkeypatch.setattr(studio_golden_run, "resolve_golden_profile", lambda name: _g_profile())
+
+    def _forbid(*args, **kwargs):
+        raise AssertionError("combined request must dispatch nothing")
+
+    store = GoldenStageEventStore(max_events=16, max_runs=2, ttl_seconds=60)
+    result = asyncio.run(studio_golden_run.run_golden_workflow(
+        workflow_id=wf["workflow_id"],
+        version_id=version["workflow_version_id"],
+        controls={},
+        request_id="golden-refs-combo",
+        node_dir=str(root),
+        profile_name="golden-test",
+        event_store=store,
+        handle_factory=_forbid,
+        studio_method={"kind": "expand", "method": "pad",
+                       "params": {"top": 1, "right": 0, "bottom": 0, "left": 0}},
+        studio_references=_g_ref_companion(
+            wf["workflow_id"], version["workflow_version_id"], ["ref_a.png"]),
+    ))
+    assert result["status"] == "error"
+    assert "cannot be combined" in result["message"]
+    assert store.active_count == 0

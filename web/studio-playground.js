@@ -273,7 +273,7 @@ import { openHistoryPicker } from "./studio-history-picker.js";
 import { mountPostprocessWorkspace } from "./studio-postprocess.js";
 import { renderLoadingState } from "./studio-loading.js";
 import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
-import { FIELD_BLOCKS } from "./studio-field-blocks.js";
+import { FIELD_BLOCKS, createUploadGuard } from "./studio-field-blocks.js";
 import { renderWorkflowPicker } from "./studio-workflow-picker.js";
 import { STYLE_CATALOG, STYLE_SETS } from "./studio-style-catalog.js";
 import {
@@ -281,6 +281,9 @@ import {
   saveShelfLayout,
   loadShelfValues,
   saveShelfValues,
+  loadReferenceCards,
+  saveReferenceCards,
+  WORKFLOW_REFERENCE_METHODS,
   saveSkipTextGenerate,
   loadToolWorkflows,
   saveToolWorkflows,
@@ -1776,6 +1779,10 @@ function workflowGatingInfo(store, wf, state) {
   var _methodReason = null;
   try { _methodReason = _studioMethodGate(state); } catch (_e) { _methodReason = null; }
   if (_methodReason) return { text: _methodReason, color: "#d9a441" };
+  // Phase 8: reference requirements gate the same line/button.
+  var _refReason = null;
+  try { _refReason = _studioReferenceGate(state); } catch (_e2) { _refReason = null; }
+  if (_refReason) return { text: _refReason, color: "#d9a441" };
   // Use the same local/remote decision as the Run button. A selected Golden
   // profile executes in the deployed container, so host-local dependency
   // reasons must not be shown as a reason that remote execution is blocked.
@@ -2010,8 +2017,10 @@ function _workflowSelectEl(state, actions, context) {
   // directions stay reachable.
   var _shellMode = activeModeOf(state);
   var _shellSub = activeSubtoolOf(state);
+  var _currentId = store.workflowId ? String(store.workflowId) : "";
   var rows = (store.library || []).filter(function (w) {
     var t = _workflowTypeOfRow(w);
+    if (_currentId && String(w.workflow_id) === _currentId) return true;
     if (!t) return true;
     if (t === tool) return true;
     if (_shellMode === "edit" && _shellSub === "select" && t === "inpaint") return true;
@@ -2019,6 +2028,11 @@ function _workflowSelectEl(state, actions, context) {
     // Phase 6 compatibility: Sketch shells list ordinary I2I (t === tool
     // above) plus legacy dedicated sketch workflows as expert overrides.
     if ((_shellMode === "generate" || _shellMode === "edit") && _shellSub === "sketch" && t === "sketch") return true;
+    // Phase 8 References spans normal T2I/I2I workflows: under the
+    // references subtool both types stay selectable so a reference-bound
+    // I2I workflow is reachable from Generate. Per-workflow capability
+    // (mapping-bound methods) still gates incompatible ones honestly.
+    if (_shellSub === "references" && (t === "t2i" || t === "i2i")) return true;
     return false;
   });
   if (!rows.length) {
@@ -2578,6 +2592,9 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
   if (!_gate) {
     try { _gate = _studioMethodGate(state); } catch (_e) { _gate = null; }
   }
+  if (!_gate) {
+    try { _gate = _studioReferenceGate(state); } catch (_eRef) { _gate = null; }
+  }
   if (_gate && !_gateBusy) {
     if (state && state.playground && state.playground.queueMode) {
       btn.textContent = "Queue";
@@ -2831,6 +2848,12 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
     var _sm = _studioMethodForRun(state, store);
     if (_sm) payload.studio_method = _sm;
   } catch (_e) {}
+  // Phase 8: ordered reference companion (never inside controls, which are
+  // schema-validated). Null/absent means a plain run.
+  try {
+    var _refs = _studioReferencesForRun(state, store);
+    if (_refs) payload.studio_references = _refs;
+  } catch (_eRef) {}
   // Phase 5: prompt-style composition. The user's prompt stays first and
   // verbatim; the selected style fragment appends deterministically (see
   // composeStylePrompt). studio_style carries user_prompt + style identity
@@ -7884,6 +7907,10 @@ function _pickerTypesForShell(state) {
   if (mode === "edit" && sub === "select") return ["i2i", "inpaint"];
   if (mode === "edit" && sub === "expand") return ["i2i", "outpaint"];
   if ((mode === "generate" || mode === "edit") && sub === "sketch") return ["i2i", "sketch"];
+  // Phase 8: References runs on the selected T2I/I2I engine plus the chosen
+  // Reference Method — both workflow families stay reachable together,
+  // under Generate and under Edit.
+  if (sub === "references" && (mode === "generate" || mode === "edit")) return ["t2i", "i2i"];
   return activeToolOf(state);
 }
 
@@ -8506,7 +8533,8 @@ function _openMethodOverridePicker(state, context, kind, currentId, onPick, onCl
     });
     dialog.appendChild(el("h4", {
       class: "comfymodal-studio-block-heading",
-      text: kind === "expand" ? "Dedicated Expand workflow" : "Dedicated Inpaint workflow",
+      text: kind === "expand" ? "Dedicated Expand workflow"
+        : (kind === "references" ? "Dedicated References workflow" : "Dedicated Inpaint workflow"),
     }));
     var closed = false;
     function onKey(ev) {
@@ -8549,7 +8577,11 @@ function _openMethodOverridePicker(state, context, kind, currentId, onPick, onCl
     dialog.appendChild(renderWorkflowPicker({
       apiBase: apiBase,
       mode: "single",
-      workflowTypes: kind === "expand" ? ["outpaint"] : ["inpaint"],
+      // A dedicated reference workflow is still a generation workflow (the
+      // override carries specialized identity handling, not a new family),
+      // so both T2I and I2I stay reachable. No reference-only workflow type
+      // exists to constrain to.
+      workflowTypes: kind === "expand" ? ["outpaint"] : (kind === "references" ? ["t2i", "i2i"] : ["inpaint"]),
       selectedIds: currentId ? [currentId] : [],
       confirmLabel: "Use workflow",
       onConfirm: function (ids) {
@@ -8700,6 +8732,575 @@ function _methodSelectRow(state, context, actions, kind, noteText) {
   return row;
 }
 
+// ── Phase 8: References (Lane C) ─────────────────────────────────────
+// Ordered reference collection beside the ordinary controls: method prefs
+// live per workflow in methods.v1 (referenceMethod + referenceOverride),
+// card values per workflow+version, structural bindings in the Mapping
+// (Lane A, read-only here). No Auto: the dropdown always shows one explicit
+// method (or Choose… until picked). A remembered method the current version
+// does not bind stays visible and blocked — never auto-switched.
+
+function _referenceTracker(state) {
+  var pg = state && state.playground;
+  if (!pg) return null;
+  if (!pg._refUpload || typeof pg._refUpload !== "object") {
+    pg._refUpload = { identity: "", busy: {}, errors: {}, seq: {}, pending: {}, guards: {} };
+  }
+  return pg._refUpload;
+}
+
+// Identity-synced tracker: a workflow/version switch orphans older entries.
+// They are dropped (never block the new selection); guards are kept so late
+// completions still drop on their own checks instead of committing wrongly.
+function _referenceTrackerSynced(state) {
+  var t = _referenceTracker(state);
+  var store = _shelfStore(state);
+  if (!t || !store) return t;
+  var identity = _selectionIdentity(store);
+  if (t.identity !== identity) {
+    t.identity = identity;
+    t.busy = {}; t.errors = {}; t.seq = {}; t.pending = {};
+  }
+  return t;
+}
+
+function _referenceCardsOf(state) {
+  var store = _shelfStore(state);
+  var wf = _shelfModule(state);
+  var raw = [];
+  try {
+    if (store && store.workflowId) raw = loadReferenceCards(store.workflowId, store.workflowVersionId || "");
+  } catch (_e) { raw = []; }
+  try {
+    if (wf && typeof wf.sanitizeReferenceCards === "function") return wf.sanitizeReferenceCards(raw);
+  } catch (_e2) {}
+  return Array.isArray(raw) ? raw.filter(function (c) { return c && typeof c === "object"; }) : [];
+}
+
+function _saveReferenceCardsOf(state, cards) {
+  var store = _shelfStore(state);
+  if (!store || !store.workflowId) return;
+  try { saveReferenceCards(store.workflowId, store.workflowVersionId || "", cards || []); } catch (_e) {}
+}
+
+function _referenceMethodStateOf(state) {
+  var store = _shelfStore(state);
+  var wf = _shelfModule(state);
+  if (!store || !wf || typeof wf.resolveReferenceMethodState !== "function") return null;
+  var prefs = {};
+  try { prefs = loadWorkflowMethods(store.workflowId || ""); } catch (_e) { prefs = {}; }
+  try { return wf.resolveReferenceMethodState(store, prefs); } catch (_e2) { return null; }
+}
+
+function _refCardUploadState(state, cardId) {
+  var t = _referenceTracker(state);
+  var store = _shelfStore(state);
+  if (!t || t.identity !== _selectionIdentity(store)) return { busy: false, error: "" };
+  return { busy: !!(t.busy && t.busy[cardId]), error: (t.errors && t.errors[cardId]) || "" };
+}
+
+// Busy/error reports from a card's image block (file/drop/paste ingests).
+// Reference counting (not a boolean) keeps overlapping ingests honest: a
+// stale completion clears only its own share, never a newer ingest's busy
+// state, and only current-token failures set the error text.
+function _onRefCardUploadState(state, context, actions, cardId, s) {
+  var store = _shelfStore(state);
+  if (!store) return;
+  var t = _referenceTrackerSynced(state);
+  if (!t) return;
+  if (!t.guards[cardId]) {
+    try { t.guards[cardId] = createUploadGuard(); } catch (_e) {}
+  }
+  if (s && s.busy) {
+    var guard = t.guards[cardId];
+    if (guard) t.pending[cardId] = guard.begin();
+    t.seq[cardId] = (t.seq[cardId] || 0) + 1;
+    t.busy[cardId] = true;
+    delete t.errors[cardId];
+  } else {
+    t.seq[cardId] = Math.max(0, (t.seq[cardId] || 1) - 1);
+    if (!t.seq[cardId]) delete t.busy[cardId];
+    if (s && s.error) t.errors[cardId] = String(s.error);
+  }
+  _syncWorkflowGating(state, context, actions);
+  _refreshShelfSection(state, context, actions);
+}
+
+// Commit one card's image file. Drops late commits after a workflow/version
+// switch, commits for removed cards, and older replacements superseded by a
+// newer ingest — so a wrong image can never land on a card or in the run.
+function _commitReferenceCardFile(state, context, actions, cardId, file) {
+  var store = _shelfStore(state);
+  var t = _referenceTracker(state);
+  if (!store || !t) return;
+  if (t.identity !== _selectionIdentity(store)) return;
+  var guard = t.guards[cardId];
+  if (guard && t.pending && t.pending[cardId] !== undefined && !guard.isCurrent(t.pending[cardId])) return;
+  var cards = _referenceCardsOf(state);
+  var at = -1;
+  for (var i = 0; i < cards.length; i++) {
+    if (cards[i] && cards[i].id === cardId) { at = i; break; }
+  }
+  if (at === -1) return;
+  cards[at] = { id: cardId, file: String(file || ""), label: cards[at].label || "" };
+  _saveReferenceCardsOf(state, cards);
+  _syncWorkflowGating(state, context, actions);
+  _refreshShelfSection(state, context, actions);
+}
+
+function _commitReferenceCardLabel(state, cardId, label) {
+  var store = _shelfStore(state);
+  if (!store || !store.workflowId) return;
+  var changed = false;
+  var next = _referenceCardsOf(state).map(function (c) {
+    if (!c || c.id !== cardId) return c;
+    changed = true;
+    return { id: c.id, file: c.file, label: String(label || "").slice(0, 80) };
+  });
+  if (!changed) return;
+  // Labels never gate and need no repaint (preserves input focus).
+  _saveReferenceCardsOf(state, next);
+}
+
+function _removeReferenceCard(state, context, actions, cardId) {
+  var wf = _shelfModule(state);
+  if (!wf || typeof wf.removeReferenceCard !== "function") return;
+  var next = [];
+  try { next = wf.removeReferenceCard(_referenceCardsOf(state), cardId); } catch (_e) { return; }
+  _saveReferenceCardsOf(state, next);
+  var t = _referenceTracker(state);
+  if (t) {
+    // Guards are kept on purpose: a late completion for the removed card
+    // drops on the existence check instead of resurrecting it.
+    if (t.busy) delete t.busy[cardId];
+    if (t.errors) delete t.errors[cardId];
+    if (t.seq) delete t.seq[cardId];
+    if (t.pending) delete t.pending[cardId];
+  }
+  _syncWorkflowGating(state, context, actions);
+  _refreshShelfSection(state, context, actions);
+}
+
+function _moveReferenceCard(state, context, actions, cardId, delta) {
+  var wf = _shelfModule(state);
+  if (!wf || typeof wf.moveReferenceCard !== "function") return;
+  var next = [];
+  try { next = wf.moveReferenceCard(_referenceCardsOf(state), cardId, delta); } catch (_e) { return; }
+  _saveReferenceCardsOf(state, next);
+  _syncWorkflowGating(state, context, actions);
+  _refreshShelfSection(state, context, actions);
+}
+
+// Shared fetch → upload → filename flow for Current/History picks onto a
+// card. Reuses the verified on-drive fast path (no duplicate upload) and
+// the existing /upload/image route. Returns the filename or "" and never
+// commits: callers commit through _commitReferenceCardFile.
+async function _materializeUrlToFile(state, url, prefix) {
+  var store = _shelfStore(state);
+  var identity = _selectionIdentity(store);
+  var hit = null;
+  try { hit = await _resolveVerifiedCanvasFile(state, url); } catch (_e) { hit = null; }
+  if (hit && hit.filename) {
+    if (_selectionIdentity(_shelfStore(state)) !== identity) return "";
+    return String(hit.filename);
+  }
+  var resp = null;
+  try {
+    resp = await fetch(url);
+  } catch (fetchErr) {
+    throw new Error("fetching the image: " + ((fetchErr && fetchErr.message) || fetchErr));
+  }
+  if (!resp || !resp.ok) throw new Error("fetching the image (HTTP " + (resp && resp.status) + ")");
+  var blob = await resp.blob();
+  var mod = await import("./studio-field-blocks.js");
+  var name = await mod.uploadImageBlob(blob, mod.uniqueImageName(prefix || "studio-reference"));
+  if (_selectionIdentity(_shelfStore(state)) !== identity) return "";
+  return String(name);
+}
+
+async function _linkUrlAsReferenceCard(state, context, actions, cardId, url, prefix) {
+  var store = _shelfStore(state);
+  if (!store) return;
+  var t = _referenceTrackerSynced(state);
+  if (!t) return;
+  var identity = _selectionIdentity(store);
+  if (!t.guards[cardId]) {
+    try { t.guards[cardId] = createUploadGuard(); } catch (_e) {}
+  }
+  var guard = t.guards[cardId];
+  if (guard) t.pending[cardId] = guard.begin();
+  t.seq[cardId] = (t.seq[cardId] || 0) + 1;
+  t.busy[cardId] = true;
+  delete t.errors[cardId];
+  _syncWorkflowGating(state, context, actions);
+  _refreshShelfSection(state, context, actions);
+  var name = "";
+  var err = "";
+  try {
+    name = await _materializeUrlToFile(state, url, prefix);
+    if (!name) throw new Error("the image could not be read");
+  } catch (_e2) {
+    err = "Could not use that image — " + ((_e2 && _e2.message) || "linking failed") + ".";
+  }
+  // A workflow/version switch mid-flight orphans this completion: the gate
+  // ignores stale-identity tracker entries, so just stop without touching
+  // the new selection's UI.
+  if (_selectionIdentity(_shelfStore(state)) !== identity) return;
+  t.seq[cardId] = Math.max(0, (t.seq[cardId] || 1) - 1);
+  if (!t.seq[cardId]) delete t.busy[cardId];
+  if (err) {
+    t.errors[cardId] = err;
+    _syncWorkflowGating(state, context, actions);
+    _refreshShelfSection(state, context, actions);
+    return;
+  }
+  _commitReferenceCardFile(state, context, actions, cardId, name);
+}
+
+async function _shelfUseCurrentAsReferenceCard(state, context, actions, cardId) {
+  var url = _shelfCurrentImageUrl(state);
+  if (!url) return;
+  await _linkUrlAsReferenceCard(state, context, actions, cardId, url, "studio-current");
+}
+
+async function _shelfUseHistoryAsReferenceCard(state, context, actions, cardId, url) {
+  if (!url) return;
+  await _linkUrlAsReferenceCard(state, context, actions, cardId, url, "studio-history");
+}
+
+function _referenceMethodOptions(wf) {
+  var ids = (wf && wf.REFERENCE_METHODS) || WORKFLOW_REFERENCE_METHODS;
+  var labels = (wf && wf.REFERENCE_METHOD_LABELS) || {};
+  return ids.map(function (id) { return [id, labels[id] || id]; });
+}
+
+function _referenceStatusText(state, st) {
+  if (!st) return "";
+  var cap = st.capability || {};
+  if (!cap.hasMapping) return "Reference capability loads with the workflow.";
+  if (!st.boundMethod) {
+    return "No reference bindings in this version — bind a Reference Method in the Workflow Setup Wizard.";
+  }
+  if (!st.method) {
+    return "Pick a method — the choice is remembered for this workflow. Cards map to the run payload in order.";
+  }
+  if (!st.supported) return st.reason || "";
+  if (st.method === "conditioning_slots") {
+    var n = cap.refSlots ? cap.refSlots.length : 0;
+    return n + " bound slot" + (n === 1 ? "" : "s") + " — cards map to slots in order.";
+  }
+  if (st.method === "reference_latent_chain") {
+    return "Repeats the bound latent branch per card, in card order.";
+  }
+  if (st.method === "dedicated") {
+    var store = _shelfStore(state);
+    var prefs = {};
+    try { prefs = loadWorkflowMethods(store && store.workflowId ? store.workflowId : ""); } catch (_e) {}
+    return prefs.referenceOverride
+      ? "Runs the dedicated reference workflow for every run."
+      : "Pick the dedicated reference workflow.";
+  }
+  return "";
+}
+
+function _referenceCountText(state) {
+  var cards = _referenceCardsOf(state);
+  var base = cards.length + " reference" + (cards.length === 1 ? "" : "s");
+  try {
+    var st = _referenceMethodStateOf(state);
+    var wf = _shelfModule(state);
+    var cap = st && wf && typeof wf.referenceCapacityFor === "function" ? wf.referenceCapacityFor(st) : null;
+    if (cap != null) base += " · " + cards.length + " of " + cap + " slots";
+  } catch (_e) {}
+  return base;
+}
+
+function _referenceMethodRow(state, context, actions) {
+  var store = _shelfStore(state);
+  var wf = _shelfModule(state);
+  function rowWfId() {
+    try {
+      var s = _shelfStore(state);
+      return (s && s.workflowId) ? String(s.workflowId) : "";
+    } catch (_e) { return ""; }
+  }
+  var wfId = rowWfId();
+  var prefs = loadWorkflowMethods(wfId);
+  var row = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center;" });
+  row.appendChild(el("span", {
+    text: "Reference Method",
+    style: "font-size:12px;color:#aaa;",
+  }));
+  var sel = el("select", { "data-testid": "reference-method", "aria-label": "Reference Method" });
+  var empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = "Choose…";
+  if (!prefs.referenceMethod) empty.selected = true;
+  sel.appendChild(empty);
+  _referenceMethodOptions(wf).forEach(function (pair) {
+    var o = document.createElement("option");
+    o.value = pair[0];
+    o.textContent = pair[1];
+    if (prefs.referenceMethod === pair[0]) o.selected = true;
+    sel.appendChild(o);
+  });
+  row.appendChild(sel);
+  var overBtn = el("button", {
+    type: "button", class: "comfymodal-secondary-btn",
+    text: _overrideButtonLabel(state, store, prefs.referenceOverride),
+    "data-testid": "reference-override-btn",
+    title: "Choose a dedicated reference workflow",
+  });
+  overBtn.style.display = prefs.referenceMethod === "dedicated" ? "" : "none";
+  function pickOverride() {
+    var cur = "";
+    try { cur = String(loadWorkflowMethods(rowWfId()).referenceOverride || ""); } catch (_e) {}
+    _openMethodOverridePicker(state, context, "references", cur, function (nextId) {
+      try { saveWorkflowMethods(rowWfId(), { referenceOverride: nextId }); } catch (_e2) {}
+      try { overBtn.textContent = _overrideButtonLabel(state, store, nextId); } catch (_e3) {}
+      try { _syncWorkflowGating(state, context, actions); } catch (_e4) {}
+      try { _refreshShelfSection(state, context, actions); } catch (_e5) {}
+    }, function () {
+      try { _syncWorkflowGating(state, context, actions); } catch (_e6) {}
+      try { _refreshShelfSection(state, context, actions); } catch (_e7) {}
+    });
+  }
+  overBtn.addEventListener("click", pickOverride);
+  row.appendChild(overBtn);
+  var note = el("p", {
+    class: "comfymodal-studio-control-note",
+    text: "",
+    style: "font-size:11px;color:#888;margin:0;flex-basis:100%;",
+    "data-testid": "reference-method-note",
+  });
+  row.appendChild(note);
+  function paintNote() {
+    if (!note.isConnected) return;
+    try {
+      var st = _referenceMethodStateOf(state);
+      note.textContent = _referenceStatusText(state, st) || "";
+      note.style.color = (st && !st.supported && st.reason) ? "#d9a441" : "#888";
+    } catch (_e) {}
+  }
+  paintNote();
+  sel.addEventListener("change", function () {
+    var prev = "";
+    try { prev = String(loadWorkflowMethods(rowWfId()).referenceMethod || ""); } catch (_e) {}
+    try { saveWorkflowMethods(rowWfId(), { referenceMethod: sel.value }); } catch (_e2) {}
+    var isDed = sel.value === "dedicated";
+    overBtn.style.display = isDed ? "" : "none";
+    paintNote();
+    if (isDed) {
+      var cur2 = "";
+      try { cur2 = String(loadWorkflowMethods(rowWfId()).referenceOverride || ""); } catch (_e3) {}
+      // Dedicated means nothing without an override: picking opens the
+      // picker now, and cancelling reverts instead of stranding the choice.
+      if (!cur2) {
+        _openMethodOverridePicker(state, context, "references", "", function (nextId) {
+          try { saveWorkflowMethods(rowWfId(), { referenceOverride: nextId }); } catch (_e4) {}
+          try { overBtn.textContent = _overrideButtonLabel(state, store, nextId); } catch (_e5) {}
+          try { _syncWorkflowGating(state, context, actions); } catch (_e6) {}
+          try { _refreshShelfSection(state, context, actions); } catch (_e7) {}
+        }, function () {
+          try { saveWorkflowMethods(rowWfId(), { referenceMethod: prev }); } catch (_e8) {}
+          try { sel.value = prev; } catch (_e9) {}
+          overBtn.style.display = "none";
+          paintNote();
+          try { _syncWorkflowGating(state, context, actions); } catch (_e10) {}
+          try { _refreshShelfSection(state, context, actions); } catch (_e11) {}
+        });
+        return;
+      }
+    }
+    try { _syncWorkflowGating(state, context, actions); } catch (_e12) {}
+  });
+  return row;
+}
+
+function _renderReferenceCard(state, context, actions, card, index, total) {
+  var store = _shelfStore(state);
+  var wf = _shelfModule(state);
+  if (!store || !wf || !card) return null;
+  var st = null;
+  try { st = _referenceMethodStateOf(state); } catch (_e) { st = null; }
+  var up = _refCardUploadState(state, card.id);
+  var wrap = el("div", {
+    class: "comfymodal-studio-shelf-card",
+    "data-testid": "reference-card-" + (index + 1),
+    "data-card-id": card.id,
+  });
+  var head = el("div", { class: "comfymodal-studio-shelf-card-head" });
+  var title = "Reference " + (index + 1) + " of " + total;
+  var slotLabel = "";
+  try {
+    slotLabel = (wf && typeof wf.referenceSlotLabel === "function") ? wf.referenceSlotLabel(st, index) : "";
+  } catch (_e2) {}
+  head.appendChild(el("span", {
+    class: "comfymodal-studio-shelf-card-label",
+    text: slotLabel ? (title + " — " + slotLabel) : title,
+  }));
+  wrap.appendChild(head);
+  var body = el("div", { class: "comfymodal-studio-shelf-card-body" });
+  var labelInput = el("input", {
+    type: "text",
+    class: "comfymodal-input comfymodal-studio-text-input",
+    value: card.label || "",
+    placeholder: "Label (optional, e.g. Logo)",
+    "data-testid": "reference-label-" + (index + 1),
+    "aria-label": "Reference " + (index + 1) + " label",
+    style: "margin-bottom:6px;",
+  });
+  labelInput.addEventListener("input", function () {
+    _commitReferenceCardLabel(state, card.id, labelInput.value);
+  });
+  body.appendChild(labelInput);
+  var imgProps = {
+    value: card.file || "",
+    testid: "reference-card-" + (index + 1) + "-image",
+    label: "Reference " + (index + 1),
+    hideClear: true,
+    uploadBusy: up.busy,
+    uploadError: up.error,
+    onChange: function (next) {
+      _commitReferenceCardFile(state, context, actions, card.id, next);
+    },
+    onUploadState: function (s) {
+      _onRefCardUploadState(state, context, actions, card.id, s || {});
+    },
+    onUseCurrent: function () { _shelfUseCurrentAsReferenceCard(state, context, actions, card.id); },
+  };
+  var historyItems = [];
+  try { historyItems = _historyPickerItems(state); } catch (_e3) { historyItems = []; }
+  if (historyItems.length) {
+    imgProps.onPickHistory = function (url) {
+      _shelfUseHistoryAsReferenceCard(state, context, actions, card.id, url);
+    };
+    imgProps.historyItems = historyItems;
+  }
+  body.appendChild(FIELD_BLOCKS.image.render(imgProps));
+  var ops = el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;" });
+  function opBtn(label, testid, disabled, title) {
+    var b = el("button", {
+      type: "button", class: "comfymodal-secondary-btn",
+      text: label, "data-testid": testid, title: title || label,
+    });
+    if (disabled) b.disabled = true;
+    ops.appendChild(b);
+    return b;
+  }
+  var earlier = opBtn("← Earlier", "reference-earlier-" + (index + 1),
+    index === 0, "Move this card earlier (payload order follows card order)");
+  earlier.addEventListener("click", function () { _moveReferenceCard(state, context, actions, card.id, -1); });
+  var later = opBtn("Later →", "reference-later-" + (index + 1),
+    index >= total - 1, "Move this card later (payload order follows card order)");
+  later.addEventListener("click", function () { _moveReferenceCard(state, context, actions, card.id, 1); });
+  var remove = opBtn("Remove", "reference-remove-" + (index + 1), false, "Remove this reference card");
+  remove.addEventListener("click", function () { _removeReferenceCard(state, context, actions, card.id); });
+  body.appendChild(ops);
+  wrap.appendChild(body);
+  return wrap;
+}
+
+function _renderReferenceSection(state, context, actions) {
+  var store = _shelfStore(state);
+  var wf = _shelfModule(state);
+  if (!store || !wf) return null;
+  var box = el("div", {
+    class: "comfymodal-studio-references",
+    "data-testid": "references-section",
+    style: "margin:8px 0;",
+  });
+  box.appendChild(_referenceMethodRow(state, context, actions));
+  var cards = _referenceCardsOf(state);
+  var list = el("div", { "data-testid": "reference-cards" });
+  cards.forEach(function (card, i) {
+    var node = _renderReferenceCard(state, context, actions, card, i, cards.length);
+    if (node) list.appendChild(node);
+  });
+  box.appendChild(list);
+  var foot = el("div", { style: "display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;" });
+  var addBtn = el("button", {
+    type: "button", class: "comfymodal-secondary-btn",
+    text: "Add reference",
+    "data-testid": "reference-add",
+    title: "Add a reference image",
+  });
+  // Overcapacity stays addable: the run gate explains the overflow instead
+  // of silently truncating the collection.
+  addBtn.addEventListener("click", function () {
+    var next = null;
+    try { next = wf.addReferenceCard(_referenceCardsOf(state), {}); } catch (_e) { return; }
+    if (!next) return;
+    _saveReferenceCardsOf(state, next);
+    try { _syncWorkflowGating(state, context, actions); } catch (_e2) {}
+    _refreshShelfSection(state, context, actions);
+  });
+  foot.appendChild(addBtn);
+  foot.appendChild(el("span", {
+    "data-testid": "reference-count",
+    class: "comfymodal-studio-control-note",
+    text: _referenceCountText(state),
+    style: "font-size:11px;color:#888;",
+  }));
+  box.appendChild(foot);
+  return box;
+}
+
+// Honest run gate for references (reason string or null). Engagement-gated,
+// not view-gated: a chosen method or any card means the user set up
+// references, so every submit carries them or blocks — no silent fallback
+// to a plain run. Makes no inference request; the Mapping binding is read
+// from the cached run-context bundle only.
+function _studioReferenceGate(state) {
+  try {
+    var pg = state && state.playground;
+    var store = pg && pg._workflowRun;
+    var wf = pg && pg._workflowRunModule;
+    if (!pg || !store || !wf || !store.workflowId || !store.workflowVersionId) return null;
+    if (!store.runContext || !store.runContext.mapping) return null;
+    if (typeof wf.resolveReferenceMethodState !== "function") return null;
+    var cards = _referenceCardsOf(state);
+    var prefs = loadWorkflowMethods(store.workflowId);
+    var method = (prefs && prefs.referenceMethod) || "";
+    if (!method && !cards.length) return null;
+    var tracker = _referenceTrackerSynced(state);
+    var identity = _selectionIdentity(store);
+    if (tracker && tracker.identity === identity) {
+      var busyIds = Object.keys(tracker.busy || {}).filter(function (id) { return tracker.busy[id]; });
+      if (busyIds.length) return "Reference upload in progress…";
+      var errIds = Object.keys(tracker.errors || {}).filter(function (id) { return tracker.errors[id]; });
+      if (errIds.length) return String(tracker.errors[errIds[0]]);
+    }
+    var st = wf.resolveReferenceMethodState(store, prefs);
+    if (!st) return null;
+    if (st.reason) return st.reason;
+    if (!method && cards.length) return "Choose a Reference Method";
+    if (st.method === "dedicated" && !prefs.referenceOverride) {
+      return "Choose a dedicated reference workflow";
+    }
+    if (typeof wf.validateReferenceCards === "function") {
+      var v = wf.validateReferenceCards(cards, st);
+      if (v && v.errors && v.errors.length) return String(v.errors[0]);
+    }
+    return null;
+  } catch (_e) { return null; }
+}
+
+// Explicit reference companion for the current run, or null for a plain run.
+// Fail-closed twice: the gate blocks submits, and the payload builder drops
+// anything unsupported or incomplete instead of partially submitting.
+function _studioReferencesForRun(state, store) {
+  try {
+    var wf = state && state.playground && state.playground._workflowRunModule;
+    if (!state || !store || !wf || typeof wf.buildStudioReferencesCompanion !== "function") return null;
+    if (!store.workflowId) return null;
+    var cards = _referenceCardsOf(state);
+    if (!cards.length) return null;
+    var prefs = loadWorkflowMethods(store.workflowId);
+    return wf.buildStudioReferencesCompanion(store, cards, prefs);
+  } catch (_e) { return null; }
+}
+
 // Sensible visible shell for an internal execution type. A sketch shell
 // keeps the already-visible Generate/Edit Sketch choice when compatible
 // (both the I2I sketch path and the legacy sketch compatibility override
@@ -8725,6 +9326,12 @@ function _defaultShellForTool(toolId, currentMode, currentSubtool) {
   if (toolId === "i2i" && currentMode === "edit"
     && (currentSubtool === "text" || currentSubtool === "select" || currentSubtool === "expand")) {
     return { mode: "edit", subtool: currentSubtool };
+  }
+  // Phase 8: References spans normal T2I/I2I workflows — switching between
+  // reference-bound workflows keeps the already-visible References subtool
+  // instead of yanking the user back to Text. Mode follows the new tool.
+  if (currentSubtool === "references" && (toolId === "t2i" || toolId === "i2i")) {
+    return { mode: toolId === "i2i" ? "edit" : "generate", subtool: "references" };
   }
   var defaults = {
     t2i: { mode: "generate", subtool: "text" },
@@ -12334,6 +12941,16 @@ function _populateShelfSection(section, state, context, actions) {
     var promptCard = _shelfFieldCard(state, context, actions, entries, promptRole, null, true);
     if (promptCard) section.appendChild(promptCard);
   }
+
+  // Phase 8: references are an ordered collection beside the ordinary
+  // controls — rendered only in the References view, never as mapped
+  // reference_1..N fields.
+  try {
+    if (activeSubtoolOf(state) === "references") {
+      var _refSection = _renderReferenceSection(state, context, actions);
+      if (_refSection) section.appendChild(_refSection);
+    }
+  } catch (_eRef) {}
 
   // Phase 5: visual prompt-style browser under Generate → Text only. The
   // user's prompt stays the source of truth; a selected style deterministically

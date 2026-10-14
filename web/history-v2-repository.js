@@ -312,6 +312,77 @@ export function selectDetailAsset(output) {
   return { kind: "none", url: "", label: "No image" };
 }
 
+// ── Studio references (Phase 8, Lane D) ─────────────────────────────────
+//
+// Normalizes the saved `studio_references` companion projected by the
+// backend (explicit method, origin/executing identities, ordered card IDs,
+// image identity + submitted source provenance, concrete slot/chain
+// assignments, applied order, graph identity).  Order is preserved
+// verbatim: position = order, never a global role lookup.  Absent input
+// (legacy records) normalizes to null so detail surfaces render nothing.
+export function normalizeStudioReferences(raw) {
+  const src = raw && typeof raw === "object" ? raw : null;
+  if (!src) return null;
+  const cards = [];
+  (Array.isArray(src.card_ids) ? src.card_ids : (Array.isArray(src.cardIds) ? src.cardIds : []))
+    .forEach(function (v) {
+      if (typeof v === "string" && v) cards.push(v);
+    });
+  const images = [];
+  (Array.isArray(src.images) ? src.images : []).forEach(function (entry) {
+    const e = entry && typeof entry === "object" ? entry : null;
+    if (!e || typeof e.filename !== "string" || !e.filename) return;
+    const source = e.source && typeof e.source === "object" && !Array.isArray(e.source)
+      ? e.source
+      : (typeof e.source === "string" && e.source ? { ref: e.source } : {});
+    images.push({
+      cardId: typeof e.card_id === "string" ? e.card_id : (typeof e.cardId === "string" ? e.cardId : ""),
+      filename: e.filename,
+      sha256: typeof e.sha256 === "string" ? e.sha256 : "",
+      byteSize: e.byte_size != null ? e.byte_size : (e.byteSize != null ? e.byteSize : null),
+      source: source,
+    });
+  });
+  const slots = [];
+  (Array.isArray(src.slots) ? src.slots : []).forEach(function (entry, position) {
+    const e = entry && typeof entry === "object" ? entry : null;
+    if (!e || typeof e.node_id !== "string" || !e.node_id) return;
+    if (typeof e.socket !== "string" || !e.socket) return;
+    slots.push({
+      cardId: typeof e.card_id === "string" ? e.card_id : (typeof e.cardId === "string" ? e.cardId : ""),
+      position: position,
+      order: e.order != null ? e.order : position,
+      nodeId: e.node_id,
+      socket: e.socket,
+      kind: typeof e.kind === "string" ? e.kind : "reference",
+      outputIndex: e.output_index != null ? e.output_index : (e.outputIndex != null ? e.outputIndex : null),
+      edge: typeof e.edge === "string" ? e.edge : "",
+    });
+  });
+  const applied = [];
+  (Array.isArray(src.applied_order) ? src.applied_order : (Array.isArray(src.appliedOrder) ? src.appliedOrder : []))
+    .forEach(function (v) {
+      if (typeof v === "string" && v) applied.push(v);
+    });
+  if (cards.length === 0 && images.length === 0 && slots.length === 0) return null;
+  return {
+    method: _firstString(src.method),
+    originWorkflowId: _firstString(src.origin_workflow_id, src.originWorkflowId),
+    originVersionId: _firstString(src.origin_version_id, src.originVersionId),
+    executingWorkflowId: _firstString(src.executing_workflow_id, src.executingWorkflowId),
+    executingVersionId: _firstString(src.executing_version_id, src.executingVersionId),
+    dedicatedTarget: _firstString(src.dedicated_target, src.dedicatedTarget),
+    cardIds: cards,
+    images: images,
+    slots: slots,
+    chain: src.chain && typeof src.chain === "object" && !Array.isArray(src.chain) ? src.chain : {},
+    appliedOrder: applied.length > 0 ? applied : cards.slice(),
+    graphHash: _firstString(src.graph_hash, src.graphHash),
+    workflowVersionId: _firstString(src.workflow_version_id, src.workflowVersionId),
+    provenance: src.provenance && typeof src.provenance === "object" && !Array.isArray(src.provenance) ? src.provenance : {},
+  };
+}
+
 export function normalizeHistoryAttempt(raw) {
   const attempt = raw && typeof raw === "object" ? raw : {};
   return {
@@ -620,6 +691,10 @@ function _normalizeGeneration(raw) {
     // Durable replay-incapability marker (legacy snapshots): consumed by the
     // Generate Original / Resume eligibility gates.
     irreproducible: _toBool(raw.irreproducible, false),
+    // Lane D: saved studio references companion (null on legacy records).
+    studioReferences: normalizeStudioReferences(
+      raw.studio_references != null ? raw.studio_references : raw.studioReferences,
+    ),
     // Machine-readable snapshot state for the viewer's lineage rows.
     replayReason: _firstString(raw.replay_unavailable_reason, raw.replayUnavailableReason),
     featuredOutput: _featuredOutput(raw, outputs),
@@ -800,6 +875,7 @@ function _emptyGenerationRecord() {
     preset: "", prompt: "", negativePrompt: "", startedAt: "", completedAt: "",
     durationMs: null, favorite: false, note: "", tags: [], models: [],
     outputCount: 0, hasImage: false, previewOnly: false, originalAvailable: false,
+    studioReferences: null,
     featuredOutput: {
       index: 0, thumbUrl: "", previewUrl: "", originalUrl: "", originalFailed: false,
       previewAssetId: null, previewExportState: null,

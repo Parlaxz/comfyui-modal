@@ -79,13 +79,55 @@ function _gen(id, status, workflow, preset, model, durationMs, offsetSec, output
     originalAvailable: o.originalAvailable != null ? o.originalAvailable : (outputCount > 0 && !o.previewOnly),
     originalFailed: !!o.originalFailed,
     hasImage: o.hasImage != null ? o.hasImage : outputCount > 0,
+    // Lane D: optional saved studio_references companion (only generations
+    // with an explicit payload carry one; all others stay legacy-clean).
+    references: o.references || null,
   };
 }
+
+// Lane D deterministic reference companion for gen_003: explicit method,
+// ordered stable card IDs (position = order), image identity + submitted
+// source provenance, concrete slot assignments in applied order, and the
+// stored graph identity + effective execution graph hash.
+const GEN_003_REFERENCES = {
+  method: "conditioning_slots",
+  origin_workflow_id: "wf_portrait_pro",
+  origin_version_id: "wv_portrait_pro_3",
+  executing_workflow_id: "wf_portrait_pro",
+  executing_version_id: "wv_portrait_pro_3",
+  dedicated_target: "",
+  card_ids: ["card_alpha", "card_beta"],
+  images: [
+    {
+      card_id: "card_alpha",
+      filename: "ref_alpha.png",
+      sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      byte_size: 1234,
+      source: { kind: "upload", ref: "ref_alpha.png" },
+    },
+    {
+      card_id: "card_beta",
+      filename: "ref_beta.png",
+      sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      byte_size: 2345,
+      source: { kind: "library", ref: "lib://textures/beta" },
+    },
+  ],
+  slots: [
+    { card_id: "card_alpha", node_id: "12", socket: "reference", kind: "reference", order: 0 },
+    { card_id: "card_beta", node_id: "12", socket: "reference_2", kind: "reference", order: 1 },
+  ],
+  chain: {},
+  applied_order: ["card_alpha", "card_beta"],
+  graph_hash: "fixture-graph-hash-gen003",
+  workflow_version_id: "wv_portrait_pro_3",
+  provenance: { source: "mapping" },
+};
 
 const GENERATION_SPECS = [
   _gen("gen_001", "success", "Portrait Pro", "preset_a", "sd_xl_base", 4200, 690, 1, { tags: ["portrait"] }),
   _gen("gen_002", "success", "Portrait Pro", "preset_a", "sd_xl_base", 8600, 780, 1, { favorite: true, tags: ["portrait"] }),
-  _gen("gen_003", "success", "Portrait Pro", "preset_a", "flux_dev", 15300, 870, 4, { tags: ["portrait", "multi"] }),
+  _gen("gen_003", "success", "Portrait Pro", "preset_a", "flux_dev", 15300, 870, 4, { tags: ["portrait", "multi"], references: GEN_003_REFERENCES }),
   _gen("gen_004", "success", "Portrait Pro", "preset_a", "dreamshaper_xl", 2900, 960, 1, { tags: ["portrait"] }),
   _gen("gen_005", "success", "Portrait Pro", "preset_a", "sd_xl_base", 12400, 1050, 1, { originalFailed: true, originalAvailable: true, tags: ["portrait"] }),
   _gen("gen_006", "success", "Portrait Pro", "preset_a", "flux_dev", 6100, 1140, 1, { tags: ["portrait"] }),
@@ -183,6 +225,9 @@ function _buildGenerationRecord(spec) {
     original_available: spec.originalAvailable,
     run_id: "run_" + spec.id,
     featured_output_index: 0,
+    // Lane D: saved companion rides the raw record so normalizeFeedItem
+    // projects studioReferences (order/provenance preserved verbatim).
+    ...(spec.references ? { studio_references: spec.references } : {}),
   };
 }
 

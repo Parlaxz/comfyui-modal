@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 from .graph import (
     INPUT_BINDING_KINDS,
     derive_mapping_candidates,
+    discover_reference_candidates,
     extract_dependency_metadata,
     extract_executable_prompt,
     find_binding_candidates,
@@ -33,6 +34,7 @@ from .graph import (
     ui_graph_to_api_prompt,
 )
 from .models import (
+    REFERENCE_METHOD_IDS,
     ImmutableVersionError,
     Mapping,
     MappingAlreadyExistsError,
@@ -44,9 +46,11 @@ from .models import (
     WorkflowDomainValidationError,
     WorkflowVersion,
     WorkflowVersionNotFoundError,
+    build_studio_references_companion,
     make_mapping_id,
     make_version_id,
     make_workflow_id,
+    normalize_reference_bindings,
     now_iso,
 )
 from .store import WorkflowDomainStore
@@ -498,6 +502,254 @@ class WorkflowDomainService:
                 )
         return node_id
 
+    # ── References (Phase 8, Lane A) ────────────────────────────────────
+
+    def get_reference_candidates(
+        self, workflow_version_id: str
+    ) -> dict[str, Any]:
+        """Structural reference candidates for one version's stored graph.
+
+        Reuses subgraph expansion + target resolution via
+        :func:`discover_reference_candidates` over the version's executable
+        prompt, installed node schemas, selected output upstream graph, and
+        existing prompt/source-image mappings. Never raises.
+        """
+        version = self.store.get_version(workflow_version_id)
+        if version is None:
+            raise WorkflowVersionNotFoundError(
+                f"workflow version {workflow_version_id!r} not found"
+            )
+        executable = version.get("executable_prompt") or {}
+        ui_graph = version.get("graph_json")
+        mapping = self.store.get_mapping_for_version(workflow_version_id)
+        prompt_bindings: dict[str, Any] = {}
+        output_node_id = ""
+        try:
+            if isinstance(mapping, dict):
+                for raw in mapping.get("entries") or []:
+                    if not isinstance(raw, dict):
+                        continue
+                    role = str(raw.get("semantic_role", ""))
+                    if role in ("positive_prompt", "prompt", "source_image", "mask"):
+                        prompt_bindings[role if role != "positive_prompt" else "prompt"] = {
+                            "node_id": str(raw.get("node_id", "")),
+                            "input_name": str(raw.get("input_name", "")),
+                        }
+                output_node_id = str(mapping.get("output_node_id", "") or "")
+        except Exception:
+            pass
+        if not output_node_id:
+            try:
+                output_node_id = str(version.get("output_node_id", "") or "")
+            except Exception:
+                output_node_id = ""
+        return discover_reference_candidates(
+            executable,
+            ui_graph=ui_graph,
+            node_def_provider=self._node_def_provider,
+            output_node_id=output_node_id,
+            prompt_bindings=prompt_bindings,
+        )
+
+    def _validate_reference_bindings(
+        self,
+        reference_method: Any,
+        reference_bindings: Any,
+        version: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        """Validate version-bound reference bindings against the graph.
+
+        Fail-closed: unknown methods, stale nodes/sockets (including
+        subgraph-ambiguous bindings), and Method-2 chains outside the
+        evidenced segment are rejected. Returns ``(method, normalized)``.
+        """
+        method, normalized, problems = normalize_reference_bindings(
+            reference_method, reference_bindings
+        )
+        if problems:
+            raise WorkflowDomainValidationError("; ".join(problems))
+        if not method:
+            return "", {}
+        if method not in REFERENCE_METHOD_IDS:
+            raise WorkflowDomainValidationError(
+                f"unknown reference method {method!r}"
+            )
+        executable = version.get("executable_prompt") or {}
+        ui_graph = version.get("graph_json")
+        discovery = discover_reference_candidates(
+            executable,
+            ui_graph=ui_graph,
+            node_def_provider=self._node_def_provider,
+            prompt_bindings=None,
+        )
+        by_id = {
+            str(c.get("candidate_id", "")): c
+            for c in discovery.get("candidates", [])
+            if isinstance(c, dict)
+        }
+        errors: list[str] = []
+        if method == "dedicated":
+            target = str(normalized.get("dedicated_target", "") or "")
+            if not target:
+                raise WorkflowDomainValidationError(
+                    "dedicated reference method requires a dedicated target"
+                )
+            if node_exists(executable, target) or subgraph_node_present(
+                executable, ui_graph, target
+            ):
+                return method, normalized
+            # A dedicated target may also be a stored workflow (selected
+            # explicitly through the workflow picker); the run path resolves
+            # and freezes its version at acceptance. Anything else stays
+            # rejected — never a guessed node.
+            try:
+                stored = self.store.get_workflow(target)
+            except Exception:
+                stored = None
+            if isinstance(stored, dict) and stored:
+                return method, normalized
+            raise WorkflowDomainValidationError(
+                f"dedicated reference target node {target} not present in graph"
+            )
+        candidate_id = str(normalized.get("candidate_id", "") or "")
+        if method == "conditioning_slots":
+            slots = normalized.get("slots", [])
+            if not isinstance(slots, list) or not slots:
+                raise WorkflowDomainValidationError(
+                    "conditioning_slots requires at least one reference slot"
+                )
+            # Multi-candidate confirmation: an explicit candidate pick is
+            # required whenever discovery is ambiguous.
+            if len(discovery.get("candidates", [])) > 1 and not candidate_id:
+                raise WorkflowDomainValidationError(
+                    "multiple reference candidates evidenced; "
+                    "confirm one conditioning candidate before saving"
+                )
+            candidate = by_id.get(candidate_id) if candidate_id else None
+            if candidate_id and candidate is None:
+                raise WorkflowDomainValidationError(
+                    f"reference candidate {candidate_id!r} is not evidenced on this version"
+                )
+            evidenced_slots: dict[tuple[str, str], dict[str, Any]] = {}
+            if isinstance(candidate, dict):
+                for slot in candidate.get("slots", []) or []:
+                    if isinstance(slot, dict) and slot.get("node_id") and slot.get("socket"):
+                        evidenced_slots[(str(slot["node_id"]), str(slot["socket"]))] = slot
+            for slot in slots:
+                nid = str(slot.get("node_id", ""))
+                socket = str(slot.get("socket", ""))
+                kind = str(slot.get("kind", "reference"))
+                if kind == "source":
+                    continue
+                ev_slot = evidenced_slots.get((nid, socket)) if evidenced_slots else None
+                if isinstance(ev_slot, dict):
+                    # The candidate already evidenced this slot: a required
+                    # slot must be wired, while an optional one may bind an
+                    # isolated loader branch at run time (discovery marks it
+                    # writable). Trust that evidence instead of re-resolving.
+                    if bool(ev_slot.get("required")) and not bool(ev_slot.get("resolvable")):
+                        errors.append(
+                            f"reference slot socket {socket!r} on node {nid} "
+                            "is required but has no resolvable binding path"
+                        )
+                    continue
+                target = resolve_binding_target(
+                    executable, nid, socket, ui_graph=ui_graph,
+                    node_def_provider=self._node_def_provider,
+                )
+                if target.get("subgraph_candidates"):
+                    errors.append(
+                        f"reference slot node {nid} socket {socket!r} is ambiguous "
+                        "across subgraphs; bind the outer subgraph widget"
+                    )
+                elif not target.get("resolvable"):
+                    if not target.get("node_present"):
+                        errors.append(
+                            f"reference slot node {nid} not present in graph"
+                        )
+                    else:
+                        errors.append(
+                            f"reference slot socket {socket!r} not present on node {nid}"
+                        )
+                elif evidenced_slots and (nid, socket) not in evidenced_slots:
+                    errors.append(
+                        f"reference slot {socket!r} on node {nid} is outside the "
+                        f"confirmed candidate {candidate_id!r} slot order"
+                    )
+            if errors:
+                raise WorkflowDomainValidationError("; ".join(errors))
+            return method, normalized
+        # reference_latent_chain
+        chain = normalized.get("chain", {})
+        if not isinstance(chain, dict) or not chain:
+            raise WorkflowDomainValidationError(
+                "reference_latent_chain requires a chain boundary"
+            )
+        ref_id = str(chain.get("reference_latent_node_id", "") or "")
+        if not ref_id:
+            raise WorkflowDomainValidationError(
+                "reference_latent_chain requires a reference latent node"
+            )
+        evidenced = None
+        for cand in discovery.get("candidates", []) or []:
+            if not isinstance(cand, dict):
+                continue
+            if cand.get("method") != "reference_latent_chain":
+                continue
+            cand_chain = cand.get("chain", {}) if isinstance(cand.get("chain"), dict) else {}
+            if str(cand_chain.get("reference_latent_node_id", "")) == ref_id:
+                evidenced = cand
+                break
+        if evidenced is None:
+            raise WorkflowDomainValidationError(
+                f"reference latent chain at node {ref_id} is not evidenced; "
+                "generic workflow without the chain pattern is incompatible"
+            )
+        cand_chain = evidenced.get("chain", {})
+        for key in ("loader_node_id", "vae_encode_node_id", "reference_latent_node_id"):
+            want = str(cand_chain.get(key, "") or "")
+            got = str(chain.get(key, "") or "")
+            if want and got and want != got:
+                errors.append(
+                    f"chain boundary {key} {got!r} does not match evidenced {want!r}"
+                )
+        if errors:
+            raise WorkflowDomainValidationError("; ".join(errors))
+        return method, normalized
+
+    def build_studio_references(
+        self, workflow_version_id: str
+    ) -> dict[str, Any]:
+        """Top-level ``studio_references`` run companion for one version.
+
+        Explicit method, origin workflow/version, dedicated target where
+        applicable, ordered card ids, server image refs (empty until the
+        run attaches uploads), and source provenance. No client graph
+        patches. Never raises for missing bindings (returns unbound).
+        """
+        version = self.store.get_version(workflow_version_id)
+        if version is None:
+            raise WorkflowVersionNotFoundError(
+                f"workflow version {workflow_version_id!r} not found"
+            )
+        mapping = self.store.get_mapping_for_version(workflow_version_id)
+        method = ""
+        bindings: dict[str, Any] = {}
+        try:
+            if isinstance(mapping, dict):
+                method = str(mapping.get("reference_method", "") or "")
+                raw = mapping.get("reference_bindings")
+                if isinstance(raw, dict):
+                    bindings = raw
+        except Exception:
+            pass
+        return build_studio_references_companion(
+            method=method,
+            origin_workflow_id=str(version.get("workflow_id", "") or ""),
+            origin_version_id=str(version.get("workflow_version_id", "") or ""),
+            bindings=bindings,
+        )
+
     # ── Workflow ─────────────────────────────────────────────────────────
 
     def create_workflow(
@@ -940,6 +1192,8 @@ class WorkflowDomainService:
         entries: dict[str, dict[str, Any]],
         output_node_id: str = "",
         text_generate_node_id: Optional[str] = None,
+        reference_method: str = "",
+        reference_bindings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Change a Mapping by creating a NEW immutable Workflow Version.
 
@@ -965,6 +1219,9 @@ class WorkflowDomainService:
         self._validate_entries_against_graph(normalized, source)
         text_generate_node_id = self._validate_text_generate_binding(
             self._normalize_text_generate_node_id(text_generate_node_id), source
+        )
+        ref_method, ref_bindings = self._validate_reference_bindings(
+            reference_method, reference_bindings, source
         )
         output_node_id = self.normalize_output_node_id(
             output_node_id,
@@ -1000,6 +1257,8 @@ class WorkflowDomainService:
             output_node_id=str(output_node_id or ""),
             text_generate_node_id=text_generate_node_id,
             entries=normalized,
+            reference_method=ref_method,
+            reference_bindings=ref_bindings,
         )
         self.store.insert_mapping(mapping)
 
@@ -1111,6 +1370,24 @@ class WorkflowDomainService:
             )
             if not output_ok:
                 reasons.append("no output node")
+            # Reference bindings are version-bound: revalidate the stored
+            # method/bindings against the current executable graph on every
+            # read (version change, regeneration, submission gate). Stale
+            # nodes/sockets or an unevidenced chain block runnable state.
+            try:
+                ref_method = str((mapping.get("reference_method", "") or ""))
+                ref_bindings = mapping.get("reference_bindings")
+                if ref_method:
+                    try:
+                        self._validate_reference_bindings(
+                            ref_method, ref_bindings, version
+                        )
+                    except WorkflowDomainValidationError as ref_exc:
+                        reasons.append(f"stale reference bindings: {ref_exc}")
+                    except Exception:
+                        reasons.append("stale reference bindings")
+            except Exception:
+                pass
             # Profile completeness: a version missing a required Tool Input
             # for its workflow type cannot run. Without this, an image tool
             # version saved without its Source Image binding reports ready and
@@ -1203,6 +1480,8 @@ class WorkflowDomainService:
         entries: dict[str, dict[str, Any]],
         output_node_id: str = "",
         text_generate_node_id: Optional[str] = None,
+        reference_method: str = "",
+        reference_bindings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Attach the (single, immutable) Mapping to a Workflow Version.
 
@@ -1229,6 +1508,9 @@ class WorkflowDomainService:
         text_generate_node_id = self._validate_text_generate_binding(
             self._normalize_text_generate_node_id(text_generate_node_id), version
         )
+        ref_method, ref_bindings = self._validate_reference_bindings(
+            reference_method, reference_bindings, version
+        )
         output_node_id = self.normalize_output_node_id(
             output_node_id,
             version.get("executable_prompt") or {},
@@ -1242,6 +1524,8 @@ class WorkflowDomainService:
             output_node_id=str(output_node_id or ""),
             text_generate_node_id=text_generate_node_id,
             entries=normalized,
+            reference_method=ref_method,
+            reference_bindings=ref_bindings,
         )
         stored = self.store.insert_mapping(mapping)
         raw_workflow = self.store.get_workflow(str(version.get("workflow_id", "")))
@@ -1287,6 +1571,9 @@ class WorkflowDomainService:
         enriched = dict(mapping)
         # Records written before TextGenerate bypass support are unbound.
         enriched.setdefault("text_generate_node_id", None)
+        # Records written before reference support carry no bindings.
+        enriched.setdefault("reference_method", "")
+        enriched.setdefault("reference_bindings", {})
         enriched["version_state"] = self.derive_version_state(version_id).to_dict()
         return enriched
 

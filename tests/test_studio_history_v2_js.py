@@ -193,6 +193,46 @@ class HistoryV2FixturesTests(unittest.TestCase):
         _assert_no_framework_imports(self, self.m)
 
 
+class HistoryV2StudioReferencesJsTests(unittest.TestCase):
+    """Lane D: studio_references normalization, detail rendering, fixtures."""
+
+    def test_repository_exports_reference_normalizer(self):
+        m = _JsModule(WEB / "history-v2-repository.js")
+        self.assertTrue(m.has_export("normalizeStudioReferences"))
+
+    def test_repository_normalizes_references_on_generations(self):
+        m = _JsModule(WEB / "history-v2-repository.js")
+        self.assertIn("studioReferences: normalizeStudioReferences(", m.text)
+        self.assertIn("studio_references", m.text)
+
+    def test_detail_renders_method_refs_and_provenance(self):
+        m = _JsModule(WEB / "studio-history-v2-detail.js")
+        self.assertTrue(m.has_export("buildReferencesSection"))
+        self.assertTrue(m.has_export("studioReferenceMethodLabel"))
+        self.assertIn("history-v2-references", m.text)
+        self.assertIn("Conditioning slots", m.text)
+        self.assertIn("Reference latent chain", m.text)
+        self.assertIn("Dedicated reference workflow", m.text)
+
+    def test_fixture_generation_carries_ordered_references(self):
+        m = _JsModule(WEB / "history-v2-fixtures.js")
+        self.assertIn("GEN_003_REFERENCES", m.text)
+        self.assertIn("studio_references", m.text)
+        self.assertIn('"card_alpha", "card_beta"', m.text)
+        self.assertIn('"conditioning_slots"', m.text)
+
+    def test_reference_surfaces_have_no_inner_html(self):
+        for name in ("studio-history-v2-detail.js", "history-v2-fixtures.js"):
+            with self.subTest(name=name):
+                self.assertNotIn("innerHTML", _JsModule(WEB / name).text)
+
+    def test_reference_surfaces_have_no_framework_imports(self):
+        for name in ("history-v2-repository.js", "studio-history-v2-detail.js",
+                     "history-v2-fixtures.js"):
+            with self.subTest(name=name):
+                _assert_no_framework_imports(self, _JsModule(WEB / name))
+
+
 class HistoryV2ViewStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.m = _JsModule(WEB / "history-v2-view-state.js")

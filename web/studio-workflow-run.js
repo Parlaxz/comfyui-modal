@@ -746,3 +746,403 @@ export function resolveHandoffSelection(store) {
   store.setHandoff(handoff);
   return { ok: true, handoff };
 }
+
+// ── References (Phase 8, Lane C) ───────────────────────────────────────
+//
+// Ordered reference collection, separate from ordinary mapped controls.
+// Frozen method ids mirror studio_domain/models.py REFERENCE_METHOD_IDS
+// (no Auto/best-available anywhere). Structural bindings live in the
+// Mapping (Lane A: mapping.reference_method + mapping.reference_bindings);
+// card values live per workflow+version in studio-playground-state.js;
+// this module owns the pure glue: capability reads, method-vs-binding
+// compatibility, card list helpers, validation, and the studio_references
+// run companion. No DOM, no storage, no fetch — fully node-testable.
+
+/** Frozen reference method ids. Never rename: Mapping, companion, prefs. */
+export const REFERENCE_METHODS = Object.freeze([
+  "conditioning_slots",
+  "reference_latent_chain",
+  "dedicated",
+]);
+
+export const REFERENCE_METHOD_LABELS = Object.freeze({
+  conditioning_slots: "Conditioning slots",
+  reference_latent_chain: "Reference latent chain",
+  dedicated: "Dedicated reference workflow",
+});
+
+export function referenceMethodLabel(id) {
+  return REFERENCE_METHOD_LABELS[id] || String(id || "reference method");
+}
+
+/** Stable internal card id. Display numbering always follows array order. */
+export function makeReferenceCardId() {
+  const rand = Math.floor(Math.random() * Math.pow(36, 6)).toString(36);
+  return "ref_" + Date.now().toString(36) + "_" + rand;
+}
+
+/**
+ * Normalize a raw card list into [{id, file, label}]. Non-objects drop;
+ * missing ids are generated (stability comes from persisting the result).
+ * Never invents image files: file degrades to "".
+ */
+export function sanitizeReferenceCards(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const id = typeof item.id === "string" && item.id ? item.id.slice(0, 80) : makeReferenceCardId();
+    out.push({
+      id,
+      file: typeof item.file === "string" ? item.file.slice(0, 500) : "",
+      label: typeof item.label === "string" ? item.label.slice(0, 80) : "",
+    });
+  }
+  return out;
+}
+
+/** Append a card. Returns a new array; never mutates the input. */
+export function addReferenceCard(cards, card) {
+  const list = sanitizeReferenceCards(cards);
+  const next = sanitizeReferenceCards([card && typeof card === "object" ? card : {}]);
+  list.push(next[0] || { id: makeReferenceCardId(), file: "", label: "" });
+  return list;
+}
+
+/** Remove a card by id. Returns a new array; unknown ids leave it unchanged. */
+export function removeReferenceCard(cards, id) {
+  const list = sanitizeReferenceCards(cards);
+  const key = id != null ? String(id) : "";
+  const next = list.filter((c) => c.id !== key);
+  return next.length === list.length ? list : next;
+}
+
+/**
+ * Move a card earlier (delta < 0) or later (delta > 0). Clamps at the ends;
+ * unknown ids leave the order unchanged. Returns a new array.
+ */
+export function moveReferenceCard(cards, id, delta) {
+  const list = sanitizeReferenceCards(cards);
+  const key = id != null ? String(id) : "";
+  const at = list.findIndex((c) => c.id === key);
+  if (at === -1) return list;
+  const step = Number(delta) || 0;
+  if (!step) return list;
+  const to = Math.max(0, Math.min(list.length - 1, at + (step < 0 ? -1 : 1) * Math.min(Math.abs(step), list.length)));
+  if (to === at) return list;
+  const [card] = list.splice(at, 1);
+  list.splice(to, 0, card);
+  return list;
+}
+
+function _normalizeReferenceSlots(bindings) {
+  const raw = bindings && typeof bindings === "object" ? bindings.slots : null;
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") continue;
+    const nodeId = entry.node_id != null ? String(entry.node_id) : "";
+    const socket = entry.socket != null ? String(entry.socket) : "";
+    if (!nodeId || !socket) continue;
+    let order = Number(entry.order);
+    if (!Number.isFinite(order)) order = out.length;
+    out.push({
+      node_id: nodeId,
+      socket,
+      kind: entry.kind === "source" ? "source" : "reference",
+      order,
+    });
+  }
+  out.sort((a, b) => a.order - b.order);
+  out.forEach((slot, i) => { slot.order = i; });
+  return out;
+}
+
+/** Locate the Mapping node carrying reference bindings (tolerates nesting). */
+function _referenceMappingNode(store) {
+  const ctx = store && typeof store === "object" ? store.runContext : null;
+  if (!ctx || typeof ctx !== "object") return null;
+  const direct = ctx.mapping;
+  if (direct && typeof direct === "object") {
+    if ("reference_method" in direct || "reference_bindings" in direct) return direct;
+    const nested = direct.mapping;
+    if (nested && typeof nested === "object"
+      && ("reference_method" in nested || "reference_bindings" in nested)) {
+      return nested;
+    }
+    return direct;
+  }
+  const version = ctx.version;
+  const versionMapping = version && typeof version === "object" ? version.mapping : null;
+  if (versionMapping && typeof versionMapping === "object") return versionMapping;
+  return null;
+}
+
+/**
+ * Server capability for references (Lane A contract), read-only.
+ * Unbound versions yield boundMethod "" — callers block with a reason
+ * instead of inferring anything.
+ */
+export function resolveReferenceCapability(store) {
+  const node = _referenceMappingNode(store);
+  if (!node) {
+    return {
+      hasMapping: false, boundMethod: "", bindings: null,
+      slots: [], refSlots: [], chain: null, dedicatedTarget: "",
+    };
+  }
+  const rawMethod = typeof node.reference_method === "string" ? node.reference_method : "";
+  const boundMethod = REFERENCE_METHODS.indexOf(rawMethod) !== -1 ? rawMethod : "";
+  const bindings = node.reference_bindings && typeof node.reference_bindings === "object"
+    ? node.reference_bindings
+    : null;
+  const slots = _normalizeReferenceSlots(bindings);
+  const chain = bindings && bindings.chain && typeof bindings.chain === "object" ? bindings.chain : null;
+  const dedicatedTarget = bindings && bindings.dedicated_target != null
+    ? String(bindings.dedicated_target) : "";
+  return {
+    hasMapping: true, boundMethod, bindings,
+    slots, refSlots: slots.filter((s) => s.kind === "reference"),
+    chain, dedicatedTarget,
+  };
+}
+
+/**
+ * Compatibility of the remembered explicit method against the version's
+ * bound method. supported=false keeps the remembered selection visible —
+ * callers show reason and block; they never auto-switch or truncate.
+ */
+export function resolveReferenceMethodState(store, prefs) {
+  const capability = resolveReferenceCapability(store);
+  let method = prefs && typeof prefs.referenceMethod === "string" ? prefs.referenceMethod : "";
+  if (REFERENCE_METHODS.indexOf(method) === -1) method = "";
+  if (!capability.hasMapping || !capability.boundMethod) {
+    return {
+      method, boundMethod: "", supported: false,
+      reason: "This workflow version has no reference bindings — bind a Reference Method in the Workflow Setup Wizard.",
+      capability,
+    };
+  }
+  if (!method) {
+    return { method: "", boundMethod: capability.boundMethod, supported: false, reason: "", capability };
+  }
+  if (method !== capability.boundMethod) {
+    return {
+      method, boundMethod: capability.boundMethod, supported: false,
+      reason: "Reference method '" + referenceMethodLabel(method) + "' is not bound in this workflow version "
+        + "(bound: '" + referenceMethodLabel(capability.boundMethod) + "'). "
+        + "Switch the Reference Method or rebind in the Workflow Setup Wizard.",
+      capability,
+    };
+  }
+  if (method === "conditioning_slots" && capability.refSlots.length === 0) {
+    return {
+      method, boundMethod: capability.boundMethod, supported: false,
+      reason: "Conditioning slots is bound but exposes no reference slots in this version.",
+      capability,
+    };
+  }
+  return { method, boundMethod: capability.boundMethod, supported: true, reason: "", capability };
+}
+
+/**
+ * Known client-side capacity for a supported method, or null when the
+ * method is repeatable/server-ruled (chain repeats its branch; dedicated
+ * follows the override workflow). Never invents a number.
+ */
+export function referenceCapacityFor(methodState) {
+  if (!methodState || !methodState.supported) return null;
+  if (methodState.method === "conditioning_slots") {
+    return methodState.capability ? methodState.capability.refSlots.length : null;
+  }
+  return null;
+}
+
+/** Concrete per-card slot label for a supported method ("" otherwise). */
+export function referenceSlotLabel(methodState, index) {
+  if (!methodState || !methodState.supported) return "";
+  const i = Number(index) || 0;
+  if (methodState.method === "conditioning_slots") {
+    const slot = methodState.capability ? methodState.capability.refSlots[i] : null;
+    if (!slot) return "Beyond capacity";
+    return "Slot " + (i + 1) + " · " + slot.node_id + ":" + slot.socket;
+  }
+  if (methodState.method === "reference_latent_chain") return "Chain link " + (i + 1);
+  if (methodState.method === "dedicated") return "Input " + (i + 1);
+  return "";
+}
+
+/**
+ * Validate cards against a method state. images follows card order
+ * (payload order); errors are specific user-facing reasons.
+ */
+export function validateReferenceCards(cards, methodState) {
+  const list = sanitizeReferenceCards(cards);
+  const errors = [];
+  const images = [];
+  list.forEach((card, i) => {
+    if (!card.file) {
+      errors.push("Reference " + (i + 1) + " has no image — pick one or remove the card.");
+    } else {
+      images.push(card.file);
+    }
+  });
+  const capacity = referenceCapacityFor(methodState);
+  if (capacity != null && list.length > capacity) {
+    errors.push("This version exposes " + capacity + " reference slot"
+      + (capacity === 1 ? "" : "s") + " for "
+      + referenceMethodLabel(methodState && methodState.method)
+      + " — remove " + (list.length - capacity) + " card"
+      + (list.length - capacity === 1 ? "" : "s") + ".");
+  }
+  return { cards: list, images, errors };
+}
+
+/**
+ * Build the studio_references run companion, mirroring the server builder
+ * shape (studio_domain/models.py build_studio_references_companion) plus
+ * the client-known ordered image refs the server leaves empty. Fail-closed:
+ * null unless the method is supported, dedicated has its override, every
+ * card carries a file, and at least one card exists — never a partial or
+ * inferred submit.
+ *
+ * Named companion (not buildReferencePayload): that name already builds the
+ * Wizard→Mapping payload in studio-bindable-inputs.js.
+ */
+export function buildStudioReferencesCompanion(store, cards, prefs) {
+  const methodState = resolveReferenceMethodState(store, prefs);
+  if (!methodState.supported || !methodState.method) return null;
+  const { images, errors } = validateReferenceCards(cards, methodState);
+  if (errors.length || !images.length) return null;
+  const list = sanitizeReferenceCards(cards);
+  const dedicatedTarget = methodState.method === "dedicated"
+    ? String((prefs && prefs.referenceOverride) || "")
+    : "";
+  if (methodState.method === "dedicated" && !dedicatedTarget) return null;
+  // Executing identity: generic methods execute the origin workflow; a
+  // dedicated override executes the override workflow (its version resolves
+  // server-side — "" here means unknown, never a guess). Mirrors the Lane D
+  // snapshot keys so Lane B normalizes without inventing identity.
+  const originWorkflowId = (store && store.workflowId) || "";
+  const originVersionId = (store && store.workflowVersionId) || "";
+  const executingWorkflowId = methodState.method === "dedicated" ? dedicatedTarget : originWorkflowId;
+  const executingVersionId = methodState.method === "dedicated" ? "" : originVersionId;
+  return {
+    method: methodState.method,
+    origin_workflow_id: originWorkflowId,
+    origin_version_id: originVersionId,
+    executing_workflow_id: executingWorkflowId,
+    executing_version_id: executingVersionId,
+    dedicated_target: dedicatedTarget,
+    card_ids: list.map((c) => c.id),
+    images,
+    provenance: { source: "studio" },
+  };
+}
+
+// ── Canvas /prompt fail-closed reference gate (Phase 8) ─────────────────
+//
+// Pure helpers for the fetchApi patch in web/modal-node.js. The ComfyUI
+// topbar RUN posts the raw canvas graph to POST /prompt, bypassing the
+// Studio shelf RUN (which carries studio_references). When references are
+// engaged for the selected workflow — a reference method is chosen OR at
+// least one reference card exists (mirroring _studioReferenceGate in
+// web/studio-playground.js) — a canvas /prompt without a reference payload
+// must fail closed with an honest error instead of silently running
+// without the configured references. All three functions are pure
+// (explicit args, no window/localStorage/DOM) and never throw.
+
+/**
+ * Read whether Studio References are engaged for the selected workflow.
+ * Engaged = a non-empty referenceMethod for the workflow id OR >= 1 card
+ * stored under "workflowId::versionId" (mirrors _studioReferenceGate).
+ * @param {{workflowId?: string, workflowVersionId?: string}|null} selection
+ * @param {object|null} methodsMap - { [workflowId]: { referenceMethod } }
+ * @param {object|null} referencesMap - { ["wid::ver"]: [{id,file,label}] }
+ * @returns {{workflowId: string, versionId: string, method: string, cardCount: number, files: string[]}|null}
+ */
+export function readReferenceEngagement(selection, methodsMap, referencesMap) {
+  try {
+    const workflowId = selection && typeof selection.workflowId === "string"
+      ? selection.workflowId
+      : "";
+    if (!workflowId) return null;
+    const versionId = selection && typeof selection.workflowVersionId === "string"
+      ? selection.workflowVersionId
+      : "";
+    const methodEntry = methodsMap && typeof methodsMap === "object"
+      ? methodsMap[workflowId]
+      : null;
+    const rawMethod = methodEntry && typeof methodEntry === "object"
+      && typeof methodEntry.referenceMethod === "string"
+      ? methodEntry.referenceMethod
+      : "";
+    const method = rawMethod.trim() ? rawMethod : "";
+    const key = workflowId + "::" + versionId;
+    const rawCards = referencesMap && typeof referencesMap === "object"
+      ? referencesMap[key]
+      : null;
+    const cards = Array.isArray(rawCards) ? rawCards : [];
+    if (!method && cards.length === 0) return null;
+    const files = [];
+    for (const card of cards) {
+      if (card && typeof card === "object"
+        && typeof card.file === "string" && card.file) {
+        files.push(card.file);
+      }
+    }
+    return { workflowId, versionId, method, cardCount: cards.length, files };
+  } catch (_e) {
+    return null;
+  }
+}
+
+/**
+ * True when an outgoing /prompt body already carries a reference payload.
+ * @param {*} parsed - parsed /prompt request body
+ * @returns {boolean}
+ */
+export function promptCarriesReferences(parsed) {
+  try {
+    if (!parsed || typeof parsed !== "object") return false;
+    const viaExtra = parsed.extra_data && typeof parsed.extra_data === "object"
+      ? parsed.extra_data.studio_references
+      : undefined;
+    if (viaExtra !== null && viaExtra !== undefined && typeof viaExtra === "object") return true;
+    const viaTop = parsed.studio_references;
+    if (viaTop !== null && viaTop !== undefined && typeof viaTop === "object") return true;
+    return false;
+  } catch (_e) {
+    return false;
+  }
+}
+
+/**
+ * Honest block message for a canvas /prompt stopped by the reference gate.
+ * Names the workflow id, the method (or "reference cards"), the card count,
+ * and both remedies (Run from Studio References, or clear method/cards).
+ * @param {{workflowId?: string, method?: string, cardCount?: number}|null} engagement
+ * @returns {string}
+ */
+export function referenceBlockMessage(engagement) {
+  try {
+    const eng = engagement && typeof engagement === "object" ? engagement : {};
+    const workflowId = typeof eng.workflowId === "string" && eng.workflowId
+      ? eng.workflowId
+      : "unknown";
+    const count = Number(eng.cardCount);
+    const cardCount = Number.isFinite(count) && count >= 0 ? Math.floor(count) : 0;
+    const method = typeof eng.method === "string" && eng.method
+      ? "method '" + eng.method + "'"
+      : "reference cards";
+    const cardWord = cardCount === 1 ? "1 reference card" : cardCount + " reference cards";
+    return "Studio References are engaged for workflow '" + workflowId + "' ("
+      + method + ", " + cardWord + ") but this canvas run carries no reference "
+      + "payload — blocked instead of silently running without references. "
+      + "Run from Studio References, or clear the reference method/cards and run again.";
+  } catch (_e) {
+    return "Studio References are engaged but this canvas run carries no reference "
+      + "payload — blocked instead of silently running without references. "
+      + "Run from Studio References, or clear the reference method/cards and run again.";
+  }
+}
