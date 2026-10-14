@@ -1367,6 +1367,10 @@ export function resolveViewerShellArgs(viewer, adapters) {
     fileSize: fileSize,
     fileActions: a.fileActions != null ? a.fileActions : null,
     onUseAsBase: typeof a.onUseAsBase === "function" ? a.onUseAsBase : null,
+    onUseAsCurrent: typeof a.onUseAsCurrent === "function" ? a.onUseAsCurrent : null,
+    onEdit: typeof a.onEdit === "function" ? a.onEdit : null,
+    onPostProcess: typeof a.onPostProcess === "function" ? a.onPostProcess : null,
+    onUpscale: typeof a.onUpscale === "function" ? a.onUpscale : null,
     persistence: a.persistence,
     onClose: a.onClose,
   };
@@ -1435,6 +1439,10 @@ export function buildViewerShell(opts = {}) {
     format: opts.format,
     fileSize: opts.fileSize,
     fileActions: opts.fileActions,
+    onUseAsCurrent: opts.onUseAsCurrent,
+    onEdit: opts.onEdit,
+    onPostProcess: opts.onPostProcess,
+    onUpscale: opts.onUpscale,
     persistence: opts.persistence,
     onClose: close,
   }) : buildViewerBody(opts));
@@ -1451,6 +1459,10 @@ export function buildViewerShell(opts = {}) {
       fileSize: extra.fileSize != null ? extra.fileSize : opts.fileSize,
       fileActions: extra.fileActions != null ? extra.fileActions : opts.fileActions,
       onUseAsBase: extra.onUseAsBase != null ? extra.onUseAsBase : opts.onUseAsBase,
+      onUseAsCurrent: extra.onUseAsCurrent != null ? extra.onUseAsCurrent : opts.onUseAsCurrent,
+      onEdit: extra.onEdit != null ? extra.onEdit : opts.onEdit,
+      onPostProcess: extra.onPostProcess != null ? extra.onPostProcess : opts.onPostProcess,
+      onUpscale: extra.onUpscale != null ? extra.onUpscale : opts.onUpscale,
       persistence: opts.persistence,
       onClose: close,
     };
@@ -1743,6 +1755,55 @@ export function buildViewerUseAsBaseButton(record, onUseAsBase, onClose) {
   return btn;
 }
 
+// History/image handoff actions: one button per supplied handler, mounted
+// next to the use-as-base button in the shared Run Data card. Callbacks own
+// all behavior (navigation, state, uploads, mode switches) — each receives
+// { imageUrl } and a truthy return dismisses the overlay via onClose, exactly
+// like buildViewerUseAsBaseButton. `record` is accepted for signature
+// symmetry (future gating) but does not gate rendering today; an empty
+// imageUrl renders nothing.
+export function buildViewerHandoffButtons(record, imageUrl, handlers) {
+  if (imageUrl == null || String(imageUrl) === "") return [];
+  var h = handlers && typeof handlers === "object" ? handlers : {};
+  var onClose = typeof h.onClose === "function" ? h.onClose : null;
+  var specs = [
+    { key: "onUseAsCurrent", label: "Use as Current", testid: "viewer-use-as-current", title: "Set as the Playground current/canvas image" },
+    { key: "onEdit", label: "Edit", testid: "viewer-edit", title: "Send to Edit as source image" },
+    { key: "onPostProcess", label: "Post Process", testid: "viewer-post-process", title: "Open in Post Processing" },
+    { key: "onUpscale", label: "Upscale", testid: "viewer-upscale", title: "Upscale arrives in a later phase \u2014 opens the honest placeholder" },
+  ];
+  var buttons = [];
+  specs.forEach(function (spec) {
+    var fn = h[spec.key];
+    if (typeof fn !== "function") return;
+    var btn = el("button", {
+      class: "comfymodal-secondary-btn comfymodal-studio-viewer-handoff",
+      type: "button",
+      "data-testid": spec.testid,
+      text: spec.label,
+      title: spec.title,
+    });
+    btn.addEventListener("click", function () {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      var outcome = 0;
+      try { outcome = fn({ imageUrl: imageUrl }); }
+      catch (err) { outcome = 0; }
+      if (outcome) {
+        if (typeof onClose === "function") onClose();
+        return;
+      }
+      btn.textContent = "Not available";
+      setTimeout(function () {
+        btn.disabled = false;
+        btn.textContent = spec.label;
+      }, 1400);
+    });
+    buttons.push(btn);
+  });
+  return buttons;
+}
+
 // One metadata spec row ([key, value] → element or null when blank).
 export function buildViewerMetaRow(pair) {
   var text = viewerValueText(pair[1]);
@@ -1883,13 +1944,22 @@ export function buildSharedViewerOverlay(opts = {}) {
   var useAsBaseBtn = buildViewerUseAsBaseButton(record,
     typeof opts.onUseAsBase === "function" ? opts.onUseAsBase : null,
     typeof opts.onClose === "function" ? opts.onClose : null);
+  // Handoff actions (Use as Current / Edit / Post Process / Upscale): one
+  // button per function-valued handler in opts, same card as use-as-base.
+  var handoffButtons = buildViewerHandoffButtons(record, opts.imageUrl || "", {
+    onUseAsCurrent: typeof opts.onUseAsCurrent === "function" ? opts.onUseAsCurrent : null,
+    onEdit: typeof opts.onEdit === "function" ? opts.onEdit : null,
+    onPostProcess: typeof opts.onPostProcess === "function" ? opts.onPostProcess : null,
+    onUpscale: typeof opts.onUpscale === "function" ? opts.onUpscale : null,
+    onClose: typeof opts.onClose === "function" ? opts.onClose : null,
+  });
   var right = [
     buildViewerCard("Run", [el("div", { class: "comfymodal-studio-viewer-run-line" }, runLine)]),
     buildViewerCard("Run Data", [
       buildViewerPromptAccordion(prompt, negative),
       buildViewerParamsGrid(params, "preview-parameters", record),
       useAsBaseBtn,
-    ]),
+    ].concat(handoffButtons)),
   ];
   // Core file facts. Completed is deliberately absent (Started + the Run
   // line's duration already pin the run in time); Workflow always renders

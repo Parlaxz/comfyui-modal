@@ -20,7 +20,7 @@ import { _formatDuration } from "./studio-run-normalizer.js";
 import { getOutputPreferences, normalizeOutputSaveFolder } from "./studio-output-preferences.js";
 import { renderGenerationDetail } from "./studio-history-v2-detail.js";
 import { renderExperimentDetail } from "./studio-history-v2-experiment.js";
-import { setPendingPlaygroundBase } from "./studio-playground-state.js";
+import { setPendingPlaygroundBase, setPendingPlaygroundImage } from "./studio-playground-state.js";
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -784,6 +784,30 @@ export function renderHistoryV2(state, context) {
       // the one-shot payload. Offered only when navigation exists.
       onUseAsBase: (typeof context.setPage === "function") ? function (payload) {
         setPendingPlaygroundBase(payload);
+        context.setPage("playground");
+        return 1;
+      } : undefined,
+      // Phase 10: image handoffs. Stash the output URL with its purpose and
+      // destination view; the next Playground build consumes the one-shot
+      // payload (canvas image immediately, destination mode right after via
+      // the canonical subtool switch). Each returns 1 so the viewer dismisses.
+      onUseAsCurrent: (typeof context.setPage === "function") ? function (payload) {
+        setPendingPlaygroundImage({ url: payload && payload.imageUrl, purpose: "current" });
+        context.setPage("playground");
+        return 1;
+      } : undefined,
+      onEdit: (typeof context.setPage === "function") ? function (payload) {
+        setPendingPlaygroundImage({ url: payload && payload.imageUrl, purpose: "edit-source", mode: "edit", subtool: "text" });
+        context.setPage("playground");
+        return 1;
+      } : undefined,
+      onPostProcess: (typeof context.setPage === "function") ? function (payload) {
+        setPendingPlaygroundImage({ url: payload && payload.imageUrl, purpose: "post", mode: "post", subtool: "adjust" });
+        context.setPage("playground");
+        return 1;
+      } : undefined,
+      onUpscale: (typeof context.setPage === "function") ? function (payload) {
+        setPendingPlaygroundImage({ url: payload && payload.imageUrl, purpose: "post", mode: "post", subtool: "upscale" });
         context.setPage("playground");
         return 1;
       } : undefined,

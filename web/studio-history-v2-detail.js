@@ -159,6 +159,13 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       revealAsset: function (assetId) { return repo.revealAsset(assetId); },
     },
     onUseAsBase: typeof callbacks.onUseAsBase === "function" ? callbacks.onUseAsBase : undefined,
+    // Phase 10: image handoffs (Use as Current / Edit / Post / Upscale).
+    // Pass-through only — the viewer buttons call these with {imageUrl} and
+    // the page-level callbacks own stash + navigation. Absent = no button.
+    onUseAsCurrent: typeof callbacks.onUseAsCurrent === "function" ? callbacks.onUseAsCurrent : undefined,
+    onEdit: typeof callbacks.onEdit === "function" ? callbacks.onEdit : undefined,
+    onPostProcess: typeof callbacks.onPostProcess === "function" ? callbacks.onPostProcess : undefined,
+    onUpscale: typeof callbacks.onUpscale === "function" ? callbacks.onUpscale : undefined,
     // `close` is a hoisted function declaration below: the overlay's Delete
     // button dismisses through the shell's own close, which runs this full
     // surface cleanup (timers, layers, focus, onClose callback).

@@ -267,6 +267,7 @@ export async function loadExperimentIntoPlayground(state, context, experimentId)
   return { ok: true };
 }
 import { el, buildViewerShell, resolveViewerShellArgs, viewerFirst, renderEmptyState } from "./studio-ui.js";
+import { openComparePair } from "./studio-image-compare.js";
 import { mountPostprocessWorkspace } from "./studio-postprocess.js";
 import { renderLoadingState } from "./studio-loading.js";
 import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
@@ -283,6 +284,8 @@ import {
   saveToolWorkflows,
   loadToolDefault,
   takePendingPlaygroundBase,
+  setPendingPlaygroundImage,
+  takePendingPlaygroundImage,
 } from "./studio-playground-state.js";
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Polling helper for experiment status ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
@@ -1012,6 +1015,25 @@ export function renderPlayground(state, context) {
   container.appendChild(leftPanel);
   container.appendChild(resizeHandle);
   container.appendChild(rightWorkspace);
+
+  // One-shot image handoff (History/viewer actions). Consumed here — the
+  // page root that runs on every Playground show — not in a sub-section
+  // build that cached-page navigation can skip. current/post set the
+  // canvas image (Post reads it as input); edit-source uploads through
+  // the existing history-as-source path so execution gets a mapped
+  // filename. Best-effort, never blocking, rejections swallowed.
+  try {
+    var pendingImage = takePendingPlaygroundImage();
+    if (pendingImage && pendingImage.url) {
+      if (pendingImage.purpose === "edit-source") {
+        var _imgActions = (state.playground && state.playground._runActions) || buildActions(state, context);
+        var _imgP = _shelfUseHistoryAsSource(state, context, _imgActions, "source_image", pendingImage.url);
+        if (_imgP && typeof _imgP.catch === "function") _imgP.catch(function () {});
+      } else {
+        _setCanvasImage(state, pendingImage.url, context);
+      }
+    }
+  } catch (_eImg) {}
 
   return container;
 }
@@ -8661,11 +8683,46 @@ export async function openRunImagePreview(state, context, run, outputUrl) {
     _preview = buildViewerShell(resolveViewerShellArgs(_viewer, {
       fileActions: _fileActions,
       // Same-page base: the shelf is right here, so apply directly and
-      // rebuild — the overlay closes itself on a positive count.
+      // rebuild - the overlay closes itself on a positive count.
       onUseAsBase: function (payload) {
         var applied = _applyShelfBaseValues(state, payload || {});
         _rerenderWorkflowSection(state, context, actions);
         return applied;
+      },
+      // Phase 10: same-page image handoffs. Current sets the canvas image
+      // in place; Edit uploads through the history-as-source path (mapped
+      // filename for execution) and navigates to Edit/Text; Post sets the
+      // canvas image (the Post engine reads it) and navigates to Post;
+      // Upscale navigates to the honest Phase-11 placeholder.
+      onUseAsCurrent: function (payload) {
+        var url = payload && payload.imageUrl;
+        if (!url) return 0;
+        try { _setCanvasImage(state, String(url), context); } catch (_e) {}
+        return 1;
+      },
+      onEdit: function (payload) {
+        var url = payload && payload.imageUrl;
+        if (!url) return 0;
+        try {
+          var _p = _shelfUseHistoryAsSource(state, context, actions, "source_image", String(url));
+          if (_p && typeof _p.catch === "function") _p.catch(function () {});
+        } catch (_e) {}
+        try { _setActiveSubtool(state, context, actions, "edit", "text"); } catch (_e2) {}
+        return 1;
+      },
+      onPostProcess: function (payload) {
+        var url = payload && payload.imageUrl;
+        if (!url) return 0;
+        try { _setCanvasImage(state, String(url), context); } catch (_e) {}
+        try { _setActiveSubtool(state, context, actions, "post", "adjust"); } catch (_e2) {}
+        return 1;
+      },
+      onUpscale: function (payload) {
+        var url = payload && payload.imageUrl;
+        if (!url) return 0;
+        try { _setCanvasImage(state, String(url), context); } catch (_e) {}
+        try { _setActiveSubtool(state, context, actions, "post", "upscale"); } catch (_e2) {}
+        return 1;
       },
       onClose: function () {
         if (state.playground) state.playground._previewOpen = false;
@@ -9139,6 +9196,162 @@ function _renderQueuedItem(state, context, item, idx, total) {
   return card;
 }
 
+// Phase 10: compare picker modal. A = current canvas (when one exists)
+// or a History output; B = a History output. Both sides resolve to plain
+// {url, label} descriptors for openComparePair. No new state, no backend.
+function _openComparePicker(state, context, actions) {
+  try {
+    var olds = document.querySelector('[data-testid="compare-picker"]');
+    if (olds && olds.parentNode) olds.parentNode.removeChild(olds);
+    var runs = [];
+    try {
+      runs = (getRecentRuns() || []).filter(function (nr) {
+        return nr && typeof nr.imageUrl === "string" && nr.imageUrl;
+      }).slice(0, 20);
+    } catch (_e) { runs = []; }
+    var currentUrl = "";
+    try { currentUrl = _canvasImageUrl(state) || ""; } catch (_e2) { currentUrl = ""; }
+    function runLabel(nr, i) {
+      var t = (nr && (nr.prompt || nr.label || nr.id)) || ("Run " + (i + 1));
+      return String(t).slice(0, 60);
+    }
+    var overlay = el("div", {
+      class: "comfymodal-studio-compare-picker-overlay",
+      "data-testid": "compare-picker",
+      style: "position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:80;display:flex;align-items:center;justify-content:center;",
+    });
+    var dialog = el("div", {
+      role: "dialog",
+      "aria-label": "Choose images to compare",
+      style: "background:#141416;border:1px solid var(--color-border, #333);border-radius:10px;padding:16px;max-width:560px;width:calc(100% - 32px);max-height:80vh;overflow:auto;",
+    });
+    dialog.appendChild(el("h4", {
+      text: "Compare images",
+      style: "margin:0 0 4px;",
+    }));
+    dialog.appendChild(el("p", {
+      text: "A shows on the left of the divider, B on the right.",
+      style: "font-size:11px;color:#888;margin:0 0 10px;",
+    }));
+    var goBtn = null;
+    function paintGo() {
+      // Runs during row construction (before goBtn/rows exist) as well as
+      // after: null-safe so early paints only refresh thumbnails.
+      try {
+        if (!goBtn) return;
+        var ok = !!(rowA._resolveUrl() && rowB._resolveUrl());
+        goBtn.disabled = !ok;
+      } catch (_e) {}
+    }
+    function sideRow(side) {
+      var isA = side === "A";
+      var row = el("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:8px;" });
+      row.appendChild(el("span", { text: side, style: "font-size:12px;color:#aaa;flex:none;width:14px;" }));
+      var sel = el("select", {
+        "data-testid": "compare-pick-" + side.toLowerCase(),
+        class: "comfymodal-input",
+        style: "flex:1;min-width:0;",
+      });
+      if (isA) {
+        var cur = document.createElement("option");
+        cur.value = "current";
+        cur.textContent = currentUrl ? "Current canvas" : "Current canvas (no image)";
+        if (!currentUrl) cur.disabled = true;
+        else cur.selected = true;
+        sel.appendChild(cur);
+      }
+      runs.forEach(function (nr, i) {
+        var o = document.createElement("option");
+        o.value = String(i);
+        o.textContent = runLabel(nr, i);
+        if (!isA && i === 0) o.selected = true;
+        sel.appendChild(o);
+      });
+      var thumb = el("img", {
+        "data-testid": "compare-thumb-" + side.toLowerCase(),
+        alt: "",
+        style: "width:56px;height:56px;object-fit:cover;border-radius:6px;flex:none;background:#000;",
+      });
+      row.appendChild(sel);
+      row.appendChild(thumb);
+      function resolve() {
+        if (isA && sel.value === "current") return currentUrl;
+        var nr = runs[Number(sel.value)];
+        return (nr && nr.imageUrl) || "";
+      }
+      function paint() {
+        var u = resolve();
+        if (u) { thumb.setAttribute("src", u); thumb.style.visibility = ""; }
+        else { thumb.removeAttribute("src"); thumb.style.visibility = "hidden"; }
+        paintGo();
+      }
+      sel.addEventListener("change", paint);
+      row._resolveUrl = resolve;
+      row._select = sel;
+      paint();
+      return row;
+    }
+    var rowA = sideRow("A");
+    var rowB = sideRow("B");
+    dialog.appendChild(rowA);
+    dialog.appendChild(rowB);
+    var foot = el("div", { style: "display:flex;gap:8px;justify-content:flex-end;margin-top:10px;" });
+    var closeBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Close", "data-testid": "compare-picker-close" });
+    goBtn = el("button", {
+      type: "button", class: "comfymodal-primary-btn", text: "Compare →",
+      "data-testid": "compare-start",
+    });
+    var closed = false;
+    function closePicker() {
+      if (closed) return;
+      closed = true;
+      try { document.removeEventListener("keydown", onPickerKey); } catch (_e) {}
+      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+    }
+    function onPickerKey(ev) {
+      if (!ev || ev.key !== "Escape") return;
+      // Self-cleaning: only act while our overlay is still mounted.
+      if (!document.querySelector('[data-testid="compare-picker"]')) {
+        try { document.removeEventListener("keydown", onPickerKey); } catch (_e) {}
+        return;
+      }
+      closePicker();
+    }
+    closeBtn.addEventListener("click", function () {
+      closePicker();
+    });
+    overlay.addEventListener("click", function (ev) {
+      if (ev.target === overlay) closePicker();
+    });
+    try { document.addEventListener("keydown", onPickerKey); } catch (_e) {}
+    goBtn.addEventListener("click", function () {
+      var au = "", bu = "";
+      try { au = rowA._resolveUrl(); bu = rowB._resolveUrl(); } catch (_e) {}
+      if (!au || !bu) return;
+      var anr = null, bnr = null;
+      try {
+        var av = rowA._select.value, bv = rowB._select.value;
+        anr = av === "current" ? null : runs[Number(av)];
+        bnr = runs[Number(bv)];
+      } catch (_e2) {}
+      var ok = false;
+      try {
+        ok = openComparePair({
+          a: { url: au, label: anr ? runLabel(anr, 0) : "Current canvas" },
+          b: { url: bu, label: bnr ? runLabel(bnr, 0) : "History image" },
+        });
+      } catch (_e3) { ok = false; }
+      if (ok && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+    });
+    foot.appendChild(closeBtn);
+    foot.appendChild(goBtn);
+    dialog.appendChild(foot);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    paintGo();
+  } catch (_e) {}
+}
+
 function renderWorkspaceTopBar(state, context, actions) {
   var pg = state.playground || {};
   var queueMode = !!pg.queueMode;
@@ -9343,6 +9556,21 @@ function renderWorkspaceTopBar(state, context, actions) {
     primaryBtn.title = "Select a workflow to run";
   }
   right.appendChild(primaryBtn);
+
+  // Phase 10: Compare launcher beside RUN. Opens a History picker (current
+  // canvas vs a past output, or two past outputs) and opens the shared
+  // reveal-divider compare view. Always available — comparing is local.
+  var compareBtn = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn",
+    "data-testid": "compare-open",
+    text: "Compare",
+    title: "Compare the current canvas with a History image, or two History images",
+  });
+  compareBtn.addEventListener("click", function () {
+    try { _openComparePicker(state, context, actions); } catch (_e) {}
+  });
+  right.appendChild(compareBtn);
 
   // Run-queue button: only in queue mode, beside the Queue button.
   if (queueMode) {

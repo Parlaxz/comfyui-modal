@@ -196,7 +196,10 @@ function _onBodyMutated() {
 }
 
 function _ensureTray() {
-  const anchor = document.querySelector('[data-testid="history-v2-page"]');
+  // Prefer the History page as liveness anchor (navigating away tears the
+  // session down); fall back to document.body so Playground-initiated
+  // compares (e.g. the topbar Compare picker) can open anywhere.
+  const anchor = document.querySelector('[data-testid="history-v2-page"]') || document.body;
   if (!anchor) {
     _teardownSession();
     return false;
@@ -462,7 +465,113 @@ export function openCompareView(opener) {
   });
   slider.textContent = "\u21d4";
   stage.appendChild(slider);
+
+  // ── Synchronized zoom/pan: one {scale, tx, ty} state applied IDENTICALLY
+  // to both images via CSS transform, so pan/zoom stay synchronized by
+  // construction. The divider authority stays untouched screen-space %{pos}.
+  var zoom = { scale: 1, tx: 0, ty: 0 };
+  var ZOOM_MIN = 0.1;
+  var ZOOM_MAX = 8;
+  var ZOOM_STEP = 1.25;
+  var zoomLabel = null;
+  function _clampScale(s) {
+    try {
+      var n = Number(s);
+      if (isNaN(n)) return zoom.scale;
+      return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, n));
+    } catch (err) { return zoom.scale; }
+  }
+  function _applyZoomTransform() {
+    try {
+      var t = "translate(" + zoom.tx + "px, " + zoom.ty + "px) scale(" + zoom.scale + ")";
+      imgA.style.transform = t;
+      imgB.style.transform = t;
+      imgA.style.transformOrigin = "center center";
+      imgB.style.transformOrigin = "center center";
+    } catch (err) { /* best-effort */ }
+  }
+  function _paintZoomLabel(showFit) {
+    try {
+      if (zoomLabel) zoomLabel.textContent = showFit ? "Fit" : Math.round(zoom.scale * 100) + "%";
+    } catch (err) { /* best-effort */ }
+  }
+  function _zoomFit() {
+    try {
+      var iw = (imgA && imgA.naturalWidth) || (imgB && imgB.naturalWidth) || 0;
+      var ih = (imgA && imgA.naturalHeight) || (imgB && imgB.naturalHeight) || 0;
+      var fit = 1;
+      try {
+        var r = stage.getBoundingClientRect();
+        if (iw > 0 && ih > 0 && r.width > 0 && r.height > 0) {
+          fit = Math.min(r.width / iw, r.height / ih);
+        }
+      } catch (err2) { fit = 1; }
+      zoom.scale = _clampScale(fit);
+      zoom.tx = 0;
+      zoom.ty = 0;
+      _applyZoomTransform();
+      _paintZoomLabel(true);
+    } catch (err) { /* best-effort */ }
+  }
+  function _zoom11() {
+    try {
+      zoom.scale = 1;
+      zoom.tx = 0;
+      zoom.ty = 0;
+      _applyZoomTransform();
+      _paintZoomLabel(false);
+    } catch (err) { /* best-effort */ }
+  }
+  function _zoomStep(dir) {
+    try {
+      if (dir < 0) zoom.scale = _clampScale(zoom.scale / ZOOM_STEP);
+      else zoom.scale = _clampScale(zoom.scale * ZOOM_STEP);
+      _applyZoomTransform();
+      _paintZoomLabel(false);
+    } catch (err) { /* best-effort */ }
+  }
+  var toolbar = el("div", { class: "cm-compare-zoombar", "data-testid": "cm-zoom-bar" });
+  toolbar.appendChild(el("button", {
+    class: "comfymodal-secondary-btn cm-zoom-btn",
+    "data-testid": "cm-zoom-fit",
+    type: "button",
+    text: "Fit",
+    title: "Fit images to stage",
+    onclick: function () { _zoomFit(); },
+  }));
+  toolbar.appendChild(el("button", {
+    class: "comfymodal-secondary-btn cm-zoom-btn",
+    "data-testid": "cm-zoom-11",
+    type: "button",
+    text: "1:1",
+    title: "Actual size",
+    onclick: function () { _zoom11(); },
+  }));
+  toolbar.appendChild(el("button", {
+    class: "comfymodal-secondary-btn cm-zoom-btn",
+    "data-testid": "cm-zoom-in",
+    type: "button",
+    text: "+",
+    title: "Zoom in",
+    onclick: function () { _zoomStep(1); },
+  }));
+  toolbar.appendChild(el("button", {
+    class: "comfymodal-secondary-btn cm-zoom-btn",
+    "data-testid": "cm-zoom-out",
+    type: "button",
+    text: "\u2212",
+    title: "Zoom out",
+    onclick: function () { _zoomStep(-1); },
+  }));
+  zoomLabel = el("span", {
+    class: "cm-zoom-label",
+    "data-testid": "cm-zoom-label",
+    text: "100%",
+  });
+  toolbar.appendChild(zoomLabel);
+  dialog.appendChild(toolbar);
   dialog.appendChild(stage);
+  _applyZoomTransform();
 
   const hint = el("div", {
     class: "cm-compare-hint",
@@ -531,29 +640,85 @@ export function openCompareView(opener) {
     }
   });
 
-  // Pointer: drag anywhere on the stage / handle — same authority.
-  let dragging = false;
-  let dragPointerId = null;
+  // Pointer: divider-handle drags drive the single divider authority
+  // (existing screen-space %{pos} behavior, transforms untouched); presses
+  // starting anywhere else pan the shared zoom transform. Tiny (<3px)
+  // background presses are clicks and keep the legacy divider-set behavior.
+  var dragging = false;
+  var dragPointerId = null;
+  var dragIsPan = false;
+  var panStartX = 0;
+  var panStartY = 0;
+  var panBaseTx = 0;
+  var panBaseTy = 0;
+  var panMoved = false;
+  function _isDividerHandle(target) {
+    try {
+      if (!target) return false;
+      if (target === slider || target === divider) return true;
+      if (typeof target.closest === "function") {
+        if (target.closest(".cm-compare-slider")) return true;
+        if (target.closest(".cm-compare-divider")) return true;
+      }
+    } catch (err) { /* best-effort */ }
+    return false;
+  }
   function _onPointerDown(e) {
-    if (e.button != null && e.button !== 0) return;
-    dragging = true;
-    dragPointerId = e.pointerId;
-    const pct = _pctFromEvent(e, stage, mode);
-    if (pct != null && _session.setPosition(pct)) _paint();
-    try { stage.setPointerCapture(e.pointerId); } catch (err) { /* drag still works */ }
-    e.preventDefault();
+    try {
+      if (e.button != null && e.button !== 0) return;
+      if (_isDividerHandle(e.target)) {
+        dragging = true;
+        dragIsPan = false;
+        dragPointerId = e.pointerId;
+        var pct = _pctFromEvent(e, stage, mode);
+        if (pct != null && _session.setPosition(pct)) _paint();
+      } else {
+        dragging = true;
+        dragIsPan = true;
+        dragPointerId = e.pointerId;
+        panMoved = false;
+        panStartX = e.clientX || 0;
+        panStartY = e.clientY || 0;
+        panBaseTx = zoom.tx;
+        panBaseTy = zoom.ty;
+      }
+      try { stage.setPointerCapture(e.pointerId); } catch (err2) { /* drag still works */ }
+      e.preventDefault();
+    } catch (err) { /* best-effort */ }
   }
   function _onPointerMove(e) {
-    if (!dragging || e.pointerId !== dragPointerId) return;
-    const pct = _pctFromEvent(e, stage, mode);
-    if (pct != null && _session.setPosition(pct)) _paint();
+    try {
+      if (!dragging || e.pointerId !== dragPointerId) return;
+      if (dragIsPan) {
+        var dx = (e.clientX || 0) - panStartX;
+        var dy = (e.clientY || 0) - panStartY;
+        if (!panMoved && Math.sqrt(dx * dx + dy * dy) < 3) return;
+        panMoved = true;
+        zoom.tx = panBaseTx + dx;
+        zoom.ty = panBaseTy + dy;
+        _applyZoomTransform();
+      } else {
+        var pct = _pctFromEvent(e, stage, mode);
+        if (pct != null && _session.setPosition(pct)) _paint();
+      }
+    } catch (err) { /* best-effort */ }
   }
   function _onPointerUp(e) {
-    if (!dragging || e.pointerId !== dragPointerId) return;
-    dragging = false;
-    dragPointerId = null;
-    try { stage.releasePointerCapture(e.pointerId); } catch (err) { /* released */ }
+    try {
+      if (!dragging || e.pointerId !== dragPointerId) return;
+      if (dragIsPan && !panMoved) {
+        try {
+          var pct = _pctFromEvent(e, stage, mode);
+          if (pct != null && _session.setPosition(pct)) _paint();
+        } catch (err2) { /* best-effort */ }
+      }
+      dragging = false;
+      dragIsPan = false;
+      dragPointerId = null;
+      try { stage.releasePointerCapture(e.pointerId); } catch (err3) { /* released */ }
+    } catch (err) { /* best-effort */ }
   }
+  try { stage.style.touchAction = "none"; } catch (err) { /* best-effort */ }
   stage.addEventListener("pointerdown", _onPointerDown);
   stage.addEventListener("pointermove", _onPointerMove);
   stage.addEventListener("pointerup", _onPointerUp);

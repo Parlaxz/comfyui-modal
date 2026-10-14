@@ -934,6 +934,42 @@ export function takePendingPlaygroundBase() {
   return pending;
 }
 
+// One-shot image handoff (a past run's output URL + purpose) for the
+// Playground. Same exactly-once in-memory discipline as the base payload:
+// {url: string, purpose: "current"|"edit-source"|"post", mode: string|null,
+// subtool: string|null}. The mode/subtool preselects the destination view
+// (Edit/Text, Post/adjust, Post/upscale); null means stay where you are.
+// Unknown purposes degrade to "current" at consume time; empty URLs are
+// dropped here.
+let _pendingPlaygroundImage = null;
+
+/**
+ * Stash an image handoff for the next Playground build.
+ * @param {{url?: string, purpose?: string, mode?: string, subtool?: string}|null|undefined} payload
+ */
+export function setPendingPlaygroundImage(payload) {
+  var url = payload && typeof payload.url === "string" ? payload.url : "";
+  if (!url) {
+    _pendingPlaygroundImage = null;
+    return;
+  }
+  var purpose = payload && typeof payload.purpose === "string" ? payload.purpose : "current";
+  if (purpose !== "current" && purpose !== "edit-source" && purpose !== "post") purpose = "current";
+  var mode = payload && typeof payload.mode === "string" && payload.mode ? payload.mode : null;
+  var subtool = payload && typeof payload.subtool === "string" && payload.subtool ? payload.subtool : null;
+  _pendingPlaygroundImage = { url: url, purpose: purpose, mode: mode, subtool: subtool };
+}
+
+/**
+ * Take the stashed image handoff, clearing the slot.
+ * @returns {{url: string, purpose: string, mode: string|null, subtool: string|null}|null}
+ */
+export function takePendingPlaygroundImage() {
+  const pending = _pendingPlaygroundImage;
+  _pendingPlaygroundImage = null;
+  return pending;
+}
+
 // ── Per-workflow explicit method preferences ────────────────────────────
 //
 // Explicit inpaint/expand method + override + expand-pad preferences,
