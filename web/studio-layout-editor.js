@@ -427,6 +427,8 @@ function injectStyle() {
     ".stlay-side{flex:1 1 260px;max-width:360px;}",
     ".stlay-lrow .stlay-lnum{color:#aaa;}",
     ".stlay-disc{border:1px solid #333;border-radius:4px;padding:2px 6px 4px;background:#1a1a1c;}",
+    ".stlay-send-slot{position:sticky;bottom:0;background:#1e1e1e;border-top:1px solid #333;padding:8px 2px 2px;margin-top:6px;display:flex;flex-direction:column;gap:6px;}",
+    ".stlay-wrap{padding-bottom:10px;border-bottom:1px solid #2c2c2c;margin-bottom:10px;}",
     ".stlay-disc>summary{cursor:pointer;color:#9db8c6;font-size:11px;padding:2px 0;}",
     ".stlay-disc>summary:hover{color:#fff;}",
     ".stlay-geosum{color:#8a8a8a;font-size:11px;}",
@@ -623,6 +625,11 @@ export function createLayoutEditor(container, opts) {
   const pre = el("pre", "stlay-pre", "");
   jsonDetails.appendChild(pre);
   side.appendChild(jsonDetails);
+  // P0 bounded layout: the host moves its primary Send action into this
+  // sticky slot (class hook keeps DOM-stubbed unit tests working), so
+  // completion lives in the inspector and never paints over Recent Runs.
+  const sendSlot = el("div", "stlay-send-slot");
+  side.appendChild(sendSlot);
 
   // ---- utilities: import / export (localStorage only), collapsed ----
   const utilHead = el("div", "stlay-sect", "Import / export");
@@ -1449,9 +1456,12 @@ export function createLayoutEditor(container, opts) {
     if (!draft.boxes.length) {
       listBox.appendChild(el("div", "stlay-lbl", "No regions — drag on the canvas to draw one."));
     }
-    // Oracle P1-5: tie the inspector to its canvas/list identity.
-    edHead.textContent = activeIdx >= 0 && draft.boxes[activeIdx]
-      ? "Selected region " + String(activeIdx + 1).padStart(2, "0")
+    // Inspector heading prefers the human-readable label, numeric id second.
+    const _headBox = activeIdx >= 0 ? draft.boxes[activeIdx] : null;
+    const _headLabel = _headBox ? rowLabel(_headBox) : "";
+    edHead.textContent = _headBox
+      ? "Selected region " + (_headLabel.length > 42 ? _headLabel.slice(0, 41) + "…" : _headLabel) +
+        " (" + String(activeIdx + 1).padStart(2, "0") + ")"
       : "Selected element";
     renderElementEditor();
   }

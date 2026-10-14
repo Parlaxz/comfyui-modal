@@ -4780,7 +4780,17 @@ function _renderLayoutEditor(state, context, actions) {
     // inline editor below owns the full UI (same signature).
     return _renderLegacyLayoutEditor(state, context, actions);
   }
-  wrap.appendChild(toolbar);
+  // P0 bounded layout: the primary action lives sticky at the bottom of the
+  // delegated inspector (never over canvas, JSON, list, or Recent Runs).
+  // Without a slot (older editor build), keep the standalone toolbar row.
+  var slot = null;
+  try { slot = mount.querySelector(".stlay-send-slot"); } catch (_e) { slot = null; }
+  if (slot) {
+    slot.appendChild(sendBtn);
+    slot.appendChild(sendHint);
+  } else {
+    wrap.appendChild(toolbar);
+  }
   wrap.appendChild(preview);
   // Teardown-safe: no explicit unmount exists upstream, so destroy the
   // delegated editor when this wrap leaves the DOM on re-render.
