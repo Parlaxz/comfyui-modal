@@ -98,6 +98,11 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await expect(page.locator('[data-testid="pp-inspector"]')).toBeVisible();
     await expect(page.locator('[data-testid="pp-filmstrip"]')).toBeVisible();
     await expect(page.locator('[data-testid="pp-upload-empty"]')).toBeVisible();
+    // Phase 4 corrective contract: the one engine's inspector is native to
+    // the left rail while its same stage is the central image surface.
+    await expect(page.locator('[data-testid="pp-sidebar"]')).toBeVisible();
+    await expect(page.locator('[data-testid="canvas-area"] [data-testid="pp-canvas"]')).toBeVisible();
+    await expect(page.locator('[data-testid="pp-shell"]')).toHaveCount(0);
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
@@ -107,6 +112,7 @@ test.describe("Post Processing workspace (fake backend)", () => {
     const bad = watch4xx(page);
     await openPostprocess(page);
     await uploadSource(page);
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-slider-exposure"]')).toBeVisible();
     const before = await viewSignature(page);
     expect(before).toBeTruthy();
 

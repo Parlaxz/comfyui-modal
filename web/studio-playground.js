@@ -1185,13 +1185,38 @@ function renderControlPanel(state, context) {
   var _isPostView = _shellMode === "post";
   var _isPlaceholderView = !_isPostView && _isPlaceholderSubtool(_shellSub);
 
-  if (_isPostView) {
-    panel.appendChild(el("p", {
-      class: "comfymodal-studio-control-note",
-      "data-testid": "post-side-note",
-      text: "Post Processing runs in the local editor in the canvas area — Adjust, Color, Detail, Effects, Crop, and Heal controls live there.",
-    }));
+  if (_isPostView && _shellSub !== "upscale") {
+    // The finishing engine is mounted in the native left rail. Its inspector,
+    // presets, LUTs, undo stack, and export handlers remain the single owner;
+    // only its stage is re-homed into the center canvas below.
+    var postHost = el("div", {
+      class: "comfymodal-studio-postprocess-sidebar",
+      "data-testid": "pp-sidebar",
+    });
+    var postSource = "";
+    try { postSource = _canvasImageUrl(state) || _editorBaseImageUrl(state) || ""; } catch (_postSourceErr) {}
+    try {
+      state.playground._postProcessMount = mountPostprocessWorkspace(postHost, {
+        sourceUrl: postSource,
+        nativeSidebar: true,
+      });
+      panel.appendChild(postHost);
+      _focusPostCategory(_shellSub, postHost);
+    } catch (_postErr) {
+      postHost.appendChild(el("p", {
+        class: "comfymodal-studio-control-note",
+        text: "Post Processing failed to start: " + ((_postErr && _postErr.message) || "unknown error"),
+      }));
+      panel.appendChild(postHost);
+    }
   } else {
+    if (_isPostView && _shellSub === "upscale") {
+      panel.appendChild(el("p", {
+        class: "comfymodal-studio-control-note",
+        "data-testid": "post-side-note",
+        text: "Upscale arrives in a later phase — execution is disabled. Your Post recipe and image remain preserved.",
+      }));
+    }
     panel.appendChild(renderWorkflowSelector(state, context, actions));
 
     if (_isPlaceholderView) {
@@ -4495,34 +4520,6 @@ function renderNoteEditor(nr, actions, apiBase) {
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Right Workspace ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
-// ── Post Processing shell ─────────────────────────────────────────────
-// Mounts the TinyLuma-based finishing editor (web/studio-postprocess.js)
-// with the current run output as its source. Defined here because
-// renderWorkspace branches to it per tool; the editor owns all of its own
-// DOM, state, and rendering below this host node.
-function renderPostProcessShell(state, context, actions) {
-  var shell = el("div", {
-    class: "comfymodal-studio-postprocess-shell",
-    "data-testid": "pp-shell",
-    style: "width:100%;",
-  });
-  var src = "";
-  try {
-    src = _canvasImageUrl(state) || _editorBaseImageUrl(state) || "";
-  } catch (_e) {
-    src = "";
-  }
-  try {
-    mountPostprocessWorkspace(shell, { sourceUrl: src });
-  } catch (_ppErr) {
-    shell.appendChild(el("p", {
-      text: "Post Processing failed to start: " + ((_ppErr && _ppErr.message) || "unknown error"),
-      style: "color:var(--color-danger, #f87171);font-size:var(--font-size-sm);",
-    }));
-  }
-  return shell;
-}
-
 function renderWorkspace(state, context) {
   // Shelf: the right-side workspace is the single result panel (output
   // canvas, progress, metadata, recent filmstrip) — never a movable card.
@@ -4551,12 +4548,23 @@ function renderWorkspace(state, context) {
   // Post Processing mounts the existing local engine; the Upscale category
   // is an honest later-phase placeholder and falls through to the canvas.
   if (activeModeOf(state) === "post" && activeSubtoolOf(state) !== "upscale") {
-    var _ppShell = renderPostProcessShell(state, context, wsActions);
-    workspace.appendChild(_ppShell);
-    // The engine resets its tool on every mount: apply the selected
-    // category to the fresh mount (groups expand, Crop/Heal arm). Scoped
-    // to the new subtree so it works pre-attach; no new editor state.
-    try { _focusPostCategory(activeSubtoolOf(state), _ppShell); } catch (_e) {}
+    // Keep the Studio canvas central. The post engine was mounted by the
+    // left control panel; move its existing stage here instead of rendering a
+    // second post-processing workspace inside the canvas.
+    var postCanvas = renderCanvas(state, context, wsActions);
+    var ppMount = state.playground && state.playground._postProcessMount;
+    var ppStage = ppMount && ppMount.stage;
+    if (ppStage) {
+      var legacyOutput = postCanvas.querySelector('[data-testid="canvas-output"]');
+      if (legacyOutput) legacyOutput.style.display = "none";
+      ppStage.classList.add("comfymodal-studio-postprocess-stage");
+      ppStage.style.width = "100%";
+      ppStage.style.height = "100%";
+      ppStage.style.minHeight = "420px";
+      postCanvas.appendChild(ppStage);
+    }
+    workspace.appendChild(postCanvas);
+    workspace.appendChild(renderProgressSection(state, context));
     return workspace;
   }
 

@@ -562,6 +562,14 @@ function injectPngMetadata(pngBytes, srcBytes) {
 
 var CSS = [
   ".pp-ws{display:flex;flex-direction:column;gap:8px;height:min(80vh,940px);min-height:480px;background:#101013;color:#e4e4e7;font-size:12px;outline:none;overflow:hidden}",
+  ".pp-native-sidebar{height:auto;min-height:0;overflow:visible;background:transparent;gap:6px}",
+  ".pp-native-sidebar .pp-toolbar{order:3;flex-wrap:wrap;padding:6px 0;border-top:1px solid #26262c}",
+  ".pp-native-sidebar .pp-toolbar .pp-title{width:100%;font-size:11px}",
+  ".pp-native-sidebar .pp-main{display:block;overflow:visible;min-height:0}",
+  ".pp-native-sidebar .pp-looks{display:block;max-height:none;border:0;padding:0;background:transparent}",
+  ".pp-native-sidebar .pp-insp{max-height:none;border:0;padding:0;background:transparent;overflow:visible}",
+  ".pp-native-sidebar .pp-film{max-height:76px;overflow-x:auto;overflow-y:hidden}",
+  ".pp-native-sidebar .pp-status{font-size:11px}",
   ".pp-toolbar{flex:none;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 8px;background:#17171b;border:1px solid #26262c;border-radius:8px}",
   ".pp-toolbar .pp-title{font-weight:600;margin-right:auto;letter-spacing:.02em}",
   ".pp-btn{background:#232329;border:1px solid #34343c;color:#e4e4e7;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px}",
@@ -623,7 +631,7 @@ export function mountPostprocessWorkspace(host, opts) {
   opts = opts || {};
   var sourceUrl = opts.sourceUrl || "";
   host.innerHTML = "";
-  var ws = el("div", { class: "pp-ws", "data-testid": "pp-workspace", tabindex: "0" });
+  var ws = el("div", { class: "pp-ws" + (opts.nativeSidebar ? " pp-native-sidebar" : ""), "data-testid": "pp-workspace", tabindex: "0" });
   host.appendChild(ws);
 
   var UI = PP_STORE.ui;
@@ -1637,5 +1645,11 @@ export function mountPostprocessWorkspace(host, opts) {
     });
     insp.appendChild(up0);
   }
-  return { setSource: function (url) { addItem("Studio output", url, null); } };
+  return {
+    setSource: function (url) { addItem("Studio output", url, null); },
+    // The native Studio shell owns the image surface; this is the same
+    // engine canvas, moved into that surface by studio-playground.js.
+    stage: stage,
+    workspace: ws,
+  };
 }
