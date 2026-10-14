@@ -7508,6 +7508,18 @@ function _focusPostCategory(subtool, root) {
       var head = g.querySelector(".pp-grouphead");
       if (head && head.getAttribute("aria-expanded") !== "true") head.click();
     });
+    // Routing must be visible: collapse groups outside this category so the
+    // switch lands on its section instead of a wall of open groups. The
+    // output group (export format/quality) stays as the user left it, and
+    // recipe values are untouched — only disclosure state changes.
+    try {
+      Array.prototype.forEach.call(ws.querySelectorAll('[data-group]'), function (g) {
+        var id = g.getAttribute("data-group");
+        if (!id || id === "output" || groups.indexOf(id) !== -1) return;
+        var head = g.querySelector(".pp-grouphead");
+        if (head && head.getAttribute("aria-expanded") === "true") head.click();
+      });
+    } catch (_e2) {}
     if (first && first.scrollIntoView) first.scrollIntoView({ block: "nearest" });
   } catch (_e) { /* routing is best-effort */ }
 }

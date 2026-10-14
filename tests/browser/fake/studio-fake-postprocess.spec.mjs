@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { setupFakeTest } from "./helpers.mjs";
 
 const STRIP = '[data-testid="studio-tool-strip"]';
-const PP_TOOL = '[data-testid="studio-tool-postprocess"]';
+const PP_TOOL = '[data-testid="studio-tool-post"]';
 const PP_WS = '[data-testid="pp-workspace"]';
 const SOURCE_FIXTURE = fileURLToPath(new URL("./fixtures/studio-source.png", import.meta.url));
 // Pre-existing shell↔fake-server gap: web/studio-shell.js polls
@@ -67,6 +67,22 @@ async function viewSignature(page) {
     const k = n / 4;
     return { w: c.width, h: c.height, r: Math.round(sr / k), g: Math.round(sg / k), b: Math.round(sb / k) };
   });
+}
+
+async function groupExpanded(page, id) {
+  return page.evaluate((gid) => {
+    const g = document.querySelector(`[data-testid="pp-inspector"] .pp-group[data-group="${gid}"]`);
+    if (!g) return null;
+    const head = g.querySelector(".pp-grouphead");
+    return head ? head.getAttribute("aria-expanded") : null;
+  }, id);
+}
+
+async function clickPostSubtool(page, subtool) {
+  const btn = page.locator(`[data-testid="studio-subtool-${subtool}"]`);
+  await expect(btn).toBeVisible({ timeout: 10000 });
+  await btn.click();
+  await expect(btn).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
 }
 
 test.describe("Post Processing workspace (fake backend)", () => {
@@ -125,7 +141,7 @@ test.describe("Post Processing workspace (fake backend)", () => {
     const edited = await viewSignature(page);
 
     // Force a full Studio re-render (new workspace mount, same document).
-    await page.locator('[data-testid="studio-tool-t2i"]').click();
+    await page.locator('[data-testid="studio-tool-generate"]').click();
     await openPostprocess(page);
     await expect(page.locator('[data-testid="pp-view"]')).toBeVisible({ timeout: 15000 });
     // Recipe, slider position, and pixels all restored without re-upload.
@@ -186,6 +202,81 @@ test.describe("Post Processing workspace (fake backend)", () => {
     const recipe = await page.evaluate(() => window.__ppRecipe);
     expect(recipe.recipe.contrast).toBe(30);
     await expect(page.locator(PP_WS)).toBeVisible();
+    expectOnlySync404(bad);
+    await fx.assertNoConsoleErrors(ALLOW);
+  });
+
+  test("T5 — Color category expands color groups, collapses the rest", async ({ page }) => {
+    const fx = await setupFakeTest(page);
+    const bad = watch4xx(page);
+    await openPostprocess(page);
+    await uploadSource(page);
+    const outputBefore = await groupExpanded(page, "output");
+
+    await clickPostSubtool(page, "color");
+    // Routing lands: all four Color groups open.
+    for (const id of ["color", "curves", "mixer", "grading"]) {
+      await expect.poll(() => groupExpanded(page, id), { timeout: 10000 }).toBe("true");
+    }
+    // Groups outside the category collapse; output stays as the user left it.
+    for (const id of ["light", "detail", "effects"]) {
+      await expect.poll(() => groupExpanded(page, id), { timeout: 10000 }).toBe("false");
+    }
+    expect(await groupExpanded(page, "output")).toBe(outputBefore);
+    await expect(page.locator(PP_WS)).toBeVisible();
+    expectOnlySync404(bad);
+    await fx.assertNoConsoleErrors(ALLOW);
+  });
+
+  test("T6 — Detail category leaves only detail expanded; recipe untouched", async ({ page }) => {
+    const fx = await setupFakeTest(page);
+    const bad = watch4xx(page);
+    await openPostprocess(page);
+    await uploadSource(page);
+    // A real recipe value to guard against switch-driven resets.
+    await page.locator('[data-testid="pp-slider-exposure"] input[type="range"]').fill("2");
+    await expect.poll(() => page.evaluate(() => window.__ppRecipe && window.__ppRecipe.recipe.exposure),
+      { timeout: 10000 }).toBe(2);
+    const before = await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe));
+    const outputBefore = await groupExpanded(page, "output");
+
+    await clickPostSubtool(page, "color");
+    await expect.poll(() => groupExpanded(page, "color"), { timeout: 10000 }).toBe("true");
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+
+    await clickPostSubtool(page, "detail");
+    await expect.poll(() => groupExpanded(page, "detail"), { timeout: 10000 }).toBe("true");
+    for (const id of ["light", "color", "curves", "mixer", "grading", "effects"]) {
+      await expect.poll(() => groupExpanded(page, id), { timeout: 10000 }).toBe("false");
+    }
+    expect(await groupExpanded(page, "output")).toBe(outputBefore);
+    // Category switches only change disclosure state — values survive.
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+    expect(await page.evaluate(() => window.__ppRecipe.recipe.exposure)).toBe(2);
+    expectOnlySync404(bad);
+    await fx.assertNoConsoleErrors(ALLOW);
+  });
+
+  test("T7 — RUN stays disabled in Post; Upscale is an honest placeholder", async ({ page }) => {
+    const fx = await setupFakeTest(page);
+    const bad = watch4xx(page);
+    await openPostprocess(page);
+    await uploadSource(page);
+
+    // Post runs locally — no workflow execution from this view.
+    const runBtn = page.locator('[data-testid="run-btn"]');
+    await expect(runBtn).toBeVisible({ timeout: 10000 });
+    await expect(runBtn).toBeDisabled({ timeout: 10000 });
+    await expect(page.locator('[data-testid="shell-gate-reason"]')).toContainText("Post Processing runs locally");
+
+    // Upscale category: editor unmounts, placeholder notice + disabled run.
+    await clickPostSubtool(page, "upscale");
+    await expect(page.locator('[data-testid="shell-placeholder"]')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('[data-testid="shell-placeholder"]')).toContainText("Upscale");
+    await expect(page.locator(PP_WS)).toHaveCount(0);
+    await expect(runBtn).toBeDisabled({ timeout: 10000 });
+    await expect(page.locator('[data-testid="shell-gate-reason"]')).toContainText("Upscale arrives in a later phase");
+    await expect(page.locator('[data-testid="submenu-post-note"]')).toContainText("Upscale arrives in a later phase");
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
