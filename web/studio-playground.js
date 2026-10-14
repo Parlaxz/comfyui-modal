@@ -272,7 +272,7 @@ import { renderLoadingState } from "./studio-loading.js";
 import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
 import { FIELD_BLOCKS } from "./studio-field-blocks.js";
 import { renderWorkflowPicker } from "./studio-workflow-picker.js";
-import { STYLE_CATALOG } from "./studio-style-catalog.js";
+import { STYLE_CATALOG, STYLE_SETS } from "./studio-style-catalog.js";
 import {
   loadShelfLayout,
   saveShelfLayout,
@@ -2779,6 +2779,7 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
         fragment: _sty.style.prompt_fragment,
         user_prompt: _sty.userPrompt,
         catalog_version: (STYLE_CATALOG && STYLE_CATALOG.version) || 0,
+        set: _sty.setId || "",
       };
     }
   } catch (_e2) {}
@@ -6955,10 +6956,11 @@ function _methodMaskFile(state, store, prefs) {
 }
 
 // Phase 5: visual prompt-style browser state. Global (not per-workflow):
-// a style is prompt-authoring preference. {selectedId:"", favorites:[]}.
+// a style is prompt-authoring preference. {selectedId:"", favorites:[], setId:"curated"}.
+// Old shapes without setId migrate to "curated"; favorites span all tabs.
 var STYLE_STORE_KEY = "comfymodal.studio.style.v1";
 function loadStyleSelection() {
-  var out = { selectedId: "", favorites: [] };
+  var out = { selectedId: "", favorites: [], setId: "curated" };
   try {
     var raw = localStorage.getItem(STYLE_STORE_KEY);
     if (!raw) return out;
@@ -6967,6 +6969,7 @@ function loadStyleSelection() {
     if (j && Array.isArray(j.favorites)) {
       out.favorites = j.favorites.filter(function (x) { return typeof x === "string"; });
     }
+    if (j && typeof j.setId === "string" && _styleSetById(j.setId)) out.setId = j.setId;
   } catch (_e) {}
   return out;
 }
@@ -6975,19 +6978,60 @@ function saveStyleSelection(patch) {
     var cur = loadStyleSelection();
     if (patch && typeof patch.selectedId === "string") cur.selectedId = patch.selectedId;
     if (patch && Array.isArray(patch.favorites)) cur.favorites = patch.favorites;
+    if (patch && typeof patch.setId === "string" && _styleSetById(patch.setId)) cur.setId = patch.setId;
     localStorage.setItem(STYLE_STORE_KEY, JSON.stringify(cur));
   } catch (_e) {}
 }
-function _styleCatalogStyles() {
+function _styleSets() {
+  try {
+    if (Array.isArray(STYLE_SETS) && STYLE_SETS.length) return STYLE_SETS;
+  } catch (_e) {}
   try {
     var list = STYLE_CATALOG && STYLE_CATALOG.styles;
-    return Array.isArray(list) ? list : [];
+    if (Array.isArray(list)) return [{ id: "curated", title: "Curated", styles: list }];
+  } catch (_e2) {}
+  return [];
+}
+function _styleSetById(id) {
+  var sets = _styleSets();
+  for (var i = 0; i < sets.length; i++) {
+    if (sets[i] && String(sets[i].id) === String(id)) return sets[i];
+  }
+  return null;
+}
+function _styleSetStyles(set) {
+  try {
+    if (set && Array.isArray(set.styles)) return set.styles;
+  } catch (_e) {}
+  return [];
+}
+// Styles of the active tab. Falls back to curated when the stored set is unknown.
+function _styleCatalogStyles() {
+  try {
+    var sel = null;
+    try { sel = loadStyleSelection(); } catch (_e0) {}
+    var set = (sel && sel.setId && _styleSetById(sel.setId)) || _styleSetById("curated") || _styleSets()[0];
+    return _styleSetStyles(set);
   } catch (_e) { return []; }
 }
+// Cross-set lookup so a selection persists when its tab is not active.
 function _styleById(id) {
-  var styles = _styleCatalogStyles();
-  for (var i = 0; i < styles.length; i++) {
-    if (styles[i] && String(styles[i].id) === String(id)) return styles[i];
+  var sets = _styleSets();
+  for (var i = 0; i < sets.length; i++) {
+    var styles = _styleSetStyles(sets[i]);
+    for (var k = 0; k < styles.length; k++) {
+      if (styles[k] && String(styles[k].id) === String(id)) return styles[k];
+    }
+  }
+  return null;
+}
+function _styleSetForId(id) {
+  var sets = _styleSets();
+  for (var i = 0; i < sets.length; i++) {
+    var styles = _styleSetStyles(sets[i]);
+    for (var k = 0; k < styles.length; k++) {
+      if (styles[k] && String(styles[k].id) === String(id)) return sets[i];
+    }
   }
   return null;
 }
@@ -7015,10 +7059,12 @@ function _studioStyleForRun(state, store) {
     if (!style || !style.prompt_fragment) return null;
     var cv = (store && store.controlValues) || {};
     var userPrompt = cv.prompt == null ? "" : String(cv.prompt);
+    var setFor = _styleSetForId(sel.selectedId);
     return {
       style: style,
       userPrompt: userPrompt,
       composed: composeStylePrompt(userPrompt, style.prompt_fragment),
+      setId: (setFor && setFor.id) || "",
     };
   } catch (_e) { return null; }
 }
@@ -7029,9 +7075,16 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
     if (activeModeOf(state) !== "generate") return null;
     if (activeSubtoolOf(state) !== "text") return null;
     if (!promptRole) return null;
-    var styles = _styleCatalogStyles();
-    if (!styles.length) return null;
+    var sets = _styleSets();
+    if (!sets.length) return null;
     var sel0 = loadStyleSelection();
+    var activeSet = _styleSetById(sel0.setId) || _styleSetById("curated") || sets[0];
+    if (sel0.setId !== activeSet.id) {
+      saveStyleSelection({ setId: activeSet.id });
+      sel0.setId = activeSet.id;
+    }
+    var styles = _styleSetStyles(activeSet);
+    if (!styles.length) return null;
     if (sel0.selectedId && !_styleById(sel0.selectedId)) {
       saveStyleSelection({ selectedId: "" });
       sel0.selectedId = "";
@@ -7061,6 +7114,47 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
     });
     head.appendChild(noneBtn);
     box.appendChild(head);
+    // Set tabs above search: search/category/favorites/None/details/
+    // effective-preview all operate within the active tab. Favorites and
+    // the selection persist across tabs (global store key).
+    var tabs = el("div", {
+      role: "tablist",
+      "data-testid": "style-tabs",
+      style: "display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap;",
+    });
+    var tabBtns = [];
+    sets.forEach(function (set) {
+      var tab = el("button", {
+        type: "button",
+        class: "comfymodal-secondary-btn",
+        "data-testid": "style-tab-" + set.id,
+        role: "tab",
+        text: set.title || set.id,
+        title: set.title || set.id,
+      });
+      tabBtns.push({ set: set, btn: tab });
+      tab.addEventListener("click", function () {
+        try { saveStyleSelection({ setId: set.id }); } catch (_e) {}
+        activeSet = set;
+        styles = _styleSetStyles(activeSet);
+        rebuildCategories();
+        buildCards();
+        paintTabStates();
+        paintSelection();
+        applyFilter();
+        paintSourceNote();
+      });
+      tabs.appendChild(tab);
+    });
+    box.appendChild(tabs);
+    function paintTabStates() {
+      tabBtns.forEach(function (entry) {
+        var on = !!activeSet && entry.set.id === activeSet.id;
+        entry.btn.classList.toggle("is-selected", on);
+        entry.btn.setAttribute("aria-pressed", on ? "true" : "false");
+        entry.btn.setAttribute("aria-selected", on ? "true" : "false");
+      });
+    }
     var tools = el("div", { style: "display:flex;gap:8px;margin-bottom:6px;" });
     var search = el("input", {
       type: "search", placeholder: "Search styles…",
@@ -7068,22 +7162,27 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
       class: "comfymodal-input comfymodal-studio-text-input",
       style: "flex:2;min-width:0;",
     });
-    var cats = ["All"];
-    styles.forEach(function (s) {
-      if (s && s.category && cats.indexOf(s.category) === -1) cats.push(s.category);
-    });
     var catSel = el("select", {
       "data-testid": "style-category",
       class: "comfymodal-input",
       style: "flex:1;min-width:0;",
       title: "Filter by category",
     });
-    cats.forEach(function (c) {
-      var o = document.createElement("option");
-      o.value = c;
-      o.textContent = c === "All" ? "All categories" : c;
-      catSel.appendChild(o);
-    });
+    function rebuildCategories() {
+      while (catSel.firstChild) catSel.removeChild(catSel.firstChild);
+      var cats = ["All"];
+      _styleSetStyles(activeSet).forEach(function (s) {
+        if (s && s.category && cats.indexOf(s.category) === -1) cats.push(s.category);
+      });
+      cats.forEach(function (c) {
+        var o = document.createElement("option");
+        o.value = c;
+        o.textContent = c === "All" ? "All categories" : c;
+        catSel.appendChild(o);
+      });
+      catSel.value = "All";
+    }
+    rebuildCategories();
     tools.appendChild(search);
     tools.appendChild(catSel);
     box.appendChild(tools);
@@ -7104,6 +7203,33 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
       style: "font-size:11px;color:#888;margin:4px 0 0;overflow-wrap:anywhere;",
     });
     box.appendChild(effLine);
+    // Attribution + source links for remote-preview sets. Curated presets
+    // need none (bundled text under MIT); the Style Library is remote-only
+    // with an unverified license, so the post/gallery/Drive links stay
+    // visible next to the previews they back.
+    var sourceNote = el("p", {
+      "data-testid": "style-library-source",
+      class: "comfymodal-studio-control-note",
+      style: "font-size:11px;color:#888;margin:4px 0 0;",
+    });
+    box.appendChild(sourceNote);
+    function paintSourceNote() {
+      while (sourceNote.firstChild) sourceNote.removeChild(sourceNote.firstChild);
+      if (!activeSet || activeSet.id !== "reddit-style-library") {
+        sourceNote.style.display = "none";
+        return;
+      }
+      sourceNote.style.display = "";
+      sourceNote.appendChild(document.createTextNode("Previews: Dear-Spend-2865 via r/StableDiffusion (remote only, not bundled; license unverified) — "));
+      [["post", "https://www.reddit.com/r/StableDiffusion/comments/1uzdj7o/krea_2_styles_wildcards_txt/"],
+       ["gallery", "https://www.reddit.com/gallery/1uzdj7o"],
+       ["source file (Drive)", "https://drive.google.com/file/d/1z1tY_365qpIgXtvm6_QcfKEGYE9ix2xw/view?usp=drivesdk"]
+      ].forEach(function (link, i) {
+        if (i > 0) sourceNote.appendChild(document.createTextNode(" · "));
+        var a = el("a", { href: link[1], target: "_blank", rel: "noopener", text: link[0] });
+        sourceNote.appendChild(a);
+      });
+    }
     function currentPromptText() {
       try {
         var store = _shelfStore(state);
@@ -7114,12 +7240,20 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
     function paintSelection() {
       var sel = loadStyleSelection();
       var st = sel.selectedId ? _styleById(sel.selectedId) : null;
-      selName.textContent = st ? ("Selected: " + st.title) : "No style (plain prompt)";
+      var refOnly = !!(st && st.reference_only);
+      selName.textContent = st
+        ? ("Selected: " + st.title + (refOnly ? " (reference-only)" : ""))
+        : "No style (plain prompt)";
       details.textContent = st
-        ? (st.title + " — " + (st.description || "") + (st.tags && st.tags.length ? " [" + st.tags.join(", ") + "]" : ""))
+        ? (refOnly
+          ? (st.title + " — reference-only gallery preview; no prompt fragment is bundled, so runs use your plain prompt. Overlaid style label unverified.")
+          : (st.title + " — " + (st.description || "") + (st.tags && st.tags.length ? " [" + st.tags.join(", ") + "]" : "")))
         : "Pick a style card to append its fragment to your prompt at run time.";
+      var composed = st ? composeStylePrompt(currentPromptText(), st.prompt_fragment) : "";
       effLine.textContent = st
-        ? ("Effective prompt: " + composeStylePrompt(currentPromptText(), st.prompt_fragment))
+        ? (composed
+          ? ("Effective prompt: " + composed + (refOnly ? " (prompt unchanged — reference-only)" : ""))
+          : (refOnly ? "Reference-only preview — no prompt fragment; run uses your plain prompt." : ""))
         : "";
       Array.prototype.forEach.call(grid.querySelectorAll('[data-testid^="style-card-"]'), function (card) {
         var on = !!st && card.getAttribute("data-style-id") === st.id;
@@ -7141,6 +7275,8 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
         card.style.display = show ? "" : "none";
       });
     }
+    function buildCards() {
+    while (grid.firstChild) grid.removeChild(grid.firstChild);
     styles.forEach(function (s) {
       var card = el("button", {
         type: "button",
@@ -7150,12 +7286,41 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
         title: s.title + " — " + (s.description || ""),
         style: "display:flex;flex-direction:column;gap:4px;padding:6px;border:1px solid var(--color-border, #333);border-radius:8px;background:transparent;cursor:pointer;text-align:left;",
       });
-      var hue = Number(s.hue);
-      if (!isFinite(hue)) hue = 210;
-      card.appendChild(el("span", {
-        "data-testid": "style-swatch-" + s.id,
-        style: "display:block;height:44px;border-radius:6px;background:linear-gradient(135deg,hsl(" + hue + ",60%,42%),hsl(" + ((hue + 40) % 360) + ",65%,26%));",
-      }));
+      // Remote-source previews render as actual <img> (lazy, no prefetch
+      // storm). A load failure renders an honest text fallback — never a
+      // generated-art, stock, or CSS-swatch substitute. Curated presets
+      // carry no preview_image and keep their hue swatches.
+      if (s.preview_image) {
+        var mediaWrap = el("span", {
+          "data-testid": "style-media-" + s.id,
+          style: "display:block;height:44px;border-radius:6px;overflow:hidden;background:#1a1a1a;",
+        });
+        var img = document.createElement("img");
+        img.setAttribute("src", s.preview_image);
+        img.setAttribute("alt", s.title + " (remote gallery preview)");
+        img.setAttribute("loading", "lazy");
+        img.setAttribute("data-testid", "style-img-" + s.id);
+        img.style.cssText = "display:block;width:100%;height:44px;object-fit:cover;";
+        img.addEventListener("error", function () {
+          try {
+            while (mediaWrap.firstChild) mediaWrap.removeChild(mediaWrap.firstChild);
+            mediaWrap.appendChild(el("span", {
+              "data-testid": "style-img-fallback-" + s.id,
+              text: "Preview unavailable — see source link below.",
+              style: "display:block;font-size:10px;color:#888;padding:6px;",
+            }));
+          } catch (_eImg) {}
+        });
+        mediaWrap.appendChild(img);
+        card.appendChild(mediaWrap);
+      } else {
+        var hue = Number(s.hue);
+        if (!isFinite(hue)) hue = 210;
+        card.appendChild(el("span", {
+          "data-testid": "style-swatch-" + s.id,
+          style: "display:block;height:44px;border-radius:6px;background:linear-gradient(135deg,hsl(" + hue + ",60%,42%),hsl(" + ((hue + 40) % 360) + ",65%,26%));",
+        }));
+      }
       var row = el("span", { style: "display:flex;align-items:center;gap:4px;" });
       row.appendChild(el("span", {
         text: s.title,
@@ -7194,6 +7359,8 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
       });
       grid.appendChild(card);
     });
+    }
+    buildCards();
     noneBtn.addEventListener("click", function () {
       try { saveStyleSelection({ selectedId: "" }); } catch (_e) {}
       paintSelection();
@@ -7214,13 +7381,19 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
           if (!effLine.isConnected) return;
           var sel = loadStyleSelection();
           var st = sel.selectedId ? _styleById(sel.selectedId) : null;
+          var refOnly = !!(st && st.reference_only);
+          var composedLive = st ? composeStylePrompt(t.value, st.prompt_fragment) : "";
           effLine.textContent = st
-            ? ("Effective prompt: " + composeStylePrompt(t.value, st.prompt_fragment))
+            ? (composedLive
+              ? ("Effective prompt: " + composedLive + (refOnly ? " (prompt unchanged — reference-only)" : ""))
+              : (refOnly ? "Reference-only preview — no prompt fragment; run uses your plain prompt." : ""))
             : "";
         } catch (_e) {}
       });
     } catch (_e) {}
+    paintTabStates();
     paintSelection();
+    paintSourceNote();
     applyFilter();
     return box;
   } catch (_e) { return null; }
