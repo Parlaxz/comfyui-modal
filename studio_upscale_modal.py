@@ -16,10 +16,50 @@ so the dispatch lane's ``raw.get("status") != "ok"`` branch works unchanged.
 
 Inference is NOT reimplemented here: the function imports the existing local
 adapter callables (``upscale_vosr2`` / ``upscale_seedvr2``) shipped into the
-image via ``add_local_file``.  Loaded models are reused across invocations
-through the module-level ``_WARMED`` record plus the adapters' own
-module state (``studio_upscale_vosr2._BUNDLE``; torch/upstream modules stay
-imported in the warm container), so a second call skips reload.
+image via ``add_local_file``.  VOSR2 is TRUE-COLD capable: container-level
+``startup(snap=True)`` (below) performs the adapter's CPU-only static init
+and returns ready for platform snapshot capture; ``restore(snap=False)``
+re-runs the minimal post-snapshot path (mutable reset, CUDA init once, H2D
+materialization).  Both are idempotent and are driven from the request path,
+so a warm container's second call skips reload; the module-level ``_WARMED``
+record plus the adapter's own ``studio_upscale_vosr2._VOSR2_STATIC`` state is
+the observable proof hook (logged on hit).
+
+────────────────────────────────────────────────────────────────────────────
+TRUE-COLD SNAPSHOT LIFECYCLE (VOSR2 only — SeedVR2 shares nothing with it)
+────────────────────────────────────────────────────────────────────────────
+Golden mapping (comfymodal_runtime/modal_app.py — Modal CPU memory
+snapshots, NOT GPU):
+
+* ``startup(snap=True)`` ~ ``startup`` (10979): imports, args.json,
+  path resolution, class construction, CPU state — quiescent, zero
+  ``torch.cuda`` calls, zero network, zero subprocess.  Enabling param is
+  ``enable_memory_snapshot=True`` on the ``studio_upscale`` function;
+  capture is platform-side after startup returns ready.
+* ``restore(snap=False)`` ~ ``restore`` (12674): mutable reset (stale
+  rendezvous env dropped, eval re-asserted), CUDA init once, per-model H2D,
+  ``forward_flexible`` rebind, request-ready.  Mirrors the Golden
+  ``CpuSnapshotModels`` container pattern via the adapter's
+  ``_VOSR2_STATIC`` record and the post-restore timing fields
+  (``restore_entry_wall_unix_ns`` … ``restore_exit_wall_unix_ns``,
+  per-model ``*_source_read_ms`` / ``*_cpu_materialize_ms`` / ``*_h2d_ms``,
+  ``model_ready_ms``).
+* Weight strategy behind ``COMFYMODAL_VOSR2_SNAPSHOT_MODE`` =
+  ``"lean"`` (default: shells + paths snapshotted, weights re-read
+  post-restore) | ``"cpu_weights"`` (weights resident CPU, snapshot
+  captures them) so the operator can measure both.  NO Modal GPU
+  snapshotting anywhere.
+* Request timing decomposition is returned additively as ``vosr2_timing``
+  in the ``ok`` response (existing ``status`` / ``image_b64`` keys
+  unchanged; dispatch ignores the extra key): restore keys above plus
+  ``seed_ms``, ``decode_ms``, ``dinov2_fwd_ms``, ``vae_encode_ms``,
+  ``dit_onestep_ms``, ``vae_decode_ms``, ``color_correct_ms``,
+  ``materialize_ms``, ``png_encode_ms``, ``request_total_ms`` and the
+  effective tiling (``tiling`` ``full`` | ``tiled``).  Load + inference are
+  never lumped.
+* Tiling: outputs with long side <= 2048px take the full-image path
+  (``tile_size = 0``, ``vae_tile_size = None``); larger outputs honor the
+  caller's tiling knobs through the upstream tiled kernels.
 
 ────────────────────────────────────────────────────────────────────────────
 WEIGHT PLACEMENT (operator step — weights are NOT downloaded by this lane)
@@ -94,28 +134,23 @@ where the dispatch lane runs.
 ────────────────────────────────────────────────────────────────────────────
 CONCRETE BLOCKERS (verified in upstream source 2026-10-14 — no graph fallback)
 ────────────────────────────────────────────────────────────────────────────
-B1. VOSR CLI flag mismatch (adapter seam, owns: adapters/dispatch lane).
-    ``studio_upscale_vosr2._run_cli`` invokes::
-
-        inference_vosr_onestep.py -u <float-scale> --input <src>
-            --output <dst> --weights <dir> --tile_size … --seed …
-
-    but upstream ``inference_vosr_onestep.py`` (cswry/VOSR, ``main``) takes
-    ``-c/--checkpoint`` (required), ``-i/--input_image`` (required),
-    ``-o/--output_dir`` (required) — there are NO ``--input`` / ``--output``
-    / ``--weights`` flags — and ``-u/--upscale`` is ``type=int``.  Against a
-    real checkout the call exits 2 (argparse error), and fractional scales
-    can never survive ``int()``.  Fix is in the adapter's argv (or a thin
-    in-process call); the official CPU of truth is::
-
-        python inference_vosr_onestep.py -c preset/ckpts/VOSR2 \\
-            -i <input> -o <out> -u 4
+B1. VOSR2 subprocess path (CLOSED 2026-10-14 — in-process adapter).
+    ``studio_upscale_vosr2`` no longer shells out: it imports the upstream
+    checkout (``inference_vosr_onestep`` helpers, ``LightningDiT``,
+    ``LightDecoder``, ``VOSR``, ``encode_dispatch``/``decode_dispatch``,
+    Qwen/SD2 VAE loader) and calls them in-process with the exact upstream
+    call order (config -> construct -> CPU state -> .to(cuda) -> decode ->
+    DINO -> VAE encode -> one-step DiT -> VAE decode -> color align).
+    Static init is CPU-only (snapshot-capturable); there is no ``subprocess``
+    or ``socket`` import left in the adapter.
 
 B2. VOSR runtime download: upstream ``load_dinov2`` calls
     ``torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')`` — a GitHub
     fetch at inference time.  Either pre-warm ``TORCH_HUB_DIR`` at image build
     or vendor the dinov2 files from the HF bundle; otherwise the first remote
-    call needs egress.
+    call needs egress.  (Adapter side: static init stages pre-warmed cache
+    file-only and fails closed with ``VOSR2_UNAVAILABLE`` when absent — it
+    never probes the network and never downloads.)
 B3. SeedVR2 has NO importable entrypoint (owns: adapters/dispatch lane).
     Upstream provides NO ``seedvr`` package: inference is the cwd-relative
     CLI script ``projects/inference_seedvr2_3b.py`` with hardcoded relative
@@ -140,6 +175,7 @@ imports (never duplicates) the adapters so their fixes flow straight through.
 from __future__ import annotations
 
 import os
+import sys
 
 import modal
 
@@ -217,18 +253,19 @@ upscale_image = (
     )
     # CONFLICT RESOLUTION (torch): upstream pins (VOSR torch==2.5.1+cu121,
     # SeedVR torch==2.4.0+cu121) are training-era and incompatible with CUDA
-    # 13.0 / Blackwell.  Honor the foundation instead — with one deliberate
-    # exception: torch 2.14/torchvision 0.29 DELETED the OSS
-    # torchvision.io.video implementation (video.py is now a stub re-export
-    # of Meta-internal pytorch.vision.fb.io.video), which upstream SeedVR2's
-    # `from torchvision.io.video import read_video` requires.  Pin the last
-    # pair that still ships OSS video IO (torchvision 0.24 keeps _video_opt).
-    # Identical install mechanics to comfyapp.py:8483-8488, and NEVER list
-    # torch/torchvision in .pip_install (default-index torch would clobber
-    # this).  Inference uses stable torch APIs only.
+    # 13.0 / Blackwell.  Honor the foundation instead: latest cu130 torch,
+    # installed here from the PyTorch index — identical to
+    # comfyapp.py:8483-8488 — and NEVER list torch/torchvision in
+    # .pip_install (default-index torch would clobber this).
+    # DO NOT pin torch 2.9 / torchvision 0.24 for SeedVR2's video IO here:
+    # torch 2.9 rejects the explicit dtype=None/device=None that timm
+    # 1.0.30's Mlp passes into torch.empty, breaking VOSR2 construction
+    # (torch 2.14 accepts it; VOSR2 is proven on 2.14).  SeedVR2 is parked
+    # this pass; its video-IO + flash_attn needs stay documented BLOCKEDs.
+    # Inference uses stable torch APIs only.
     .run_commands(
         "python -m pip install --upgrade --no-input "
-        "torch==2.9.1 torchvision==0.24.1 "
+        "torch torchvision "
         "--index-url https://download.pytorch.org/whl/cu130",
     )
     .pip_install(*UPSTREAM_PIP_DEPS)
@@ -270,6 +307,12 @@ upscale_image = (
             # trusted_list, staged per the adapter docstring) so upstream
             # load_dinov2 runs offline.
             "COMFYMODAL_VOSR2_DINOV2": f"{MODELS_PATH}/upscale_models/torch_cache",
+            # Snapshot weight strategy under measurement (see acceptance
+            # cohort): "lean" re-reads weights post-restore, "cpu_weights"
+            # keeps them CPU-resident through the snapshot (H2D-only
+            # restore).  Production keeps exactly one; this line selects
+            # the arm under test.
+            "COMFYMODAL_VOSR2_SNAPSHOT_MODE": "cpu_weights",
             # NOTE: VOSR_REPO_DIR is deliberately NOT on PYTHONPATH.  Both
             # checkouts ship top-level `models/` (and `common/`, `data/`)
             # packages; VOSR's are regular packages (__init__.py) while
@@ -290,10 +333,48 @@ upscale_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 # Module-level reuse record: set after a method's first successful inference
 # in THIS container.  The heavy state itself lives in the imported modules
-# (torch + upstream code stay imported; vosr2 adapter caches its bundle per
-# weights dir), so a warm container's second call skips reload; this record
-# is the observable proof hook (logged on hit).
+# (torch + upstream code stay imported; the vosr2 adapter caches its static
+# CPU state plus restored CUDA executables in
+# ``studio_upscale_vosr2._VOSR2_STATIC``), so a warm container's second call
+# skips reload; this record is the observable proof hook (logged on hit).
 _WARMED: dict[str, str] = {}
+
+
+def startup(snap: bool = True) -> dict:
+    """TRUE-COLD static init (Modal ``startup(snap=True)`` scope).
+
+    CPU-only, quiescent, zero CUDA/network/subprocess: resolves the VOSR2
+    bundle, reads ``args.json``, imports upstream modules, constructs model
+    shells (``cpu_weights`` mode: full CPU-resident weights) and returns
+    ready for platform snapshot capture.  Mirrors Golden ``startup``
+    (``comfymodal_runtime/modal_app.py`` ~10979).  Idempotent.  SeedVR2
+    shares nothing with this path.
+    """
+    if snap is not True:
+        raise ValueError(f"startup requires snap=True, got {snap!r}")
+    if ADAPTER_DIR not in sys.path:
+        sys.path.insert(0, ADAPTER_DIR)
+    from studio_upscale_vosr2 import vosr2_static_init
+
+    return vosr2_static_init(snap=True)
+
+
+def restore(snap: bool = False) -> dict:
+    """Post-snapshot restore (Modal ``restore(snap=False)`` scope).
+
+    Minimal: mutable-state reset, CUDA init once, per-model source re-read
+    (``lean`` mode only) + CPU materialize + H2D, then request-ready.
+    Mirrors Golden ``restore`` (``comfymodal_runtime/modal_app.py`` ~12674).
+    Idempotent — repeat calls return the cached restore timing.  NO Modal
+    GPU snapshotting.
+    """
+    if snap is not False:
+        raise ValueError(f"restore requires snap=False, got {snap!r}")
+    if ADAPTER_DIR not in sys.path:
+        sys.path.insert(0, ADAPTER_DIR)
+    from studio_upscale_vosr2 import vosr2_restore
+
+    return vosr2_restore(snap=False)
 
 
 @app.function(
@@ -308,6 +389,11 @@ _WARMED: dict[str, str] = {}
     gpu="A100-80GB",
     cpu=8,
     memory=65536,
+    # TRUE-COLD CPU memory snapshots (NOT GPU): the platform captures the
+    # container after CPU-resident static init (startup(snap=True)) returns
+    # ready; post-snapshot work (CUDA init, H2D) runs in restore(snap=False).
+    # This is the enabling param — capture itself is platform-side.
+    enable_memory_snapshot=True,
     # Proven budget: matches UPSCALE_MODAL_TIMEOUT_S = 1800.0 in
     # studio_upscale_run.py (single-image diffusion upscale + cold load).
     timeout=1800,
@@ -367,8 +453,16 @@ def studio_upscale(payload: dict) -> dict:
     try:
         if method == "vosr2":
             from studio_upscale_vosr2 import VOSR2Unavailable
+            from studio_upscale_vosr2 import get_last_vosr2_timing
             from studio_upscale_vosr2 import upscale_vosr2
 
+            # TRUE-COLD lifecycle: static init once (CPU-only, idempotent),
+            # restore once (mutable reset + CUDA init + H2D, idempotent),
+            # then per-image execution.  Warm containers skip straight to
+            # inference; the request path itself does no imports, no config
+            # reads, no path scans, and no network.
+            startup(snap=True)
+            restore(snap=False)
             out = upscale_vosr2(
                 rgb,
                 scale=scale_value,
@@ -377,10 +471,12 @@ def studio_upscale(payload: dict) -> dict:
                 vae_tile_size=int(payload.get("vae_tile_size", 256)),
                 seed=seed,
             )
+            vosr2_timing = get_last_vosr2_timing()
         else:
             from studio_upscale_seedvr2 import SeedVR2Unavailable
             from studio_upscale_seedvr2 import upscale_seedvr2
 
+            vosr2_timing = {}
             out = upscale_seedvr2(rgb, scale=scale_value, seed=seed)
     except Exception as exc:  # fail-closed, never raise across the boundary
         code = getattr(exc, "error_code", None) or (
@@ -400,8 +496,18 @@ def studio_upscale(payload: dict) -> dict:
     _WARMED[method] = weights_env or "(default)"
 
     buf = io.BytesIO()
+    import time as _time
+
+    _png0 = _time.perf_counter()
     out.save(buf, format="PNG")
-    return {
+    _png_ms = round((_time.perf_counter() - _png0) * 1000, 3)
+    response: dict = {
         "status": "ok",
         "image_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
     }
+    if method == "vosr2" and vosr2_timing:
+        # Additive only: dispatch reads status/image_b64 and ignores this.
+        vosr2_timing = dict(vosr2_timing)
+        vosr2_timing["png_encode_ms"] = _png_ms
+        response["vosr2_timing"] = vosr2_timing
+    return response

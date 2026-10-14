@@ -23,11 +23,18 @@ runs in milliseconds.
 
 from __future__ import annotations
 
+import ast
+import contextlib
+import json
+import sys
+import types
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import studio_upscale_deps as deps
+import studio_upscale_vosr2 as vosr2_mod
 from studio_upscale_run import (
     UPSCALE_METHODS,
     UPSCALE_MODAL_APP_ENV,
@@ -54,10 +61,24 @@ from studio_upscale_vosr2 import (
     DEFAULT_TILE_OVERLAP,
     DEFAULT_TILE_SIZE,
     DEFAULT_VAE_TILE_SIZE,
+    REQUEST_TIMING_KEYS,
+    RESTORE_TIMING_KEYS,
+    SNAPSHOT_MODE_CPU_WEIGHTS,
+    SNAPSHOT_MODE_LEAN,
+    STARTUP_TIMING_KEYS,
+    VOSR2_FULL_IMAGE_MAX_PX,
     VOSR2_METHOD,
+    VOSR2_SNAPSHOT_MODE_ENV,
     VOSR2Unavailable,
+    _reset_vosr2_state,
+    get_last_vosr2_timing,
+    resolve_vosr2_tiling,
     upscale_vosr2,
     validate_vosr2_scale,
+    vosr2_is_restored,
+    vosr2_is_static_ready,
+    vosr2_restore,
+    vosr2_static_init,
 )
 
 pytestmark = pytest.mark.fast_unit
@@ -442,3 +463,652 @@ def test_upscale_history_hook_kwargs_match_record_run_signature():
     }
     for kw in ("status", "meta", "timings", "output_path"):
         assert kw_defaults.get(kw) is not None, f"{kw} must have a default"
+
+
+# ── TRUE-COLD VOSR2: in-process adapter contract ────────────────────────────
+#
+# These tests exercise the real ``studio_upscale_vosr2`` static/restore/
+# per-image split against stub upstream modules (recorded fakes injected
+# via ``sys.modules``).  No real torch import (real torch takes seconds and
+# owns CUDA), no network, no subprocess, no GPU.  Each test runs in
+# milliseconds.
+
+
+_FAKE_VOSR2_ARGS = {
+    "ae_type": "qwen",
+    "ae_path": "preset/ckpts/Qwen-Image-vae-2d",
+    "enc_type": "dinov2l",
+    "layer_dinov2b_list": [21, 22, 23],
+    "dim": 64,
+    "depth": 2,
+    "num_heads": 4,
+    "mlp_ratio": 4.0,
+    "enc_dim": 32,
+    "encdim_ratio": 2.0,
+    "resolution": 256,
+    "patch_size": 2,
+    "time_dist": ["lognorm", -0.4, 1.0],
+    "cfg_ratio": 0.1,
+    "cfg_scale": 2.0,
+    "interp_type": "lin",
+    "t_start": 0.0,
+    "t_end": 1.0,
+    "dinov2_size": 256,
+    "infer_steps": 1,
+    "align_method": "wavelet",
+}
+
+
+class _FakeTensor:
+    """Numpy-backed tensor double: supports exactly the ops the adapter's
+    own IO helpers use (model math stays inside the stub upstream fns)."""
+
+    def __init__(self, arr, calls):
+        self._arr = np.asarray(arr, dtype=np.float32)
+        self._calls = calls
+
+    @property
+    def shape(self):
+        return self._arr.shape
+
+    def __len__(self):
+        return len(self._arr)
+
+    def __getitem__(self, idx):
+        return _FakeTensor(self._arr[idx], self._calls)
+
+    def unsqueeze(self, dim):
+        return _FakeTensor(np.expand_dims(self._arr, dim), self._calls)
+
+    def permute(self, *dims):
+        return _FakeTensor(np.transpose(self._arr, dims), self._calls)
+
+    def to(self, device):
+        self._calls.append(("tensor.to", str(device)))
+        return self
+
+    def cpu(self):
+        return self
+
+    def detach(self):
+        return self
+
+    def numpy(self):
+        return self._arr
+
+    def _binop(self, other, op):
+        rhs = other._arr if isinstance(other, _FakeTensor) else other
+        return _FakeTensor(op(self._arr, rhs), self._calls)
+
+    def __mul__(self, other):
+        return self._binop(other, np.multiply)
+
+    __rmul__ = __mul__
+
+    def __add__(self, other):
+        return self._binop(other, np.add)
+
+    def __sub__(self, other):
+        return self._binop(other, np.subtract)
+
+    def __truediv__(self, other):
+        return self._binop(other, np.true_divide)
+
+
+class _FakeModel:
+    def __init__(self, calls, name, **kwargs):
+        self._calls = calls
+        self._name = name
+        self.kwargs = dict(kwargs)
+
+    def to(self, device):
+        self._calls.append((f"{self._name}.to", str(device)))
+        return self
+
+    def eval(self):
+        self._calls.append((f"{self._name}.eval",))
+        return self
+
+    def parameters(self):
+        return []
+
+    def load_state_dict(self, state, strict=False):
+        self._calls.append((f"{self._name}.load_state_dict", len(state)))
+        return self
+
+
+def _build_vosr2_stubs(calls):
+    """Build the stub torch + upstream module doubles.  Every boundary the
+    contract cares about (cuda touches, weight reads, H2D, kernel choice)
+    appends to ``calls``."""
+
+    class _FakeCuda:
+        def is_available(self):
+            calls.append(("cuda.is_available",))
+            return True
+
+        def init(self):
+            calls.append(("cuda.init",))
+
+        def manual_seed_all(self, seed):
+            calls.append(("cuda.manual_seed_all", seed))
+
+        def synchronize(self):
+            calls.append(("cuda.synchronize",))
+
+        def empty_cache(self):
+            calls.append(("cuda.empty_cache",))
+
+    torch_stub = types.ModuleType("torch")
+    torch_stub.cuda = _FakeCuda()
+
+    def _device(name):
+        calls.append(("torch.device", str(name)))
+        return str(name)
+
+    torch_stub.device = _device
+
+    def _manual_seed(seed):
+        calls.append(("torch.manual_seed", seed))
+
+    torch_stub.manual_seed = _manual_seed
+
+    def _torch_load(path, map_location=None):
+        calls.append(("torch.load", str(path)))
+        return {}
+
+    torch_stub.load = _torch_load
+
+    def _from_numpy(arr):
+        return _FakeTensor(arr, calls)
+
+    torch_stub.from_numpy = _from_numpy
+    torch_stub.hub = types.SimpleNamespace(
+        set_dir=lambda d: calls.append(("hub.set_dir", str(d))),
+    )
+    torch_stub.no_grad = lambda: contextlib.nullcontext()
+
+    class _FakeDiT(_FakeModel):
+        def __init__(self, **kwargs):
+            super().__init__(calls, "dit", **kwargs)
+            calls.append(("dit.construct", sorted(kwargs)))
+
+        def forward_flexible(self, *args, **kwargs):
+            calls.append(("dit.forward_flexible",))
+            return _FakeTensor(np.zeros((1, 16, 4, 4)), calls)
+
+    class _FakeEncoder(_FakeModel):
+        def __init__(self):
+            super().__init__(calls, "venc")
+            calls.append(("venc.construct",))
+
+    class _FakeVAE(_FakeModel):
+        def __init__(self):
+            super().__init__(calls, "vae")
+
+        @classmethod
+        def from_pretrained(cls, path):
+            calls.append(("vae.from_pretrained", str(path)))
+            return cls()
+
+    class _FakeVOSR:
+        def __init__(self, **kwargs):
+            self._calls = calls
+            calls.append(("vosr.construct", sorted(kwargs)))
+
+        def eval(self):
+            return self
+
+        def sample_onestep(
+            self, model, lq, venc_fea=None, n_steps=1, schedule="linear"
+        ):
+            calls.append(("vosr.sample_onestep", n_steps))
+            return _FakeTensor(np.zeros((1, 16, 4, 4)), calls)
+
+    def _load_dinov2(config, device):
+        calls.append(("load_dinov2", str(device)))
+        return _FakeEncoder()
+
+    def _get_venc_features(venc, lq, args):
+        calls.append(("get_venc_features",))
+        return [_FakeTensor(np.zeros((1, 5, 3)), calls)]
+
+    def _encode_dispatch(vae, x, args, device):
+        calls.append(("encode_dispatch", str(device)))
+        h, w = x.shape[2] // 8, x.shape[3] // 8
+        return (
+            _FakeTensor(np.zeros((1, 16, h, w)), calls),
+            _FakeTensor(np.zeros((1, 16, 1, 1)), calls),
+            _FakeTensor(np.ones((1, 16, 1, 1)), calls),
+        )
+
+    def _decode_dispatch(vae, latent, args, mean, std, light_decoder=None):
+        calls.append(("decode_dispatch",))
+        h, w = latent.shape[2] * 8, latent.shape[3] * 8
+        return _FakeTensor(np.zeros((1, 3, h, w)), calls)
+
+    def _tiled_latent_inference(
+        model, vae, venc, lq, args, device, light_decoder=None
+    ):
+        calls.append(("tiled_latent_inference", str(device)))
+        h, w = lq.shape[2], lq.shape[3]
+        return _FakeTensor(np.zeros((1, 3, h, w)), calls)
+
+    def _wavelet(img, ref):
+        calls.append(("wavelet_color_fix",))
+        return img
+
+    def _adain(img, ref):
+        calls.append(("adain_color_fix",))
+        return img
+
+    upstream = types.ModuleType("inference_vosr_onestep")
+    upstream.load_dinov2 = _load_dinov2
+    upstream.get_venc_features = _get_venc_features
+    upstream.tiled_latent_inference = _tiled_latent_inference
+    upstream.wavelet_color_fix = _wavelet
+    upstream.adain_color_fix = _adain
+
+    tiled_vae = types.ModuleType("tiled_vae")
+    tiled_vae.encode_dispatch = _encode_dispatch
+    tiled_vae.decode_dispatch = _decode_dispatch
+
+    models_pkg = types.ModuleType("models")
+    models_pkg.__path__ = []
+    dit_mod = types.ModuleType("models.lightningdit")
+    dit_mod.LightningDiT = _FakeDiT
+    decoder_mod = types.ModuleType("models.light_decoder")
+    decoder_mod.LightDecoder = _FakeModel
+    qwen_mod = types.ModuleType("models.qwenimage_vae2d")
+    qwen_mod.AutoencoderKLQwenImage2D = _FakeVAE
+    vosr_mod = types.ModuleType("vosr")
+    vosr_mod.VOSR = _FakeVOSR
+
+    safetensors_pkg = types.ModuleType("safetensors")
+    safetensors_pkg.__path__ = []
+    safetensors_torch = types.ModuleType("safetensors.torch")
+
+    def _load_file(path):
+        calls.append(("safetensors.load_file", str(path)))
+        return {"w": _FakeTensor(np.zeros((2, 2)), calls)}
+
+    safetensors_torch.load_file = _load_file
+
+    return {
+        "torch": torch_stub,
+        "models": models_pkg,
+        "models.lightningdit": dit_mod,
+        "models.light_decoder": decoder_mod,
+        "models.qwenimage_vae2d": qwen_mod,
+        "vosr": vosr_mod,
+        "tiled_vae": tiled_vae,
+        "inference_vosr_onestep": upstream,
+        "safetensors": safetensors_pkg,
+        "safetensors.torch": safetensors_torch,
+    }
+
+
+def _write_fake_vosr2_bundle(tmp_path, *, with_dinov2=True, with_weights=True):
+    """Create a fake checkout + weights bundle (files only — the stub
+    modules above stand in for torch/upstream)."""
+    repo = tmp_path / "repo"
+    weights = tmp_path / "weights"
+    (weights / "checkpoints").mkdir(parents=True)
+    (weights / "args.json").write_text(json.dumps(_FAKE_VOSR2_ARGS))
+    if with_weights:
+        (weights / "checkpoints" / "ema_model.safetensors").write_bytes(b"fake")
+    vae_dir = repo / "preset" / "ckpts" / "Qwen-Image-vae-2d"
+    vae_dir.mkdir(parents=True)
+    (vae_dir / "config.json").write_text("{}")
+    if with_dinov2:
+        cache = (
+            repo / "preset" / "ckpts" / "torch_cache"
+            / "facebookresearch_dinov2_main"
+        )
+        cache.mkdir(parents=True)
+        (cache / "README").write_text("fake")
+    (repo / "inference_vosr_onestep.py").write_text("# stub marker\n")
+    return repo, weights
+
+
+@pytest.fixture
+def vosr2_stub(monkeypatch, tmp_path):
+    """Stub torch + upstream VOSR modules with a pre-warmed fake bundle."""
+    calls: list = []
+    repo, weights = _write_fake_vosr2_bundle(tmp_path)
+    for name, mod in _build_vosr2_stubs(calls).items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("COMFYMODAL_VOSR2_WEIGHTS", str(weights))
+    monkeypatch.setenv("COMFYMODAL_VOSR2_REPO", str(repo))
+    for knob in (
+        "COMFYMODAL_VOSR2_DINOV2",
+        "COMFYMODAL_VOSR2_DINOV2_PATH",
+        "COMFYMODAL_VOSR2_TORCH_HUB",
+        "COMFYMODAL_VOSR2_SNAPSHOT_MODE",
+    ):
+        monkeypatch.delenv(knob, raising=False)
+    monkeypatch.setenv("TORCH_HUB_DIR", str(tmp_path / "empty_hub"))
+    _reset_vosr2_state()
+    yield {"calls": calls, "repo": repo, "weights": weights}
+    _reset_vosr2_state()
+
+
+def _cuda_touches(calls) -> list:
+    return [
+        call
+        for call in calls
+        if call[0].startswith("cuda.")
+        or (call[0].endswith(".to") and call[-1] != "cpu")
+        or (call[0] == "tensor.to" and call[-1] != "cpu")
+    ]
+
+
+def test_vosr2_adapter_has_no_subprocess_network_or_cli_surface():
+    # The TRUE-COLD adapter is in-process: no subprocess, no sockets, no
+    # CLI argv — and the upstream call happens through real upstream
+    # symbols, not reimplemented math.  (Bans are code patterns, not prose:
+    # the docstring legitimately names what was removed.)
+    text = (ROOT / "studio_upscale_vosr2.py").read_text(encoding="utf-8")
+    for banned in (
+        "import subprocess",
+        "from subprocess",
+        "subprocess.run",
+        "subprocess.Popen",
+        "import socket",
+        "from socket",
+        "socket.create_connection",
+        "_run_cli",
+        "Popen(",
+        "check_output",
+        "sys.executable",
+        "torch.hub.load(",
+        "--tile_size",
+    ):
+        assert banned not in text, f"request-time surface leaked: {banned}"
+    for required in (
+        "tiled_latent_inference",
+        "encode_dispatch",
+        "decode_dispatch",
+        "sample_onestep",
+        "get_venc_features",
+        "vosr2_static_init",
+        "vosr2_restore",
+    ):
+        assert required in text, f"upstream call missing: {required}"
+
+
+def test_vosr2_request_path_has_no_imports_and_static_has_no_cuda():
+    # Zero request-time imports/config/path-scanning: the per-image body
+    # uses cached static state only.  Snapshot-capturable static init:
+    # zero torch.cuda touches (asserted structurally, not by luck).
+    tree = ast.parse(
+        (ROOT / "studio_upscale_vosr2.py").read_text(encoding="utf-8")
+    )
+    fns = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    request_body = fns["upscale_vosr2"]
+    assert not any(
+        isinstance(node, (ast.Import, ast.ImportFrom))
+        for node in ast.walk(request_body)
+    ), "request path must not import"
+    static_body = fns["vosr2_static_init"]
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr == "cuda"
+        for node in ast.walk(static_body)
+    ), "static init must not touch torch.cuda"
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "cuda"
+        for node in ast.walk(static_body)
+    ), "static init must not name cuda"
+
+
+def test_vosr2_static_split_and_timing_boundaries(vosr2_stub):
+    # STATIC (CPU-only, no CUDA, no weight bytes in lean mode) vs RESTORE
+    # (CUDA init once, H2D, lean re-reads) vs PER-IMAGE (decode -> DINO ->
+    # VAE -> DiT -> VAE -> align), with disjoint timing boundaries.
+    calls = vosr2_stub["calls"]
+    assert not vosr2_is_static_ready() and not vosr2_is_restored()
+
+    ready = vosr2_static_init()
+    assert ready["status"] == "ready"
+    assert ready["snapshot_mode"] == SNAPSHOT_MODE_LEAN
+    assert vosr2_is_static_ready() and not vosr2_is_restored()
+    assert _cuda_touches(calls) == []
+    # Lean static defers every weight/DINO load to restore (shells + paths
+    # only); the hub cache pointer is CPU config and is set now.
+    assert ("hub.set_dir", str(vosr2_stub["repo"] / "preset" / "ckpts" / "torch_cache")) in calls
+    assert ("load_dinov2", "cpu") not in calls
+    # Lean static reads no weight bytes — only records paths.
+    assert [
+        call
+        for call in calls
+        if call[0]
+        in ("safetensors.load_file", "torch.load", "vae.from_pretrained")
+    ] == []
+    startup_timing = ready["startup_timing"]
+    assert all(key in startup_timing for key in STARTUP_TIMING_KEYS)
+    assert not any(key in startup_timing for key in REQUEST_TIMING_KEYS)
+
+    restored = vosr2_restore()
+    assert restored["status"] == "ready"
+    assert vosr2_is_restored()
+    assert ("cuda.init",) in calls
+    assert ("dit.to", "cuda") in calls
+    assert ("vae.to", "cuda") in calls
+    assert ("venc.to", "cuda") in calls
+    # Lean restore loads DINOv2 on CPU first, then H2Ds everything.
+    assert ("load_dinov2", "cpu") in calls
+    # Lean restore re-reads weights from disk, then materializes.
+    assert any(
+        call[0] == "safetensors.load_file" for call in calls
+    )
+    assert any(call[0] == "vae.from_pretrained" for call in calls)
+    restore_timing = restored["restore_timing"]
+    assert all(key in restore_timing for key in RESTORE_TIMING_KEYS)
+    assert set(RESTORE_TIMING_KEYS).isdisjoint(REQUEST_TIMING_KEYS)
+    assert set(STARTUP_TIMING_KEYS).isdisjoint(REQUEST_TIMING_KEYS)
+
+    from PIL import Image
+
+    out = upscale_vosr2(Image.new("RGB", (16, 16), (10, 20, 30)), scale=2)
+    assert out.size == (32, 32)
+    timing = get_last_vosr2_timing()
+    assert all(key in timing for key in REQUEST_TIMING_KEYS)
+    assert all(key in timing for key in RESTORE_TIMING_KEYS)
+    assert timing["tiling"] == "full"
+    assert timing["tile_size_effective"] == 0
+    assert timing["vae_tile_size_effective"] is None
+    # Small image: full-image kernels, never the tiled DiT kernel.
+    assert ("vosr.sample_onestep", 1) in calls
+    assert any(call[0] == "encode_dispatch" for call in calls)
+    assert not any(call[0] == "tiled_latent_inference" for call in calls)
+
+    # Restore is idempotent: no second source read, no second H2D.
+    reads_before = len(
+        [
+            call
+            for call in calls
+            if call[0]
+            in ("safetensors.load_file", "torch.load", "vae.from_pretrained")
+        ]
+    )
+    h2d_before = len([call for call in calls if call[0].endswith(".to")])
+    second = vosr2_restore()
+    assert second["cached"] is True
+    assert (
+        len(
+            [
+                call
+                for call in calls
+                if call[0]
+                in (
+                    "safetensors.load_file",
+                    "torch.load",
+                    "vae.from_pretrained",
+                )
+            ]
+        )
+        == reads_before
+    )
+    assert len([call for call in calls if call[0].endswith(".to")]) == h2d_before
+
+
+def test_vosr2_snapshot_modes_lean_vs_cpu_weights(vosr2_stub, monkeypatch):
+    # The operator knob switches weight residency; nothing else changes.
+    calls = vosr2_stub["calls"]
+    monkeypatch.setenv(VOSR2_SNAPSHOT_MODE_ENV, SNAPSHOT_MODE_CPU_WEIGHTS)
+    vosr2_static_init()
+    static_reads = [
+        call
+        for call in calls
+        if call[0]
+        in ("safetensors.load_file", "torch.load", "vae.from_pretrained")
+    ]
+    assert static_reads, "cpu_weights must read weights at static init"
+    assert _cuda_touches(calls) == []
+    vosr2_restore()
+    assert (
+        len(
+            [
+                call
+                for call in calls
+                if call[0]
+                in (
+                    "safetensors.load_file",
+                    "torch.load",
+                    "vae.from_pretrained",
+                )
+            ]
+        )
+        == len(static_reads)
+    ), "cpu_weights restore must not re-read weights"
+
+    _reset_vosr2_state()
+    calls.clear()
+    monkeypatch.setenv(VOSR2_SNAPSHOT_MODE_ENV, SNAPSHOT_MODE_LEAN)
+    vosr2_static_init()
+    assert [
+        call
+        for call in calls
+        if call[0]
+        in ("safetensors.load_file", "torch.load", "vae.from_pretrained")
+    ] == []
+    vosr2_restore()
+    assert [
+        call
+        for call in calls
+        if call[0]
+        in ("safetensors.load_file", "torch.load", "vae.from_pretrained")
+    ], "lean restore must re-read weights"
+
+    _reset_vosr2_state()
+    monkeypatch.setenv(VOSR2_SNAPSHOT_MODE_ENV, "bogus-mode")
+    with pytest.raises(VOSR2Unavailable) as caught:
+        vosr2_static_init()
+    assert "VOSR2_UNAVAILABLE" in str(caught.value)
+
+
+def test_vosr2_tiling_rule_full_for_small_tiled_for_large(
+    vosr2_stub, monkeypatch
+):
+    # 400x400-class outputs take the normal full-image path; only genuinely
+    # large outputs honor the caller's tiling knobs.
+    assert VOSR2_FULL_IMAGE_MAX_PX == 2048
+    small = resolve_vosr2_tiling(400, 400, 4, 512, 64, 256)
+    assert small["tiling"] == "full"
+    assert small["tile_size"] == 0 and small["vae_tile_size"] is None
+    at_threshold = resolve_vosr2_tiling(512, 512, 4, 512, 64, 256)
+    assert at_threshold["tiling"] == "full"  # 2048 == threshold
+    large = resolve_vosr2_tiling(1600, 1600, 4, 512, 64, 256)
+    assert large["tiling"] == "tiled"
+    assert large["tile_size"] == 512 and large["tile_overlap"] == 64
+    assert large["vae_tile_size"] == 256
+
+    # The tiled execution path drives the upstream tiled kernel (stub) and
+    # reports itself as tiled — never lumped with the full-image timings.
+    calls = vosr2_stub["calls"]
+    monkeypatch.setattr(vosr2_mod, "VOSR2_FULL_IMAGE_MAX_PX", 16)
+    from PIL import Image
+
+    out = upscale_vosr2(Image.new("RGB", (16, 16), (10, 20, 30)), scale=2)
+    assert out.size == (32, 32)
+    assert any(call[0] == "tiled_latent_inference" for call in calls)
+    assert not any(call[0] == "encode_dispatch" for call in calls)
+    assert get_last_vosr2_timing()["tiling"] == "tiled"
+
+
+def test_vosr2_fails_closed_offline_without_prewarm(monkeypatch, tmp_path):
+    # No staged cache, no knob content, no hub content -> explicit
+    # VOSR2_UNAVAILABLE (and, by construction, no network attempt: the
+    # module has no socket surface at all).
+    calls: list = []
+    repo, weights = _write_fake_vosr2_bundle(tmp_path, with_dinov2=False)
+    for name, mod in _build_vosr2_stubs(calls).items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setenv("COMFYMODAL_VOSR2_WEIGHTS", str(weights))
+    monkeypatch.setenv("COMFYMODAL_VOSR2_REPO", str(repo))
+    for knob in (
+        "COMFYMODAL_VOSR2_DINOV2",
+        "COMFYMODAL_VOSR2_DINOV2_PATH",
+        "COMFYMODAL_VOSR2_TORCH_HUB",
+        "COMFYMODAL_VOSR2_SNAPSHOT_MODE",
+    ):
+        monkeypatch.delenv(knob, raising=False)
+    monkeypatch.setenv("TORCH_HUB_DIR", str(tmp_path / "empty_hub"))
+    _reset_vosr2_state()
+    try:
+        with pytest.raises(VOSR2Unavailable) as caught:
+            vosr2_static_init()
+        assert "VOSR2_UNAVAILABLE" in str(caught.value)
+        assert "dinov2" in str(caught.value).lower()
+    finally:
+        _reset_vosr2_state()
+
+
+def test_vosr2_lifecycle_arg_validation_and_missing_weights(
+    monkeypatch, tmp_path
+):
+    # snap= flags are contracts, not hints; missing bundles fail closed
+    # before any heavy work.
+    _reset_vosr2_state()
+    try:
+        with pytest.raises(VOSR2Unavailable):
+            vosr2_restore()  # before static init
+        with pytest.raises(VOSR2Unavailable):
+            vosr2_static_init(snap=False)
+        with pytest.raises(VOSR2Unavailable):
+            vosr2_restore(snap=True)
+        empty = tmp_path / "empty_weights"
+        empty.mkdir()
+        monkeypatch.setenv("COMFYMODAL_VOSR2_WEIGHTS", str(empty))
+        monkeypatch.delenv("COMFYMODAL_VOSR2_SNAPSHOT_MODE", raising=False)
+        with pytest.raises(VOSR2Unavailable) as caught:
+            vosr2_static_init()
+        assert "VOSR2_UNAVAILABLE" in str(caught.value)
+        assert "args.json" in str(caught.value)
+    finally:
+        _reset_vosr2_state()
+
+
+def test_modal_true_cold_lifecycle_wiring():
+    # Snapshot lifecycle mirrors Golden: enabling param on the serving
+    # function, startup(snap=True) -> static init, restore(snap=False) ->
+    # CUDA/H2D, additive vosr2_timing in the ok response.  Dispatch and the
+    # remote payload schema are untouched.
+    text = (ROOT / "studio_upscale_modal.py").read_text(encoding="utf-8")
+    assert "enable_memory_snapshot=True" in text
+    assert "def startup(snap: bool = True)" in text
+    assert "def restore(snap: bool = False)" in text
+    assert "vosr2_static_init" in text and "vosr2_restore" in text
+    assert '"vosr2_timing"' in text and '"png_encode_ms"' in text
+    assert "NO Modal GPU" in text or "NOT GPU" in text
+    # Remote contract stable: same entrypoint, same ok keys.
+    assert "def studio_upscale(payload: dict)" in text
+    assert '"status": "ok"' in text and '"image_b64"' in text
+    run_text = (ROOT / "studio_upscale_run.py").read_text(encoding="utf-8")
+    assert "vosr2_timing" not in run_text
+    seed_text = (ROOT / "studio_upscale_seedvr2.py").read_text(encoding="utf-8")
+    assert "vosr2" not in seed_text.lower()  # SeedVR2 shares nothing
