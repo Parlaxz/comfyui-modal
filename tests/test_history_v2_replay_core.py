@@ -1,11 +1,15 @@
 """Offline tests for the isolated History V2 replay core."""
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import sys
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -15,6 +19,8 @@ from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan
 from history_v2_models import RunAttempt
 from history_v2_replay import (
     OriginalDecision,
+    REASON_REFERENCE_CONTENT_MISMATCH,
+    REASON_REFERENCE_CONTENT_MISSING,
     ReplayCapabilityError,
     build_original_replay_plan,
     build_replay_dispatch,
@@ -24,6 +30,7 @@ from history_v2_replay import (
     validate_original_retry,
     validate_replay_capability,
     validate_replay_delta,
+    validate_studio_reference_content,
 )
 
 
@@ -299,6 +306,197 @@ class HistoryV2ReplayCoreTests(unittest.TestCase):
                 generation_id="gen_1",
                 attempt_id="run_original_2",
             )
+
+
+@pytest.mark.fast_unit
+class HistoryV2StudioReferencesReplayTests(unittest.TestCase):
+    """Lane D: Generate Original replays saved references, never ambient state.
+
+    - Saved graph + reference order + image bytes + bindings replay verbatim
+      from the snapshot; ambient "current prefs" are never consulted.
+    - Missing/unverifiable image content fails closed (irreproducible) and
+      is never substituted with current files.
+    - Legacy snapshots without the companion stay replay-capable.
+    """
+
+    def setUp(self) -> None:
+        self.image_bytes = {
+            "ref_b.png": b"fake-image-bytes-b",
+            "ref_a.png": b"fake-image-bytes-a",
+        }
+        workflow = {
+            "1": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 0, "steps": 0, "cfg": 0.0},
+            },
+            "12": {
+                "class_type": "ReferenceLoader",
+                "inputs": {"reference": "ref_b.png", "reference_2": "ref_a.png"},
+            },
+            "7": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+        }
+        options = ExecutionOptions(
+            production_enabled=True,
+            production_output_node_ids=("7",),
+            output_conversion_options={"format": "webp", "quality": 70},
+            result_route="history-v2",
+            profiling_level="detailed",
+            requested_backend="modal",
+            cancellation_options={"grace_seconds": 0},
+            progress_options={"events": False},
+            compatibility_flags={"legacy_mode": False},
+            legacy_passthrough={"future_option": {"enabled": True}},
+        )
+        input_images = {
+            name: base64.b64encode(payload).decode("ascii")
+            for name, payload in self.image_bytes.items()
+        }
+        self.plan = ExecutionPlan(
+            schema_version=1,
+            workflow=workflow,
+            workflow_hash="executed-workflow-hash",
+            source_workflow_hash="source-workflow-hash",
+            production_report={"enabled": True, "output_node_ids": ["7"]},
+            model_stack={"checkpoint": "frozen.safetensors"},
+            prompt_bundle={"prompt": "immutable prompt", "negative_prompt": "none"},
+            output_node_ids=("7",),
+            input_images=input_images,
+            execution_options=options,
+            request_metadata={
+                "workflow_id": "wf_frozen",
+                "workflow_version_id": "wv_frozen",
+                "preset_id": "preset_frozen",
+                "prompt_id": "preview-prompt",
+                "studio_controls": {"seed": 0, "steps": 0},
+            },
+            validation={"schema_version": 1, "validated": True, "certificate": "proof"},
+            deployment_identity={"app": "comfy", "revision": "deploy-1"},
+        )
+        self.raw_plan = self.plan.to_dict()
+        self.snapshot = {
+            "snapshot_id": "snap_refs",
+            "schema_version": 1,
+            "workflow": copy.deepcopy(self.raw_plan["workflow"]),
+            "workflow_hash": self.raw_plan["workflow_hash"],
+            "workflow_version_id": "wv_frozen",
+            "request": {
+                "workflow_id": "wf_frozen",
+                "workflow_version_id": "wv_frozen",
+                "preset_id": "preset_frozen",
+                "controls": {"seed": 0, "steps": 0},
+                "workflow_hash": self.raw_plan["workflow_hash"],
+                "source_workflow_hash": self.raw_plan["source_workflow_hash"],
+                "studio_references": {
+                    "method": "conditioning_slots",
+                    "origin_workflow_id": "wf_frozen",
+                    "origin_version_id": "wv_frozen",
+                    "executing_workflow_id": "wf_frozen",
+                    "executing_version_id": "wv_frozen",
+                    "card_ids": ["card_b", "card_a"],
+                    "images": [
+                        {
+                            "card_id": "card_b",
+                            "filename": "ref_b.png",
+                            "sha256": hashlib.sha256(
+                                self.image_bytes["ref_b.png"]
+                            ).hexdigest(),
+                            "byte_size": len(self.image_bytes["ref_b.png"]),
+                            "source": {"kind": "upload", "ref": "ref_b.png"},
+                        },
+                        {
+                            "card_id": "card_a",
+                            "filename": "ref_a.png",
+                            "sha256": hashlib.sha256(
+                                self.image_bytes["ref_a.png"]
+                            ).hexdigest(),
+                            "source": {"kind": "library", "ref": "lib://a"},
+                        },
+                    ],
+                    "slots": [
+                        {
+                            "card_id": "card_b",
+                            "node_id": "12",
+                            "socket": "reference",
+                            "kind": "reference",
+                            "order": 0,
+                        },
+                        {
+                            "card_id": "card_a",
+                            "node_id": "12",
+                            "socket": "reference_2",
+                            "kind": "reference",
+                            "order": 1,
+                        },
+                    ],
+                    "applied_order": ["card_b", "card_a"],
+                    "graph_hash": "executed-workflow-hash",
+                    "workflow_version_id": "wv_frozen",
+                    "provenance": {"source": "mapping"},
+                },
+            },
+            "preset_snapshot": {"preset_id": "preset_frozen"},
+            "generation_params": {"workflow_id": "wf_frozen"},
+            "execution_plan": copy.deepcopy(self.raw_plan),
+            "deployment_identity": copy.deepcopy(self.raw_plan["deployment_identity"]),
+        }
+
+    def test_matching_reference_content_is_replay_capable(self):
+        capability = validate_replay_capability(self.snapshot)
+        self.assertTrue(capability.capable, capability.reason)
+        content = validate_studio_reference_content(self.snapshot)
+        self.assertTrue(content.capable, content.reason)
+
+    def test_missing_reference_image_refuses_honestly(self):
+        snapshot = copy.deepcopy(self.snapshot)
+        del snapshot["execution_plan"]["input_images"]["ref_a.png"]
+        capability = validate_replay_capability(snapshot)
+        self.assertFalse(capability.capable)
+        self.assertEqual(capability.reason, REASON_REFERENCE_CONTENT_MISSING)
+        with self.assertRaises(ReplayCapabilityError):
+            load_replay_plan(snapshot)
+
+    def test_tampered_reference_bytes_refuse_honestly(self):
+        snapshot = copy.deepcopy(self.snapshot)
+        snapshot["execution_plan"]["input_images"]["ref_b.png"] = (
+            base64.b64encode(b"substituted-current-file").decode("ascii")
+        )
+        capability = validate_replay_capability(snapshot)
+        self.assertFalse(capability.capable)
+        self.assertEqual(capability.reason, REASON_REFERENCE_CONTENT_MISMATCH)
+
+    def test_legacy_snapshot_without_companion_stays_capable(self):
+        snapshot = copy.deepcopy(self.snapshot)
+        del snapshot["request"]["studio_references"]
+        capability = validate_replay_capability(snapshot)
+        self.assertTrue(capability.capable, capability.reason)
+
+    def test_dispatch_replays_saved_inputs_and_ignores_ambient_prefs(self):
+        # Ambient "current prefs": a decoy snapshot with different controls,
+        # images, and bindings.  Dispatch takes ONLY the saved snapshot, so
+        # nothing ambient can leak into the replayed plan.
+        decoy = copy.deepcopy(self.snapshot)
+        decoy["request"]["controls"] = {"seed": 999, "steps": 99}
+        decoy["execution_plan"]["input_images"] = {
+            "ref_b.png": base64.b64encode(b"current-file").decode("ascii")
+        }
+        dispatch = build_replay_dispatch(
+            self.snapshot,
+            generation_id="gen_refs",
+            attempt_id="run_original_refs",
+            snapshot_id="snap_refs",
+            request_id="req_refs",
+        )
+        saved_images = self.snapshot["execution_plan"]["input_images"]
+        self.assertEqual(dict(dispatch.plan.input_images), saved_images)
+        for name, payload in self.image_bytes.items():
+            self.assertEqual(
+                base64.b64decode(dispatch.plan.input_images[name]), payload
+            )
+        self.assertEqual(dispatch.plan.workflow_hash, "executed-workflow-hash")
+        self.assertEqual(
+            dispatch.plan.to_dict()["workflow"],
+            self.snapshot["execution_plan"]["workflow"],
+        )
 
 
 if __name__ == "__main__":

@@ -55,6 +55,10 @@ import {
 import {
   BINDABLE_INPUTS,
   OUTPUT_BINDING,
+  REFERENCE_METHOD_IDS,
+  applyReferenceConfirmation,
+  buildReferencePayload,
+  isReferenceSelectionValid,
   T2I_REQUIRED_INPUTS,
   T2I_OPTIONAL_INPUTS,
   I2I_REQUIRED_INPUTS,
@@ -421,6 +425,29 @@ export function isValidConcreteBinding(val, key) {
   return !!(val.widgetName || val.inputName);
 }
 
+// ── Phase 8 references (bounded wizard extension) ───────────────────────
+// Which conditioning candidate, which sockets are refs vs the reserved I2I
+// source, Method-2 chain + VAE + consumer boundary, confirmed order +
+// capacity. Shows node ids/sockets/path summaries; blocks ambiguous or
+// invalid saves; persists via Mapping creation/revision. References are
+// opt-in: untouched wizards save exactly as before.
+//
+// The pure selection rules (isReferenceSelectionValid, buildReferencePayload,
+// applyReferenceConfirmation) live in studio-bindable-inputs.js beside the
+// frozen REFERENCE_METHODS catalog and are unit-tested there; this module
+// owns only fetching + rendering.
+
+export async function fetchReferenceCandidates(apiBase, versionId) {
+  const base = String(apiBase || "/comfymodal").replace(/\/$/, "");
+  const url = base + "/studio/workflows/versions/" + encodeURIComponent(String(versionId || "")) + "/references/candidates";
+  const resp = await fetch(url, { method: "GET" });
+  if (!resp || !resp.ok) {
+    const text = resp ? await resp.text().catch(() => "") : "";
+    throw new Error(text || ("Reference candidates unavailable (" + (resp ? resp.status : "?") + ")"));
+  }
+  return resp.json();
+}
+
 function _mappingToBindings(mapping) {
   const bindings = {};
   const source = mapping && mapping.mapping && typeof mapping.mapping === "object"
@@ -516,6 +543,18 @@ function makeInitialState(options) {
     step: "features",           // features | bindings | details | saving | saved | error
     selectedFeatures: [],
     bindings: {},               // { [bindingKey]: bindingTarget | null }
+    // Phase 8 references (opt-in): which conditioning candidate, which
+    // sockets are refs vs the reserved I2I source, Method-2 chain + VAE +
+    // consumer boundary, confirmed order + capacity. Nothing auto-binds.
+    referenceEnabled: false,
+    referenceMethod: "",
+    referenceCandidateId: "",
+    referenceSlots: [],         // [{ nodeId, socket, order, kind }]
+    referenceReserved: null,    // { nodeId, socket } | null
+    referenceChain: null,       // Method-2 chain boundary | null
+    referenceConfirmed: false,
+    referenceCandidates: null,  // server discovery payload | null
+    referenceStatus: "",
     textGenerateBinding: null,  // optional execution target, never a catalog row
     suggestedTextGenerateTargets: [],
     bindingCaptureActive: null, // bindingKey currently being captured, or null
@@ -953,7 +992,7 @@ function renderWizard(panel, state) {
       onclick: () => navigateStep("bindings"),
     }));
   } else if (state.step === "bindings") {
-    const allRequiredBound = checkAllRequiredBindings(state);
+    const allRequiredBound = checkAllRequiredBindings(state) && isReferenceSelectionValid(state);
     const graphOk = graphContext.ok || state.graphCaptured;
 
     footer.appendChild(el("button", {
@@ -979,8 +1018,8 @@ function renderWizard(panel, state) {
   } else if (state.step === "details") {
     const graphReady = getComfyGraphContext().ok || state.graphCaptured;
     const canSave = state.isVersionSetup
-      ? checkAllRequiredBindings(state) && graphReady
-      : state.details.name.trim().length > 0 && checkAllRequiredBindings(state) && graphReady;
+      ? checkAllRequiredBindings(state) && isReferenceSelectionValid(state) && graphReady
+      : state.details.name.trim().length > 0 && checkAllRequiredBindings(state) && isReferenceSelectionValid(state) && graphReady;
     footer.appendChild(el("button", {
       class: "comfymodal-secondary-btn",
       text: "Back to Bindings",
@@ -1385,6 +1424,9 @@ function renderBindingsStep(body, state) {
     body.appendChild(execution);
   }
 
+  // ── References (Phase 8, opt-in) ────────────────────────────────────
+  body.appendChild(renderReferenceSection(state));
+
   // ── Binding summary (T2I save gate) ─────────────────────────────────
   // Save stays blocked until every required role holds a valid concrete
   // binding (exact node widget/field). Non-catalog bindings never count.
@@ -1396,6 +1438,180 @@ function renderBindingsStep(body, state) {
     text: `${boundCount} of ${requiredKeys.length} required bindings complete • API graph ${graphOk ? "ready" : "unavailable"}`,
   });
   body.appendChild(summary);
+}
+
+// Renders the opt-in reference section: candidate pick, ref-vs-source
+// sockets, Method-2 chain + VAE + consumer boundary, order + capacity
+// confirmation. Shows node ids/sockets/path summaries; ambiguous or invalid
+// selections fail the save gate via isReferenceSelectionValid.
+function renderReferenceSection(state) {
+  const section = el("div", {
+    class: "comfymodal-studio-wizard-reference-section",
+    "data-testid": "wizard-reference-section",
+    style: "margin:16px 0 4px;padding:10px 12px;border:1px solid rgba(255,255,255,.10);border-radius:8px;",
+  }, [
+    el("strong", { text: "Reference images (optional)", style: "font-size:12px;display:block;margin-bottom:3px;" }),
+    el("p", { text: "Confirm which conditioning candidate, which sockets take references vs the I2I source, and the chain boundary. Nothing binds until you confirm.", style: "font-size:10px;color:#888;margin:0 0 8px;" }),
+  ]);
+  const data = state.referenceCandidates;
+  const candidates = (data && Array.isArray(data.candidates) ? data.candidates : []);
+  const enableRow = el("label", { style: "display:flex;gap:6px;align-items:center;font-size:11px;margin-bottom:8px;" });
+  const toggle = el("input", { type: "checkbox" });
+  toggle.checked = !!state.referenceEnabled;
+  toggle.setAttribute("data-testid", "wizard-reference-enable");
+  toggle.addEventListener("change", () => {
+    state.referenceEnabled = !!toggle.checked;
+    if (!state.referenceEnabled) {
+      state.referenceMethod = "";
+      state.referenceCandidateId = "";
+      state.referenceConfirmed = false;
+    }
+    _rerenderWizardRef(state);
+  });
+  enableRow.appendChild(toggle);
+  enableRow.appendChild(el("span", { text: "This workflow takes reference images" }));
+  section.appendChild(enableRow);
+  if (!state.referenceEnabled) return section;
+  if (!data) {
+    section.appendChild(el("p", {
+      "data-testid": "wizard-reference-loading",
+      style: "font-size:10px;color:#888;margin:0 0 8px;",
+      text: state.referenceStatus || "Loading reference candidates…",
+    }));
+    section.appendChild(el("button", {
+      class: "comfymodal-secondary-btn", text: "Scan graph for references",
+      "data-testid": "wizard-reference-scan",
+      style: "width:auto;padding:4px 9px;font-size:10px;",
+      onclick: async (event) => {
+        event.preventDefault();
+        state.referenceStatus = "Scanning…";
+        _rerenderWizardRef(state);
+        try {
+          const result = await fetchReferenceCandidates(state._apiBase, state.workflowVersionId);
+          state.referenceCandidates = result;
+          state.referenceStatus = "";
+        } catch (err) {
+          state.referenceStatus = (err && err.message) || "Could not load reference candidates.";
+        }
+        _rerenderWizardRef(state);
+      },
+    }));
+    return section;
+  }
+  if (!candidates.length) {
+    section.appendChild(el("p", {
+      "data-testid": "wizard-reference-empty",
+      style: "font-size:10px;color:#888;margin:0 0 8px;",
+      text: "No reference structure evidenced — this workflow is incompatible with reference methods.",
+    }));
+    return section;
+  }
+  if (data.truncated) {
+    section.appendChild(el("p", {
+      "data-testid": "wizard-reference-truncated",
+      style: "font-size:10px;color:#fbbf24;margin:0 0 8px;",
+      text: "Candidate list is incomplete (truncated). Confirm from the full graph before saving.",
+    }));
+  }
+  const selector = el("select", {
+    class: "comfymodal-input",
+    "data-testid": "wizard-reference-candidate",
+    "aria-label": "Reference candidate",
+    style: "width:100%;margin-bottom:8px;",
+    onchange: () => {
+      state.referenceCandidateId = String(selector.value || "");
+      _rerenderWizardRef(state);
+    },
+  });
+  selector.appendChild(el("option", { value: "", text: candidates.length > 1 ? "Select a candidate to confirm…" : "Select the candidate to confirm…" }));
+  candidates.forEach((c) => {
+    const cap = c.capacity || {};
+    const label = c.method + " — node " + c.node_id
+      + (c.method === "conditioning_slots" ? " — slots " + (c.slot_order || []).join(", ") + " (capacity " + (cap.kind || "?") + ")" : "")
+      + (c.method === "reference_latent_chain" && c.chain ? " — chain " + (c.chain.order || []).join(" > ") : "")
+      + (c.compatible ? "" : " (unsupported: " + (c.reasons || []).join("; ") + ")");
+    const option = el("option", { value: String(c.candidate_id || ""), text: label });
+    if (String(c.candidate_id) === String(state.referenceCandidateId)) option.selected = true;
+    selector.appendChild(option);
+  });
+  section.appendChild(selector);
+  const selected = candidates.find((c) => String(c.candidate_id) === String(selector.value)) || null;
+  if (selected) {
+    const detail = selected.method === "conditioning_slots"
+      ? "Node " + selected.node_id + " — sockets " + (selected.slot_order || []).join(", ")
+        + " — capacity " + JSON.stringify(selected.capacity || {})
+        + (selected.needs_isolated_branch ? " — needs isolated loader branch" : "")
+      : "Chain " + ((selected.chain && selected.chain.order) || []).join(" > ")
+        + " — VAE " + ((selected.chain && selected.chain.vae_node_id) || "?");
+    section.appendChild(el("p", {
+      "data-testid": "wizard-reference-detail",
+      style: "font-size:10px;color:#aaa;margin:0 0 8px;",
+      text: detail,
+    }));
+  }
+  const actions = el("div", { style: "display:flex;gap:6px;align-items:center;flex-wrap:wrap;" });
+  actions.appendChild(el("button", {
+    class: "comfymodal-secondary-btn", text: "Confirm selection",
+    "data-testid": "wizard-reference-confirm",
+    style: "width:auto;padding:4px 9px;font-size:10px;", disabled: !selected,
+    onclick: (event) => {
+      event.preventDefault();
+      if (!selected) return;
+      applyReferenceConfirmation(state, String(selected.candidate_id), selected.method);
+      _rerenderWizardRef(state);
+    },
+  }));
+  if (state.referenceConfirmed && state.referenceCandidateId) {
+    actions.appendChild(el("span", {
+      "data-testid": "wizard-reference-confirmed",
+      style: "font-size:10px;color:#4ade80;",
+      text: "Confirmed: " + state.referenceMethod + " — " + state.referenceCandidateId,
+    }));
+    actions.appendChild(el("button", {
+      class: "comfymodal-secondary-btn", text: "Clear",
+      style: "width:auto;padding:4px 9px;font-size:10px;",
+      onclick: () => {
+        state.referenceMethod = "";
+        state.referenceCandidateId = "";
+        state.referenceConfirmed = false;
+        state.referenceSlots = [];
+        state.referenceChain = null;
+        _rerenderWizardRef(state);
+      },
+    }));
+  }
+  section.appendChild(actions);
+  if (state.referenceEnabled && !isReferenceSelectionValid(state)) {
+    section.appendChild(el("p", {
+      "data-testid": "wizard-reference-invalid",
+      style: "font-size:10px;color:#fbbf24;margin:8px 0 0;",
+      text: "Ambiguous or invalid reference selection — confirm one candidate, sockets, order, and capacity before saving.",
+    }));
+  }
+  return section;
+}
+
+function _rerenderWizardRef(state) {
+  try {
+    const root = (typeof _wizardRoot !== "undefined" && _wizardRoot) ? _wizardRoot : null;
+    const panel = root && root.querySelector ? root.querySelector(".comfymodal-studio-wizard-panel") : null;
+    if (panel) renderWizard(panel, state);
+  } catch (_e) { /* best-effort */ }
+}
+
+async function prefetchReferenceCandidates(state) {
+  if (!state || !state.isVersionSetup || !state.workflowVersionId) return;
+  if (state.referenceCandidates) return;
+  state.referenceStatus = state.referenceStatus || "Loading reference candidates…";
+  try {
+    const result = await fetchReferenceCandidates(state._apiBase, state.workflowVersionId);
+    if (state.referenceCandidates) return;
+    state.referenceCandidates = result;
+    state.referenceStatus = "";
+  } catch (_e) {
+    state.referenceStatus = "Reference candidates unavailable.";
+  }
+  _rerenderWizardRef(state);
 }
 
 // ── Step: Dependencies (version-setup mode) ─────────────────────────────
@@ -2591,6 +2807,15 @@ function renderDetailsStep(body, state) {
     const summary = el("div", { style: "margin-top:12px;padding:8px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:3px;" });
     summary.appendChild(el("p", { text: `Features: ${state.selectedFeatures.join(", ")}`, style: "font-size:11px;color:#888;margin:0 0 4px;" }));
     summary.appendChild(el("p", { text: `Bindings: ${Object.keys(state.bindings).length} configured`, style: "font-size:11px;color:#888;margin:0;" }));
+    summary.appendChild(el("p", {
+      "data-testid": "wizard-details-reference",
+      style: "font-size:11px;color:#888;margin:4px 0 0;",
+      text: state.referenceEnabled
+        ? (isReferenceSelectionValid(state)
+          ? `References: ${state.referenceMethod} — ${state.referenceCandidateId || "dedicated"} (confirmed)`
+          : "References: invalid — go back and confirm before saving")
+        : "References: none",
+    }));
     body.appendChild(summary);
     return;
   }
@@ -2618,7 +2843,7 @@ function renderDetailsStep(body, state) {
     state.details.name = nameInput.value;
     const saveBtn = _wizardRoot && _wizardRoot.querySelector('[data-role="save-setup"]');
     if (saveBtn) {
-      saveBtn.disabled = !(state.details.name.trim().length > 0 && checkAllRequiredBindings(state) && getComfyGraphContext().ok);
+      saveBtn.disabled = !(state.details.name.trim().length > 0 && checkAllRequiredBindings(state) && isReferenceSelectionValid(state) && getComfyGraphContext().ok);
     }
   });
   nameGroup.appendChild(nameInput);
@@ -2802,9 +3027,11 @@ async function executeSave(state) {
     // version already has one. The T2I save gate is re-checked here (never
     // trust the button state alone); no snapshot or preset is created.
     if (state.isVersionSetup) {
-      if (!checkAllRequiredBindings(state)) {
+      if (!checkAllRequiredBindings(state) || !isReferenceSelectionValid(state)) {
         state.step = "error";
-        state.errorMessage = "All required bindings must be confirmed before saving.";
+        state.errorMessage = !isReferenceSelectionValid(state)
+          ? "Reference selection is ambiguous or invalid. Confirm one candidate, sockets, order, and capacity before saving."
+          : "All required bindings must be confirmed before saving.";
         return;
       }
   const mappingPayload = buildVersionMappingPayload(state);
@@ -2976,9 +3203,38 @@ async function prefetchVersionSetupGraph(state) {
      if (!state.textGenerateBinding) {
        state.textGenerateBinding = _textGenerateBindingFromMapping(mappingResponse);
      }
+     _restoreReferenceFromMapping(state, mappingResponse);
   }
+  prefetchReferenceCandidates(state);
   const panel = _wizardRoot && _wizardRoot.querySelector(".comfymodal-studio-wizard-panel");
   if (panel) renderWizard(panel, state);
+}
+
+function _restoreReferenceFromMapping(state, mappingResponse) {
+  try {
+    const source = mappingResponse && mappingResponse.mapping && typeof mappingResponse.mapping === "object"
+      ? mappingResponse.mapping : mappingResponse;
+    const method = source && typeof source.reference_method === "string" ? source.reference_method : "";
+    const bindings = source && typeof source.reference_bindings === "object" ? source.reference_bindings : null;
+    if (!method || REFERENCE_METHOD_IDS.indexOf(method) === -1 || !bindings) return;
+    if (state.referenceEnabled && state.referenceConfirmed) return;
+    state.referenceEnabled = true;
+    state.referenceMethod = method;
+    state.referenceCandidateId = bindings.candidate_id ? String(bindings.candidate_id) : "";
+    const slots = Array.isArray(bindings.slots) ? bindings.slots : [];
+    state.referenceSlots = slots.map((s) => ({
+      nodeId: s.node_id, socket: s.socket, order: s.order, kind: s.kind || "reference",
+    }));
+    state.referenceReserved = bindings.reserved_source_socket
+      ? { nodeId: bindings.reserved_source_socket.node_id, socket: bindings.reserved_source_socket.socket }
+      : null;
+    state.referenceChain = bindings.chain ? { ...bindings.chain } : null;
+    if (method === "dedicated") {
+      state.referenceDedicatedTarget = bindings.dedicated_target || "";
+      state.referenceCandidateId = "";
+    }
+    state.referenceConfirmed = !!(state.referenceCandidateId || method === "dedicated");
+  } catch (_e) { /* best-effort */ }
 }
 
 /** Catalog block → server mapping control_kind vocabulary. */
@@ -3038,11 +3294,15 @@ function buildVersionMappingPayload(state) {
     };
   });
   if (Object.keys(entries).length === 0) return null;
+  const referencePayload = buildReferencePayload(state);
+  if (referencePayload === null) return null;
   return {
     entries: entries,
     output_node_id: String(outputBinding.nodeId),
     text_generate_node_id: state.textGenerateBinding && state.textGenerateBinding.nodeId != null
       ? String(state.textGenerateBinding.nodeId) : null,
+    reference_method: referencePayload.reference_method,
+    reference_bindings: referencePayload.reference_bindings,
   };
 }
 
@@ -3226,4 +3486,5 @@ export {
   checkAllRequiredBindings,
   applySuggestedBinding,
   T2I_SAVE_GATE_KEYS,
+  renderReferenceSection,
 };

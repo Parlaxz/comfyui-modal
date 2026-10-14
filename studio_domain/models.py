@@ -55,6 +55,31 @@ OUTPUT_NODE_CLASSES: tuple[str, ...] = (
 )
 
 
+# ── Reference methods (Phase 8, Lane A) ─────────────────────────────────
+# Frozen method ids. Never rename: the Wizard, Mapping records, and the
+# ``studio_references`` run companion all key on these exact strings.
+REFERENCE_METHOD_IDS: frozenset[str] = frozenset({
+    "conditioning_slots",
+    "reference_latent_chain",
+    "dedicated",
+})
+
+REFERENCE_METHOD_LABELS: dict[str, str] = {
+    "conditioning_slots": "Conditioning slots",
+    "reference_latent_chain": "Reference latent chain",
+    "dedicated": "Dedicated reference workflow",
+}
+
+# Version-bound reference bindings live on the existing Mapping record (no
+# second store, no graph DSL, no model-family identifiers): concrete node
+# ids, socket names, output indices, edges, slot order, the reserved I2I
+# source socket, and — for Method-2 — the chain boundary.
+REFERENCE_BINDING_SOCKET_KINDS: frozenset[str] = frozenset({
+    "reference",
+    "source",
+})
+
+
 # ── Errors ───────────────────────────────────────────────────────────────
 
 
@@ -317,6 +342,11 @@ class Mapping:
     output_node_id: str = ""
     text_generate_node_id: Optional[str] = None
     entries: dict[str, MappingEntry] = field(default_factory=dict)
+    # Phase 8 reference bindings: version-bound, concrete only (node ids,
+    # socket names, output indices, edges, slot order, reserved source
+    # socket, Method-2 chain boundary). Empty/"" means unbound.
+    reference_method: str = ""
+    reference_bindings: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -327,6 +357,8 @@ class Mapping:
             "output_node_id": self.output_node_id,
             "text_generate_node_id": self.text_generate_node_id,
             "entries": [e.to_dict() for e in self.entries.values()],
+            "reference_method": self.reference_method,
+            "reference_bindings": dict(self.reference_bindings or {}),
         }
 
     @classmethod
@@ -337,6 +369,10 @@ class Mapping:
                 entry = MappingEntry.from_dict(raw)
                 if entry.semantic_role:
                     entries[entry.semantic_role] = entry
+        method = str(data.get("reference_method", "") or "")
+        if method not in REFERENCE_METHOD_IDS:
+            method = "" if method else method
+        bindings = data.get("reference_bindings")
         return cls(
             mapping_id=str(data.get("mapping_id", "")),
             workflow_version_id=str(data.get("workflow_version_id", "")),
@@ -349,7 +385,155 @@ class Mapping:
                 else str(data.get("text_generate_node_id"))
             ),
             entries=entries,
+            reference_method=method,
+            reference_bindings=(
+                dict(bindings) if isinstance(bindings, dict) else {}
+            ),
         )
+
+
+# ── Reference binding helpers ────────────────────────────────────────────
+
+
+def normalize_reference_bindings(
+    method: Any, bindings: Any
+) -> tuple[str, dict[str, Any], list[str]]:
+    """Normalize a reference method + bindings pair without graph access.
+
+    Returns ``(method, normalized, problems)``. Never raises. Structural
+    only: method must be a frozen id; bindings must be a dict carrying only
+    concrete addressing (node ids, socket names, output indices, edges,
+    slot order, reserved source socket, chain boundary). Unknown keys are
+    dropped; malformed shapes are reported, never coerced into evidence.
+    """
+    problems: list[str] = []
+    name = str(method or "")
+    if name and name not in REFERENCE_METHOD_IDS:
+        return "", {}, [f"unknown reference method {name!r}"]
+    if not name:
+        return "", {}, []
+    if not isinstance(bindings, dict):
+        return name, {}, [f"reference bindings for {name!r} must be an object"]
+    normalized: dict[str, Any] = {}
+    try:
+        candidate_id = bindings.get("candidate_id", bindings.get("candidateId", ""))
+        if candidate_id is not None and str(candidate_id) != "":
+            normalized["candidate_id"] = str(candidate_id)
+        slots = bindings.get("slots", bindings.get("slot_order", []))
+        if isinstance(slots, dict):
+            slots = list(slots.values())
+        norm_slots: list[dict[str, Any]] = []
+        if isinstance(slots, (list, tuple)):
+            for raw in slots:
+                if not isinstance(raw, dict):
+                    continue
+                node_id = str(raw.get("node_id", raw.get("nodeId", "")) or "")
+                socket = str(raw.get("socket", raw.get("socket_name", raw.get("input_name", ""))) or "")
+                if not node_id or not socket:
+                    continue
+                entry: dict[str, Any] = {"node_id": node_id, "socket": socket}
+                kind = str(raw.get("kind", raw.get("role", "reference")) or "reference")
+                entry["kind"] = kind if kind in REFERENCE_BINDING_SOCKET_KINDS else "reference"
+                try:
+                    entry["order"] = int(raw.get("order", len(norm_slots)))
+                except (TypeError, ValueError):
+                    entry["order"] = len(norm_slots)
+                out_idx = raw.get("output_index", raw.get("outputIndex"))
+                if out_idx is not None:
+                    try:
+                        entry["output_index"] = int(out_idx)
+                    except (TypeError, ValueError):
+                        pass
+                edge = raw.get("edge", raw.get("edge_id"))
+                if edge is not None and str(edge) != "":
+                    entry["edge"] = str(edge)
+                norm_slots.append(entry)
+        norm_slots.sort(key=lambda s: (int(s.get("order", 0)), s.get("node_id", ""), s.get("socket", "")))
+        # Re-number densely so order is always 0..n-1 in slot order.
+        for idx, entry in enumerate(norm_slots):
+            entry["order"] = idx
+        normalized["slots"] = norm_slots
+        reserved = bindings.get("reserved_source_socket", bindings.get("reservedSourceSocket"))
+        if isinstance(reserved, dict):
+            rid = str(reserved.get("node_id", reserved.get("nodeId", "")) or "")
+            rsock = str(reserved.get("socket", reserved.get("socket_name", reserved.get("input_name", ""))) or "")
+            if rid and rsock:
+                normalized["reserved_source_socket"] = {"node_id": rid, "socket": rsock}
+        elif reserved is not None and not isinstance(reserved, dict):
+            problems.append("reserved source socket must be an object")
+        chain = bindings.get("chain", bindings.get("chain_boundary", bindings.get("chainBoundary")))
+        if isinstance(chain, dict):
+            norm_chain: dict[str, Any] = {}
+            for key in ("loader_node_id", "vae_encode_node_id", "reference_latent_node_id",
+                        "consumer_node_id", "vae_node_id"):
+                val = chain.get(key)
+                if val is not None and str(val) != "":
+                    norm_chain[key] = str(val)
+            for key in ("loader_socket", "vae_socket", "latent_socket", "conditioning_socket"):
+                val = chain.get(key)
+                if val is not None and str(val) != "":
+                    norm_chain[key] = str(val)
+            edges = chain.get("edges")
+            if isinstance(edges, list):
+                norm_chain["edges"] = [str(e) for e in edges if str(e) != ""]
+            order = chain.get("order")
+            if isinstance(order, list):
+                norm_chain["order"] = [str(o) for o in order if str(o) != ""]
+            if norm_chain:
+                normalized["chain"] = norm_chain
+        dedicated = bindings.get("dedicated_target", bindings.get("dedicatedTarget"))
+        if dedicated is not None and str(dedicated) != "":
+            normalized["dedicated_target"] = str(dedicated)
+        cards = bindings.get("card_ids", bindings.get("cardIds"))
+        if isinstance(cards, list):
+            normalized["card_ids"] = [str(c) for c in cards if str(c) != ""]
+    except Exception:
+        problems.append("reference bindings are malformed")
+    return name, normalized, problems
+
+
+def build_studio_references_companion(
+    *,
+    method: str,
+    origin_workflow_id: str,
+    origin_version_id: str,
+    bindings: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the top-level ``studio_references`` run companion.
+
+    Explicit method, origin workflow/version, dedicated target where
+    applicable, ordered card ids, server image refs (empty until the run
+    attaches uploads), and source provenance. Never carries client graph
+    patches — only addressing the server resolves against the version's
+    stored graph. Never raises.
+    """
+    cards: list[str] = []
+    dedicated_target = ""
+    try:
+        src = bindings if isinstance(bindings, dict) else {}
+        raw_cards = src.get("card_ids", [])
+        if isinstance(raw_cards, list) and [c for c in raw_cards if str(c) != ""]:
+            cards = [str(c) for c in raw_cards if str(c) != ""]
+        else:
+            slots = src.get("slots", [])
+            if isinstance(slots, list):
+                cards = [
+                    f"{s.get('node_id')}:{s.get('socket')}"
+                    for s in slots
+                    if isinstance(s, dict) and s.get("node_id") and s.get("socket")
+                ]
+        dedicated_target = str(src.get("dedicated_target", "") or "")
+    except Exception:
+        pass
+    return {
+        "method": str(method or ""),
+        "origin_workflow_id": str(origin_workflow_id or ""),
+        "origin_version_id": str(origin_version_id or ""),
+        "dedicated_target": dedicated_target,
+        "card_ids": list(cards),
+        "images": [],
+        "provenance": {"source": "mapping"},
+    }
 
 
 # ── Derived states ───────────────────────────────────────────────────────

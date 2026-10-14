@@ -271,6 +271,127 @@ export const OUTPAINT_OPTIONAL_INPUTS = Object.freeze([
   "mask",
 ]);
 
+// Phase 8 references — frozen method ids. Never rename: the Mapping record,
+// the setup wizard, and the `studio_references` run companion key on these.
+export const REFERENCE_METHODS = Object.freeze({
+  conditioning_slots: Object.freeze({
+    key: "conditioning_slots",
+    name: "Conditioning slots",
+    description: "Reference images as extra CONDITIONING inputs on the active path.",
+  }),
+  reference_latent_chain: Object.freeze({
+    key: "reference_latent_chain",
+    name: "Reference latent chain",
+    description: "Loader IMAGE to VAEEncode to ReferenceLatent chain boundary.",
+  }),
+  dedicated: Object.freeze({
+    key: "dedicated",
+    name: "Dedicated reference workflow",
+    description: "A dedicated reference workflow target.",
+  }),
+});
+
+export const REFERENCE_METHOD_IDS = Object.freeze(Object.keys(REFERENCE_METHODS));
+
+export function getReferenceMethod(key) {
+  return REFERENCE_METHODS[key] || null;
+}
+
+function _referenceCandidateById(state, candidateId) {
+  const list = (state && state.referenceCandidates && state.referenceCandidates.candidates) || [];
+  return list.find((c) => c && String(c.candidate_id) === String(candidateId)) || null;
+}
+
+// Pure reference-selection rules shared with the setup wizard: which
+// conditioning candidate, which sockets are refs vs the reserved I2I
+// source, Method-2 chain boundary, confirmed order + capacity. Operates on
+// plain state objects; never touches the DOM or network.
+export function isReferenceSelectionValid(state) {
+  if (!state || !state.referenceEnabled) return true;
+  if (!state.referenceMethod || REFERENCE_METHOD_IDS.indexOf(state.referenceMethod) === -1) return false;
+  if (state.referenceMethod === "dedicated") return state.referenceConfirmed === true;
+  const candidate = _referenceCandidateById(state, state.referenceCandidateId);
+  if (!candidate) return false;
+  if (state.referenceConfirmed !== true) return false;
+  if (state.referenceMethod === "conditioning_slots") {
+    const slots = Array.isArray(state.referenceSlots) ? state.referenceSlots : [];
+    const refs = slots.filter((s) => s && s.kind !== "source");
+    if (!refs.length) return false;
+    return refs.every((s) => s.nodeId != null && s.socket);
+  }
+  if (state.referenceMethod === "reference_latent_chain") {
+    const chain = state.referenceChain;
+    return !!(chain && chain.reference_latent_node_id);
+  }
+  return false;
+}
+
+export function buildReferencePayload(state) {
+  if (!state || !state.referenceEnabled) return { reference_method: "", reference_bindings: {} };
+  if (!isReferenceSelectionValid(state)) return null;
+  if (state.referenceMethod === "dedicated") {
+    return {
+      reference_method: "dedicated",
+      reference_bindings: {
+        dedicated_target: state.referenceDedicatedTarget || "",
+        card_ids: [],
+      },
+    };
+  }
+  const candidate = _referenceCandidateById(state, state.referenceCandidateId);
+  if (!candidate) return null;
+  const slots = (Array.isArray(state.referenceSlots) ? state.referenceSlots : []).map((s, idx) => ({
+    node_id: String(s.nodeId),
+    socket: String(s.socket),
+    order: idx,
+    kind: s.kind === "source" ? "source" : "reference",
+  }));
+  const payload = { candidate_id: String(state.referenceCandidateId), slots };
+  if (state.referenceReserved && state.referenceReserved.nodeId != null && state.referenceReserved.socket) {
+    payload.reserved_source_socket = {
+      node_id: String(state.referenceReserved.nodeId),
+      socket: String(state.referenceReserved.socket),
+    };
+  }
+  if (state.referenceMethod === "reference_latent_chain" && state.referenceChain) {
+    payload.chain = { ...state.referenceChain };
+  }
+  return { reference_method: state.referenceMethod, reference_bindings: payload };
+}
+
+export function applyReferenceConfirmation(state, candidateId, method) {
+  if (!state) return false;
+  const candidate = _referenceCandidateById(state, candidateId);
+  if (!candidate || (method && candidate.method !== method)) return false;
+  state.referenceMethod = candidate.method;
+  state.referenceCandidateId = String(candidate.candidate_id || "");
+  if (candidate.method === "conditioning_slots") {
+    const slots = Array.isArray(candidate.slots) ? candidate.slots : [];
+    state.referenceSlots = slots.map((s, idx) => ({
+      nodeId: s.node_id,
+      socket: s.socket,
+      order: idx,
+      kind: s.kind || "reference",
+    }));
+    const cap = candidate.capacity || {};
+    state.referenceReserved = cap.reserved_source_socket
+      ? { nodeId: cap.reserved_source_socket.node_id, socket: cap.reserved_source_socket.socket }
+      : null;
+    state.referenceChain = null;
+  } else if (candidate.method === "reference_latent_chain") {
+    state.referenceChain = candidate.chain ? { ...candidate.chain } : null;
+    state.referenceSlots = [];
+    state.referenceReserved = null;
+  }
+  state.referenceConfirmed = true;
+  state.referenceEnabled = true;
+  return true;
+}
+
+export function listReferenceMethods() {
+  return REFERENCE_METHOD_IDS.map((key) => REFERENCE_METHODS[key]);
+}
+
 export function getBindableInput(key) {
   return BINDABLE_INPUTS[key] || null;
 }

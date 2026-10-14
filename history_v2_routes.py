@@ -780,6 +780,28 @@ def _workflow_name(workflow_json: Any, preset_snapshot: Any = None) -> Optional[
     return None
 
 
+def _studio_references_from_snapshot(
+    snapshot: Optional[RequestSnapshot],
+) -> Optional[dict[str, Any]]:
+    """Project the saved ``studio_references`` companion (Lane D).
+
+    Verbatim passthrough of the normalized record stored in the request
+    snapshot (explicit method, origin/executing identities, ordered card
+    ids, image identity + source provenance, slot/chain assignments,
+    applied order, graph hash).  None when the snapshot predates the
+    companion (legacy records stay valid) — never synthesized.
+    """
+    if snapshot is None:
+        return None
+    request = snapshot.request
+    if not isinstance(request, dict):
+        return None
+    references = request.get("studio_references")
+    if not isinstance(references, dict) or not references:
+        return None
+    return dict(references)
+
+
 def _generation_feed_item(
     g: dict[str, Any],
     assets: list[Asset],
@@ -874,6 +896,8 @@ def _generation_feed_item(
         "original_available": has_original,
         "featured_output_index": featured_index,
         "outputs": outputs,
+        # Lane D: saved studio references (None on legacy records).
+        "studio_references": _studio_references_from_snapshot(snapshot),
         **_replay_capability_fields(snapshot, g),
     }
 
@@ -1326,6 +1350,8 @@ def _cell_generation_payload(
         "request_snapshot": (
             _snapshot_dict(snapshot) if snapshot is not None else None
         ),
+        # Lane D: saved studio references (None on legacy records).
+        "studio_references": _studio_references_from_snapshot(snapshot),
         "outputs": _build_outputs(
             detail.assets, attempts=attempts, export_state_of=export_state_of
         ),

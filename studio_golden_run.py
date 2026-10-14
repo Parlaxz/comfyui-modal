@@ -550,6 +550,7 @@ def _golden_history_meta(
     method: str = "",
     studio_method: Mapping[str, Any] | None = None,
     studio_style: Mapping[str, Any] | None = None,
+    studio_references: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     controls_map = controls if isinstance(controls, Mapping) else {}
     actual_method = method or profile.target["method"]
@@ -578,6 +579,14 @@ def _golden_history_meta(
     if isinstance(studio_style, Mapping):
         try:
             meta["studio_style"] = json.loads(json.dumps(dict(studio_style)))
+        except Exception:
+            pass
+    # Phase 8: frozen reference companion (method + ordered images +
+    # origin/executing identities). Provenance only; execution never reads
+    # it back.
+    if isinstance(studio_references, Mapping):
+        try:
+            meta["studio_references"] = json.loads(json.dumps(dict(studio_references)))
         except Exception:
             pass
     return meta
@@ -613,6 +622,7 @@ def _begin_golden_history(
     method: str = "",
     studio_method: Mapping[str, Any] | None = None,
     studio_style: Mapping[str, Any] | None = None,
+    studio_references: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Open the nonterminal History record BEFORE the run is dispatched.
 
@@ -636,7 +646,7 @@ def _begin_golden_history(
             kind="playground_run",
             prompt_id=request_id,
             status="running",
-            meta=_golden_history_meta(request_id, profile, controls, method, studio_method, studio_style),
+            meta=_golden_history_meta(request_id, profile, controls, method, studio_method, studio_style, studio_references),
         )
         if not isinstance(record, dict):
             return "", ""
@@ -751,6 +761,7 @@ async def run_golden_workflow(
     handle_factory: Callable[[GoldenProfile, Mapping[str, Any] | None], Any] | None = None,
     studio_method: Mapping[str, Any] | None = None,
     studio_style: Mapping[str, Any] | None = None,
+    studio_references: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve controls, submit the selected Golden method, and retain events."""
     request_id = validate_request_id(request_id)
@@ -768,11 +779,18 @@ async def run_golden_workflow(
     # The Studio preset collapse removed preset_id and
     # allow_remote_execution from this seam; control defaults now come from
     # the version's own executable_prompt via bundle["defaults"].
+    from studio_workflow_run import _sanitize_studio_references
+    _g_ref, _g_ref_error = _sanitize_studio_references(
+        dict(studio_references) if isinstance(studio_references, Mapping) else studio_references
+    )
+    if _g_ref_error:
+        return {"status": "error", "message": _g_ref_error}
     bundle = resolve_workflow_run_bundle(
         workflow_id,
         version_id,
         node_dir,
         remote_model_readiness=True,
+        reference_request=_g_ref,
     )
     if bundle.get("status") != "ok":
         return bundle
@@ -794,6 +812,11 @@ async def run_golden_workflow(
     _g_method, _g_method_error = _sanitize_studio_method(studio_method)
     if _g_method_error:
         return {"status": "error", "message": _g_method_error}
+    if _g_ref is not None and _g_method is not None:
+        return {
+            "status": "error",
+            "message": "studio_method and studio_references cannot be combined in one run",
+        }
     # Phase 5: style provenance is validated but never blocks or alters
     # execution; a malformed companion fails loudly, never silently dropped.
     _g_style, _g_style_error = _sanitize_studio_style(studio_style)
@@ -855,6 +878,31 @@ async def run_golden_workflow(
             "override": _g_method.get("override", ""),
             "origin_workflow": str(workflow_id or ""),
         }
+    # ── Phase 8: explicit reference orchestration shares the ordinary
+    #    implementation (one prep/mutation for both lanes). A dedicated
+    #    reference run swaps in the executing (override) bundle + values;
+    #    other methods keep the origin bundle. Plain runs skip untouched.
+    _g_ref_ctx = None
+    _g_ref_mutator = None
+    _g_ref_companion = None
+    if _g_ref is not None:
+        from studio_workflow_run import (
+            _build_reference_prompt_mutator,
+            _prepare_reference_run,
+        )
+        _g_ref_prep = _prepare_reference_run(
+            bundle, _g_ref, dict(_effective_values), node_dir
+        )
+        if "error" in _g_ref_prep:
+            return {"status": "error", "message": _g_ref_prep["error"]}
+        bundle = _g_ref_prep["bundle"]
+        _effective_values = _g_ref_prep["values"]
+        _g_ref_ctx = _g_ref_prep["ctx"]
+        _g_ref_companion = _g_ref_prep["companion"]
+        try:
+            _g_ref_mutator = _build_reference_prompt_mutator(_g_ref_prep["prep"])
+        except ValueError as exc:
+            return {"status": "error", "message": str(exc)[:500]}
     effective_options = dict(modal_options or {})
     try:
         applied, studio_meta, dropdown_repairs = _prepare_variant_prompt(
@@ -866,7 +914,17 @@ async def run_golden_workflow(
             "error_code": "WORKFLOW_CONTROL_APPLICATION",
             "message": str(exc),
         }
-    use_generic_executor = not _canonical_golden_fast_path(applied["workflow"])
+    # Phase 8: the executor decision classifies the FINAL mutated graph, not
+    # the pre-mutation one. The mutator runs on a request-local classification
+    # copy (the stored version is untouched); a mutation failure blocks with
+    # its reason before anything is submitted — a stripped graph never runs.
+    _final_workflow = applied["workflow"]
+    if _g_ref_mutator is not None:
+        try:
+            _final_workflow = _g_ref_mutator(copy.deepcopy(applied["workflow"]))
+        except ValueError as exc:
+            raise GoldenRunError(str(exc)[:300])
+    use_generic_executor = not _canonical_golden_fast_path(_final_workflow)
     # Phase 3: conditioning insertion on the fast path mutates the prepared
     # per-request copy (never the stored version); unknown node classes fail
     # here loudly via ValueError, never silently.
@@ -875,6 +933,10 @@ async def run_golden_workflow(
             applied["workflow"] = _g_prompt_mutator(applied["workflow"])
         except ValueError as exc:
             raise GoldenRunError(str(exc)[:300])
+    if _g_ref_mutator is not None and not use_generic_executor:
+        # The fast path submits the classified FINAL graph (references
+        # included). The pre-mutation copy is never submitted for ref runs.
+        applied["workflow"] = _final_workflow
 
     event_store.start(request_id)
     event_store.append(request_id, {
@@ -919,6 +981,11 @@ async def run_golden_workflow(
             "request_id": request_id,
         },
     }
+    if _g_ref_companion is not None:
+        # Phase 8: the frozen studio_references companion rides beside the
+        # effective graph + studio meta on the fast path (the generic path
+        # carries it in the plan's request metadata instead).
+        payload["extra_data"]["studio_references"] = copy.deepcopy(_g_ref_companion)
 
     history_run_id = ""
     history_generation_id = ""
@@ -950,6 +1017,7 @@ async def run_golden_workflow(
                   if isinstance(_g_method_ctx, dict) else None
               ),
             studio_style=_g_style,
+            studio_references=_g_ref_companion,
         )
         handle = (
             handle_factory(profile, workspace)
@@ -962,7 +1030,12 @@ async def run_golden_workflow(
                 _effective_values,
                 modal_options=effective_options,
                 comfyui_root=str(node_dir),
-                prompt_mutator=_g_prompt_mutator,
+                prompt_mutator=(
+                    _g_ref_mutator
+                    if _g_ref_mutator is not None
+                    else _g_prompt_mutator
+                ),
+                studio_references=_g_ref_companion,
             )
             if plan_error is not None or plan is None:
                 raise GoldenRunError(str(plan_error or "generic_execution_plan_failed"))

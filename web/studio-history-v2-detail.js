@@ -73,6 +73,99 @@ export function historyAttemptPurposeLabel(mode) {
   return "Run";
 }
 
+// ── Studio references (Phase 8, Lane D) ─────────────────────────────────
+//
+// Detail rendering for the saved `studio_references` companion: explicit
+// method, ordered reference cards with submitted source provenance,
+// concrete slot/chain assignments in applied order, and the stored graph
+// identity.  Legacy records (absent companion) render nothing — they stay
+// valid and the section is simply omitted.
+
+const REFERENCE_METHOD_LABELS = {
+  conditioning_slots: "Conditioning slots",
+  reference_latent_chain: "Reference latent chain",
+  dedicated: "Dedicated reference workflow",
+};
+
+export function studioReferenceMethodLabel(method) {
+  const key = method == null ? "" : String(method);
+  return REFERENCE_METHOD_LABELS[key] || (key ? key : "No references");
+}
+
+function _provenanceText(source) {
+  const s = source && typeof source === "object" ? source : null;
+  if (!s) return "";
+  const kind = s.kind != null ? String(s.kind) : "";
+  const ref = s.ref != null ? String(s.ref) : (s.source != null ? String(s.source) : "");
+  if (kind && ref) return kind + " · " + ref;
+  return kind || ref;
+}
+
+export function buildReferencesSection(record) {
+  const rec = record && typeof record === "object" ? record : {};
+  const refs = rec.studioReferences && typeof rec.studioReferences === "object"
+    ? rec.studioReferences
+    : (rec.studio_references && typeof rec.studio_references === "object" ? rec.studio_references : null);
+  if (!refs) return null;
+  const cards = Array.isArray(refs.cardIds) ? refs.cardIds
+    : (Array.isArray(refs.card_ids) ? refs.card_ids : []);
+  const images = Array.isArray(refs.images) ? refs.images : [];
+  const slots = Array.isArray(refs.slots) ? refs.slots : [];
+  const applied = Array.isArray(refs.appliedOrder) ? refs.appliedOrder
+    : (Array.isArray(refs.applied_order) ? refs.applied_order : []);
+  if (cards.length === 0 && images.length === 0 && slots.length === 0) return null;
+  const imageByCard = {};
+  images.forEach(function (entry) {
+    const e = entry && typeof entry === "object" ? entry : {};
+    const key = e.cardId != null ? String(e.cardId) : (e.card_id != null ? String(e.card_id) : "");
+    const filename = e.filename != null ? String(e.filename) : "";
+    if (!filename) return;
+    const provenance = _provenanceText(e.source);
+    const label = filename + (provenance ? " (" + provenance + ")" : "");
+    if (key && imageByCard[key] == null) imageByCard[key] = label;
+  });
+  const order = applied.length > 0 ? applied : cards;
+  const cardRows = order.map(function (cardId, position) {
+    const id = cardId != null ? String(cardId) : "";
+    const detail = imageByCard[id] || id;
+    return el("div", { class: "comfymodal-studio-history-v2-row" }, [
+      el("span", { class: "comfymodal-studio-history-v2-row-key", text: "Ref " + (position + 1) }),
+      el("span", { class: "comfymodal-studio-history-v2-row-value", text: detail }),
+    ]);
+  });
+  const slotRows = slots.map(function (entry) {
+    const e = entry && typeof entry === "object" ? entry : {};
+    const nodeId = e.nodeId != null ? String(e.nodeId) : (e.node_id != null ? String(e.node_id) : "");
+    const socket = e.socket != null ? String(e.socket) : "";
+    const kind = e.kind != null ? String(e.kind) : "reference";
+    const cardId = e.cardId != null ? String(e.cardId) : (e.card_id != null ? String(e.card_id) : "");
+    const target = nodeId + (socket ? "." + socket : "");
+    const label = (cardId ? cardId + " → " : "") + target + " (" + kind + ")";
+    return el("div", { class: "comfymodal-studio-history-v2-row" }, [
+      el("span", { class: "comfymodal-studio-history-v2-row-key", text: "Slot" }),
+      el("span", { class: "comfymodal-studio-history-v2-row-value", text: label }),
+    ]);
+  });
+  const rows = [
+    _row("Method", studioReferenceMethodLabel(refs.method)),
+  ].concat(cardRows).concat(slotRows);
+  const chain = refs.chain && typeof refs.chain === "object" && !Array.isArray(refs.chain)
+    ? refs.chain : null;
+  if (chain && Object.keys(chain).length > 0) {
+    rows.push(_row("Chain", JSON.stringify(chain)));
+  }
+  const graphHash = refs.graphHash != null ? String(refs.graphHash) : (refs.graph_hash != null ? String(refs.graph_hash) : "");
+  if (graphHash) rows.push(_row("Graph hash", graphHash));
+  const versionId = refs.workflowVersionId != null ? String(refs.workflowVersionId)
+    : (refs.workflow_version_id != null ? String(refs.workflow_version_id) : "");
+  if (versionId) rows.push(_row("Workflow version", versionId));
+  const section = _section("References", rows);
+  if (section) {
+    section.setAttribute("data-testid", "history-v2-references");
+  }
+  return section;
+}
+
 function _statusChip(status) {
   const key = STATUS_LABELS[status] ? status : "running";
   const label = STATUS_LABELS[status] || status || "Running";
@@ -1101,6 +1194,15 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     const viewer = resolveViewerInput(record);
     const args = resolveViewerShellArgs(viewer, shellAdapters);
     sharedShell.render(args.record, args);
+    // Lane D: saved studio references render as their own section inside
+    // the shared shell content (legacy records without the companion
+    // render nothing — they stay valid).
+    try {
+      const referencesSection = buildReferencesSection(record);
+      if (referencesSection && sharedShell.contentEl) {
+        sharedShell.contentEl.appendChild(referencesSection);
+      }
+    } catch (err) { /* references never break the detail surface */ }
     _ensureDialogFocus();
   }
 

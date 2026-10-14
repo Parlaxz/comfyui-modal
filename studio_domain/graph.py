@@ -1581,3 +1581,617 @@ def ui_graph_to_api_prompt(
         except Exception:
             continue
     return prompt
+
+
+# ── Reference discovery (Phase 8, Lane A) ─────────────────────────────────
+#
+# Structural discovery beside the existing graph inspection, reusing the
+# subgraph expansion + target resolution above. Inspects the captured
+# executable prompt, connection pairs, installed node schemas (including
+# autogrow), the selected output's upstream graph, and the existing
+# prompt/source-image mappings.
+#
+# Evidence is structural only: node/socket/edge ids, declared socket types,
+# connectivity, schema capacity. Model names, node titles, filenames, and
+# iteration order are never evidence.
+
+#: Frozen reference method ids (mirrors models.REFERENCE_METHOD_IDS).
+REFERENCE_METHOD_IDS: frozenset[str] = frozenset({
+    "conditioning_slots",
+    "reference_latent_chain",
+    "dedicated",
+})
+
+_IMAGE_TYPE_NAMES = frozenset({"IMAGE", "MASK"})
+_CONDITIONING_TYPE_NAMES = frozenset({"CONDITIONING"})
+_CLIP_TYPE_NAMES = frozenset({"CLIP"})
+_VAE_TYPE_NAMES = frozenset({"VAE"})
+_LATENT_TYPE_NAMES = frozenset({"LATENT"})
+
+_REFERENCE_DISCOVERY_LIMIT = 25
+
+
+def _slot_order_key(socket_name: str) -> tuple[int, int, str]:
+    """Numeric slot order key: trailing digits order numerically (10 after 2).
+
+    Returns ``(has_number, number, name)`` so numbered sockets sort by
+    their numeric suffix and unnumbered sockets sort stably by name.
+    """
+    try:
+        name = str(socket_name or "")
+        digits = ""
+        for ch in reversed(name):
+            if ch.isdigit():
+                digits = ch + digits
+            else:
+                break
+        if digits:
+            return (0, int(digits), name)
+        return (1, 0, name)
+    except Exception:
+        return (1, 0, str(socket_name or ""))
+
+
+def _declared_input_types(
+    class_type: str,
+    node_def_provider: Optional[Callable[[str], Optional[tuple]]] = None,
+) -> dict[str, tuple[str, dict[str, Any], bool]]:
+    """Map declared input name → (type_name, options, required).
+
+    Probes the installed node schema via ``node_def_provider`` (or the lazy
+    registry probe). Never raises; {} when the schema is unavailable.
+    """
+    out: dict[str, tuple[str, dict[str, Any], bool]] = {}
+    try:
+        provider = node_def_provider or _probe_node_def
+        probed = provider(str(class_type or ""))
+        if not (isinstance(probed, tuple) and len(probed) in (2, 3)):
+            return out
+        for required, defs_dict in (
+            (True, probed[0] if len(probed) >= 1 else {}),
+            (False, probed[1] if len(probed) >= 2 else {}),
+        ):
+            if not isinstance(defs_dict, dict):
+                continue
+            for input_name, spec in defs_dict.items():
+                try:
+                    type_name, options = _parse_type_spec(spec)
+                    out[str(input_name)] = (str(type_name or ""), dict(options or {}), bool(required))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+def _connection_pairs(prompt: dict[str, Any]) -> list[dict[str, Any]]:
+    """All executable connection pairs as edge dicts. Never raises."""
+    edges: list[dict[str, Any]] = []
+    try:
+        if not isinstance(prompt, dict):
+            return edges
+        for dst_id, node in prompt.items():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict):
+                continue
+            for socket, value in inputs.items():
+                if _is_connection_spec(value):
+                    try:
+                        edges.append({
+                            "edge_id": f"{value[0]}:{value[1]}->{dst_id}:{socket}",
+                            "src_node_id": str(value[0]),
+                            "src_slot": int(value[1]),
+                            "dst_node_id": str(dst_id),
+                            "dst_socket": str(socket),
+                        })
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return edges
+
+
+def _upstream_closure(prompt: dict[str, Any], start_ids: list[str]) -> set[str]:
+    """Upstream node ids feeding ``start_ids`` (inclusive). Never raises."""
+    seen: set[str] = set()
+    try:
+        queue = [str(s) for s in (start_ids or []) if str(s)]
+        upstream: dict[str, list[str]] = {}
+        if isinstance(prompt, dict):
+            for dst_id, node in prompt.items():
+                if not isinstance(node, dict):
+                    continue
+                inputs = node.get("inputs")
+                if not isinstance(inputs, dict):
+                    continue
+                for value in inputs.values():
+                    if _is_connection_spec(value):
+                        upstream.setdefault(str(dst_id), []).append(str(value[0]))
+        while queue:
+            nid = queue.pop()
+            if not nid or nid in seen:
+                continue
+            seen.add(nid)
+            for parent in upstream.get(nid, []):
+                if parent not in seen:
+                    queue.append(parent)
+    except Exception:
+        pass
+    return seen
+
+
+def _active_node_ids(
+    prompt: dict[str, Any], output_node_id: str = ""
+) -> set[str]:
+    """Nodes on the selected output's upstream path (or all nodes)."""
+    try:
+        if not isinstance(prompt, dict):
+            return set()
+        oid = str(output_node_id or "")
+        if oid and oid in prompt:
+            return _upstream_closure(prompt, [oid])
+        outputs = derive_output_node_ids_from_prompt(prompt)
+        if outputs:
+            return _upstream_closure(prompt, outputs)
+        return {str(k) for k in prompt.keys() if isinstance(k, str)}
+    except Exception:
+        return set()
+
+
+def _image_slots_from_schema(
+    declared: dict[str, tuple[str, dict[str, Any], bool]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Declared IMAGE slots in numeric order + autogrow derivation.
+
+    Single / fixed / autogrow naming, order, and max all derive from the
+    schema: numeric suffixes order numerically (never lexically); a lone
+    IMAGE socket whose options carry ``autogrow``/``dynamic``/``max`` is
+    expandable up to that max (else reported as expandable-unbounded).
+    """
+    slots: list[dict[str, Any]] = []
+    try:
+        for name, (type_name, options, required) in declared.items():
+            if str(type_name or "").upper() in _IMAGE_TYPE_NAMES:
+                slots.append({
+                    "socket": str(name),
+                    "required": bool(required),
+                    "options": dict(options or {}),
+                })
+    except Exception:
+        pass
+    slots.sort(key=lambda s: _slot_order_key(str(s.get("socket", ""))))
+    capacity: dict[str, Any] = {"kind": "none", "count": 0}
+    try:
+        if not slots:
+            return [], capacity
+        if len(slots) == 1:
+            options = slots[0].get("options") or {}
+            autogrow = bool(
+                options.get("autogrow") or options.get("dynamic")
+                or options.get("flexible") or options.get("allow_additional")
+            )
+            max_inputs = options.get("max", options.get("max_inputs", options.get("limit")))
+            try:
+                max_n = int(max_inputs) if max_inputs is not None else None
+            except (TypeError, ValueError):
+                max_n = None
+            if autogrow:
+                capacity = {"kind": "autogrow", "count": 1,
+                            "max": max_n, "base": str(slots[0].get("socket", ""))}
+            else:
+                capacity = {"kind": "single", "count": 1}
+        else:
+            capacity = {"kind": "fixed", "count": len(slots)}
+    except Exception:
+        pass
+    return slots, capacity
+
+
+def _has_connected_clip(prompt_node: dict[str, Any]) -> tuple[bool, Any]:
+    """True + upstream id when a CLIP-typed input is connected."""
+    try:
+        inputs = prompt_node.get("inputs") if isinstance(prompt_node, dict) else None
+        if not isinstance(inputs, dict):
+            return False, None
+        for name in ("clip", "clip_1", "clip_2"):
+            value = inputs.get(name)
+            if _is_connection_spec(value):
+                return True, str(value[0])  # type: ignore[index]
+        for name, value in inputs.items():
+            if "clip" in str(name).lower() and _is_connection_spec(value):
+                return True, str(value[0])  # type: ignore[index]
+    except Exception:
+        pass
+    return False, None
+
+
+def _has_prompt_input(prompt_node: dict[str, Any]) -> bool:
+    """True when a text/prompt input carries a value or connection."""
+    try:
+        inputs = prompt_node.get("inputs") if isinstance(prompt_node, dict) else None
+        if not isinstance(inputs, dict):
+            return False
+        for name in ("text", "prompt", "positive_prompt", "negative_prompt", "string"):
+            if name in inputs and inputs.get(name) is not None:
+                return True
+        for name, value in inputs.items():
+            lowered = str(name).lower()
+            if ("prompt" in lowered or "text" in lowered) and value is not None:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _return_types_of(
+    class_type: str,
+    return_types_provider: Optional[Callable[[str], Optional[list]]] = None,
+) -> Optional[list]:
+    try:
+        if callable(return_types_provider):
+            returns = return_types_provider(str(class_type or ""))
+            return list(returns) if isinstance(returns, (list, tuple)) else None
+        return _probe_return_types(str(class_type or ""))
+    except Exception:
+        return None
+
+
+def discover_reference_candidates(
+    prompt_or_capture: Any,
+    *,
+    ui_graph: Any = None,
+    node_def_provider: Optional[Callable[[str], Optional[tuple]]] = None,
+    return_types_provider: Optional[Callable[[str], Optional[list]]] = None,
+    output_node_id: str = "",
+    prompt_bindings: dict[str, Any] | None = None,
+    limit: int = _REFERENCE_DISCOVERY_LIMIT,
+) -> dict[str, Any]:
+    """Discover ALL reference candidates beside existing graph inspection.
+
+    Reuses subgraph expansion + target resolution
+    (:func:`resolve_binding_target`). Inspects the captured executable
+    prompt, connection pairs, installed node schemas (including autogrow),
+    the selected output's upstream graph, and the existing
+    prompt/source-image mappings. Never inspects model names, node titles,
+    filenames, or iteration order as evidence.
+
+    Returns ``{"candidates", "incompatible", "truncated", "resolution"}``:
+
+    * ``candidates`` — fully or partially evidenced Method-1/Method-2
+      entries with node/socket/edge ids, type/connectivity evidence,
+      writable vs unsupported paths, proven capacity or precise
+      limitation, and compatibility status + reasons.
+    * ``resolution`` — ``"unique"`` (one presentable candidate),
+      ``"unresolved"`` (multiples need Wizard confirmation), or
+      ``"incompatible"`` (nothing evidenced).
+    * ``truncated`` — True when enumeration hit ``limit`` (reports
+      incomplete, never silently picks first).
+    """
+    result: dict[str, Any] = {
+        "candidates": [], "incompatible": [],
+        "truncated": False, "resolution": "incompatible",
+    }
+    try:
+        if isinstance(prompt_or_capture, dict) and (
+            "api_prompt_json" in prompt_or_capture or "executable_prompt" in prompt_or_capture
+        ):
+            capture = prompt_or_capture
+            prompt = extract_executable_prompt(capture.get("api_prompt_json") or {})
+            if not prompt and isinstance(capture.get("executable_prompt"), dict):
+                prompt = capture["executable_prompt"]
+            if ui_graph is None:
+                ui_graph = capture.get("graph_json")
+        elif isinstance(prompt_or_capture, dict):
+            prompt = prompt_or_capture
+            capture = {}
+        else:
+            return result
+        if not isinstance(prompt, dict) or not prompt:
+            result["incompatible"].append({
+                "method": "", "compatible": False,
+                "reason": "no executable prompt to inspect",
+            })
+            return result
+
+        try:
+            lim = int(limit)
+        except (TypeError, ValueError):
+            lim = _REFERENCE_DISCOVERY_LIMIT
+        lim = max(1, min(int(lim), 100))
+
+        edges = _connection_pairs(prompt)
+        edges_by_dst: dict[tuple[str, str], dict[str, Any]] = {}
+        consumers_by_src: dict[str, list[dict[str, Any]]] = {}
+        for edge in edges:
+            edges_by_dst[(edge["dst_node_id"], edge["dst_socket"])] = edge
+            consumers_by_src.setdefault(edge["src_node_id"], []).append(edge)
+
+        active = _active_node_ids(prompt, str(output_node_id or ""))
+
+        # Reserved I2I source socket (confirmed mapping only): excluded from
+        # reference capacity by default, reported explicitly.
+        reserved: Optional[tuple[str, str]] = None
+        try:
+            bindings = prompt_bindings if isinstance(prompt_bindings, dict) else {}
+            src = bindings.get("source_image", bindings.get("sourceImage"))
+            if isinstance(src, dict):
+                rid = str(src.get("node_id", src.get("nodeId", "")) or "")
+                rsock = str(src.get("input_name", src.get("inputName", src.get("socket", ""))) or "")
+                if rid and rsock:
+                    reserved = (rid, rsock)
+        except Exception:
+            reserved = None
+
+        # ── Method-1: CONDITIONING slots ────────────────────────────────
+        method1: list[dict[str, Any]] = []
+        for node_id, node in prompt.items():
+            try:
+                if not isinstance(node, dict):
+                    continue
+                nid = str(node_id)
+                class_type = str(node.get("class_type", ""))
+                declared = _declared_input_types(class_type, node_def_provider)
+                image_slots, capacity = _image_slots_from_schema(declared)
+                if not image_slots:
+                    continue
+                on_active = nid in active
+                clip_ok, clip_upstream = _has_connected_clip(node)
+                prompt_ok = _has_prompt_input(node)
+                returns = _return_types_of(class_type, return_types_provider)
+                conditioning_out: Optional[bool] = None
+                if isinstance(returns, (list, tuple)) and returns:
+                    conditioning_out = any(
+                        str(r or "").upper() in _CONDITIONING_TYPE_NAMES for r in returns
+                    )
+                downstream = [e for e in edges if e["src_node_id"] == nid]
+                reasons: list[str] = []
+                if not on_active:
+                    reasons.append(f"node {nid} is not on the selected output path")
+                if not clip_ok:
+                    reasons.append(f"node {nid} has no connected CLIP input")
+                if not prompt_ok:
+                    reasons.append(f"node {nid} has no prompt input")
+                if conditioning_out is False:
+                    reasons.append(f"node {nid} declares no CONDITIONING output")
+                elif conditioning_out is None and not downstream:
+                    reasons.append(f"node {nid} has no downstream consumer")
+                # Per-slot binding paths (subgraph-aware resolution reused).
+                slot_entries: list[dict[str, Any]] = []
+                unresolvable: list[str] = []
+                for order, slot in enumerate(image_slots):
+                    socket = str(slot.get("socket", ""))
+                    is_reserved = reserved is not None and reserved == (nid, socket)
+                    target = resolve_binding_target(
+                        prompt, nid, socket, ui_graph=ui_graph,
+                        node_def_provider=node_def_provider,
+                    )
+                    edge = edges_by_dst.get((nid, socket))
+                    entry: dict[str, Any] = {
+                        "node_id": nid,
+                        "socket": socket,
+                        "order": order,
+                        "required": bool(slot.get("required", False)),
+                        "kind": "source" if is_reserved else "reference",
+                        "writable": bool(target.get("resolvable")) and not is_reserved,
+                        "resolvable": bool(target.get("resolvable")),
+                        "linked": bool(target.get("linked")),
+                        "upstream_node_id": target.get("upstream_node_id"),
+                        "edge_id": edge.get("edge_id") if isinstance(edge, dict) else None,
+                    }
+                    if is_reserved:
+                        entry["reserved"] = True
+                        entry["reason"] = (
+                            f"socket {socket} on node {nid} is the confirmed "
+                            "source-image socket and is reserved"
+                        )
+                    elif not target.get("resolvable"):
+                        if entry["required"]:
+                            unresolvable.append(socket)
+                            entry["reason"] = (
+                                f"socket {socket} on node {nid} has no resolvable binding path"
+                            )
+                        else:
+                            # Optional but unlinked: no evidenced wiring, yet the
+                            # declared socket accepts an image — execution binds
+                            # an isolated loader branch for it. Reported as a
+                            # capacity limitation, never a silent block.
+                            entry["writable"] = True
+                            entry["reason"] = (
+                                f"socket {socket} on node {nid} is unlinked; "
+                                "references bind an isolated loader branch at run time"
+                            )
+                    slot_entries.append(entry)
+                if unresolvable:
+                    reasons.append(
+                        f"node {nid} sockets lack resolvable binding paths: "
+                        + ", ".join(unresolvable)
+                    )
+                # Shared upstream loader fan-out → isolated branch decision.
+                fanout_notes: list[str] = []
+                needs_branch = False
+                try:
+                    for slot in slot_entries:
+                        up = slot.get("upstream_node_id")
+                        if not up:
+                            continue
+                        consumers = consumers_by_src.get(str(up), [])
+                        others = [c for c in consumers
+                                  if not (c["dst_node_id"] == nid and c["dst_socket"] == slot["socket"])]
+                        if others:
+                            needs_branch = True
+                            fanout_notes.append(
+                                f"loader {up} fans out to "
+                                f"{len(consumers)} consumers; isolate a loader branch for references"
+                            )
+                            break
+                except Exception:
+                    pass
+                reference_slots = [s for s in slot_entries if s.get("kind") == "reference"]
+                proven_capacity = len([s for s in reference_slots if s.get("resolvable") or s.get("writable")])
+                compatible = not reasons and proven_capacity > 0
+                candidate: dict[str, Any] = {
+                    "candidate_id": f"conditioning_slots:{nid}",
+                    "method": "conditioning_slots",
+                    "node_id": nid,
+                    "compatible": bool(compatible),
+                    "reasons": list(reasons),
+                    "evidence": {
+                        "output_type": "CONDITIONING" if conditioning_out is not False else "unknown",
+                        "clip_connected": bool(clip_ok),
+                        "clip_upstream_node_id": clip_upstream,
+                        "prompt_present": bool(prompt_ok),
+                        "on_active_path": bool(on_active),
+                        "downstream_edges": [
+                            e["edge_id"] for e in downstream if e.get("edge_id")
+                        ],
+                    },
+                    "slots": slot_entries,
+                    "slot_order": [s["socket"] for s in slot_entries],
+                    "capacity": {**capacity, "reference_writable": proven_capacity,
+                                 "reserved_source_socket": (
+                                     {"node_id": reserved[0], "socket": reserved[1]}
+                                     if reserved else None)},
+                    "needs_isolated_branch": bool(needs_branch),
+                    "fanout_notes": fanout_notes,
+                }
+                if compatible:
+                    method1.append(candidate)
+                else:
+                    candidate["method"] = "conditioning_slots"
+                    result["incompatible"].append(candidate)
+            except Exception:
+                continue
+
+        # ── Method-2: reference latent chain ────────────────────────────
+        # Concrete IMAGE loader → VAEEncode(pixels, vae) → LATENT →
+        # ReferenceLatent(latent, conditioning) → downstream consumer, walked
+        # through connected edges. Class names are recorded as evidence but
+        # matching is structural (socket names + type flow), so renamed
+        # unrelated classes never change discovery.
+        method2: list[dict[str, Any]] = []
+        try:
+            inputs_by_node: dict[str, dict[str, Any]] = {}
+            for dst_id, node in prompt.items():
+                if isinstance(node, dict) and isinstance(node.get("inputs"), dict):
+                    inputs_by_node[str(dst_id)] = node["inputs"]
+            for vae_enc_id, vae_inputs in inputs_by_node.items():
+                try:
+                    pix = vae_inputs.get("pixels")
+                    vae = vae_inputs.get("vae")
+                    if not (_is_connection_spec(pix) and _is_connection_spec(vae)):
+                        continue
+                    loader_id, loader_slot = str(pix[0]), int(pix[1])  # type: ignore[index]
+                    vae_src_id = str(vae[0])  # type: ignore[index]
+                    # Upstream CONDITIONING → ReferenceLatent.conditioning and
+                    # LATENT → ReferenceLatent.latent; downstream consumer.
+                    for ref_id, ref_inputs in inputs_by_node.items():
+                        try:
+                            lat = ref_inputs.get("latent")
+                            cond = ref_inputs.get("conditioning")
+                            if not (_is_connection_spec(lat) and _is_connection_spec(cond)):
+                                continue
+                            if str(lat[0]) != vae_enc_id:  # type: ignore[index]
+                                continue
+                            cond_src = str(cond[0])  # type: ignore[index]
+                            consumers = [
+                                e for e in edges if e["src_node_id"] == ref_id
+                            ]
+                            chain_nodes = [loader_id, vae_enc_id, ref_id]
+                            on_active = all(n in active for n in chain_nodes)
+                            downstream_ok = bool(consumers) and any(
+                                c["dst_node_id"] in active for c in consumers
+                            )
+                            reasons2: list[str] = []
+                            if not on_active:
+                                reasons2.append(
+                                    f"chain {loader_id}->{vae_enc_id}->{ref_id} "
+                                    "is not on the selected output path"
+                                )
+                            if not downstream_ok:
+                                reasons2.append(
+                                    f"reference node {ref_id} has no downstream consumer"
+                                )
+                            order = [loader_id, vae_enc_id, ref_id]
+                            try:
+                                first_consumer = next(
+                                    c["dst_node_id"] for c in consumers
+                                    if c["dst_node_id"] in active
+                                )
+                                order = [loader_id, vae_enc_id, ref_id, str(first_consumer)]
+                            except StopIteration:
+                                pass
+                            edge_ids = [
+                                f"{loader_id}:{loader_slot}->{vae_enc_id}:pixels",
+                                f"{vae_src_id}:{vae[1]}->{vae_enc_id}:vae",  # type: ignore[index]
+                                f"{vae_enc_id}:{lat[1]}->{ref_id}:latent",  # type: ignore[index]
+                                f"{cond_src}:{cond[1]}->{ref_id}:conditioning",  # type: ignore[index]
+                            ]
+                            entry2: dict[str, Any] = {
+                                "candidate_id": f"reference_latent_chain:{ref_id}",
+                                "method": "reference_latent_chain",
+                                "node_id": ref_id,
+                                "compatible": not reasons2,
+                                "reasons": list(reasons2),
+                                "evidence": {
+                                    "loader_node_id": loader_id,
+                                    "vae_encode_node_id": vae_enc_id,
+                                    "reference_latent_node_id": ref_id,
+                                    "vae_node_id": vae_src_id,
+                                    "conditioning_upstream_node_id": cond_src,
+                                    "on_active_path": bool(on_active),
+                                    "downstream_consumer_ids": sorted(
+                                        {c["dst_node_id"] for c in consumers}
+                                    ),
+                                },
+                                "chain": {
+                                    "loader_node_id": loader_id,
+                                    "loader_socket": "image",
+                                    "loader_output_index": loader_slot,
+                                    "vae_node_id": vae_src_id,
+                                    "vae_encode_node_id": vae_enc_id,
+                                    "reference_latent_node_id": ref_id,
+                                    "consumer_node_id": order[-1] if len(order) == 4 else "",
+                                    "edges": edge_ids,
+                                    "order": order,
+                                },
+                                "isolatable_segment": [loader_id, vae_enc_id, ref_id],
+                            }
+                            if not reasons2:
+                                method2.append(entry2)
+                            else:
+                                result["incompatible"].append(entry2)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Generic T2I without evidence fails closed as incompatible.
+        all_candidates = method1 + method2
+        if not all_candidates and not result["incompatible"]:
+            result["incompatible"].append({
+                "method": "", "compatible": False,
+                "reason": (
+                    "no conditioning slots or reference-latent chain evidenced; "
+                    "generic workflow without reference structure is incompatible"
+                ),
+            })
+        # Truncated enumeration reports incomplete, never picks first.
+        total = len(all_candidates)
+        if total > lim:
+            result["truncated"] = True
+            result["candidates"] = all_candidates[:lim]
+        else:
+            result["candidates"] = all_candidates
+        if len(result["candidates"]) == 1 and not result["truncated"]:
+            result["resolution"] = "unique"
+        elif len(result["candidates"]) > 1:
+            result["resolution"] = "unresolved"
+        else:
+            result["resolution"] = "incompatible" if not result["candidates"] else "unique"
+    except Exception:
+        pass
+    return result

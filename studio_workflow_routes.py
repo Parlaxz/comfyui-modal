@@ -820,6 +820,8 @@ def register_workflow_routes(
                 entries=body.get("entries") or {},
                 output_node_id=str(body.get("output_node_id", "")),
                 text_generate_node_id=body.get("text_generate_node_id"),
+                reference_method=str(body.get("reference_method", "") or ""),
+                reference_bindings=body.get("reference_bindings"),
             )
             return web.json_response({"status": "ok", "mapping": mapping})
         except WorkflowVersionNotFoundError as exc:
@@ -871,6 +873,8 @@ def register_workflow_routes(
                 entries=body.get("entries") or {},
                 output_node_id=str(body.get("output_node_id", "")),
                 text_generate_node_id=body.get("text_generate_node_id"),
+                reference_method=str(body.get("reference_method", "") or ""),
+                reference_bindings=body.get("reference_bindings"),
             )
             return web.json_response({"status": "ok", "version": version})
         except WorkflowVersionNotFoundError as exc:
@@ -879,6 +883,34 @@ def register_workflow_routes(
             return _json_error(400, str(exc))
         except Exception as exc:  # noqa: BLE001
             _log.exception("Mapping revision failed")
+            status, message = _domain_status(exc)
+            return _json_error(status, message)
+
+    @server.routes.get("/comfymodal/studio/workflows/versions/{version_id}/references/candidates")
+    async def references_candidates(request: web.Request) -> web.Response:
+        """Structural reference candidates for one version's stored graph."""
+        version_id = request.match_info.get("version_id", "")
+        try:
+            result = service.get_reference_candidates(version_id)
+            return web.json_response({"status": "ok", **result})
+        except WorkflowVersionNotFoundError as exc:
+            return _json_error(404, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Reference candidates failed")
+            status, message = _domain_status(exc)
+            return _json_error(status, message)
+
+    @server.routes.get("/comfymodal/studio/workflows/versions/{version_id}/references")
+    async def references_companion(request: web.Request) -> web.Response:
+        """Top-level ``studio_references`` run companion for one version."""
+        version_id = request.match_info.get("version_id", "")
+        try:
+            companion = service.build_studio_references(version_id)
+            return web.json_response({"status": "ok", "studio_references": companion})
+        except WorkflowVersionNotFoundError as exc:
+            return _json_error(404, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Reference companion failed")
             status, message = _domain_status(exc)
             return _json_error(status, message)
 

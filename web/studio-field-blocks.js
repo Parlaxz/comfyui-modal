@@ -248,6 +248,23 @@ function _historyBrowserKey(ev) {
   if (ev && ev.key === "Escape") _closeHistoryBrowser();
 }
 
+// Monotonic upload guard: every ingest takes a token via begin(); only the
+// latest token may commit. Older completions are stale (a newer replace won
+// the race) and must not overwrite the newer value. Node-testable, no DOM.
+export function createUploadGuard() {
+  let seq = 0;
+  return {
+    begin() { seq += 1; return seq; },
+    isCurrent(token) { return token === seq; },
+  };
+}
+
+function _uploadErrorMessage(err) {
+  if (err && err.message) return String(err.message);
+  if (typeof err === "string") return err;
+  try { return JSON.stringify(err); } catch (_e) { return "image upload failed"; }
+}
+
 export function renderImageBlock(props = {}) {  const wrap = el("div", { ...controlProps(props, "image"), "data-testid": props.testid || "shelf-image-block" });
   wrap.style.display = "flex";
   wrap.style.flexDirection = "column";
@@ -283,21 +300,46 @@ export function renderImageBlock(props = {}) {  const wrap = el("div", { ...cont
     "data-testid": (props.testid || "shelf-image") + "-file",
     "aria-label": props.label || "Choose image",
   });
+  if (props.uploadBusy) file.disabled = true;
+  // One guard per mounted block: file/drop/paste ingests race, and only the
+  // latest completion may commit. Failures surface through onUploadState and
+  // never touch the previous value (no onChange on failure). Stale (late or
+  // superseded) completions report idle without committing, so a removed or
+  // replaced card can never receive a wrong image.
+  const _guard = createUploadGuard();
+  const _notifyUpload = (busy, error) => {
+    if (typeof props.onUploadState !== "function") return;
+    try { props.onUploadState({ busy: !!busy, error: error || "" }); } catch (_e) {}
+  };
   file.addEventListener("change", async () => {
     const f = file.files && file.files[0];
     if (!f || typeof props.onChange !== "function") return;
+    const token = _guard.begin();
+    _notifyUpload(true, "");
     try {
       const name = await uploadImageBlob(f, f.name);
+      if (!_guard.isCurrent(token)) { _notifyUpload(false, ""); return; }
       props.onChange(name);
-    } catch (_e) { /* caller surfaces errors via run gating; keep prior value */ }
+      _notifyUpload(false, "");
+    } catch (_e) {
+      if (!_guard.isCurrent(token)) { _notifyUpload(false, ""); return; }
+      _notifyUpload(false, _uploadErrorMessage(_e));
+    }
   });
   row.appendChild(file);
   const ingestFile = async (f) => {
     if (!f || typeof props.onChange !== "function") return;
+    const token = _guard.begin();
+    _notifyUpload(true, "");
     try {
       const name = await uploadImageBlob(f, f.name);
+      if (!_guard.isCurrent(token)) { _notifyUpload(false, ""); return; }
       props.onChange(name);
-    } catch (_e) { /* keep prior value, same as file handler */ }
+      _notifyUpload(false, "");
+    } catch (_e) {
+      if (!_guard.isCurrent(token)) { _notifyUpload(false, ""); return; }
+      _notifyUpload(false, _uploadErrorMessage(_e));
+    }
   };
   wrap.setAttribute("tabindex", "0");
   wrap.addEventListener("dragover", (ev) => {
@@ -367,7 +409,7 @@ export function renderImageBlock(props = {}) {  const wrap = el("div", { ...cont
     });
     row.appendChild(browseBtn);
   }
-  if (current && typeof props.onChange === "function") {
+  if (current && typeof props.onChange === "function" && props.hideClear !== true) {
     const clearBtn = el("button", {
       type: "button",
       class: "comfymodal-secondary-btn",
@@ -378,6 +420,21 @@ export function renderImageBlock(props = {}) {  const wrap = el("div", { ...cont
     row.appendChild(clearBtn);
   }
   wrap.appendChild(row);
+  if (props.uploadBusy) {
+    wrap.appendChild(el("p", {
+      class: "comfymodal-studio-control-note",
+      text: "Uploading…",
+      "data-testid": (props.testid || "shelf-image") + "-upload-busy",
+    }));
+  }
+  if (props.uploadError) {
+    wrap.appendChild(el("p", {
+      class: "comfymodal-studio-control-note",
+      text: String(props.uploadError),
+      style: "color:#f87171;",
+      "data-testid": (props.testid || "shelf-image") + "-upload-error",
+    }));
+  }
   if (props.linkError) {
     wrap.appendChild(el("p", {
       class: "comfymodal-studio-control-note",

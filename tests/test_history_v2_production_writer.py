@@ -18,6 +18,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -929,6 +931,174 @@ class HistoryV2C14ProducerAssetRegressionTests(unittest.TestCase):
         self.assertEqual(detail.attempts[0].status, "completed")
         self.assertEqual(detail.assets, [])
         self.assertIsNone(detail.generation.featured_asset_id)
+
+
+@pytest.mark.fast_unit
+class HistoryV2StudioReferencesWriterTests(unittest.TestCase):
+    """Lane D: ``studio_references`` companion capture in the request snapshot.
+
+    - Writer → repository round-trip preserves the explicit method,
+      origin/executing identities, ordered card ids, image identity +
+      source provenance, slot/chain assignments, applied order, and the
+      effective graph hash (no SQL columns, JSON snapshot fields only).
+    - Legacy records without the companion stay valid (absent, never
+      synthesized) and remain readable through the same detail path.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp_root = Path(self._tmp.name)
+        self.addCleanup(reset_writer_config)
+        self.writer = get_writer(self.tmp_root)
+        self.db_path = self.tmp_root / ".studio_history_v2" / "history_v2.db"
+        self.repo = HistoryV2Repository(HistoryV2Store(self.db_path))
+
+    def _references_meta(self):
+        return {
+            "studio_references": {
+                "method": "conditioning_slots",
+                "origin_workflow_id": "wf_origin",
+                "origin_version_id": "wv_origin_1",
+                "executing_workflow_id": "wf_exec",
+                "executing_version_id": "wv_exec_2",
+                "card_ids": ["card_b", "card_a"],
+                "images": [
+                    {
+                        "card_id": "card_b",
+                        "filename": "ref_b.png",
+                        "sha256": "b" * 64,
+                        "byte_size": 10,
+                        "source": {"kind": "upload", "ref": "ref_b.png"},
+                    },
+                    {
+                        "card_id": "card_a",
+                        "filename": "ref_a.png",
+                        "sha256": "a" * 64,
+                        "source": {"kind": "library", "ref": "lib://a"},
+                    },
+                ],
+                "slots": [
+                    {
+                        "card_id": "card_b",
+                        "node_id": "12",
+                        "socket": "reference",
+                        "kind": "reference",
+                        "order": 0,
+                    },
+                    {
+                        "card_id": "card_a",
+                        "node_id": "12",
+                        "socket": "reference_2",
+                        "kind": "reference",
+                        "order": 1,
+                    },
+                ],
+                "applied_order": ["card_b", "card_a"],
+                "provenance": {"source": "mapping"},
+            },
+        }
+
+    def test_references_round_trip_preserves_order_and_provenance(self):
+        meta = dict(_SUBMIT_META)
+        meta.update(self._references_meta())
+        self.writer.record_run(
+            run_id="r_refs1", kind="studio_run", status="submitted",
+            prompt_id="exp1", workflow_hash="eff-graph-hash",
+            meta=meta,
+        )
+        self.writer.update_run(
+            "r_refs1", status="completed", completed_at=_LATER, meta={},
+        )
+        detail = self.repo.get_generation(_gen_id("r_refs1"))
+        self.assertIsNotNone(detail)
+        snapshot = detail.request_snapshot
+        self.assertIsNotNone(snapshot)
+        stored = snapshot.request.get("studio_references")
+        self.assertIsNotNone(stored)
+        # Frozen contract fields, order preserved verbatim.
+        self.assertEqual(stored["method"], "conditioning_slots")
+        self.assertEqual(stored["origin_workflow_id"], "wf_origin")
+        self.assertEqual(stored["origin_version_id"], "wv_origin_1")
+        self.assertEqual(stored["executing_workflow_id"], "wf_exec")
+        self.assertEqual(stored["executing_version_id"], "wv_exec_2")
+        self.assertEqual(stored["card_ids"], ["card_b", "card_a"])
+        self.assertEqual(stored["applied_order"], ["card_b", "card_a"])
+        self.assertEqual(
+            [img["filename"] for img in stored["images"]],
+            ["ref_b.png", "ref_a.png"],
+        )
+        self.assertEqual(
+            stored["images"][0]["source"],
+            {"kind": "upload", "ref": "ref_b.png"},
+        )
+        self.assertEqual(
+            stored["images"][1]["source"],
+            {"kind": "library", "ref": "lib://a"},
+        )
+        self.assertEqual(
+            [(s["node_id"], s["socket"], s["order"]) for s in stored["slots"]],
+            [("12", "reference", 0), ("12", "reference_2", 1)],
+        )
+        # Effective execution graph hash defaults from the run workflow hash.
+        self.assertEqual(stored["graph_hash"], "eff-graph-hash")
+        # Stored snapshot itself stays strict-JSON serializable.
+        json.dumps(snapshot.request)
+
+    def test_legacy_record_without_references_stays_valid(self):
+        self.writer.record_run(
+            run_id="r_legacy1", kind="studio_run", status="submitted",
+            prompt_id="exp1", workflow_hash="wfhash1",
+            meta=dict(_SUBMIT_META),
+        )
+        self.writer.update_run(
+            "r_legacy1", status="completed", completed_at=_LATER, meta={},
+        )
+        detail = self.repo.get_generation(_gen_id("r_legacy1"))
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail.generation.status, "completed")
+        snapshot = detail.request_snapshot
+        self.assertIsNotNone(snapshot)
+        self.assertNotIn("studio_references", snapshot.request)
+
+    def test_capture_helper_builds_companion_before_plan_freeze(self):
+        from history_v2_writer import build_studio_references_snapshot
+
+        captured = build_studio_references_snapshot(
+            method="reference_latent_chain",
+            origin_workflow_id="wf_o",
+            origin_version_id="wv_o",
+            executing_workflow_id="wf_e",
+            executing_version_id="wv_e",
+            card_ids=["c1", "c2"],
+            images=[
+                {
+                    "card_id": "c1",
+                    "filename": "r1.png",
+                    "sha256": "c" * 64,
+                    "source": {"kind": "upload", "ref": "r1.png"},
+                },
+            ],
+            slots=[{"node_id": "7", "socket": "latent"}],
+            chain={"loader_node_id": "3"},
+            graph_hash="gh",
+            workflow_version_id="wv_e",
+            provenance={"source": "wizard"},
+        )
+        self.assertEqual(captured["method"], "reference_latent_chain")
+        self.assertEqual(captured["card_ids"], ["c1", "c2"])
+        self.assertEqual(captured["applied_order"], ["c1", "c2"])
+        self.assertEqual(captured["slots"][0]["order"], 0)
+        self.assertEqual(captured["graph_hash"], "gh")
+        # Empty capture records nothing (legacy-clean).
+        self.assertEqual(build_studio_references_snapshot(), {})
+        # Unknown methods never persist as explicit methods.
+        self.assertEqual(
+            build_studio_references_snapshot(
+                method="bogus-method", card_ids=["c1"]
+            )["method"],
+            "",
+        )
 
 
 if __name__ == "__main__":

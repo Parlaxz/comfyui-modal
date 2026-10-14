@@ -155,6 +155,12 @@ NODE_UNIT_FILES: list[Path] = [
     ROOT / "tests" / "studio_run_model_unit.mjs",
     ROOT / "tests" / "studio_playground_run_unit.mjs",
     ROOT / "tests" / "studio_workflow_run_unit.mjs",
+    # Phase 8 references Lane A registration: discovery/binding contracts
+    # (bindable-inputs catalog + frozen reference-method ids/selection) and
+    # per-workflow reference-method/card persistence. Both run under plain
+    # `node` with no browser/DOM/Torch; verified green standalone.
+    ROOT / "tests" / "studio_bindable_inputs_unit.mjs",
+    ROOT / "tests" / "studio_phase3_methods_unit.mjs",
     ROOT / "tests" / "studio_history_v2_persisted_status_unit.mjs",
     # D5 frontend experiment unit tests
     ROOT / "tests" / "studio_experiment_v2_unit.mjs",

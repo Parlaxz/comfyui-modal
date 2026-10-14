@@ -214,6 +214,18 @@ _CELL_PARAM_KEYS = (
     "lora_chain",
 )
 
+# ── Studio reference methods (Phase 8, Lane D) ──────────────────────────
+# Frozen method ids mirrored from ``studio_domain.models`` (imported by
+# value, never imported as a module: this writer stays importable
+# standalone).  Never rename: history records key on these exact strings.
+REFERENCE_METHOD_IDS = frozenset({
+    "conditioning_slots",
+    "reference_latent_chain",
+    "dedicated",
+})
+
+_REFERENCE_SLOT_KINDS = frozenset({"reference", "source"})
+
 _SNAPSHOT_PARAM_KEYS = (
     "seed", "steps", "guidance", "cfg", "sampler", "scheduler", "denoise",
     "width", "height", "prompt", "negative_prompt",
@@ -620,6 +632,281 @@ def _derivative_ids_from_meta(meta: Any) -> list[str]:
     return out
 
 
+# ── Studio references record (Phase 8, Lane D) ──────────────────────────
+#
+# The ``studio_references`` run companion is explicit JSON metadata stored
+# inside the request snapshot (no SQL columns, no new provenance
+# subsystem).  Frozen contract:
+# - explicit method (one of REFERENCE_METHOD_IDS; "" means unbound/legacy),
+# - origin + executing workflow/version identities,
+# - ordered stable card ids (position = order, never a global role),
+# - image identity + submitted source provenance per card,
+# - concrete slot/chain assignments + applied order,
+# - stored graph identity + effective execution graph hash.
+# Legacy records with absent metadata stay valid: an absent companion
+# normalizes to None and is never synthesized.
+
+
+def _plain_json_copy(value: Any) -> Any:
+    """Plain JSON-safe copy (dicts/lists/scalars; other objects dropped)."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                continue
+            copied = _plain_json_copy(item)
+            if copied is not None or item is None:
+                out[key] = copied
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_plain_json_copy(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return None
+
+
+def _clean_str_list(value: Any) -> list[str]:
+    """Ordered non-empty strings from *value*; order preserved, no dedup."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item) for item in value if isinstance(item, str) and str(item)]
+
+
+def _normalize_reference_images(value: Any) -> list[dict[str, Any]]:
+    """Ordered image entries: card identity + filename + source provenance."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    images: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        filename = raw.get("filename")
+        if not isinstance(filename, str) or not filename:
+            continue
+        entry: dict[str, Any] = {"filename": filename}
+        card_id = raw.get("card_id", raw.get("cardId"))
+        if isinstance(card_id, str) and card_id:
+            entry["card_id"] = card_id
+        digest = raw.get("sha256")
+        if isinstance(digest, str) and digest:
+            entry["sha256"] = digest.strip().lower()
+        byte_size = raw.get("byte_size", raw.get("byteSize"))
+        if isinstance(byte_size, bool):
+            pass
+        elif isinstance(byte_size, int) and byte_size >= 0:
+            entry["byte_size"] = byte_size
+        elif isinstance(byte_size, str) and byte_size.isdigit():
+            entry["byte_size"] = int(byte_size)
+        source = raw.get("source", raw.get("provenance"))
+        if isinstance(source, dict):
+            entry["source"] = _plain_json_copy(source) or {}
+        elif isinstance(source, str) and source:
+            entry["source"] = {"ref": source}
+        images.append(entry)
+    return images
+
+
+def _normalize_reference_slots(value: Any) -> list[dict[str, Any]]:
+    """Concrete slot assignments in applied order (position = order).
+
+    List order is authoritative and preserved; a missing ``order`` is
+    filled with the entry's position (never re-sorted, never a global
+    role lookup).
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    slots: list[dict[str, Any]] = []
+    for position, raw in enumerate(value):
+        if not isinstance(raw, dict):
+            continue
+        node_id = raw.get("node_id", raw.get("nodeId"))
+        socket = raw.get("socket", raw.get("socket_name", raw.get("input_name")))
+        if not isinstance(node_id, str) or not node_id:
+            continue
+        if not isinstance(socket, str) or not socket:
+            continue
+        entry: dict[str, Any] = {"node_id": node_id, "socket": socket}
+        card_id = raw.get("card_id", raw.get("cardId"))
+        if isinstance(card_id, str) and card_id:
+            entry["card_id"] = card_id
+        kind = str(raw.get("kind", raw.get("role", "reference")) or "reference")
+        entry["kind"] = kind if kind in _REFERENCE_SLOT_KINDS else "reference"
+        order = raw.get("order", raw.get("position", position))
+        try:
+            entry["order"] = int(order)
+        except (TypeError, ValueError):
+            entry["order"] = position
+        if isinstance(order, bool):
+            entry["order"] = position
+        for key in ("output_index", "outputIndex"):
+            output_index = raw.get(key)
+            if output_index is not None and not isinstance(output_index, bool):
+                try:
+                    entry["output_index"] = int(output_index)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        edge = raw.get("edge", raw.get("edge_id"))
+        if isinstance(edge, str) and edge:
+            entry["edge"] = edge
+        slots.append(entry)
+    return slots
+
+
+def _normalize_studio_references(meta: Any, workflow_hash: Any = None) -> Optional[dict[str, Any]]:
+    """Normalize the ``studio_references`` companion from run *meta*.
+
+    Sources (first hit wins): top-level ``meta["studio_references"]``,
+    then ``meta["request_json"]["studio_references"]`` and
+    ``meta["request"]["studio_references"]``.  Returns None when absent
+    (legacy records stay valid) or malformed.  Never raises.
+    """
+    try:
+        raw: Any = None
+        if isinstance(meta, dict):
+            raw = meta.get("studio_references")
+            if not isinstance(raw, dict):
+                for key in ("request_json", "request"):
+                    nested = meta.get(key)
+                    if isinstance(nested, dict):
+                        candidate = nested.get("studio_references")
+                        if isinstance(candidate, dict):
+                            raw = candidate
+                            break
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        method = str(raw.get("method", "") or "")
+        if method not in REFERENCE_METHOD_IDS:
+            method = ""
+
+        def _str(*keys: str) -> str:
+            for key in keys:
+                value = raw.get(key)
+                if isinstance(value, str) and value:
+                    return value
+            return ""
+
+        card_ids = _clean_str_list(raw.get("card_ids", raw.get("cardIds")))
+        images = _normalize_reference_images(raw.get("images"))
+        slots = _normalize_reference_slots(raw.get("slots", raw.get("slot_order")))
+        chain = raw.get("chain", raw.get("chain_boundary"))
+        chain = _plain_json_copy(chain) if isinstance(chain, dict) else {}
+        applied_order = _clean_str_list(
+            raw.get("applied_order", raw.get("appliedOrder"))
+        ) or list(card_ids)
+        provenance = raw.get("provenance", raw.get("source"))
+        provenance = (
+            _plain_json_copy(provenance) if isinstance(provenance, dict) else {}
+        )
+        if isinstance(provenance, str) and provenance:
+            provenance = {"source": provenance}
+        graph_hash = _str("graph_hash", "graphHash")
+        if not graph_hash and isinstance(workflow_hash, str) and workflow_hash:
+            graph_hash = workflow_hash
+        workflow_version_id = _str("workflow_version_id", "workflowVersionId")
+        if not workflow_version_id and isinstance(meta, dict):
+            candidate = meta.get("workflow_version_id")
+            if isinstance(candidate, str) and candidate:
+                workflow_version_id = candidate
+        record: dict[str, Any] = {
+            "method": method,
+            "origin_workflow_id": _str("origin_workflow_id", "originWorkflowId"),
+            "origin_version_id": _str("origin_version_id", "originVersionId"),
+            "executing_workflow_id": _str(
+                "executing_workflow_id", "executingWorkflowId"
+            ),
+            "executing_version_id": _str(
+                "executing_version_id", "executingVersionId"
+            ),
+            "dedicated_target": _str("dedicated_target", "dedicatedTarget"),
+            "card_ids": card_ids,
+            "images": images,
+            "slots": slots,
+            "chain": chain or {},
+            "applied_order": applied_order,
+            "graph_hash": graph_hash,
+            "workflow_version_id": workflow_version_id,
+            "provenance": provenance or {},
+        }
+        import json as _json
+
+        _json.dumps(record)
+        return record
+    except Exception:
+        logger.debug(
+            "history_v2_writer: studio_references normalization failed; "
+            "dropping companion",
+            exc_info=True,
+        )
+        return None
+
+
+def build_studio_references_snapshot(
+    *,
+    method: Any = "",
+    origin_workflow_id: Any = "",
+    origin_version_id: Any = "",
+    executing_workflow_id: Any = "",
+    executing_version_id: Any = "",
+    dedicated_target: Any = "",
+    card_ids: Any = None,
+    images: Any = None,
+    slots: Any = None,
+    chain: Any = None,
+    applied_order: Any = None,
+    graph_hash: Any = "",
+    workflow_version_id: Any = "",
+    provenance: Any = None,
+) -> dict[str, Any]:
+    """Capture helper: build the ``studio_references`` companion BEFORE plan
+    freeze, beside the exact effective graph + collected image payloads.
+
+    Mirrors the ``_build_plan_replay_meta`` shape discipline (plain
+    JSON-safe copies at every nesting level, never raises): callers pass
+    the run's explicit method, origin/executing identities, ordered stable
+    card ids, image identity + submitted source provenance, concrete
+    slot/chain assignments and applied order; the result rides in run
+    ``meta["studio_references"]`` so the writer stores it verbatim in the
+    request snapshot.  Returns ``{}`` when there is nothing to record.
+    """
+    try:
+        raw: dict[str, Any] = {
+            "method": method,
+            "origin_workflow_id": origin_workflow_id,
+            "origin_version_id": origin_version_id,
+            "executing_workflow_id": executing_workflow_id,
+            "executing_version_id": executing_version_id,
+            "dedicated_target": dedicated_target,
+            "card_ids": card_ids,
+            "images": images,
+            "slots": slots,
+            "chain": chain,
+            "applied_order": applied_order,
+            "graph_hash": graph_hash,
+            "workflow_version_id": workflow_version_id,
+            "provenance": provenance,
+        }
+        normalized = _normalize_studio_references({"studio_references": raw})
+        if normalized is None:
+            return {}
+        if (
+            not normalized["method"]
+            and not normalized["card_ids"]
+            and not normalized["images"]
+            and not normalized["slots"]
+        ):
+            return {}
+        return normalized
+    except Exception:
+        logger.debug(
+            "history_v2_writer: studio_references capture failed",
+            exc_info=True,
+        )
+        return {}
+
+
 class HistoryV2ProductionWriter:
     """Mirrors production run/experiment events into the History V2 store.
 
@@ -999,6 +1286,15 @@ class HistoryV2ProductionWriter:
         request = meta.get("request_json")
         if not isinstance(request, dict):
             request = {}
+        # Lane D: the normalized studio_references companion (explicit
+        # method, identities, ordered card ids, image identity + source
+        # provenance, slot/chain assignments, applied order, graph hash)
+        # rides inside the stored request JSON.  Absent on legacy records
+        # (stays absent — never synthesized).
+        studio_references = _normalize_studio_references(meta, workflow_hash)
+        if studio_references is not None:
+            request = dict(request)
+            request["studio_references"] = studio_references
         execution_plan = meta.get("execution_plan_json")
         if not isinstance(execution_plan, dict):
             execution_plan = {}
