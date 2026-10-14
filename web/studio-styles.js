@@ -393,7 +393,7 @@ body.comfymodal-body-scroll-lock {
 }
 
 .comfymodal-studio-control-panel {
-  width: 400px;
+  width: 333px;
   min-width: 200px;
   flex-shrink: 0;
   overflow-y: auto;

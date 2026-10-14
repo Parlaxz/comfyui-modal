@@ -78,6 +78,10 @@ async function groupExpanded(page, id) {
   }, id);
 }
 
+async function groupVisible(page, id) {
+  return page.locator(`[data-testid="pp-inspector"] .pp-group[data-group="${id}"]`).isVisible();
+}
+
 async function clickPostSubtool(page, subtool) {
   const btn = page.locator(`[data-testid="studio-subtool-${subtool}"]`);
   await expect(btn).toBeVisible({ timeout: 10000 });
@@ -228,6 +232,14 @@ test.describe("Post Processing workspace (fake backend)", () => {
     for (const id of ["light", "detail", "effects"]) {
       await expect.poll(() => groupExpanded(page, id), { timeout: 10000 }).toBe("false");
     }
+    // Corrective contract: irrelevant controls are not merely collapsed into
+    // a long inspector; the native sidebar only shows this tool's groups.
+    for (const id of ["color", "curves", "mixer", "grading", "output"]) {
+      await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(true);
+    }
+    for (const id of ["light", "detail", "effects"]) {
+      await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(false);
+    }
     expect(await groupExpanded(page, "output")).toBe(outputBefore);
     await expect(page.locator(PP_WS)).toBeVisible();
     expectOnlySync404(bad);
@@ -255,10 +267,39 @@ test.describe("Post Processing workspace (fake backend)", () => {
     for (const id of ["light", "color", "curves", "mixer", "grading", "effects"]) {
       await expect.poll(() => groupExpanded(page, id), { timeout: 10000 }).toBe("false");
     }
+    await expect.poll(() => groupVisible(page, "detail"), { timeout: 10000 }).toBe(true);
+    await expect.poll(() => groupVisible(page, "output"), { timeout: 10000 }).toBe(true);
+    for (const id of ["light", "color", "curves", "mixer", "grading", "effects"]) {
+      await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(false);
+    }
     expect(await groupExpanded(page, "output")).toBe(outputBefore);
     // Category switches only change disclosure state — values survive.
     expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
     expect(await page.evaluate(() => window.__ppRecipe.recipe.exposure)).toBe(2);
+    expectOnlySync404(bad);
+    await fx.assertNoConsoleErrors(ALLOW);
+  });
+
+  test("T8 — subtool views preserve the recipe and keep the canvas central", async ({ page }) => {
+    const fx = await setupFakeTest(page);
+    const bad = watch4xx(page);
+    await openPostprocess(page);
+    await uploadSource(page);
+    await page.locator('[data-testid="pp-slider-exposure"] input[type="range"]').fill("2");
+    await expect.poll(() => page.evaluate(() => window.__ppRecipe && window.__ppRecipe.recipe.exposure),
+      { timeout: 10000 }).toBe(2);
+    const before = await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe));
+    for (const [subtool, visible, hidden] of [
+      ["adjust", ["light", "output"], ["color", "detail", "effects"]],
+      ["color", ["color", "curves", "mixer", "grading", "output"], ["light", "detail", "effects"]],
+      ["effects", ["effects", "output"], ["light", "color", "detail"]],
+    ]) {
+      await clickPostSubtool(page, subtool);
+      for (const id of visible) await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(true);
+      for (const id of hidden) await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(false);
+      expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+      await expect(page.locator('[data-testid="canvas-area"] [data-testid="pp-canvas"]')).toBeVisible();
+    }
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });

@@ -1041,7 +1041,7 @@ export function renderPlayground(state, context) {
 var _PANEL_WIDTH_KEY = "comfymodal-studio-panel-width";
 var _PANEL_WIDTH_MIN = 200;
 var _PANEL_WIDTH_MAX = 600;
-var _PANEL_WIDTH_DEFAULT = 400;
+var _PANEL_WIDTH_DEFAULT = 333;
 
 function _createResizeHandle(leftPanel) {
   var handle = el("div", { class: "comfymodal-studio-resize-handle" });
@@ -8204,6 +8204,10 @@ function _focusPostCategory(subtool, root) {
     var ws = scope.querySelector('[data-testid="pp-workspace"]');
     if (!ws) return;
     if (!root && !ws.isConnected) return;
+    // The native sidebar is a focused view, not a relocated legacy inspector.
+    // Keep the single mounted engine and only change which presentation groups
+    // are visible; values, history, and the central stage remain untouched.
+    ws.setAttribute("data-post-category", subtool || "adjust");
     if (subtool === "crop" || subtool === "heal") {
       var toolBtn = ws.querySelector('[data-testid="pp-' + subtool + '"]');
       if (toolBtn && !toolBtn.classList.contains("on")) toolBtn.click();
