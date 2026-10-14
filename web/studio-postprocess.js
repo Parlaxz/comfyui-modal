@@ -562,11 +562,26 @@ function injectPngMetadata(pngBytes, srcBytes) {
 
 var CSS = [
   ".pp-ws{display:flex;flex-direction:column;gap:8px;height:min(80vh,940px);min-height:480px;background:#101013;color:#e4e4e7;font-size:12px;outline:none;overflow:hidden}",
-  ".pp-toolbar{flex:none;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 8px;background:#17171b;border:1px solid #26262c;border-radius:8px}",
+  ".pp-native-sidebar{height:auto;min-height:0;overflow:visible;background:transparent;gap:8px;color:var(--color-text-primary,#e4e4e7);font-size:var(--font-size-sm,12px)}",
+  ".pp-native-sidebar .pp-toolbar{order:3;flex-wrap:wrap;padding:6px 0;border-top:1px solid var(--color-border,#2b2d35)}",
+  ".pp-native-sidebar .pp-toolbar .pp-title{width:100%;font-size:var(--font-size-xs,11px);color:var(--color-text-muted,#9aa0ad)}",
+  ".pp-native-sidebar .pp-looks{display:block;max-height:180px;overflow:auto;border:0;border-top:1px solid var(--color-border,#2b2d35);padding:8px 0;background:transparent;order:2}",
+  ".pp-native-sidebar .pp-insp{max-height:none;border:0;padding:0;background:transparent;overflow:visible;order:1;display:flex;flex-direction:column}",
+  ".pp-native-sidebar .pp-insp>.pp-note{order:90}",
+  ".pp-native-sidebar .pp-insp>.pp-hist{order:91}",
+  ".pp-native-sidebar .pp-main{display:flex;flex-direction:column;gap:8px}",
+  ".pp-native-sidebar .pp-main>.pp-stage{display:none}",
+  ".pp-native-sidebar[data-post-category=adjust] .pp-insp .pp-group:not([data-group=light]):not([data-group=output]),.pp-native-sidebar[data-post-category=color] .pp-insp .pp-group:not([data-group=color]):not([data-group=curves]):not([data-group=mixer]):not([data-group=grading]):not([data-group=output]),.pp-native-sidebar[data-post-category=detail] .pp-insp .pp-group:not([data-group=detail]):not([data-group=output]),.pp-native-sidebar[data-post-category=effects] .pp-insp .pp-group:not([data-group=effects]):not([data-group=output]),.pp-native-sidebar[data-post-category=crop] .pp-insp .pp-group:not([data-group=output]),.pp-native-sidebar[data-post-category=heal] .pp-insp .pp-group:not([data-group=output]){display:none}",
+  ".pp-native-sidebar .pp-film{max-height:76px;overflow-x:auto;overflow-y:hidden}",
+  ".pp-native-sidebar .pp-status{font-size:var(--font-size-xs,11px);color:var(--color-text-muted,#9aa0ad)}",
+  ".pp-native-sidebar .pp-dot{background:var(--color-accent,#5a7fdb)}",
+  ".pp-native-sidebar .pp-thumb.active{border-color:var(--color-accent,#5a7fdb)}",
+  ".pp-native-sidebar .pp-curve-tabs button.on{border-color:var(--color-accent,#5a7fdb)}",
+  ".pp-toolbar{flex:none;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 0;background:transparent;border:0;border-radius:0}",
   ".pp-toolbar .pp-title{font-weight:600;margin-right:auto;letter-spacing:.02em}",
-  ".pp-btn{background:#232329;border:1px solid #34343c;color:#e4e4e7;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px}",
-  ".pp-btn:hover{background:#2d2d35}.pp-btn:disabled{opacity:.45;cursor:default}.pp-btn.on{border-color:#d9a441;color:#f5d78e}",
-  ".pp-btn.primary{background:#3a2f14;border-color:#d9a441}",
+  ".pp-btn{background:var(--color-bg-secondary,#24262e);border:1px solid var(--color-border,#3a3d47);color:var(--color-text-primary,#e4e4e7);border-radius:var(--radius-sm,6px);min-height:30px;padding:5px 10px;cursor:pointer;font-size:var(--font-size-sm,12px);line-height:1.2}",
+  ".pp-btn:hover{background:var(--color-bg-tertiary,#30333d)}.pp-btn:disabled{opacity:.45;cursor:default}.pp-btn.on{border-color:var(--color-accent,#5a7fdb);color:var(--color-text-primary,#fff);background:var(--color-accent-muted,rgba(90,127,219,.16))}",
+  ".pp-btn.primary{background:var(--color-accent-strong,#3b5cc0);border-color:var(--color-accent-strong,#3b5cc0)}",
   ".pp-main{display:grid;grid-template-columns:220px minmax(0,1fr) 264px;gap:8px;min-height:0;flex:1;overflow:hidden}",
   ".pp-looks,.pp-insp{background:#17171b;border:1px solid #26262c;border-radius:8px;padding:8px;overflow-y:auto;min-height:0;max-height:100%}",
   ".pp-stage{position:relative;background:#0a0a0c;border:1px solid #26262c;border-radius:8px;overflow:auto;min-height:0;display:flex;align-items:center;justify-content:center}",
@@ -576,26 +591,86 @@ var CSS = [
   ".pp-compare{position:absolute;top:8px;right:8px;display:flex;gap:6px;align-items:center;background:rgba(10,10,12,.75);padding:4px 8px;border-radius:6px}",
   ".pp-divider{position:absolute;top:0;bottom:0;width:2px;background:#d9a441;cursor:ew-resize}",
   ".pp-divider::after{content:'◂ ▸';position:absolute;top:8px;left:-16px;font-size:10px;background:#d9a441;color:#111;border-radius:4px;padding:1px 4px}",
-  ".pp-group{border-bottom:1px solid #232329;padding:6px 0}",
-  ".pp-grouphead{display:flex;align-items:center;gap:6px;width:100%;background:none;border:none;color:#e4e4e7;cursor:pointer;padding:4px 0;font-size:12px;font-weight:600}",
-  ".pp-chev{color:#d9a441;width:12px;flex:none}",
+  ".pp-group{border-bottom:1px solid var(--color-border,#2b2d35);padding:2px 0}",
+  ".pp-grouphead{display:flex;align-items:center;gap:7px;width:100%;background:none;border:0;color:var(--color-text-primary,#e4e4e7);cursor:pointer;padding:8px 2px;font-size:var(--font-size-sm,12px);font-weight:600;text-align:left}",
+  ".pp-chev{color:var(--color-text-muted,#9aa0ad);width:12px;flex:none}",
   ".pp-insptools{display:flex;gap:4px;margin-bottom:4px}",
   ".pp-dot{width:7px;height:7px;border-radius:50%;background:#d9a441;display:none}.pp-group.has-edits .pp-dot{display:inline-block}",
-  ".pp-grouphead .pp-reset{margin-left:auto;font-size:10px;color:#a1a1aa;background:none;border:none;cursor:pointer}",
-  ".pp-row{display:grid;grid-template-columns:92px 1fr 52px;gap:6px;align-items:center;padding:2px 0}",
-  ".pp-row label{color:#b6b6bd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-  ".pp-row input[type=range]{width:100%;accent-color:#d9a441}",
-  ".pp-row input[type=number]{width:52px;background:#101013;border:1px solid #34343c;color:#e4e4e7;border-radius:4px;font-size:11px;padding:1px 3px}",
-  ".pp-note{color:#8b8b94;font-size:11px}",
+  ".pp-grouphead .pp-reset{margin-left:auto;font-size:var(--font-size-xs,11px);color:var(--color-accent,#5a7fdb);background:none;border:none;cursor:pointer;text-decoration:underline}",
+  ".pp-row{display:grid;grid-template-columns:96px minmax(0,1fr) 52px;gap:8px;align-items:center;padding:5px 0}",
+  ".pp-row label{color:var(--color-text-secondary,#b6b6bd);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+  ".pp-row input[type=range]{width:100%;accent-color:var(--color-accent,#5a7fdb);height:18px}",
+  ".pp-row input[type=number]{width:52px;box-sizing:border-box;background:var(--color-bg-primary,#17191f);border:1px solid var(--color-border,#3a3d47);color:var(--color-text-primary,#e4e4e7);border-radius:var(--radius-sm,5px);font-size:var(--font-size-xs,11px);padding:4px 5px;min-height:28px}",
+  ".pp-note{color:var(--color-text-muted,#9aa0ad);font-size:var(--font-size-xs,11px)}",
   ".pp-film{display:flex;gap:6px;align-items:center;background:#17171b;border:1px solid #26262c;border-radius:8px;padding:6px 8px;overflow-x:auto}",
   ".pp-thumb{width:56px;height:56px;object-fit:cover;border-radius:6px;border:2px solid transparent;cursor:pointer;background:#0a0a0c}",
   ".pp-thumb.active{border-color:#d9a441}",
-  ".pp-hist{width:100%;height:64px;background:#0a0a0c;border:1px solid #26262c;border-radius:6px}",
+  ".pp-hist{width:100%;height:38px;background:var(--color-bg-primary,#17191f);border:1px solid var(--color-border,#2b2d35);border-radius:var(--radius-sm,5px)}",
   ".pp-curve-tabs{display:flex;gap:4px;margin:4px 0}",
   ".pp-curve-tabs button.on{border-color:#d9a441}",
   ".pp-status{color:#8b8b94;font-size:11px;min-height:14px}",
   "@media (max-width:1100px){.pp-main{grid-template-columns:minmax(0,1fr) 264px}.pp-looks{display:none}.pp-looks.open{display:block;position:absolute;z-index:5;max-width:260px}}",
   "@media (max-width:800px){.pp-main{grid-template-columns:minmax(0,1fr)}.pp-insp{max-height:300px}}",
+  // ── Phase-4 FLATTEN: one persistent panel grid (native left rail only) ──
+  // The same 11 panels in every Post view; panel state is a UI-only ws
+  // attribute (data-pp-tab), so switching panels never rebuilds controls or
+  // touches the recipe/engine. Crop/Heal keep their focused tool views and
+  // hide the cross-category Looks panel; the grid itself stays so any panel
+  // is one click away (the click navigates subtools and disarms the tool).
+  // The grid is the SOLE adjustment navigation (the top row keeps only
+  // Crop/Heal/Upscale modes), so it reads as a compact tool palette.
+  ".pp-native-sidebar .pp-tabs{position:sticky;top:0;z-index:3;display:grid;gap:3px;padding:6px 0;background:var(--color-bg-primary,#17191f);border-bottom:1px solid var(--color-border,#2b2d35);grid-template-columns:repeat(3,minmax(0,1fr))}",
+  ".pp-native-sidebar .pp-tabs .pp-btn{min-height:26px;padding:3px 6px;font-size:var(--font-size-sm,12px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+  ".pp-native-sidebar .pp-tabs .pp-btn.on{border-color:var(--color-accent,#5a7fdb);background:var(--color-accent-muted,rgba(90,127,219,.16));color:var(--color-text-primary,#fff);font-weight:600}",
+  ".pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-insp .pp-group,.pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-insp [data-pp-section=histogram],.pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-looks{display:none}",
+  ".pp-native-sidebar[data-post-category=adjust][data-pp-tab=light] .pp-insp .pp-group[data-group=light]{display:block}",
+  ".pp-native-sidebar[data-post-category=adjust][data-pp-tab=output] .pp-insp .pp-group[data-group=output]{display:block}",
+  ".pp-native-sidebar[data-post-category=adjust][data-pp-tab=histogram] .pp-insp [data-pp-section=histogram]{display:block}",
+  ".pp-native-sidebar[data-post-category=adjust][data-pp-tab=looks] .pp-looks{display:block}",
+  ".pp-native-sidebar[data-post-category=adjust] .pp-looks [data-pp-section=lut]{display:none}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab] .pp-insp .pp-group,.pp-native-sidebar[data-post-category=color][data-pp-tab] .pp-insp [data-pp-section=histogram],.pp-native-sidebar[data-post-category=color][data-pp-tab] .pp-looks{display:none}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=basic] .pp-insp .pp-group[data-group=color]{display:block}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=curves] .pp-insp .pp-group[data-group=curves]{display:block}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=mixer] .pp-insp .pp-group[data-group=mixer]{display:block}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=grading] .pp-insp .pp-group[data-group=grading]{display:block}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=histogram] .pp-insp [data-pp-section=histogram]{display:block}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=lut] .pp-looks{display:block}",
+  ".pp-native-sidebar[data-post-category=color] .pp-looks [data-pp-section=looks]{display:none}",
+  ".pp-native-sidebar[data-post-category=crop] .pp-looks,.pp-native-sidebar[data-post-category=heal] .pp-looks{display:none}",
+  // Phase-4 tool purity: Crop/Heal are canvas interaction modes, not
+  // adjustment views — no passive inspector groups, filmstrip, or histogram
+  // beneath the grid. What remains is the grid (one-click exit), the tool
+  // status line (concise instruction + live counts), and the utility toolbar.
+  // Histogram isolation: the histogram renders ONLY under an explicit
+  // Histogram panel click. The existing per-tab show rules re-enable it
+  // there (higher specificity); everywhere else it stays hidden, including
+  // Detail/Effects/Output/Crop/Heal views that have no histogram tab.
+  ".pp-native-sidebar[data-post-category=crop] .pp-insp,.pp-native-sidebar[data-post-category=heal] .pp-insp,.pp-native-sidebar[data-post-category=crop] .pp-film,.pp-native-sidebar[data-post-category=heal] .pp-film{display:none}",
+  ".pp-native-sidebar .pp-insp [data-pp-section=histogram]{display:none}",
+  // ── Phase-4 FINAL POLISH: sticky utility action row ──
+  // Compare stays: the Studio top-bar Compare is a History A/B picker, a
+  // different system from the engine before/after. Crop/Heal/WB hide here
+  // (still in DOM so the Post subtools + C/J/W shortcuts arm the same tools).
+  ".pp-native-sidebar .pp-toolbar{position:sticky;bottom:0;z-index:3;background:var(--color-bg-primary,#17191f)}",
+  ".pp-native-sidebar .pp-toolbar .pp-btn{min-height:28px;padding:4px 9px}",
+  // Active canvas mode in the top Post row (Crop/Heal/Upscale): the shared
+  // secondary-button .is-on has no visible treatment anywhere, so an active
+  // mode looked identical to idle ones. Scoped to the Post row so
+  // Generate/Edit submenu styling is untouched. Lives here (not
+  // studio-styles.js) because this array is the stylesheet guaranteed to be
+  // injected in every Post view — ensureStudioStyles is not loaded on the
+  // Studio path, which is why the rule had no effect there.
+  "[data-testid=tool-submenu-post] .comfymodal-secondary-btn.is-on,[data-testid=tool-submenu-post] .comfymodal-secondary-btn.active{border-color:var(--color-accent,#5a7fdb);background:var(--color-accent-muted,rgba(90,127,219,.16));color:var(--color-text-primary,#fff);font-weight:600}",
+  ".pp-native-sidebar .pp-toolbar [data-testid=pp-crop],.pp-native-sidebar .pp-toolbar [data-testid=pp-heal],.pp-native-sidebar .pp-toolbar [data-testid=pp-wb]{display:none}",
+  // ── Phase-4 FINAL POLISH: density (native only; standalone untouched) ──
+  ".pp-native-sidebar .pp-row{grid-template-columns:88px minmax(0,1fr) 48px;gap:6px;padding:3px 0}",
+  ".pp-native-sidebar .pp-row input[type=range]{height:16px}",
+  ".pp-native-sidebar .pp-row input[type=number]{width:48px;min-height:24px;padding:3px 4px}",
+  ".pp-native-sidebar .pp-group{padding:1px 0}",
+  ".pp-native-sidebar .pp-grouphead{padding:6px 2px}",
+  ".pp-native-sidebar .pp-film{max-height:64px;padding:4px 6px}",
+  ".pp-native-sidebar .pp-thumb{width:48px;height:48px}",
+  ".pp-native-sidebar .pp-curve-tabs{margin:2px 0}",
 ].join("\n");
 function ensureStyle() {
   if (_styleInjected) return;
@@ -618,12 +693,36 @@ function itemKeyOf(it) {
   return "url:" + (it.url || "");
 }
 
+// ── Native sidebar panel grid (Phase-4 FLATTEN, presentation only) ──
+// ONE persistent grid across Post: every major panel is one click away from
+// anywhere. Each panel maps to its owning engine category + section; a click
+// inside the live category only flips the UI-only data-pp-tab attribute, while
+// a click into another category presets the landing section and takes the
+// REAL shell path (opts.onRequestSubtool — the same subtool switch as the top
+// buttons), so submenu, category, and grid share one navigation truth. Tab
+// state lives in the module store per category; nothing rebuilds controls and
+// the recipe/engine are untouched, so values always survive switching.
+var PP_PANELS = [
+  { id: "light", label: "Light", cat: "adjust", tab: "light" },
+  { id: "color", label: "Color", cat: "color", tab: "basic" },
+  { id: "curves", label: "Curves", cat: "color", tab: "curves" },
+  { id: "detail", label: "Detail", cat: "detail", tab: null },
+  { id: "effects", label: "Effects", cat: "effects", tab: null },
+  { id: "looks", label: "Looks", cat: "adjust", tab: "looks" },
+  { id: "mixer", label: "Mixer", cat: "color", tab: "mixer" },
+  { id: "grading", label: "Grading", cat: "color", tab: "grading" },
+  { id: "lut", label: "LUT", cat: "color", tab: "lut" },
+  { id: "histogram", label: "Histogram", cat: "adjust", tab: "histogram" },
+  { id: "output", label: "Output", cat: "adjust", tab: "output" },
+];
+var PP_TAB_DEFAULTS = { adjust: "light", color: "basic" };
+
 export function mountPostprocessWorkspace(host, opts) {
   ensureStyle();
   opts = opts || {};
   var sourceUrl = opts.sourceUrl || "";
   host.innerHTML = "";
-  var ws = el("div", { class: "pp-ws", "data-testid": "pp-workspace", tabindex: "0" });
+  var ws = el("div", { class: "pp-ws" + (opts.nativeSidebar ? " pp-native-sidebar" : ""), "data-testid": "pp-workspace", tabindex: "0" });
   host.appendChild(ws);
 
   var UI = PP_STORE.ui;
@@ -654,9 +753,112 @@ export function mountPostprocessWorkspace(host, opts) {
   }
   window.__ppRecipe = null;
 
+  // Global panel grid (native sidebar only): the same bounded Post-specific
+  // buttons in every Post view. Buttons reuse .pp-btn secondary styling with
+  // the existing .on active treatment. Same-category clicks only flip
+  // data-pp-tab (CSS shows that section); cross-category clicks go through
+  // the shell so the top submenu stays truthful. Either way no control is
+  // rebuilt and the recipe/engine are untouched, so values cannot reset.
+  var tabsBar = null, tabBtns = {};
+  if (opts.nativeSidebar) {
+    tabsBar = el("div", { class: "pp-tabs", "data-testid": "pp-tabs" });
+    ws.insertBefore(tabsBar, ws.firstChild);
+  }
+  function ppPanelById(id) {
+    for (var i = 0; i < PP_PANELS.length; i++) {
+      if (PP_PANELS[i].id === id) return PP_PANELS[i];
+    }
+    return null;
+  }
+  function ppActivePanelId() {
+    var cat = ws.getAttribute("data-post-category") || "adjust";
+    var tab = ws.getAttribute("data-pp-tab");
+    tab = tab === null ? null : tab;
+    for (var i = 0; i < PP_PANELS.length; i++) {
+      var p = PP_PANELS[i];
+      if (p.cat === cat && (p.tab || null) === tab) return p.id;
+    }
+    // Tool categories (Crop/Heal) own no panel: press nothing rather than a
+    // misleading default. Tabbed categories always match above.
+    return null;
+  }
+  function ppRefreshPressed(activeId) {
+    Object.keys(tabBtns).forEach(function (k) {
+      var on = k === activeId;
+      tabBtns[k].classList.toggle("on", on);
+      tabBtns[k].setAttribute("aria-pressed", on ? "true" : "false");
+    });
+  }
+  function ppGoPanel(id) {
+    var p = ppPanelById(id);
+    if (!p) return;
+    var liveCat = ws.getAttribute("data-post-category") || "adjust";
+    PP_STORE.ppTab = PP_STORE.ppTab || {};
+    if (p.cat !== liveCat) {
+      // Cross-category: remember the landing section, then take the real
+      // shell path (same as the top buttons). The shell flips
+      // data-post-category, the observer below rebuilds this grid from the
+      // remembered tab — one shared navigation truth, no transient blank.
+      if (p.tab) PP_STORE.ppTab[p.cat] = p.tab;
+      if (typeof opts.onRequestSubtool === "function") {
+        opts.onRequestSubtool(p.cat);
+        return;
+      }
+      // Standalone mounts have no shell: set the attributes directly.
+      ws.setAttribute("data-post-category", p.cat);
+    }
+    if (p.tab) {
+      PP_STORE.ppTab[liveCat] = p.tab;
+      ws.setAttribute("data-pp-tab", p.tab);
+    } else {
+      ws.removeAttribute("data-pp-tab");
+    }
+    ppRefreshPressed(id);
+  }
+  function syncPpTabs() {
+    if (!tabsBar) return;
+    var cat = ws.getAttribute("data-post-category") || "adjust";
+    // Top-button switches land on the remembered section for tabbed
+    // categories; tool categories show their focused view (no tab). Always
+    // re-derive from memory: a tab remembered under another category must
+    // never linger here (its show-rule cannot match, hiding everything).
+    if (cat === "adjust" || cat === "color") {
+      PP_STORE.ppTab = PP_STORE.ppTab || {};
+      var mem = PP_STORE.ppTab[cat] || PP_TAB_DEFAULTS[cat];
+      if (mem) ws.setAttribute("data-pp-tab", mem);
+    }
+    if (cat !== "adjust" && cat !== "color") ws.removeAttribute("data-pp-tab");
+    tabsBar.innerHTML = ""; tabBtns = {};
+    tabsBar.style.display = "";
+    var active = ppActivePanelId();
+    PP_PANELS.forEach(function (p) {
+      var b = el("button", {
+        type: "button", class: "pp-btn" + (p.id === active ? " on" : ""),
+        "data-testid": "pp-tab-" + p.id, text: p.label, title: p.label,
+      });
+      b.setAttribute("aria-pressed", p.id === active ? "true" : "false");
+      (function (pid) {
+        b.addEventListener("click", function () { ppGoPanel(pid); });
+      })(p.id);
+      tabBtns[p.id] = b; tabsBar.appendChild(b);
+    });
+  }
+  if (tabsBar && typeof MutationObserver !== "undefined") {
+    // The Studio shell owns the category (data-post-category); follow it so
+    // subtool switches rebuild the tab set in place — no engine involvement.
+    var ppCatObs = new MutationObserver(function (muts) {
+      for (var i = 0; i < muts.length; i++) {
+        if (muts[i].attributeName === "data-post-category") { syncPpTabs(); break; }
+      }
+    });
+    ppCatObs.observe(ws, { attributes: true, attributeFilter: ["data-post-category"] });
+  }
+
   // Toolbar
   var toolbar = el("div", { class: "pp-toolbar", "data-testid": "pp-toolbar" });
-  var title = el("span", { class: "pp-title", text: "Post Processing · TinyLuma engine" });
+  // Native Studio rail: plain product title (the engine name is a
+  // developer detail that does not belong in the Studio sidebar).
+  var title = el("span", { class: "pp-title", text: opts.nativeSidebar ? "Post Processing" : "Post Processing · TinyLuma engine" });
   toolbar.appendChild(title);
   function btn(label, testid, titleText, fn) {
     var b = el("button", { type: "button", class: "pp-btn", "data-testid": testid, text: label, title: titleText || label });
@@ -1026,18 +1228,12 @@ export function mountPostprocessWorkspace(host, opts) {
     insp.innerHTML = ""; groupMeta = [];
     var r = recipe();
     if (!r) { insp.appendChild(el("p", { class: "pp-note", text: "Pick or upload an image to edit." })); return; }
-    // Histogram
-    insp.appendChild(el("div", { class: "pp-note", text: "Histogram" }));
-    var tools = el("div", { class: "pp-insptools" });
-    var expB = el("button", { type: "button", class: "pp-btn", text: "Expand all", style: "flex:1" });
-    expB.addEventListener("click", function () { setAllGroups(true); });
-    var colB = el("button", { type: "button", class: "pp-btn", text: "Collapse all", style: "flex:1" });
-    colB.addEventListener("click", function () { setAllGroups(false); });
-    tools.appendChild(expB); tools.appendChild(colB);
-    insp.appendChild(tools);
+    // Histogram is useful context, but stays a quiet secondary strip.
+    insp.appendChild(el("div", { class: "pp-note", text: "Histogram", style: "margin:4px 0", "data-pp-section": "histogram" }));
     var hc = document.createElement("canvas");
     hc.className = "pp-hist"; hc.width = 248; hc.height = 64;
     hc.setAttribute("data-testid", "pp-histogram");
+    hc.setAttribute("data-pp-section", "histogram");
     insp.appendChild(hc);
     insp._hist = hc;
 
@@ -1059,9 +1255,9 @@ export function mountPostprocessWorkspace(host, opts) {
       pick.addEventListener("click", function () { setTool("wb"); });
       b.appendChild(pick);
     });
-    group(insp, "curves", "Curves", ["curves"], function (b) { buildCurveEditor(b, r); });
-    group(insp, "mixer", "Color mixer", ["mixer"], function (b) { buildMixer(b, r); });
-    group(insp, "grading", "Color grading", ["grading"], function (b) { buildGrading(b, r); });
+    group(insp, "curves", "Curves", ["curves"], function (b) { buildCurveEditor(b, r); }, false);
+    group(insp, "mixer", "Color mixer", ["mixer"], function (b) { buildMixer(b, r); }, false);
+    group(insp, "grading", "Color grading", ["grading"], function (b) { buildGrading(b, r); }, false);
     group(insp, "detail", "Details", ["texture", "clarity", "structure", "sharpen", "detailMasking", "dehaze", "noiseChroma", "noiseLuma", "noiseDetail"], function (b) {
       [["Texture", -100, 100, 1, "texture"], ["Clarity", -100, 100, 1, "clarity"],
        ["Structure", -100, 100, 1, "structure"], ["Sharpen", 0, 150, 1, "sharpen"],
@@ -1161,7 +1357,7 @@ export function mountPostprocessWorkspace(host, opts) {
         path += (i === 0 ? "M" : "L") + X.toFixed(1) + " " + Y.toFixed(1);
       }
       var p = document.createElementNS(NS, "path");
-      p.setAttribute("d", path); p.setAttribute("stroke", "#d9a441"); p.setAttribute("fill", "none"); p.setAttribute("stroke-width", "1.5");
+      p.setAttribute("d", path); p.setAttribute("stroke", "#5a7fdb"); p.setAttribute("fill", "none"); p.setAttribute("stroke-width", "1.5");
       svg.appendChild(p);
       pts.forEach(function (pt, idx) {
         var c = document.createElementNS(NS, "circle");
@@ -1240,7 +1436,11 @@ export function mountPostprocessWorkspace(host, opts) {
       return;
     }
     var user = storeGet(LS_PRESETS, []);
-    looks.appendChild(el("div", { class: "pp-note", text: "Presets", style: "font-weight:600;margin-top:6px" }));
+    // Section hooks for the native tab bar (presentation only): presets and
+    // the LUT library are distinct tab sections in Adjust/Color views.
+    var looksSec = el("div", { "data-pp-section": "looks" });
+    looks.appendChild(looksSec);
+    looksSec.appendChild(el("div", { class: "pp-note", text: "Presets", style: "font-weight:600;margin-top:6px" }));
     BUILTIN_PRESETS.concat(user).forEach(function (p) {
       var b = el("button", { type: "button", class: "pp-btn", text: p.name, style: "display:block;width:100%;margin:2px 0;text-align:left" });
       b.addEventListener("click", function () {
@@ -1250,7 +1450,7 @@ export function mountPostprocessWorkspace(host, opts) {
         cur().recipe = incoming;
         buildInspector(); scheduleRender(); saveDraft();
       });
-      looks.appendChild(b);
+      looksSec.appendChild(b);
     });
     var saveRow = el("div", { style: "display:flex;gap:4px;margin:6px 0" });
     var nameIn = document.createElement("input");
@@ -1263,7 +1463,7 @@ export function mountPostprocessWorkspace(host, opts) {
       storeSet(LS_PRESETS, user); renderLooks(); say("Preset saved: " + nm);
     });
     saveRow.appendChild(nameIn); saveRow.appendChild(saveB);
-    looks.appendChild(saveRow);
+    looksSec.appendChild(saveRow);
     var allB = el("button", { type: "button", class: "pp-btn", text: "Apply look to all", title: "Copy current look (not crop/spots) to every filmstrip image" });
     allB.addEventListener("click", function () {
       var src = snapshot();
@@ -1275,14 +1475,16 @@ export function mountPostprocessWorkspace(host, opts) {
       });
       scheduleRender(); saveDraft(); say("Look applied to " + S.items.length + " images.");
     });
-    looks.appendChild(allB);
+    looksSec.appendChild(allB);
 
-    looks.appendChild(el("div", { class: "pp-note", text: "LUT library (.cube)", style: "font-weight:600;margin-top:10px" }));
+    var lutSec = el("div", { "data-pp-section": "lut" });
+    looks.appendChild(lutSec);
+    lutSec.appendChild(el("div", { class: "pp-note", text: "LUT library (.cube)", style: "font-weight:600;margin-top:10px" }));
     var search = document.createElement("input");
     search.placeholder = "Search LUTs…"; search.style.width = "100%"; search.className = "pp-btn"; search.style.cursor = "text";
-    looks.appendChild(search);
+    lutSec.appendChild(search);
     var lutList = el("div", {});
-    looks.appendChild(lutList);
+    lutSec.appendChild(lutList);
     var importB = el("button", { type: "button", class: "pp-btn", text: "Import .cube", style: "margin-top:6px" });
     importB.addEventListener("click", function () {
       var fi = document.createElement("input");
@@ -1301,7 +1503,7 @@ export function mountPostprocessWorkspace(host, opts) {
       });
       fi.click();
     });
-    looks.appendChild(importB);
+    lutSec.appendChild(importB);
     function paintLuts() {
       lutList.innerHTML = "";
       var q = (search.value || "").toLowerCase();
@@ -1620,7 +1822,7 @@ export function mountPostprocessWorkspace(host, opts) {
   }
 
   // Boot
-  buildInspector(); renderLooks();
+  buildInspector(); renderLooks(); syncPpTabs();
   restoreSession();
   if (sourceUrl) addItem("Studio output", sourceUrl, null);
   if (!S.items.length) {
@@ -1637,5 +1839,11 @@ export function mountPostprocessWorkspace(host, opts) {
     });
     insp.appendChild(up0);
   }
-  return { setSource: function (url) { addItem("Studio output", url, null); } };
+  return {
+    setSource: function (url) { addItem("Studio output", url, null); },
+    // The native Studio shell owns the image surface; this is the same
+    // engine canvas, moved into that surface by studio-playground.js.
+    stage: stage,
+    workspace: ws,
+  };
 }

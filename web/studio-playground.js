@@ -1041,7 +1041,7 @@ export function renderPlayground(state, context) {
 var _PANEL_WIDTH_KEY = "comfymodal-studio-panel-width";
 var _PANEL_WIDTH_MIN = 200;
 var _PANEL_WIDTH_MAX = 600;
-var _PANEL_WIDTH_DEFAULT = 400;
+var _PANEL_WIDTH_DEFAULT = 333;
 
 function _createResizeHandle(leftPanel) {
   var handle = el("div", { class: "comfymodal-studio-resize-handle" });
@@ -1185,13 +1185,42 @@ function renderControlPanel(state, context) {
   var _isPostView = _shellMode === "post";
   var _isPlaceholderView = !_isPostView && _isPlaceholderSubtool(_shellSub);
 
-  if (_isPostView) {
-    panel.appendChild(el("p", {
-      class: "comfymodal-studio-control-note",
-      "data-testid": "post-side-note",
-      text: "Post Processing runs in the local editor in the canvas area — Adjust, Color, Detail, Effects, Crop, and Heal controls live there.",
-    }));
+  if (_isPostView && _shellSub !== "upscale") {
+    // The finishing engine is mounted in the native left rail. Its inspector,
+    // presets, LUTs, undo stack, and export handlers remain the single owner;
+    // only its stage is re-homed into the center canvas below.
+    var postHost = el("div", {
+      class: "comfymodal-studio-postprocess-sidebar",
+      "data-testid": "pp-sidebar",
+    });
+    var postSource = "";
+    try { postSource = _canvasImageUrl(state) || _editorBaseImageUrl(state) || ""; } catch (_postSourceErr) {}
+    try {
+      state.playground._postProcessMount = mountPostprocessWorkspace(postHost, {
+        sourceUrl: postSource,
+        nativeSidebar: true,
+        // Global panel grid navigation: a panel in another category takes the
+        // same shell path as the top submenu buttons (single truth, and the
+        // Crop/Heal tool disarms through the existing toggle-off).
+        onRequestSubtool: function (sub) { _selectPostCategory(state, context, sub); },
+      });
+      panel.appendChild(postHost);
+      _focusPostCategory(_shellSub, postHost);
+    } catch (_postErr) {
+      postHost.appendChild(el("p", {
+        class: "comfymodal-studio-control-note",
+        text: "Post Processing failed to start: " + ((_postErr && _postErr.message) || "unknown error"),
+      }));
+      panel.appendChild(postHost);
+    }
   } else {
+    if (_isPostView && _shellSub === "upscale") {
+      panel.appendChild(el("p", {
+        class: "comfymodal-studio-control-note",
+        "data-testid": "post-side-note",
+        text: "Upscale arrives in a later phase — execution is disabled. Your Post recipe and image remain preserved.",
+      }));
+    }
     panel.appendChild(renderWorkflowSelector(state, context, actions));
 
     if (_isPlaceholderView) {
@@ -4495,34 +4524,6 @@ function renderNoteEditor(nr, actions, apiBase) {
 
 // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Right Workspace ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
 
-// ── Post Processing shell ─────────────────────────────────────────────
-// Mounts the TinyLuma-based finishing editor (web/studio-postprocess.js)
-// with the current run output as its source. Defined here because
-// renderWorkspace branches to it per tool; the editor owns all of its own
-// DOM, state, and rendering below this host node.
-function renderPostProcessShell(state, context, actions) {
-  var shell = el("div", {
-    class: "comfymodal-studio-postprocess-shell",
-    "data-testid": "pp-shell",
-    style: "width:100%;",
-  });
-  var src = "";
-  try {
-    src = _canvasImageUrl(state) || _editorBaseImageUrl(state) || "";
-  } catch (_e) {
-    src = "";
-  }
-  try {
-    mountPostprocessWorkspace(shell, { sourceUrl: src });
-  } catch (_ppErr) {
-    shell.appendChild(el("p", {
-      text: "Post Processing failed to start: " + ((_ppErr && _ppErr.message) || "unknown error"),
-      style: "color:var(--color-danger, #f87171);font-size:var(--font-size-sm);",
-    }));
-  }
-  return shell;
-}
-
 function renderWorkspace(state, context) {
   // Shelf: the right-side workspace is the single result panel (output
   // canvas, progress, metadata, recent filmstrip) — never a movable card.
@@ -4551,12 +4552,27 @@ function renderWorkspace(state, context) {
   // Post Processing mounts the existing local engine; the Upscale category
   // is an honest later-phase placeholder and falls through to the canvas.
   if (activeModeOf(state) === "post" && activeSubtoolOf(state) !== "upscale") {
-    var _ppShell = renderPostProcessShell(state, context, wsActions);
-    workspace.appendChild(_ppShell);
-    // The engine resets its tool on every mount: apply the selected
-    // category to the fresh mount (groups expand, Crop/Heal arm). Scoped
-    // to the new subtree so it works pre-attach; no new editor state.
-    try { _focusPostCategory(activeSubtoolOf(state), _ppShell); } catch (_e) {}
+    // Keep the Studio canvas central. The post engine was mounted by the
+    // left control panel; move its existing stage here instead of rendering a
+    // second post-processing workspace inside the canvas.
+    var postCanvas = renderCanvas(state, context, wsActions);
+    var ppMount = state.playground && state.playground._postProcessMount;
+    var ppStage = ppMount && ppMount.stage;
+    if (ppStage) {
+      var legacyOutput = postCanvas.querySelector('[data-testid="canvas-output"]');
+      if (legacyOutput) legacyOutput.style.display = "none";
+      // The empty-canvas placeholder belongs to the generation views: in Post
+      // the engine stage IS the image surface, so it must not show alongside.
+      var emptyNote = postCanvas.querySelector('[data-testid="canvas-empty"]');
+      if (emptyNote) emptyNote.style.display = "none";
+      ppStage.classList.add("comfymodal-studio-postprocess-stage");
+      ppStage.style.width = "100%";
+      ppStage.style.height = "100%";
+      ppStage.style.minHeight = "420px";
+      postCanvas.appendChild(ppStage);
+    }
+    workspace.appendChild(postCanvas);
+    workspace.appendChild(renderProgressSection(state, context));
     return workspace;
   }
 
@@ -8328,7 +8344,7 @@ function _setActiveSubtool(state, context, actions, mode, subtool) {
 
 function _postSubmenuNote(subtool) {
   if (subtool === "upscale") return "Upscale arrives in a later phase — execution is disabled.";
-  return "Finishing editor lives in the canvas below — pick the Studio image there, or upload your own. Shortcuts: \\ compare · C crop · J heal · W white balance · Ctrl+Z/Y undo/redo.";
+  return "Adjust the photo in the sidebar — pick the Studio image in the canvas, or upload your own. Shortcuts: \\ compare · C crop · J heal · W white balance · Ctrl+Z/Y undo/redo.";
 }
 
 // Post categories route to their honest existing anchors inside the live
@@ -8349,6 +8365,10 @@ function _focusPostCategory(subtool, root) {
     var ws = scope.querySelector('[data-testid="pp-workspace"]');
     if (!ws) return;
     if (!root && !ws.isConnected) return;
+    // The native sidebar is a focused view, not a relocated legacy inspector.
+    // Keep the single mounted engine and only change which presentation groups
+    // are visible; values, history, and the central stage remain untouched.
+    ws.setAttribute("data-post-category", subtool || "adjust");
     if (subtool === "crop" || subtool === "heal") {
       var toolBtn = ws.querySelector('[data-testid="pp-' + subtool + '"]');
       if (toolBtn && !toolBtn.classList.contains("on")) toolBtn.click();
@@ -9903,6 +9923,13 @@ function renderToolSubmenu(state, context, actions) {
   });
 
   (STUDIO_SUBMENUS[spec.id] || []).forEach(function (s) {
+    // Phase-4 dedup: the sidebar panel grid is the canonical navigation for
+    // passive adjustment panels, so the top Post row keeps only canvas
+    // interaction modes (Crop/Heal) and the Phase-11 operation (Upscale).
+    // Internal category semantics (adjust/color/detail/effects) are unchanged:
+    // STUDIO_SUBMENUS.post, _selectPostCategory validation, handoffs, and the
+    // engine data-post-category mapping all still use them.
+    if (spec.id === "post" && s !== "crop" && s !== "heal" && s !== "upscale") return;
     var isActive = s === sub;
     var btn = el("button", {
       type: "button",
