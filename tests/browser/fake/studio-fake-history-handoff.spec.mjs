@@ -21,6 +21,13 @@
 // (_openComparePicker in web/studio-playground.js) ARE the implemented
 // surface — T1/T2 below pin the live behavior. The stale comment about
 // removal is superseded.
+//
+// CORRECTIVE (compare-does-nothing): the picker opened at z-index 80,
+// underneath the Studio overlay stack (viewer 10050, tray 10070, compare
+// view 10080, queue viewer 10090), so the click visibly did nothing while
+// the DOM insisted the picker was open. The picker now opens at 10100
+// (pinned by T6), and openComparePair propagates the view result instead
+// of reporting success when no view opened (pinned by T7).
 //     via dynamic import — the harness-supported pattern from
 //     studio-fake-phase-i5-image-compare-visual.spec.mjs — instead of the
 //     removed picker selects. Descriptor validation is the real
@@ -179,6 +186,72 @@ test.describe("History handoff compare surfaces (fake backend)", () => {
     await expect(detail.locator('[data-testid="viewer-upscale"]')).toContainText("Upscale");
     await page.keyboard.press("Escape");
     await expect(page.locator(VIEWER_OVERLAY)).toHaveCount(0);
+    expectOnlySync404(bad);
+    await fx.assertNoConsoleErrors(ALLOW);
+  });
+
+  // T6 — the real user path, no module import: topbar Compare click opens
+  // the picker, the picker's own choices start the comparison, the divider
+  // overlay becomes visible, and the picker is gone. Pins the corrective
+  // z-index (picker above the Studio overlay stack) and captures proof
+  // screenshots under test-results/proof/.
+  test("T6 — real Compare click to real overlay via picker choices", async ({
+    page,
+  }) => {
+    const fx = await setupFakeTest(page);
+    const bad = watch4xx(page);
+    await expect(page.locator(TOPBAR)).toBeVisible({ timeout: 10000 });
+    await page.locator('[data-testid="compare-open"]').click();
+    const picker = page.locator('[data-testid="compare-picker"]');
+    await expect(picker).toBeVisible({ timeout: 10000 });
+    await expect(picker).toHaveCSS("z-index", "10100");
+    await page.screenshot({ path: "test-results/proof/phase10-fixed-picker.png" });
+    const start = page.locator('[data-testid="compare-start"]');
+    await expect(start).toBeEnabled({ timeout: 10000 });
+    await start.click();
+    const overlay = page.locator(OVERLAY);
+    await expect(overlay).toBeVisible({ timeout: 10000 });
+    await expect(picker).toHaveCount(0);
+    await page.screenshot({ path: "test-results/proof/phase10-fixed-compare-view.png" });
+    await page.locator('[data-testid="cm-compare-close"]').click();
+    await expect(overlay).toHaveCount(0);
+    expectOnlySync404(bad);
+    await fx.assertNoConsoleErrors(ALLOW);
+  });
+
+  // T7 — openComparePair must not report success when the view cannot open
+  // (a view is already showing): otherwise the picker closes and the user
+  // is stranded with no view and no error.
+  test("T7 — openComparePair reports view-blocked instead of fake success", async ({
+    page,
+  }) => {
+    const fx = await setupFakeTest(page);
+    const bad = watch4xx(page);
+    await fx.gotoPage("history");
+    await expect(page.locator(GEN_CARD).first()).toBeVisible({ timeout: 15000 });
+    const urls = await page
+      .locator(THUMB_IMG)
+      .evaluateAll((imgs) =>
+        Array.from(new Set(imgs.map((i) => i.getAttribute("src")).filter(Boolean))).slice(0, 2)
+      );
+    expect(urls.length).toBe(2);
+    const [first, second] = await page.evaluate(async ([a, b]) => {
+      const m = await import("/extensions/comfymodal-modal/studio-image-compare.js");
+      const one = m.openComparePair({
+        a: { url: a, label: "Pick A" },
+        b: { url: b, label: "Pick B" },
+      });
+      const two = m.openComparePair({
+        a: { url: b, label: "Pick B2" },
+        b: { url: a, label: "Pick A2" },
+      });
+      return [one, two];
+    }, urls);
+    expect(first).toBe(true);
+    expect(second).toBe(false);
+    await expect(page.locator(OVERLAY)).toBeVisible({ timeout: 10000 });
+    await page.locator('[data-testid="cm-compare-close"]').click();
+    await expect(page.locator(OVERLAY)).toHaveCount(0);
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });

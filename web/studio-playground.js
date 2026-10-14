@@ -9273,10 +9273,14 @@ function _openComparePicker(state, context, actions) {
       var t = (nr && (nr.prompt || nr.label || nr.id)) || ("Run " + (i + 1));
       return String(t).slice(0, 60);
     }
+    // Above the whole Studio overlay stack (viewer 10050, tray 10070,
+    // compare view 10080, queue viewer 10090): the picker opens from the
+    // topbar at any time, including while a viewer is open — at z-80 it
+    // painted underneath and the click looked dead.
     var overlay = el("div", {
       class: "comfymodal-studio-compare-picker-overlay",
       "data-testid": "compare-picker",
-      style: "position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:80;display:flex;align-items:center;justify-content:center;",
+      style: "position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10100;display:flex;align-items:center;justify-content:center;",
     });
     var dialog = el("div", {
       role: "dialog",
@@ -9398,7 +9402,7 @@ function _openComparePicker(state, context, actions) {
           a: { url: au, label: anr ? runLabel(anr, 0) : "Current canvas" },
           b: { url: bu, label: bnr ? runLabel(bnr, 0) : "History image" },
         });
-      } catch (_e3) { ok = false; }
+      } catch (_e3) { ok = false; console.error("comfymodal: compare failed to open", _e3); }
       if (ok && overlay.parentNode) overlay.parentNode.removeChild(overlay);
     });
     foot.appendChild(closeBtn);
@@ -9626,7 +9630,7 @@ function renderWorkspaceTopBar(state, context, actions) {
     title: "Compare the current canvas with a History image, or two History images",
   });
   compareBtn.addEventListener("click", function () {
-    try { _openComparePicker(state, context, actions); } catch (_e) {}
+    try { _openComparePicker(state, context, actions); } catch (_e) { console.error("comfymodal: compare picker failed to open", _e); }
   });
   right.appendChild(compareBtn);
 

@@ -305,8 +305,9 @@ export function openComparePair(payload) {
   }
   if (p.invoker) _originInvoker = p.invoker;
   _renderTray();
-  openCompareView(p.invoker || null);
-  return true;
+  // Propagate the view result: when the view cannot open (a view is
+  // already open) callers must not treat the pair as shown.
+  return openCompareView(p.invoker || null);
 }
 
 export function clearCompareSession() {
