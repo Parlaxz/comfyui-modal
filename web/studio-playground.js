@@ -5341,6 +5341,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     ants.width = w;
     ants.height = h;
     syncOverlayBox();
+    invalidateOutline();
   }
   // The overlay must sit exactly over the base image: the wrap may be
   // taller than the image (column-fill layout), and inset:0/100% would then
@@ -5373,32 +5374,152 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   base.addEventListener("load", fitCanvas);
   if (base.complete) setTimeout(fitCanvas, 0);
 
-  // The border is a separate, non-persistent canvas so marching ants never
-  // become part of the mask or its undo snapshots.
+  // Mask-only marching ants on a separate, non-persistent canvas so the
+  // border never becomes part of the mask or its undo snapshots. The outline
+  // is a cached Path2D derived from mask alpha whenever the mask changes;
+  // animation frames only stroke the cache and advance the dash offset.
+  // Empty mask -> no outline, no continuing animation.
   var antsFrame = 0;
+  var outlinePath = null;
+  var outlineDirty = true;
+  var outlineScan = document.createElement("canvas");
+  function invalidateOutline() {
+    if (!isMask) return;
+    outlineDirty = true;
+    startMarchingAnts();
+  }
+  function rebuildOutline() {
+    outlineDirty = false;
+    outlinePath = null;
+    try {
+      if (!paint.width || !paint.height || !ants.width || !ants.height) return;
+      var maxSide = 200;
+      var acc = Math.min(1, maxSide / Math.max(paint.width, paint.height));
+      var aw = Math.max(1, Math.round(paint.width * acc));
+      var ah = Math.max(1, Math.round(paint.height * acc));
+      if (outlineScan.width !== aw || outlineScan.height !== ah) { outlineScan.width = aw; outlineScan.height = ah; }
+      var sctx = outlineScan.getContext("2d");
+      sctx.clearRect(0, 0, aw, ah);
+      sctx.drawImage(paint, 0, 0, aw, ah);
+      var img = sctx.getImageData(0, 0, aw, ah);
+      var pix = img.data;
+      var sel = new Uint8Array(aw * ah);
+      var any = false;
+      for (var i = 0; i < aw * ah; i++) {
+        if (pix[i * 4 + 3] >= 128) { sel[i] = 1; any = true; }
+      }
+      if (!any) return;
+      function isSel(x, y) {
+        if (x < 0 || y < 0 || x >= aw || y >= ah) return false;
+        return sel[y * aw + x] === 1;
+      }
+      // Directed boundary edges in grid coords, mask interior on the right.
+      var out = {};
+      var edgeCount = 0;
+      function pushEdge(ax, ay, bx, by) {
+        var k = ax + "," + ay;
+        if (!out[k]) out[k] = [];
+        out[k].push({ bx: bx, by: by, used: false });
+        edgeCount++;
+      }
+      for (var yy = 0; yy < ah; yy++) {
+        for (var xx = 0; xx < aw; xx++) {
+          if (!isSel(xx, yy)) continue;
+          if (!isSel(xx, yy - 1)) pushEdge(xx, yy, xx + 1, yy);
+          if (!isSel(xx + 1, yy)) pushEdge(xx + 1, yy, xx + 1, yy + 1);
+          if (!isSel(xx, yy + 1)) pushEdge(xx + 1, yy + 1, xx, yy + 1);
+          if (!isSel(xx - 1, yy)) pushEdge(xx, yy + 1, xx, yy);
+        }
+      }
+      if (!edgeCount) return;
+      function findStart() {
+        for (var k in out) {
+          var list = out[k];
+          for (var q = 0; q < list.length; q++) {
+            if (!list[q].used) {
+              var sp = k.split(",");
+              return { sx: +sp[0], sy: +sp[1], e: list[q] };
+            }
+          }
+        }
+        return null;
+      }
+      var kx = ants.width / aw, ky = ants.height / ah;
+      var path = new Path2D();
+      var closedAny = false;
+      var guard = edgeCount + 1;
+      var s;
+      while ((s = findStart()) && guard-- > 0) {
+        s.e.used = true;
+        var pts = [{ x: s.sx, y: s.sy }, { x: s.e.bx, y: s.e.by }];
+        var curX = s.e.bx, curY = s.e.by;
+        var inX = curX - s.sx, inY = curY - s.sy;
+        var steps = edgeCount + 1;
+        while ((curX !== s.sx || curY !== s.sy) && steps-- > 0) {
+          var cands = out[curX + "," + curY];
+          var best = null, bestCross = -2, bestDot = -2;
+          if (cands) {
+            for (var c = 0; c < cands.length; c++) {
+              var cd = cands[c];
+              if (cd.used) continue;
+              var ox = cd.bx - curX, oy = cd.by - curY;
+              var cross = inX * oy - inY * ox;
+              var dot = inX * ox + inY * oy;
+              if (cross > bestCross || (cross === bestCross && dot > bestDot)) {
+                best = cd; bestCross = cross; bestDot = dot;
+              }
+            }
+          }
+          if (!best) break;
+          best.used = true;
+          inX = best.bx - curX; inY = best.by - curY;
+          curX = best.bx; curY = best.by;
+          pts.push({ x: curX, y: curY });
+        }
+        if (curX === s.sx && curY === s.sy && pts.length > 2) {
+          path.moveTo(pts[0].x * kx, pts[0].y * ky);
+          for (var t = 1; t < pts.length; t++) path.lineTo(pts[t].x * kx, pts[t].y * ky);
+          path.closePath();
+          closedAny = true;
+        }
+      }
+      if (closedAny) outlinePath = path;
+    } catch (_e) { outlinePath = null; }
+  }
   function drawMarchingAnts(time) {
-    if (!box.isConnected || !ants.getClientRects().length || document.hidden) {
-      if (!box.isConnected) document.removeEventListener("visibilitychange", onVisibilityChange);
+    var alive = (box.isConnected || ants.isConnected) && !document.hidden && !!ants.getClientRects().length;
+    if (!isMask || !alive) {
+      if (!box.isConnected && !ants.isConnected) {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+        try { if (antsIO) antsIO.disconnect(); } catch (_e) {}
+      }
+      try { if (ants.width) ants.getContext("2d").clearRect(0, 0, ants.width, ants.height); } catch (_e2) {}
       antsFrame = 0;
       return;
     }
+    if (outlineDirty) rebuildOutline();
     var ctx = ants.getContext("2d");
     ctx.clearRect(0, 0, ants.width, ants.height);
+    if (!outlinePath) { antsFrame = 0; return; }
+    var bpx = ants.width / Math.max(1, ants.clientWidth || 1);
+    var march = (typeof time === "number" ? time : 0) / 50 * bpx;
     ctx.save();
-    ctx.lineWidth = Math.max(2, ants.width / Math.max(1, ants.clientWidth) * 2);
-    ctx.setLineDash([8, 6]);
-    ctx.lineDashOffset = -(time / 40);
-    ctx.strokeStyle = "rgba(0,0,0,0.9)";
-    ctx.strokeRect(ctx.lineWidth / 2, ctx.lineWidth / 2, ants.width - ctx.lineWidth, ants.height - ctx.lineWidth);
-    ctx.lineWidth = Math.max(1, ants.width / Math.max(1, ants.clientWidth));
-    ctx.lineDashOffset = -(time / 40) + 7;
+    ctx.lineJoin = "round";
+    ctx.setLineDash([]);
+    ctx.lineWidth = Math.max(2, 3 * bpx);
     ctx.strokeStyle = "rgba(255,255,255,0.95)";
-    ctx.strokeRect(ctx.lineWidth / 2, ctx.lineWidth / 2, ants.width - ctx.lineWidth, ants.height - ctx.lineWidth);
+    ctx.stroke(outlinePath);
+    ctx.setLineDash([8 * bpx, 6 * bpx]);
+    ctx.lineDashOffset = -march;
+    ctx.lineWidth = Math.max(1, 1.6 * bpx);
+    ctx.strokeStyle = "rgba(0,0,0,0.95)";
+    ctx.stroke(outlinePath);
     ctx.restore();
     antsFrame = requestAnimationFrame(drawMarchingAnts);
   }
   function startMarchingAnts() {
-    if (isMask && !antsFrame) antsFrame = requestAnimationFrame(drawMarchingAnts);
+    if (!isMask || antsFrame) return;
+    antsFrame = requestAnimationFrame(drawMarchingAnts);
   }
   function stopMarchingAnts() {
     if (antsFrame) cancelAnimationFrame(antsFrame);
@@ -5406,10 +5527,21 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   }
   function onVisibilityChange() {
     if (document.hidden) stopMarchingAnts();
-    else if (box.isConnected) startMarchingAnts();
+    else if (box.isConnected || ants.isConnected) startMarchingAnts();
     else document.removeEventListener("visibilitychange", onVisibilityChange);
   }
   document.addEventListener("visibilitychange", onVisibilityChange);
+  var antsIO = null;
+  try {
+    if (typeof IntersectionObserver !== "undefined") {
+      antsIO = new IntersectionObserver(function (entries) {
+        if (!ants.isConnected && !box.isConnected) { try { antsIO.disconnect(); } catch (_e) {} return; }
+        if (entries && entries.length && entries[entries.length - 1].isIntersecting) startMarchingAnts();
+      });
+      antsIO.observe(ants);
+    }
+  } catch (_e) { antsIO = null; }
+  paint.addEventListener("comfymodal:paint-cleared", function () { invalidateOutline(); });
 
   var undoStack = [];
   var redoStack = [];
@@ -5446,11 +5578,27 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   }
   function restore(url, done) {
     var ctx = paint.getContext("2d");
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+    try { ctx.filter = "none"; } catch (_e) {}
     ctx.clearRect(0, 0, paint.width, paint.height);
+    ctx.restore();
+    invalidateOutline();
     if (!url) { if (done) done(); return; }
     var img = new Image();
-    img.onload = function () { ctx.drawImage(img, 0, 0); if (done) done(); };
-    img.onerror = function () { if (done) done(); };
+    img.onload = function () {
+      var c2 = paint.getContext("2d");
+      c2.save();
+      c2.globalCompositeOperation = "source-over";
+      c2.globalAlpha = 1;
+      try { c2.filter = "none"; } catch (_e2) {}
+      c2.drawImage(img, 0, 0);
+      c2.restore();
+      invalidateOutline();
+      if (done) done();
+    };
+    img.onerror = function () { invalidateOutline(); if (done) done(); };
     img.src = url;
   }
   function pushHistory() {
@@ -5527,6 +5675,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     ctx.stroke();
     last = to;
     preview.textContent = "Mask has paint — Save to use it.";
+    invalidateOutline();
   }
   function fillShapePath(pts) {
     var ctx = paint.getContext("2d");
@@ -5551,6 +5700,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     ctx.fill();
     ctx.restore();
     preview.textContent = "Shape added — Save to use it.";
+    invalidateOutline();
     syncUndoBtns();
   }
   paint.addEventListener("pointerdown", function (ev) {
@@ -5567,6 +5717,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
       ctx.beginPath();
       ctx.arc(last.x, last.y, size / 2, 0, Math.PI * 2);
       ctx.fill();
+      invalidateOutline();
     }
     try { paint.setPointerCapture(ev.pointerId); } catch (_e) {}
   });
@@ -5656,15 +5807,16 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     }
     ctx.putImageData(d, 0, 0);
   }
-  if (growBtn) growBtn.addEventListener("click", function () { pushHistory(); growMask(radius); preview.textContent = "Grown +" + radius + "px — Save to use it."; });
-  if (shrinkBtn) shrinkBtn.addEventListener("click", function () { pushHistory(); shrinkMask(radius); preview.textContent = "Shrunk -" + radius + "px — Save to use it."; });
-  if (featherBtn) featherBtn.addEventListener("click", function () { pushHistory(); featherMask(radius); preview.textContent = "Feathered " + radius + "px — Save to use it."; });
-  if (invertBtn) invertBtn.addEventListener("click", function () { pushHistory(); invertMask(); preview.textContent = "Inverted — Save to use it."; });
-  if (fillBtn) fillBtn.addEventListener("click", function () { pushHistory(); fillHoles(); preview.textContent = "Holes filled — Save to use it."; });
+  if (growBtn) growBtn.addEventListener("click", function () { pushHistory(); growMask(radius); invalidateOutline(); preview.textContent = "Grown +" + radius + "px — Save to use it."; });
+  if (shrinkBtn) shrinkBtn.addEventListener("click", function () { pushHistory(); shrinkMask(radius); invalidateOutline(); preview.textContent = "Shrunk -" + radius + "px — Save to use it."; });
+  if (featherBtn) featherBtn.addEventListener("click", function () { pushHistory(); featherMask(radius); invalidateOutline(); preview.textContent = "Feathered " + radius + "px — Save to use it."; });
+  if (invertBtn) invertBtn.addEventListener("click", function () { pushHistory(); invertMask(); invalidateOutline(); preview.textContent = "Inverted — Save to use it."; });
+  if (fillBtn) fillBtn.addEventListener("click", function () { pushHistory(); fillHoles(); invalidateOutline(); preview.textContent = "Holes filled — Save to use it."; });
   clearBtn.addEventListener("click", function () {
     pushHistory();
     var ctx = paint.getContext("2d");
     ctx.clearRect(0, 0, paint.width, paint.height);
+    invalidateOutline();
     preview.textContent = "Mask cleared.";
   });
   function baseImageB64() {
@@ -5715,6 +5867,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
       ctx.drawImage(tmp, 0, 0);
     }
     ctx.restore();
+    invalidateOutline();
   }
   function loadSamImage(b64) {
     return new Promise(function (res, rej) {
@@ -5917,7 +6070,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
       }
     } catch (_e) { preview.textContent = "Save failed — try again."; }
   });
-  startMarchingAnts();
+  invalidateOutline();
   return box;
 }
 
@@ -8342,6 +8495,7 @@ function _syncEditorBaseImage(state) {
         if (paint) {
           var ctx = paint.getContext("2d");
           if (ctx) ctx.clearRect(0, 0, paint.width, paint.height);
+          try { paint.dispatchEvent(new CustomEvent("comfymodal:paint-cleared")); } catch (_e2) {}
         }
       }
     });
@@ -10289,6 +10443,7 @@ function _setCanvasImage(state, url, context) {
           if (p && p.isConnected) {
             var c = p.getContext("2d");
             if (c) c.clearRect(0, 0, p.width, p.height);
+            try { p.dispatchEvent(new CustomEvent("comfymodal:paint-cleared")); } catch (_e3) {}
           }
         });
       } catch (_e2) { /* best-effort paint only */ }
@@ -10329,6 +10484,7 @@ function _clearPaintOverlays() {
       if (p && p.isConnected) {
         var c = p.getContext("2d");
         if (c) c.clearRect(0, 0, p.width, p.height);
+        try { p.dispatchEvent(new CustomEvent("comfymodal:paint-cleared")); } catch (_e2) {}
       }
     });
     // The status line must not keep claiming paint that no longer exists.
