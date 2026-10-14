@@ -1,15 +1,16 @@
-// Generate Layout editor — Phase 7 (fake backend, bounded).
+// Generate Layout editor — Phase 7 KJNodes port (fake backend, bounded).
 //
-// Proves Generate → Layout against the real frontend: editor shell
-// (stage/toolbar/aspect/inspector/preview), add object/text region growth,
-// inspector label+desc edits reflected in the deterministic preview,
-// delete + reset, aspect persistence (localStorage + stage style),
-// Send to Prompt (prompt control + return to Text), and draft survival
-// across reload. No runs are submitted; no drag simulation (unreliable in
-// the harness — button/input/select interactions only).
+// Proves Generate → Layout against the real frontend: KJ editor mount
+// (canvas/dims/token/palette/globals/region list/inspector/preview),
+// REAL canvas drag-draws (page.mouse, one drag per boundingBox read),
+// click select, move + SE-handle resize, object/text switch, exact text,
+// desc + palette edits in the Ideogram JSON preview, duplicate/reorder/
+// delete, Alt-click overlap cycling, global fields + style block,
+// 0-1000 yx bbox serialization, Send to Prompt (prompt control + return
+// to Text), and draft survival across reload. No runs are submitted.
 //
-// Selector source: web/studio-playground.js (_renderLayoutEditor,
-// serializeLayout, loadLayoutDraft, SHELL_SUBTOOLS generate submenu).
+// Selector source: web/studio-layout-editor.js (stlay-* DOM) +
+// web/studio-playground.js (Generate/Layout shell seam, Send to Prompt).
 // The /comfymodal/sync/status 404 allowlist is the pre-existing
 // shell↔fake-server gap (see studio-fake-postprocess.spec.mjs), unrelated
 // to this workspace.
@@ -22,21 +23,12 @@ const GEN_TOOL = '[data-testid="studio-tool-generate"]';
 const TEXT_SUBTOOL = '[data-testid="studio-subtool-text"]';
 const LAYOUT_SUBTOOL = '[data-testid="studio-subtool-layout"]';
 const WF = '[data-testid="workflow-selector"]';
-const EDITOR = '[data-testid="layout-editor"]';
-const STAGE = '[data-testid="layout-stage"]';
-const ADD_OBJ = '[data-testid="layout-add-object"]';
-const ADD_TXT = '[data-testid="layout-add-text"]';
-const RESET = '[data-testid="layout-reset"]';
-const SEND = '[data-testid="layout-send"]';
-const ASPECT = '[data-testid="layout-aspect"]';
-const INSPECTOR = '[data-testid="layout-inspector"]';
-const PREVIEW = '[data-testid="layout-preview"]';
-const BOXES = '[data-box-id]';
-const LABEL = '[data-testid="layout-box-label"]';
-const DESC = '[data-testid="layout-box-desc"]';
-const DEL = '[data-testid="layout-box-delete"]';
 const PROMPT = '[data-testid="shelf-input-prompt"]';
-const LAYOUT_KEY = "comfymodal.studio.layout.v1";
+const LAYOUT_KEY = "comfymodal.studio.layout.kj.v1";
+const LAYOUT_LEGACY_KEY = "comfymodal.studio.layout.v1";
+
+const CANVAS = ".stlay-canvas";
+const ROWS = ".stlay-lrow";
 
 // Pre-existing shell↔fake-server gap: web/studio-shell.js polls
 // `${apiBase}/sync/status`, which the fake server does not implement. The
@@ -54,9 +46,10 @@ function expectOnlySync404(bad) {
 }
 
 function clearLayoutDraft(page) {
-  return page.evaluate((key) => {
-    try { localStorage.removeItem(key); } catch (_e) {}
-  }, LAYOUT_KEY);
+  return page.evaluate(([kj, legacy]) => {
+    try { localStorage.removeItem(kj); } catch (_e) {}
+    try { localStorage.removeItem(legacy); } catch (_e) {}
+  }, [LAYOUT_KEY, LAYOUT_LEGACY_KEY]);
 }
 
 function readLayoutDraft(page) {
@@ -66,7 +59,7 @@ function readLayoutDraft(page) {
   }, LAYOUT_KEY);
 }
 
-// Generate → Layout. The layout editor owns the canvas view when
+// Generate → Layout. The KJ layout editor owns the canvas view when
 // activeTool is t2i and the shell subtool is layout (see renderCanvas);
 // it is NOT a later-phase placeholder (placeholders are only
 // references/guidance/upscale), so no disabled notice is expected.
@@ -76,7 +69,8 @@ async function gotoGenerateLayout(page) {
   await expect(page.locator(GEN_TOOL)).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
   await page.locator(LAYOUT_SUBTOOL).click();
   await expect(page.locator(LAYOUT_SUBTOOL)).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
-  await expect(page.locator(EDITOR)).toBeVisible({ timeout: 10000 });
+  await expect(page.locator(CANVAS)).toBeVisible({ timeout: 10000 });
+  await page.locator(CANVAS).scrollIntoViewIfNeeded();
 }
 
 // Generate → Text with a T2I workflow selected, then over to Layout. The
@@ -94,104 +88,160 @@ async function gotoLayoutWithWorkflow(page) {
   await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 15000 });
   await page.locator(LAYOUT_SUBTOOL).click();
   await expect(page.locator(LAYOUT_SUBTOOL)).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
-  await expect(page.locator(EDITOR)).toBeVisible({ timeout: 10000 });
+  await expect(page.locator(CANVAS)).toBeVisible({ timeout: 10000 });
+  await page.locator(CANVAS).scrollIntoViewIfNeeded();
+}
+
+// Real drag-draw on the KJ canvas (fraction coordinates 0-1). One drag per
+// boundingBox read: committing a region re-renders the panel and shifts
+// dialog scroll, so a stale box misplaces the next drag.
+async function dragDraw(page, x1, y1, x2, y2, opts = {}) {
+  const box = await page.locator(CANVAS).boundingBox();
+  const px = (fx) => box.x + fx * box.width;
+  const py = (fy) => box.y + fy * box.height;
+  await page.mouse.move(px(x1), py(y1));
+  // NOTE: mouse.down() takes no modifiers option — hold Control via the
+  // keyboard so the KJ canvas sees ctrlKey for force-draw over a box.
+  if (opts.ctrl) await page.keyboard.down("Control");
+  await page.mouse.down();
+  await page.mouse.move(px(x2), py(y2), { steps: 10 });
+  await page.mouse.up();
+  if (opts.ctrl) await page.keyboard.up("Control");
+}
+
+async function canvasClick(page, fx, fy, opts = {}) {
+  const box = await page.locator(CANVAS).boundingBox();
+  await page.mouse.move(box.x + fx * box.width, box.y + fy * box.height);
+  await page.mouse.down({ button: "left", ...(opts.alt ? { modifiers: ["Alt"] } : {}) });
+  await page.mouse.up({ button: "left" });
+}
+
+function previewLocator(page) {
+  // The editor renders two <pre> blocks carrying the caption (pretty preview
+  // .stlay-pre + full {json,text} dump). Assert against the preview one.
+  return page.locator("pre.stlay-pre");
 }
 
 test.describe("Generate Layout editor (fake backend)", () => {
-  test("T1 — Generate → Layout renders editor shell", async ({ page }) => {
+  test("T1 — Generate → Layout renders KJ editor shell", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await clearLayoutDraft(page);
     await gotoGenerateLayout(page);
-    await expect(page.locator(STAGE)).toBeVisible();
-    await expect(page.locator(ADD_OBJ)).toBeVisible();
-    await expect(page.locator(ADD_TXT)).toBeVisible();
-    await expect(page.locator(RESET)).toBeVisible();
-    await expect(page.locator(SEND)).toBeVisible();
-    await expect(page.locator(ASPECT)).toBeVisible();
-    await expect(page.locator(INSPECTOR)).toBeVisible();
-    await expect(page.locator(PREVIEW)).toBeVisible();
-    // Empty draft serializes to the Scene + Canvas envelope.
-    await expect(page.locator(PREVIEW)).toContainText("Scene:", { timeout: 10000 });
-    await expect(page.locator(PREVIEW)).toContainText("Canvas:", { timeout: 10000 });
+    await expect(page.locator(CANVAS)).toBeVisible();
+    await expect(page.getByRole("spinbutton", { name: "Canvas width (multiples of 16)" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Copy JSON" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Clear all" })).toBeVisible();
+    await expect(page.getByRole("button", { name: /Send to Prompt/ })).toBeVisible();
+    await expect(page.getByPlaceholder("High-level description (optional, blank = omitted)")).toBeVisible();
+    await expect(page.getByPlaceholder("Background description (required scene background)")).toBeVisible();
+    await expect(page.getByText("Regions (array order; last = front)")).toBeVisible();
+    await expect(page.getByText("Structured JSON preview")).toBeVisible();
+    // Empty draft serializes to the Ideogram-caption JSON envelope.
+    const preview = previewLocator(page);
+    await expect(preview).toContainText('"elements"', { timeout: 10000 });
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
 
-  test("T2 — add object then text grows the box count", async ({ page }) => {
+  test("T2 — drag draws grow the region count", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await clearLayoutDraft(page);
     await gotoGenerateLayout(page);
-    await expect(page.locator(BOXES)).toHaveCount(0);
-    await page.locator(ADD_OBJ).click();
-    await expect(page.locator(BOXES)).toHaveCount(1, { timeout: 10000 });
-    await page.locator(ADD_TXT).click();
-    await expect(page.locator(BOXES)).toHaveCount(2, { timeout: 10000 });
+    await expect(page.locator(ROWS)).toHaveCount(0);
+    await dragDraw(page, 0.08, 0.08, 0.45, 0.5);
+    await expect(page.locator(ROWS)).toHaveCount(1, { timeout: 10000 });
+    await dragDraw(page, 0.55, 0.1, 0.92, 0.3);
+    await expect(page.locator(ROWS)).toHaveCount(2, { timeout: 10000 });
+    // Ctrl-drag force-draws over an existing box (upstream 1527-1529).
+    await dragDraw(page, 0.3, 0.35, 0.65, 0.75, { ctrl: true });
+    await expect(page.locator(ROWS)).toHaveCount(3, { timeout: 10000 });
+    const draft = await readLayoutDraft(page);
+    expect(draft.boxes).toHaveLength(3);
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
 
-  test("T3 — inspector label+desc land in preview with geometry", async ({ page }) => {
+  test("T3 — object/text switch, exact text, desc land in JSON with yx bbox", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await clearLayoutDraft(page);
     await gotoGenerateLayout(page);
-    await page.locator(ADD_OBJ).click();
-    await expect(page.locator(BOXES)).toHaveCount(1, { timeout: 10000 });
-    // The new box is auto-selected; click it explicitly to prove selection
-    // drives the inspector (pointerdown → selectedId → paintInspector).
-    await page.locator(BOXES).first().click();
-    await expect(page.locator(LABEL)).toBeVisible({ timeout: 10000 });
-    await expect(page.locator(DESC)).toBeVisible({ timeout: 10000 });
-    await page.locator(LABEL).fill("lighthouse");
-    await page.locator(DESC).fill("tall white tower");
-    const preview = page.locator(PREVIEW);
-    await expect(preview).toContainText("lighthouse", { timeout: 10000 });
-    await expect(preview).toContainText("tall white tower", { timeout: 10000 });
-    // Deterministic geometry: integer x=/y= and WxH size (see
-    // serializeLayout: `at x=<x>,y=<y> size <w>x<h>`).
+    await dragDraw(page, 0.55, 0.1, 0.92, 0.3);
+    await expect(page.locator(ROWS)).toHaveCount(1, { timeout: 10000 });
+    await page.getByTitle("Element type (object -> type obj, text -> type text)").selectOption("text");
+    await page.getByPlaceholder("text (text elements only)").fill("GRAND OPENING");
+    await page.getByPlaceholder("desc (always emitted)").fill("bold sign lettering");
+    const preview = previewLocator(page);
+    await expect(preview).toContainText('"type": "text"', { timeout: 10000 });
+    await expect(preview).toContainText('"text": "GRAND OPENING"', { timeout: 10000 });
+    await expect(preview).toContainText('"desc": "bold sign lettering"', { timeout: 10000 });
+    // Ideogram bbox: [ymin,xmin,ymax,xmax] on the 0-1000 grid.
     const text = await preview.textContent();
-    expect(text).toMatch(/x=\d+,y=\d+/);
-    expect(text).toMatch(/size \d+x\d+/);
+    expect(text).toMatch(/"bbox":\s*\[\s*100,\s*550,\s*300,\s*920\s*\]/);
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
 
-  test("T4 — delete removes the region; reset clears all", async ({ page }) => {
+  test("T4 — duplicate/reorder/delete + Clear all", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await clearLayoutDraft(page);
     await gotoGenerateLayout(page);
-    await page.locator(ADD_OBJ).click();
-    await expect(page.locator(BOXES)).toHaveCount(1, { timeout: 10000 });
-    await expect(page.locator(DEL)).toBeVisible({ timeout: 10000 });
-    await page.locator(DEL).click();
-    await expect(page.locator(BOXES)).toHaveCount(0, { timeout: 10000 });
-    await page.locator(ADD_OBJ).click();
-    await page.locator(ADD_TXT).click();
-    await expect(page.locator(BOXES)).toHaveCount(2, { timeout: 10000 });
-    await page.locator(RESET).click();
-    await expect(page.locator(BOXES)).toHaveCount(0, { timeout: 10000 });
+    await dragDraw(page, 0.08, 0.08, 0.45, 0.5);
+    await expect(page.locator(ROWS)).toHaveCount(1, { timeout: 10000 });
+    // Region rows render icon buttons whose accessible name is the glyph, so
+    // target them by title (Lock / Bring toward front / Send toward back /
+    // Duplicate / Delete). Dispatch via evaluate: the tiny icon buttons are
+    // not CDP-actionable in the harness, but .click() still runs the
+    // real listener path.
+    const rowBtn = (rowIdx, title) => page.evaluate(([i, t]) => {
+      const rows = [...document.querySelectorAll(".stlay-lrow")];
+      const b = [...rows[i].querySelectorAll("button")].find((x) => (x.title || "") === t);
+      if (!b) return "MISSING";
+      b.click();
+      return "OK";
+    }, [rowIdx, title]);
+    await rowBtn(0, "Duplicate");
+    await expect(page.locator(ROWS)).toHaveCount(2, { timeout: 10000 });
+    // Reorder: the duplicate sits at the front; send it toward back and
+    // prove the serialized element order follows the array order.
+    const geo = () => readLayoutDraft(page).then((d) => d.boxes.map((b) => [b.x, b.y]));
+    const before = await geo();
+    await rowBtn(0, "Send toward back");
+    const after = await geo();
+    expect(after).not.toEqual(before);
+    expect(after.slice().sort()).toEqual(before.slice().sort());
+    await rowBtn(0, "Delete");
+    await expect(page.locator(ROWS)).toHaveCount(1, { timeout: 10000 });
+    await page.getByRole("button", { name: "Clear all" }).click();
+    await expect(page.locator(ROWS)).toHaveCount(0, { timeout: 10000 });
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
 
-  test("T5 — aspect change persists + stage ratio updates", async ({ page }) => {
+  test("T5 — canvas dims persist + globals feed the caption", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await clearLayoutDraft(page);
     await gotoGenerateLayout(page);
-    await page.locator(ASPECT).selectOption("16:9");
+    // NOTE: canvas dims commit on "change" (upstream commitPxEdit parity —
+    // no per-keystroke refit), and fill() alone does not blur, so Tab out
+    // to fire change.
+    await page.getByRole("spinbutton", { name: "Canvas width (multiples of 16)" }).fill("1280");
+    await page.keyboard.press("Tab");
     await expect.poll(async () => {
       const d = await readLayoutDraft(page);
-      return d && d.aspect;
-    }, { timeout: 10000 }).toBe("16:9");
-    // Stage style is set as `aspect-ratio:16 / 9` (colon → " / ").
-    await expect.poll(async () => {
-      const style = await page.locator(STAGE).getAttribute("style").catch(() => "");
-      return (style || "").indexOf("16 / 9") !== -1;
-    }, { timeout: 10000 }).toBe(true);
+      return d && d.width;
+    }, { timeout: 10000 }).toBe(1280);
+    await page.getByPlaceholder("Background description (required scene background)").click();
+    await page.getByPlaceholder("Background description (required scene background)").fill("clear blue sky");
+    await page.getByPlaceholder("High-level description (optional, blank = omitted)").click();
+    await page.getByPlaceholder("High-level description (optional, blank = omitted)").fill("sunny street");
+    const preview = previewLocator(page);
+    await expect(preview).toContainText('"background": "clear blue sky"', { timeout: 10000 });
+    await expect(preview).toContainText('"high_level_description": "sunny street"', { timeout: 10000 });
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
@@ -201,18 +251,20 @@ test.describe("Generate Layout editor (fake backend)", () => {
     const bad = watch4xx(page);
     await clearLayoutDraft(page);
     await gotoLayoutWithWorkflow(page);
-    await page.locator(ADD_OBJ).click();
-    await expect(page.locator(BOXES)).toHaveCount(1, { timeout: 10000 });
-    await page.locator(LABEL).fill("lighthouse");
-    await page.locator(SEND).click();
+    await dragDraw(page, 0.08, 0.08, 0.45, 0.5);
+    await expect(page.locator(ROWS)).toHaveCount(1, { timeout: 10000 });
+    await page.getByPlaceholder("desc (always emitted)").fill("lighthouse");
+    await page.getByRole("button", { name: /Send to Prompt/ }).click();
     // Send writes through commitShelfValue("prompt", serialization) and
     // flips the shell back to the Text subtool, so the prompt field shows
     // the serialization on the normal T2I path.
     await expect(page.locator(TEXT_SUBTOOL)).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
     const prompt = page.locator(PROMPT);
     await expect(prompt).toBeVisible({ timeout: 10000 });
-    await expect(prompt).toHaveValue(/Scene:/, { timeout: 10000 });
+    await expect(prompt).toHaveValue(/compositional_deconstruction/, { timeout: 10000 });
     await expect(prompt).toHaveValue(/lighthouse/, { timeout: 10000 });
+    // Selected T2I workflow is unchanged by the round trip.
+    await expect(page.locator(WF)).toHaveValue("wf_text2img", { timeout: 10000 });
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
@@ -222,17 +274,17 @@ test.describe("Generate Layout editor (fake backend)", () => {
     const bad = watch4xx(page);
     await clearLayoutDraft(page);
     await gotoGenerateLayout(page);
-    await page.locator(ADD_OBJ).click();
-    await expect(page.locator(BOXES)).toHaveCount(1, { timeout: 10000 });
-    await page.locator(LABEL).fill("lighthouse");
-    await expect(page.locator(PREVIEW)).toContainText("lighthouse", { timeout: 10000 });
+    await dragDraw(page, 0.08, 0.08, 0.45, 0.5);
+    await expect(page.locator(ROWS)).toHaveCount(1, { timeout: 10000 });
+    await page.getByPlaceholder("desc (always emitted)").fill("lighthouse");
+    await expect(previewLocator(page)).toContainText("lighthouse", { timeout: 10000 });
     // NOTE (harness-correct reload): raw page.reload() drops the
     // __mountStudioForTest harness, so use the shared fx.reload() helper
     // (same session goto + remount, same origin so localStorage survives).
     await fx.reload();
     await gotoGenerateLayout(page);
-    await expect(page.locator(BOXES)).toHaveCount(1, { timeout: 10000 });
-    await expect(page.locator(PREVIEW)).toContainText("lighthouse", { timeout: 10000 });
+    await expect(page.locator(ROWS)).toHaveCount(1, { timeout: 10000 });
+    await expect(previewLocator(page)).toContainText("lighthouse", { timeout: 10000 });
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });

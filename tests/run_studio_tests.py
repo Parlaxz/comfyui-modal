@@ -222,6 +222,9 @@ NODE_UNIT_FILES: list[Path] = [
     # History toolbar "Open folder": button adjacency to Clear all and the
     # shared /comfymodal/open-folder POST (default + stored save folder)
     ROOT / "tests" / "studio_history_open_folder_unit.mjs",
+    # Phase 7 KJNodes layout editor: norm/caption/parse/migration/
+    # persistence/canvas contracts (DOM-stubbed, no browser)
+    ROOT / "tests" / "studio_layout_editor_unit.mjs",
 ]
 
 # Intentionally excluded (documented in STUDIO_TEST_GATE.md):
