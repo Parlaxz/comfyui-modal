@@ -611,6 +611,48 @@ var CSS = [
   ".pp-status{color:#8b8b94;font-size:11px;min-height:14px}",
   "@media (max-width:1100px){.pp-main{grid-template-columns:minmax(0,1fr) 264px}.pp-looks{display:none}.pp-looks.open{display:block;position:absolute;z-index:5;max-width:260px}}",
   "@media (max-width:800px){.pp-main{grid-template-columns:minmax(0,1fr)}.pp-insp{max-height:300px}}",
+  // ── Phase-4 FINAL POLISH: tabbed Post sidebar (native left rail only) ──
+  // One visible section at a time; tab state is a UI-only ws attribute
+  // (data-pp-tab), so switching tabs never rebuilds controls or touches the
+  // recipe/engine. Detail/Effects/Crop/Heal keep their coherent unfocused
+  // view (no tab grid); Crop/Heal also hide the cross-category Looks panel.
+  ".pp-native-sidebar .pp-tabs{position:sticky;top:0;z-index:3;display:grid;gap:4px;padding:8px 0;background:var(--color-bg-primary,#17191f);border-bottom:1px solid var(--color-border,#2b2d35)}",
+  ".pp-native-sidebar[data-post-category=adjust] .pp-tabs{grid-template-columns:repeat(2,minmax(0,1fr))}",
+  ".pp-native-sidebar[data-post-category=color] .pp-tabs{grid-template-columns:repeat(3,minmax(0,1fr))}",
+  ".pp-native-sidebar:not([data-post-category=adjust]):not([data-post-category=color]) .pp-tabs{display:none}",
+  ".pp-native-sidebar .pp-tabs .pp-btn{min-height:28px;padding:4px 6px;font-size:var(--font-size-sm,12px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+  ".pp-native-sidebar .pp-tabs .pp-btn.on{border-color:var(--color-accent,#5a7fdb);background:var(--color-accent-muted,rgba(90,127,219,.16));color:var(--color-text-primary,#fff);font-weight:600}",
+  ".pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-insp .pp-group,.pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-insp [data-pp-section=histogram],.pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-looks{display:none}",
+  ".pp-native-sidebar[data-post-category=adjust][data-pp-tab=light] .pp-insp .pp-group[data-group=light]{display:block}",
+  ".pp-native-sidebar[data-post-category=adjust][data-pp-tab=output] .pp-insp .pp-group[data-group=output]{display:block}",
+  ".pp-native-sidebar[data-post-category=adjust][data-pp-tab=histogram] .pp-insp [data-pp-section=histogram]{display:block}",
+  ".pp-native-sidebar[data-post-category=adjust][data-pp-tab=looks] .pp-looks{display:block}",
+  ".pp-native-sidebar[data-post-category=adjust] .pp-looks [data-pp-section=lut]{display:none}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab] .pp-insp .pp-group,.pp-native-sidebar[data-post-category=color][data-pp-tab] .pp-insp [data-pp-section=histogram],.pp-native-sidebar[data-post-category=color][data-pp-tab] .pp-looks{display:none}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=basic] .pp-insp .pp-group[data-group=color]{display:block}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=curves] .pp-insp .pp-group[data-group=curves]{display:block}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=mixer] .pp-insp .pp-group[data-group=mixer]{display:block}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=grading] .pp-insp .pp-group[data-group=grading]{display:block}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=histogram] .pp-insp [data-pp-section=histogram]{display:block}",
+  ".pp-native-sidebar[data-post-category=color][data-pp-tab=lut] .pp-looks{display:block}",
+  ".pp-native-sidebar[data-post-category=color] .pp-looks [data-pp-section=looks]{display:none}",
+  ".pp-native-sidebar[data-post-category=crop] .pp-looks,.pp-native-sidebar[data-post-category=heal] .pp-looks{display:none}",
+  // ── Phase-4 FINAL POLISH: sticky utility action row ──
+  // Compare stays: the Studio top-bar Compare is a History A/B picker, a
+  // different system from the engine before/after. Crop/Heal/WB hide here
+  // (still in DOM so the Post subtools + C/J/W shortcuts arm the same tools).
+  ".pp-native-sidebar .pp-toolbar{position:sticky;bottom:0;z-index:3;background:var(--color-bg-primary,#17191f)}",
+  ".pp-native-sidebar .pp-toolbar .pp-btn{min-height:28px;padding:4px 9px}",
+  ".pp-native-sidebar .pp-toolbar [data-testid=pp-crop],.pp-native-sidebar .pp-toolbar [data-testid=pp-heal],.pp-native-sidebar .pp-toolbar [data-testid=pp-wb]{display:none}",
+  // ── Phase-4 FINAL POLISH: density (native only; standalone untouched) ──
+  ".pp-native-sidebar .pp-row{grid-template-columns:88px minmax(0,1fr) 48px;gap:6px;padding:3px 0}",
+  ".pp-native-sidebar .pp-row input[type=range]{height:16px}",
+  ".pp-native-sidebar .pp-row input[type=number]{width:48px;min-height:24px;padding:3px 4px}",
+  ".pp-native-sidebar .pp-group{padding:1px 0}",
+  ".pp-native-sidebar .pp-grouphead{padding:6px 2px}",
+  ".pp-native-sidebar .pp-film{max-height:64px;padding:4px 6px}",
+  ".pp-native-sidebar .pp-thumb{width:48px;height:48px}",
+  ".pp-native-sidebar .pp-curve-tabs{margin:2px 0}",
 ].join("\n");
 function ensureStyle() {
   if (_styleInjected) return;
@@ -632,6 +674,31 @@ function itemKeyOf(it) {
   if (it.file) return "file:" + (it.file.name || "?") + ":" + (it.file.size || 0);
   return "url:" + (it.url || "");
 }
+
+// ── Native sidebar section tabs (Phase-4 FINAL POLISH, presentation only) ──
+// Per-Post-subtool tab sets; each tab maps 1:1 to real engine UI (a group,
+// the live histogram, the presets section, or the LUT library). Detail /
+// Effects / Crop / Heal have no tab set: Detail and Effects show their one
+// coherent group directly, Crop/Heal show a focused tool view. Tab state is
+// UI-only (which section is visible) and lives in the module store per
+// subtool; it never rebuilds controls, so values always survive switching.
+var PP_TABS = {
+  adjust: [
+    { id: "light", label: "Light" },
+    { id: "looks", label: "Looks" },
+    { id: "histogram", label: "Histogram" },
+    { id: "output", label: "Output" },
+  ],
+  color: [
+    { id: "basic", label: "Basic" },
+    { id: "curves", label: "Curves" },
+    { id: "mixer", label: "Mixer" },
+    { id: "grading", label: "Grading" },
+    { id: "lut", label: "LUT" },
+    { id: "histogram", label: "Histogram" },
+  ],
+};
+var PP_TAB_DEFAULTS = { adjust: "light", color: "basic" };
 
 export function mountPostprocessWorkspace(host, opts) {
   ensureStyle();
@@ -669,9 +736,73 @@ export function mountPostprocessWorkspace(host, opts) {
   }
   window.__ppRecipe = null;
 
+  // Section tab bar (native sidebar only): a tiny bounded Post-specific
+  // selector at the top of the rail. Buttons reuse .pp-btn secondary styling
+  // with the existing .on active treatment. Clicking a tab only flips the
+  // UI-only data-pp-tab attribute (CSS shows that section); no control is
+  // rebuilt and the recipe/engine are untouched, so values cannot reset.
+  var tabsBar = null, tabBtns = {};
+  if (opts.nativeSidebar) {
+    tabsBar = el("div", { class: "pp-tabs", "data-testid": "pp-tabs" });
+    ws.insertBefore(tabsBar, ws.firstChild);
+  }
+  function ppTabOf(cat) {
+    PP_STORE.ppTab = PP_STORE.ppTab || {};
+    var tabs = PP_TABS[cat];
+    if (!tabs) return null;
+    var id = PP_STORE.ppTab[cat] || PP_TAB_DEFAULTS[cat];
+    var known = tabs.some(function (t) { return t.id === id; });
+    return known ? id : PP_TAB_DEFAULTS[cat];
+  }
+  function syncPpTabs() {
+    if (!tabsBar) return;
+    var cat = ws.getAttribute("data-post-category") || "adjust";
+    var tabs = PP_TABS[cat];
+    tabsBar.innerHTML = ""; tabBtns = {};
+    if (!tabs) { tabsBar.style.display = "none"; ws.removeAttribute("data-pp-tab"); return; }
+    tabsBar.style.display = "";
+    var active = ppTabOf(cat);
+    ws.setAttribute("data-pp-tab", active);
+    tabs.forEach(function (t) {
+      var b = el("button", {
+        type: "button", class: "pp-btn" + (t.id === active ? " on" : ""),
+        "data-testid": "pp-tab-" + t.id, text: t.label, title: t.label,
+      });
+      b.setAttribute("aria-pressed", t.id === active ? "true" : "false");
+      (function (id) {
+        b.addEventListener("click", function () {
+          // Read the live category: the bar rebuilds on every category
+          // switch, but the click must still target the visible context.
+          var liveCat = ws.getAttribute("data-post-category") || "adjust";
+          PP_STORE.ppTab = PP_STORE.ppTab || {};
+          PP_STORE.ppTab[liveCat] = id;
+          ws.setAttribute("data-pp-tab", id);
+          Object.keys(tabBtns).forEach(function (k) {
+            var on = k === id;
+            tabBtns[k].classList.toggle("on", on);
+            tabBtns[k].setAttribute("aria-pressed", on ? "true" : "false");
+          });
+        });
+      })(t.id);
+      tabBtns[t.id] = b; tabsBar.appendChild(b);
+    });
+  }
+  if (tabsBar && typeof MutationObserver !== "undefined") {
+    // The Studio shell owns the category (data-post-category); follow it so
+    // subtool switches rebuild the tab set in place — no engine involvement.
+    var ppCatObs = new MutationObserver(function (muts) {
+      for (var i = 0; i < muts.length; i++) {
+        if (muts[i].attributeName === "data-post-category") { syncPpTabs(); break; }
+      }
+    });
+    ppCatObs.observe(ws, { attributes: true, attributeFilter: ["data-post-category"] });
+  }
+
   // Toolbar
   var toolbar = el("div", { class: "pp-toolbar", "data-testid": "pp-toolbar" });
-  var title = el("span", { class: "pp-title", text: "Post Processing · TinyLuma engine" });
+  // Native Studio rail: plain product title (the engine name is a
+  // developer detail that does not belong in the Studio sidebar).
+  var title = el("span", { class: "pp-title", text: opts.nativeSidebar ? "Post Processing" : "Post Processing · TinyLuma engine" });
   toolbar.appendChild(title);
   function btn(label, testid, titleText, fn) {
     var b = el("button", { type: "button", class: "pp-btn", "data-testid": testid, text: label, title: titleText || label });
@@ -1042,10 +1173,11 @@ export function mountPostprocessWorkspace(host, opts) {
     var r = recipe();
     if (!r) { insp.appendChild(el("p", { class: "pp-note", text: "Pick or upload an image to edit." })); return; }
     // Histogram is useful context, but stays a quiet secondary strip.
-    insp.appendChild(el("div", { class: "pp-note", text: "Histogram", style: "margin:4px 0" }));
+    insp.appendChild(el("div", { class: "pp-note", text: "Histogram", style: "margin:4px 0", "data-pp-section": "histogram" }));
     var hc = document.createElement("canvas");
     hc.className = "pp-hist"; hc.width = 248; hc.height = 64;
     hc.setAttribute("data-testid", "pp-histogram");
+    hc.setAttribute("data-pp-section", "histogram");
     insp.appendChild(hc);
     insp._hist = hc;
 
@@ -1248,7 +1380,11 @@ export function mountPostprocessWorkspace(host, opts) {
       return;
     }
     var user = storeGet(LS_PRESETS, []);
-    looks.appendChild(el("div", { class: "pp-note", text: "Presets", style: "font-weight:600;margin-top:6px" }));
+    // Section hooks for the native tab bar (presentation only): presets and
+    // the LUT library are distinct tab sections in Adjust/Color views.
+    var looksSec = el("div", { "data-pp-section": "looks" });
+    looks.appendChild(looksSec);
+    looksSec.appendChild(el("div", { class: "pp-note", text: "Presets", style: "font-weight:600;margin-top:6px" }));
     BUILTIN_PRESETS.concat(user).forEach(function (p) {
       var b = el("button", { type: "button", class: "pp-btn", text: p.name, style: "display:block;width:100%;margin:2px 0;text-align:left" });
       b.addEventListener("click", function () {
@@ -1258,7 +1394,7 @@ export function mountPostprocessWorkspace(host, opts) {
         cur().recipe = incoming;
         buildInspector(); scheduleRender(); saveDraft();
       });
-      looks.appendChild(b);
+      looksSec.appendChild(b);
     });
     var saveRow = el("div", { style: "display:flex;gap:4px;margin:6px 0" });
     var nameIn = document.createElement("input");
@@ -1271,7 +1407,7 @@ export function mountPostprocessWorkspace(host, opts) {
       storeSet(LS_PRESETS, user); renderLooks(); say("Preset saved: " + nm);
     });
     saveRow.appendChild(nameIn); saveRow.appendChild(saveB);
-    looks.appendChild(saveRow);
+    looksSec.appendChild(saveRow);
     var allB = el("button", { type: "button", class: "pp-btn", text: "Apply look to all", title: "Copy current look (not crop/spots) to every filmstrip image" });
     allB.addEventListener("click", function () {
       var src = snapshot();
@@ -1283,14 +1419,16 @@ export function mountPostprocessWorkspace(host, opts) {
       });
       scheduleRender(); saveDraft(); say("Look applied to " + S.items.length + " images.");
     });
-    looks.appendChild(allB);
+    looksSec.appendChild(allB);
 
-    looks.appendChild(el("div", { class: "pp-note", text: "LUT library (.cube)", style: "font-weight:600;margin-top:10px" }));
+    var lutSec = el("div", { "data-pp-section": "lut" });
+    looks.appendChild(lutSec);
+    lutSec.appendChild(el("div", { class: "pp-note", text: "LUT library (.cube)", style: "font-weight:600;margin-top:10px" }));
     var search = document.createElement("input");
     search.placeholder = "Search LUTs…"; search.style.width = "100%"; search.className = "pp-btn"; search.style.cursor = "text";
-    looks.appendChild(search);
+    lutSec.appendChild(search);
     var lutList = el("div", {});
-    looks.appendChild(lutList);
+    lutSec.appendChild(lutList);
     var importB = el("button", { type: "button", class: "pp-btn", text: "Import .cube", style: "margin-top:6px" });
     importB.addEventListener("click", function () {
       var fi = document.createElement("input");
@@ -1309,7 +1447,7 @@ export function mountPostprocessWorkspace(host, opts) {
       });
       fi.click();
     });
-    looks.appendChild(importB);
+    lutSec.appendChild(importB);
     function paintLuts() {
       lutList.innerHTML = "";
       var q = (search.value || "").toLowerCase();
@@ -1628,7 +1766,7 @@ export function mountPostprocessWorkspace(host, opts) {
   }
 
   // Boot
-  buildInspector(); renderLooks();
+  buildInspector(); renderLooks(); syncPpTabs();
   restoreSession();
   if (sourceUrl) addItem("Studio output", sourceUrl, null);
   if (!S.items.length) {

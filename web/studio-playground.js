@@ -4557,6 +4557,10 @@ function renderWorkspace(state, context) {
     if (ppStage) {
       var legacyOutput = postCanvas.querySelector('[data-testid="canvas-output"]');
       if (legacyOutput) legacyOutput.style.display = "none";
+      // The empty-canvas placeholder belongs to the generation views: in Post
+      // the engine stage IS the image surface, so it must not show alongside.
+      var emptyNote = postCanvas.querySelector('[data-testid="canvas-empty"]');
+      if (emptyNote) emptyNote.style.display = "none";
       ppStage.classList.add("comfymodal-studio-postprocess-stage");
       ppStage.style.width = "100%";
       ppStage.style.height = "100%";
@@ -8183,7 +8187,7 @@ function _setActiveSubtool(state, context, actions, mode, subtool) {
 
 function _postSubmenuNote(subtool) {
   if (subtool === "upscale") return "Upscale arrives in a later phase — execution is disabled.";
-  return "Finishing editor lives in the canvas below — pick the Studio image there, or upload your own. Shortcuts: \\ compare · C crop · J heal · W white balance · Ctrl+Z/Y undo/redo.";
+  return "Adjust the photo in the sidebar — pick the Studio image in the canvas, or upload your own. Shortcuts: \\ compare · C crop · J heal · W white balance · Ctrl+Z/Y undo/redo.";
 }
 
 // Post categories route to their honest existing anchors inside the live

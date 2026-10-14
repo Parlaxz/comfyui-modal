@@ -89,6 +89,21 @@ async function clickPostSubtool(page, subtool) {
   await expect(btn).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
 }
 
+async function clickPpTab(page, tab) {
+  const btn = page.locator(`[data-testid="pp-sidebar"] [data-testid="pp-tab-${tab}"]`);
+  await expect(btn).toBeVisible({ timeout: 10000 });
+  await btn.click();
+  await expect(btn).toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
+}
+
+async function ppTabCount(page, tab) {
+  return page.locator(`[data-testid="pp-sidebar"] [data-testid="pp-tab-${tab}"]`).count();
+}
+
+async function sectionVisible(page, sel) {
+  return page.locator(`[data-testid="pp-sidebar"] ${sel}`).isVisible();
+}
+
 test.describe("Post Processing workspace (fake backend)", () => {
   test("T1 — tool opens without blanking the page", async ({ page }) => {
     const fx = await setupFakeTest(page);
@@ -107,6 +122,12 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await expect(page.locator('[data-testid="pp-sidebar"]')).toBeVisible();
     await expect(page.locator('[data-testid="canvas-area"] [data-testid="pp-canvas"]')).toBeVisible();
     await expect(page.locator('[data-testid="pp-shell"]')).toHaveCount(0);
+    // Phase-4 polish: the default Adjust view opens with its section tabs.
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-tabs"]')).toBeVisible();
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-tab-light"]')).toHaveAttribute("aria-pressed", "true");
+    // Oracle audit fix: the generation empty-state must not show beside the
+    // engine stage — in Post the stage IS the image surface.
+    await expect(page.locator('[data-testid="canvas-area"] [data-testid="canvas-empty"]')).toBeHidden();
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
@@ -207,7 +228,8 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await page.locator('[data-testid="pp-compare"]').click();
     await expect(page.locator('[data-testid="pp-compare-divider"]')).toBeVisible({ timeout: 5000 });
 
-    // Preset apply keeps the workspace alive and updates the recipe.
+    // Preset apply (via the Looks tab) keeps the workspace alive and updates the recipe.
+    await clickPpTab(page, "looks");
     await page.locator('[data-testid="pp-looks"] button', { hasText: "Punchy" }).click();
     const recipe = await page.evaluate(() => window.__ppRecipe);
     expect(recipe.recipe.contrast).toBe(30);
@@ -216,37 +238,60 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await fx.assertNoConsoleErrors(ALLOW);
   });
 
-  test("T5 — Color category expands color groups, collapses the rest", async ({ page }) => {
+  test("T5 — Color lands on Basic tab; every section reachable, recipe untouched", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await openPostprocess(page);
     await uploadSource(page);
+    const before = await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe));
     const outputBefore = await groupExpanded(page, "output");
 
     await clickPostSubtool(page, "color");
-    // Routing lands: all four Color groups open.
-    for (const id of ["color", "curves", "mixer", "grading"]) {
-      await expect.poll(() => groupExpanded(page, id), { timeout: 10000 }).toBe("true");
+    // The tab set is bounded and Post-specific: six Color tabs, no Adjust tabs.
+    for (const id of ["basic", "curves", "mixer", "grading", "lut", "histogram"]) {
+      await expect(page.locator(`[data-testid="pp-sidebar"] [data-testid="pp-tab-${id}"]`)).toBeVisible({ timeout: 10000 });
     }
-    // Groups outside the category collapse; output stays as the user left it.
-    for (const id of ["light", "detail", "effects"]) {
-      await expect.poll(() => groupExpanded(page, id), { timeout: 10000 }).toBe("false");
+    for (const id of ["light", "looks", "output"]) {
+      expect(await ppTabCount(page, id)).toBe(0);
     }
-    // Corrective contract: irrelevant controls are not merely collapsed into
-    // a long inspector; the native sidebar only shows this tool's groups.
-    for (const id of ["color", "curves", "mixer", "grading", "output"]) {
-      await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(true);
-    }
-    for (const id of ["light", "detail", "effects"]) {
+    // Landing tab is Basic: only the Color group shows.
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-tab-basic"]'))
+      .toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
+    await expect.poll(() => groupVisible(page, "color"), { timeout: 10000 }).toBe(true);
+    for (const id of ["light", "curves", "mixer", "grading", "detail", "effects", "output"]) {
       await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(false);
     }
+    await expect.poll(() => sectionVisible(page, '[data-testid="pp-looks"]'), { timeout: 10000 }).toBe(false);
+    await expect.poll(() => sectionVisible(page, '[data-testid="pp-histogram"]'), { timeout: 10000 }).toBe(false);
+
+    // One visible section at a time — walk every tab, recipe never moves.
+    await clickPpTab(page, "curves");
+    await expect.poll(() => groupVisible(page, "curves"), { timeout: 10000 }).toBe(true);
+    await expect.poll(() => groupVisible(page, "color"), { timeout: 10000 }).toBe(false);
+    await clickPpTab(page, "mixer");
+    await expect.poll(() => groupVisible(page, "mixer"), { timeout: 10000 }).toBe(true);
+    await expect.poll(() => groupVisible(page, "curves"), { timeout: 10000 }).toBe(false);
+    await clickPpTab(page, "grading");
+    await expect.poll(() => groupVisible(page, "grading"), { timeout: 10000 }).toBe(true);
+    await expect.poll(() => groupVisible(page, "mixer"), { timeout: 10000 }).toBe(false);
+    await clickPpTab(page, "lut");
+    await expect.poll(() => sectionVisible(page, '[data-testid="pp-looks"]'), { timeout: 10000 }).toBe(true);
+    await expect.poll(() => sectionVisible(page, '[data-testid="pp-looks"] [data-pp-section="lut"]'), { timeout: 10000 }).toBe(true);
+    await expect.poll(() => sectionVisible(page, '[data-testid="pp-looks"] [data-pp-section="looks"]'), { timeout: 10000 }).toBe(false);
+    await expect.poll(() => groupVisible(page, "grading"), { timeout: 10000 }).toBe(false);
+    await clickPpTab(page, "histogram");
+    await expect.poll(() => sectionVisible(page, '[data-testid="pp-histogram"]'), { timeout: 10000 }).toBe(true);
+    await expect.poll(() => sectionVisible(page, '[data-testid="pp-looks"]'), { timeout: 10000 }).toBe(false);
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+    // The Output group (export format/quality) stays as the user left it.
+    await clickPpTab(page, "basic");
     expect(await groupExpanded(page, "output")).toBe(outputBefore);
     await expect(page.locator(PP_WS)).toBeVisible();
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
 
-  test("T6 — Detail category leaves only detail expanded; recipe untouched", async ({ page }) => {
+  test("T6 — Detail/Effects show their coherent set with no tab grid; recipe untouched", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await openPostprocess(page);
@@ -259,17 +304,22 @@ test.describe("Post Processing workspace (fake backend)", () => {
     const outputBefore = await groupExpanded(page, "output");
 
     await clickPostSubtool(page, "color");
-    await expect.poll(() => groupExpanded(page, "color"), { timeout: 10000 }).toBe("true");
+    await expect.poll(() => groupVisible(page, "color"), { timeout: 10000 }).toBe(true);
     expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
 
+    // Detail: single coherent group + output, no tab grid at all.
     await clickPostSubtool(page, "detail");
-    await expect.poll(() => groupExpanded(page, "detail"), { timeout: 10000 }).toBe("true");
-    for (const id of ["light", "color", "curves", "mixer", "grading", "effects"]) {
-      await expect.poll(() => groupExpanded(page, id), { timeout: 10000 }).toBe("false");
-    }
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-tabs"]')).toBeHidden({ timeout: 10000 });
     await expect.poll(() => groupVisible(page, "detail"), { timeout: 10000 }).toBe(true);
     await expect.poll(() => groupVisible(page, "output"), { timeout: 10000 }).toBe(true);
     for (const id of ["light", "color", "curves", "mixer", "grading", "effects"]) {
+      await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(false);
+    }
+    // Effects: same contract — one group, no one-button tabs.
+    await clickPostSubtool(page, "effects");
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-tabs"]')).toBeHidden({ timeout: 10000 });
+    await expect.poll(() => groupVisible(page, "effects"), { timeout: 10000 }).toBe(true);
+    for (const id of ["light", "color", "detail"]) {
       await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(false);
     }
     expect(await groupExpanded(page, "output")).toBe(outputBefore);
@@ -280,7 +330,7 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await fx.assertNoConsoleErrors(ALLOW);
   });
 
-  test("T8 — subtool views preserve the recipe and keep the canvas central", async ({ page }) => {
+  test("T8 — subtool views preserve the recipe, remember tabs, keep the canvas central", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await openPostprocess(page);
@@ -288,18 +338,36 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await page.locator('[data-testid="pp-slider-exposure"] input[type="range"]').fill("2");
     await expect.poll(() => page.evaluate(() => window.__ppRecipe && window.__ppRecipe.recipe.exposure),
       { timeout: 10000 }).toBe(2);
+    // A Mixer value so the Color tab memory has something to protect.
+    await clickPostSubtool(page, "color");
+    await clickPpTab(page, "mixer");
+    await page.locator('[data-testid="pp-slider-red-h"] input[type="range"]').fill("20");
+    await expect.poll(() => page.evaluate(() => window.__ppRecipe && window.__ppRecipe.recipe.mixer[0].h),
+      { timeout: 10000 }).toBe(20);
     const before = await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe));
-    for (const [subtool, visible, hidden] of [
-      ["adjust", ["light", "output"], ["color", "detail", "effects"]],
-      ["color", ["color", "curves", "mixer", "grading", "output"], ["light", "detail", "effects"]],
-      ["effects", ["effects", "output"], ["light", "color", "detail"]],
-    ]) {
-      await clickPostSubtool(page, subtool);
-      for (const id of visible) await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(true);
-      for (const id of hidden) await expect.poll(() => groupVisible(page, id), { timeout: 10000 }).toBe(false);
-      expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
-      await expect(page.locator('[data-testid="canvas-area"] [data-testid="pp-canvas"]')).toBeVisible();
-    }
+
+    // Adjust shows only its Light section; the Color work is untouched.
+    await clickPostSubtool(page, "adjust");
+    await expect.poll(() => groupVisible(page, "light"), { timeout: 10000 }).toBe(true);
+    await expect.poll(() => groupVisible(page, "output"), { timeout: 10000 }).toBe(false);
+    expect(await ppTabCount(page, "basic")).toBe(0);
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+    await expect(page.locator('[data-testid="canvas-area"] [data-testid="pp-canvas"]')).toBeVisible();
+
+    // Back to Color: the Mixer tab (and its value) is remembered while resident.
+    await clickPostSubtool(page, "color");
+    await expect(page.locator('[data-testid="pp-sidebar"] [data-testid="pp-tab-mixer"]'))
+      .toHaveAttribute("aria-pressed", "true", { timeout: 10000 });
+    await expect.poll(() => groupVisible(page, "mixer"), { timeout: 10000 }).toBe(true);
+    await expect(page.locator('[data-testid="pp-slider-red-h"] input[type="number"]')).toHaveValue("20");
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+    await expect(page.locator('[data-testid="canvas-area"] [data-testid="pp-canvas"]')).toBeVisible();
+
+    // Effects keeps its coherent single-group view.
+    await clickPostSubtool(page, "effects");
+    await expect.poll(() => groupVisible(page, "effects"), { timeout: 10000 }).toBe(true);
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(before);
+    await expect(page.locator('[data-testid="canvas-area"] [data-testid="pp-canvas"]')).toBeVisible();
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
@@ -324,6 +392,70 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await expect(runBtn).toBeDisabled({ timeout: 10000 });
     await expect(page.locator('[data-testid="shell-gate-reason"]')).toContainText("Upscale arrives in a later phase");
     await expect(page.locator('[data-testid="submenu-post-note"]')).toContainText("Upscale arrives in a later phase");
+    expectOnlySync404(bad);
+    await fx.assertNoConsoleErrors(ALLOW);
+  });
+
+  test("T9 — Adjust tab matrix, value persistence across tabs, sticky action row", async ({ page }) => {
+    const fx = await setupFakeTest(page);
+    const bad = watch4xx(page);
+    await openPostprocess(page);
+    await uploadSource(page);
+
+    // Adjust tab set is bounded: four tabs, no Color tabs leaking in.
+    for (const id of ["light", "looks", "histogram", "output"]) {
+      await expect(page.locator(`[data-testid="pp-sidebar"] [data-testid="pp-tab-${id}"]`)).toBeVisible({ timeout: 10000 });
+    }
+    for (const id of ["basic", "curves", "mixer", "grading", "lut"]) {
+      expect(await ppTabCount(page, id)).toBe(0);
+    }
+
+    // Adjust→Light→Exposure change→Looks→preset→back to Light (values persist).
+    await page.locator('[data-testid="pp-slider-exposure"] input[type="range"]').fill("1.5");
+    await expect.poll(() => page.evaluate(() => window.__ppRecipe && window.__ppRecipe.recipe.exposure),
+      { timeout: 10000 }).toBe(1.5);
+    await clickPpTab(page, "looks");
+    await expect.poll(() => groupVisible(page, "light"), { timeout: 10000 }).toBe(false);
+    await expect.poll(() => sectionVisible(page, '[data-testid="pp-looks"] [data-pp-section="looks"]'), { timeout: 10000 }).toBe(true);
+    // The 1.5 exposure survives the Light→Looks travel (tabs never touch values).
+    expect(await page.evaluate(() => window.__ppRecipe.recipe.exposure)).toBe(1.5);
+    await page.locator('[data-testid="pp-looks"] button', { hasText: "Clean Portrait" }).click();
+    await expect.poll(() => page.evaluate(() => window.__ppRecipe && window.__ppRecipe.recipe.texture),
+      { timeout: 10000 }).toBe(-18);
+    // Engine semantics (unchanged): a preset replaces the whole look, so the
+    // post-preset recipe is the new baseline that tab travel must preserve.
+    const postPreset = await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe));
+    await clickPpTab(page, "output");
+    await expect.poll(() => groupVisible(page, "output"), { timeout: 10000 }).toBe(true);
+    await clickPpTab(page, "histogram");
+    await expect.poll(() => sectionVisible(page, '[data-testid="pp-histogram"]'), { timeout: 10000 }).toBe(true);
+    await clickPpTab(page, "light");
+    await expect.poll(() => groupVisible(page, "light"), { timeout: 10000 }).toBe(true);
+    // Post-preset values survived the full tab travel.
+    expect(await page.evaluate(() => JSON.stringify(window.__ppRecipe.recipe))).toBe(postPreset);
+    expect(await page.evaluate(() => window.__ppRecipe.recipe.texture)).toBe(-18);
+
+    // Action row: the utility set stays; duplicates moved to their owners.
+    for (const id of ["pp-undo", "pp-redo", "pp-compare", "pp-save", "pp-export"]) {
+      await expect(page.locator(`[data-testid="pp-sidebar"] [data-testid="${id}"]`)).toBeVisible({ timeout: 10000 });
+    }
+    // Compare stays in the row: the Studio top-bar Compare is a History A/B
+    // picker, a different system from the engine before/after.
+    for (const id of ["pp-crop", "pp-heal", "pp-wb"]) {
+      await expect(page.locator(`[data-testid="pp-sidebar"] [data-testid="${id}"]`)).toBeHidden({ timeout: 10000 });
+    }
+    // Real owners still exist: WB picker in Color→Basic, Crop/Heal subtools.
+    await clickPostSubtool(page, "color");
+    await expect(page.locator('[data-testid="pp-inspector"] button', { hasText: "WB picker" })).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('[data-testid="studio-subtool-crop"]')).toBeVisible();
+    await expect(page.locator('[data-testid="studio-subtool-heal"]')).toBeVisible();
+
+    // Save confirms locally; Export renders and names the edited file.
+    await clickPostSubtool(page, "adjust");
+    await page.locator('[data-testid="pp-save"]').click();
+    await expect(page.locator('[data-testid="pp-status"]')).toContainText("saved locally", { timeout: 10000 });
+    await page.locator('[data-testid="pp-export"]').click();
+    await expect(page.locator('[data-testid="pp-status"]')).toContainText("Exported", { timeout: 15000 });
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });
