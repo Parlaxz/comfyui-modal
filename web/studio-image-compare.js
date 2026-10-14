@@ -129,6 +129,14 @@ export function createCompareSessionModel(options) {
       _changed();
       return true;
     },
+    swap() {
+      if (!a || !b) return false;
+      const next = a;
+      a = b;
+      b = next;
+      _changed();
+      return true;
+    },
     /** Explicit reset: clears both slots and restores the default position. */
     reset() {
       a = null;
@@ -305,12 +313,118 @@ export function openComparePair(payload) {
   }
   if (p.invoker) _originInvoker = p.invoker;
   _renderTray();
-  openCompareView(p.invoker || null);
-  return true;
+  // Propagate the view result: when the view cannot open (a view is
+  // already open) callers must not treat the pair as shown.
+  return openCompareView(p.invoker || null);
 }
 
 export function clearCompareSession() {
   _teardownSession();
+}
+
+/**
+ * Pair refresh entry (viewer header Swap / Change confirm): setA fresh
+ * (discards the previous B so pairs stay coherent) + setB, repaint the
+ * tray, and refresh an OPEN view's images/labels/identity in place. When
+ * no view is open only the session changes; the caller opens the view.
+ * Fail-soft: unusable descriptors change nothing and return false.
+ */
+export function updateComparePair(a, b) {
+  const descA = normalizeImageDescriptor(a);
+  const descB = normalizeImageDescriptor(b);
+  if (!descA || !descB) return false;
+  if (!_session.setA(descA)) return false;
+  if (!_session.setB(descB)) {
+    _session.reset();
+    _renderTray();
+    return false;
+  }
+  _renderTray();
+  if (_view) _refreshOpenView();
+  return true;
+}
+
+// In-place refresh of an OPEN view after updateComparePair: image sources,
+// alts, labels, title, identity strip and slider naming follow the session.
+// Divider position, zoom/pan transforms and Escape behavior are untouched
+// by construction (no code path here reaches them). Previously-failed
+// images are unhidden and stale "unavailable" notes removed so a swapped-in
+// image is always shown.
+function _refreshOpenView() {
+  if (!_view || !_view.refs) return;
+  const st = _session.getState();
+  if (!st.a || !st.b || !st.a.url || !st.b.url) return;
+  const r = _view.refs;
+  try {
+    const stale = r.frame.querySelectorAll(".cm-compare-unavailable");
+    for (let i = 0; i < stale.length; i++) {
+      if (stale[i].parentNode) stale[i].parentNode.removeChild(stale[i]);
+    }
+    r.imgA.style.display = "";
+    r.imgB.style.display = "";
+    r.imgA.setAttribute("src", st.a.url);
+    r.imgA.setAttribute("alt", st.a.alt || st.a.label);
+    r.imgB.setAttribute("src", st.b.url);
+    r.imgB.setAttribute("alt", st.b.alt || st.b.label);
+    r.labelA.textContent = "A \u2014 " + st.a.label;
+    r.labelB.textContent = "B \u2014 " + st.b.label;
+    r.titleEl.textContent = "Comparing " + st.a.label + " \u2194 " + st.b.label;
+    r.dialog.setAttribute("aria-label", "Image comparison: " + st.a.label + " versus " + st.b.label);
+    r.identityA.textContent = "A — " + (st.a.meta || st.a.label);
+    r.identityB.textContent = "B — " + (st.b.meta || st.b.label);
+    r.slider.setAttribute("aria-label", "Comparison divider \u2014 " + st.a.label + " versus " + st.b.label);
+    r.slider.setAttribute("aria-valuetext", _session.getState().position + "% " + st.b.label);
+    r.hint.textContent = "Drag or use arrow keys \u2014 left of the divider shows " + st.a.label
+      + ", right shows " + st.b.label + ". Escape closes and clears.";
+  } catch (err) { /* best-effort paint */ }
+  _renderTray();
+}
+
+// Viewer header Change A/B + Back: reopen the shared gallery in pair mode
+// with the live pair as initials. Change (fresh=false) keeps the view open
+// underneath (gallery stacks above at z-10100) and confirming refreshes it
+// in place via updateComparePair; the requested side is passed through as
+// the picker's armed side so the next card click replaces THAT side.
+// Back (fresh=true) captures the pair, closes the view, and confirming
+// opens a fresh pair (tray re-ensured). The available canvas URL is passed
+// through so the picker's first card survives the round-trip, and the
+// picker's query/filters/sort are retained within this comparison flow.
+// Dynamic import keeps the picker→history→compare module cycle one-way.
+function _viewerCanvasUrl() {
+  try {
+    const img = document.querySelector('[data-testid="canvas-output"]');
+    if (img && img.isConnected) {
+      const src = img.getAttribute("src") || img.src || "";
+      if (src) return src;
+    }
+  } catch (err) { /* no canvas available */ }
+  return "";
+}
+function _openViewerGallery(fresh, side) {
+  const st = getCompareState();
+  const initialA = st.a;
+  const initialB = st.b;
+  const armedSide = side === "a" || side === "b" ? side : undefined;
+  const canvasUrl = _viewerCanvasUrl();
+  if (fresh) _closeView(false);
+  import("./studio-history-picker.js").then(function (m) {
+    if (!m || typeof m.openHistoryPicker !== "function") return;
+    m.openHistoryPicker({
+      mode: "pair",
+      initialA: initialA,
+      initialB: initialB,
+      armedSide: armedSide,
+      retainFilters: true,
+      currentCanvasUrl: canvasUrl,
+      onConfirm: function (na, nb) {
+        if (fresh) {
+          try { openComparePair({ a: na, b: nb, invoker: document.activeElement }); } catch (err) { /* best-effort */ }
+        } else if (updateComparePair(na, nb) && !_view) {
+          openCompareView(null);
+        }
+      },
+    });
+  }).catch(function () { /* picker is best-effort */ });
 }
 
 /**
@@ -381,11 +495,12 @@ export function openCompareView(opener) {
   });
 
   const header = el("div", { class: "cm-compare-header" });
-  header.appendChild(el("div", {
+  const titleEl = el("div", {
     class: "cm-compare-title",
     "data-testid": "cm-compare-title",
     text: "Comparing " + st.a.label + " \u2194 " + st.b.label,
-  }));
+  });
+  header.appendChild(titleEl);
   const closeBtn = el("button", {
     class: "cm-compare-close",
     "data-testid": "cm-compare-close",
@@ -395,7 +510,21 @@ export function openCompareView(opener) {
     onclick: function () { _closeView(true); },
   });
   header.appendChild(closeBtn);
+  const actions = el("div", { class: "cm-compare-actions" });
+  actions.appendChild(el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Swap", "data-testid": "compare-swap-view", onclick: function () { var s = _session.getState(); updateComparePair(s.b, s.a); } }));
+  actions.appendChild(el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Change A", "data-testid": "compare-change-a", onclick: function () { _openViewerGallery(false, "a"); } }));
+  actions.appendChild(el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Change B", "data-testid": "compare-change-b", onclick: function () { _openViewerGallery(false, "b"); } }));
+  actions.appendChild(el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Back", "data-testid": "compare-back", onclick: function () { _openViewerGallery(true); } }));
+  header.insertBefore(actions, closeBtn);
   dialog.appendChild(header);
+  // Compact identity strip: one line per side from the descriptor meta
+  // ("date/time · workflow"), falling back to the label.
+  const identityA = el("span", { text: "A — " + (st.a.meta || st.a.label) });
+  const identityB = el("span", { text: "B — " + (st.b.meta || st.b.label) });
+  dialog.appendChild(el("div", { class: "cm-compare-identity-strip", "data-testid": "compare-identity", style: "display:flex;gap:12px;font-size:11px;color:#aaa;padding:0 12px;" }, [
+    identityA,
+    identityB,
+  ]));
 
   const stage = el("div", {
     class: "cm-compare-stage",
@@ -441,12 +570,12 @@ export function openCompareView(opener) {
   const labelA = el("span", {
     class: "cm-compare-label cm-compare-label-a",
     "data-testid": "cm-compare-label-a",
-    text: st.a.label,
+    text: "A \u2014 " + st.a.label,
   });
   const labelB = el("span", {
     class: "cm-compare-label cm-compare-label-b",
     "data-testid": "cm-compare-label-b",
-    text: st.b.label,
+    text: "B \u2014 " + st.b.label,
   });
   stage.appendChild(labelA);
   stage.appendChild(labelB);
@@ -609,7 +738,9 @@ export function openCompareView(opener) {
       slider.style.top = "";
     }
     slider.setAttribute("aria-valuenow", String(pos));
-    slider.setAttribute("aria-valuetext", pos + "% " + st.b.label);
+    // Live B label: an in-place pair refresh (updateComparePair) swaps the
+    // session descriptors without rebuilding this closure.
+    slider.setAttribute("aria-valuetext", pos + "% " + (_session.getState().b || st.b).label);
   }
 
   function _applyMode() {
@@ -767,6 +898,15 @@ export function openCompareView(opener) {
       }
     },
     opener: opener || null,
+    // Named refs for in-place pair refresh (updateComparePair): image
+    // sources, labels, title, identity strip and slider naming follow the
+    // session without touching divider/zoom/pan state.
+    refs: {
+      imgA: imgA, imgB: imgB, frame: frame,
+      labelA: labelA, labelB: labelB, titleEl: titleEl,
+      identityA: identityA, identityB: identityB,
+      slider: slider, hint: hint, dialog: dialog,
+    },
   };
 
   // Focus lands on the slider (the primary control), falling back to Close.

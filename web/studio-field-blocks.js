@@ -5,6 +5,7 @@
 // product code adds a catalog entry/block when a new capability is approved.
 
 import { el } from "./studio-ui.js";
+import { openHistoryPicker } from "./studio-history-picker.js";
 
 export const INTEGER_RULES = Object.freeze({
   seed: Object.freeze({ minimum: null, maximum: null, step: 1, allowNegative: true }),
@@ -165,87 +166,23 @@ export async function uploadImageBlob(blob, filename) {
   return String(name);
 }
 
+// Single-select History gallery for image inputs: the shared
+// openHistoryPicker in single mode (click highlights, then Use image
+// applies). Picking hands the record URL to onPickHistory (fetch → upload
+// → bind as a real mapped filename) via Confirm; Escape/backdrop closes.
 function _openHistoryBrowser(props) {
-  // Minimal history browser: the recent-runs feed as a single-select grid.
-  // Picking an entry hands its URL to onPickHistory (fetch → upload → bind
-  // as a real mapped filename) and closes. One image per input, so the
-  // checkboxes behave single-select.
-  try {
-    _closeHistoryBrowser();
-    const testid = props.testid || "shelf-image";
-    const overlay = el("div", {
-      class: "comfymodal-studio-history-dialog-overlay",
-      "data-testid": testid + "-history-dialog",
-      role: "dialog",
-      "aria-label": "Choose an image from history",
-    });
-    // z-index 99999: this browser is body-level but opened from inside the
-    // Studio modal, whose own chrome stacks up to ~10090 — 1000 leaves it
-    // buried and unclickable (same precedent as other Studio dialogs).
-    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center;";
-    const dialog = el("div", {
-      class: "comfymodal-studio-history-dialog",
-      "data-testid": testid + "-history-panel",
-    });
-    dialog.style.cssText = "background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:12px;max-width:560px;max-height:70vh;overflow:auto;";
-    const head = el("div", { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;" });
-    head.appendChild(el("strong", { text: "History" }));
-    const closeBtn = el("button", {
-      type: "button",
-      class: "comfymodal-secondary-btn",
-      text: "Close",
-      "data-testid": testid + "-history-close",
-    });
-    closeBtn.addEventListener("click", _closeHistoryBrowser);
-    head.appendChild(closeBtn);
-    dialog.appendChild(head);
-    const grid = el("div", { "data-testid": testid + "-history-grid" });
-    grid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px;";
-    (props.historyItems || []).forEach((item, i) => {
-      if (!item || !item.url) return;
-      const cell = el("label", {
-        class: "comfymodal-studio-history-pick",
-        "data-testid": testid + "-history-pick-" + i,
-        title: String(item.label || item.url),
-        style: "display:flex;flex-direction:column;gap:4px;align-items:center;cursor:pointer;font-size:10px;color:#aaa;",
-      });
-      const box = el("input", { type: "checkbox", "aria-label": String(item.label || ("History image " + (i + 1))) });
-      const thumb = el("img", {
-        src: String(item.url),
-        alt: String(item.label || ("History image " + (i + 1))),
-        loading: "lazy",
-      });
-      thumb.style.cssText = "width:96px;height:96px;object-fit:cover;border-radius:4px;display:block;";
-      cell.appendChild(box);
-      cell.appendChild(thumb);
-      cell.appendChild(el("span", { text: String(item.label || "").slice(0, 24) }));
-      cell.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        box.checked = true;
-        try { props.onPickHistory(String(item.url)); } catch (_e) { /* caller handles */ }
-        _closeHistoryBrowser();
-      });
-      grid.appendChild(cell);
-    });
-    dialog.appendChild(grid);
-    overlay.appendChild(dialog);
-    overlay.addEventListener("click", (ev) => { if (ev.target === overlay) _closeHistoryBrowser(); });
-    document.addEventListener("keydown", _historyBrowserKey, { once: true });
-    document.body.appendChild(overlay);
-  } catch (_e) { /* browser is best-effort */ }
-}
-
-function _closeHistoryBrowser() {
-  try {
-    document.removeEventListener("keydown", _historyBrowserKey);
-    document.querySelectorAll(".comfymodal-studio-history-dialog-overlay").forEach((n) => {
-      if (n.parentNode) n.parentNode.removeChild(n);
-    });
-  } catch (_e) { /* best-effort */ }
-}
-
-function _historyBrowserKey(ev) {
-  if (ev && ev.key === "Escape") _closeHistoryBrowser();
+  const p = props || {};
+  openHistoryPicker({
+    mode: "single",
+    testid: p.testid || "shelf-image",
+    apiBase: p.apiBase,
+    historyItems: p.historyItems,
+    onConfirm: function (pick) {
+      if (pick && pick.url && typeof p.onPickHistory === "function") {
+        try { p.onPickHistory(pick.url); } catch (_e) { /* caller handles */ }
+      }
+    },
+  });
 }
 
 export function renderImageBlock(props = {}) {  const wrap = el("div", { ...controlProps(props, "image"), "data-testid": props.testid || "shelf-image-block" });

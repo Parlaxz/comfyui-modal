@@ -222,6 +222,174 @@ function _cardThumb(output, alt, containerClass) {
   return container;
 }
 
+// ── Shared generation-card renderer ───────────────────────────────────────
+//
+// Smallest shared card builder: thumbnail (feed policy via selectFeedAsset —
+// thumbUrl then previewUrl, never an eager Original), truncated prompt,
+// date/time, workflow name, favorite star, and a status chip (always, or
+// only when failed). Used by the History feed (renderGenerationCard passes
+// the options that reproduce its exact output) and by the shared history
+// picker (openHistoryPicker). The favorite star needs a repository for the
+// durable toggle: callers pass either a ready-made star node (favoriteEl,
+// used by the History feed with its page repo) or a repo (used by the
+// picker with its own repo instance).
+export function buildHistoryCard(record, opts) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const rec = record && typeof record === "object" ? record : {};
+  const feat = rec.featuredOutput && typeof rec.featuredOutput === "object" ? rec.featuredOutput : {};
+  const metaParts = [];
+  if (rec.workflow) metaParts.push(rec.workflow);
+  if (o.showPreset && rec.preset) metaParts.push(rec.preset);
+  const metaText = metaParts.join(" \u00b7 ");
+  const timeText = _shortDateTime(rec.startedAt);
+  const durText = (o.showDuration && rec.durationMs != null) ? _formatDuration(rec.durationMs) : "";
+  const prompt = typeof rec.prompt === "string" ? rec.prompt : "";
+  const promptText = (typeof o.promptLimit === "number" && prompt.length > o.promptLimit)
+    ? prompt.slice(0, o.promptLimit)
+    : prompt;
+  const chipMode = o.statusChipMode === "failed-only" ? "failed-only" : "always";
+  const chip = chipMode === "always"
+    ? _statusChip(rec.status)
+    : (rec.status === "failed" ? _statusChip("failed") : null);
+  const star = o.favoriteEl || (o.repo ? buildCardFavoriteStar(rec, o.repo) : null);
+
+  const card = el("div", {
+    class: "comfymodal-studio-history-v2-card "
+      + (o.cardClass || "comfymodal-studio-history-v2-generation-card")
+      + (o.classExtra || "")
+      + (o.dimmed ? " is-dimmed" : ""),
+    "data-testid": o.testid || "history-picker-card",
+    "data-id": rec.id != null ? String(rec.id) : "",
+    tabindex: o.dimmed ? "-1" : "0",
+    role: "button",
+    "aria-selected": o.ariaSelected != null ? o.ariaSelected : "false",
+    "aria-label": o.ariaLabel || ("History image" + (metaText ? " \u2014 " + metaText : "")),
+    "aria-disabled": o.dimmed ? "true" : "false",
+  }, [
+    _cardThumb(Object.assign({}, feat, {
+      originalAvailable: !!(feat.originalAvailable || rec.originalAvailable),
+    }), prompt || "Generation output"),
+    o.checkbox || null,
+    el("div", { class: "comfymodal-studio-history-v2-card-top" }, [
+      chip,
+      star,
+    ]),
+    o.badge === "a" || o.badge === "b"
+      ? el("span", {
+        class: "comfymodal-studio-history-picker-badge",
+        "data-testid": "history-picker-badge-" + o.badge,
+        text: o.badge.toUpperCase(),
+        style: "position:absolute;top:6px;left:6px;background:#0a0a0a;color:#fff;"
+          + "border:1px solid #555;border-radius:4px;font-size:11px;font-weight:700;"
+          + "padding:1px 6px;z-index:2;",
+      })
+      : null,
+    promptText
+      ? el("div", { class: "comfymodal-studio-history-v2-card-prompt", text: promptText })
+      : null,
+    metaText ? el("div", { class: "comfymodal-studio-history-v2-card-meta", text: metaText }) : null,
+    el("div", { class: "comfymodal-studio-history-v2-card-foot" }, [
+      timeText ? el("span", { class: "comfymodal-studio-history-v2-card-time", text: timeText }) : null,
+      durText ? el("span", { class: "comfymodal-studio-history-v2-card-time", text: durText }) : null,
+    ]),
+  ]);
+  if (o.badge === "a" || o.badge === "b") {
+    try { card.style.position = "relative"; } catch (err) { /* best-effort */ }
+  }
+  if (!o.dimmed && typeof o.onClick === "function") {
+    card.addEventListener("click", function () { o.onClick(); });
+    card.addEventListener("keydown", function (e) { _cardKeyActivate(e, o.onClick); });
+  } else if (o.dimmed) {
+    try { card.style.opacity = "0.45"; } catch (err) { /* best-effort */ }
+  }
+  return card;
+}
+
+// Module-level favorite star with the same durable-ack behavior as the
+// feed's renderFavoriteStar: the glyph flips only after the repository
+// acknowledges the PATCH; rejection restores the prior state and surfaces a
+// bounded truthful note. Needs an explicit repo (no page mount required).
+export function buildCardFavoriteStar(record, repo) {
+  const rec = record && typeof record === "object" ? record : {};
+  const wrap = el("span", { class: "comfymodal-studio-history-v2-fav-wrap" });
+  const note = el("span", {
+    class: "comfymodal-studio-history-v2-action-note",
+    role: "status",
+    "aria-live": "polite",
+  });
+  function paint(value) {
+    star.textContent = value ? "\u2605" : "\u2606";
+    star.setAttribute("aria-pressed", value ? "true" : "false");
+    star.setAttribute("aria-label", _cardFavoriteAccessibleName(rec, value));
+    star.title = _cardFavoriteAccessibleName(rec, value);
+  }
+  const star = el("button", {
+    type: "button",
+    class: "comfymodal-studio-history-v2-fav",
+    "data-testid": "history-v2-favorite-star",
+    "aria-label": _cardFavoriteAccessibleName(rec, !!rec.favorite),
+    "aria-pressed": rec.favorite ? "true" : "false",
+    title: _cardFavoriteAccessibleName(rec, !!rec.favorite),
+    text: rec.favorite ? "\u2605" : "\u2606",
+  });
+  if (!repo || typeof repo.setFavorite !== "function") {
+    star.disabled = true;
+    wrap.appendChild(star);
+    wrap.appendChild(note);
+    return wrap;
+  }
+  star.addEventListener("click", function (e) {
+    e.stopPropagation();
+    e.preventDefault();
+    if (star.disabled) return;
+    const prior = !!rec.favorite;
+    const next = !prior;
+    star.disabled = true;
+    note.textContent = "";
+    repo.setFavorite(rec.id, next).then(function (ack) {
+      rec.favorite = ack && typeof ack.favorite === "boolean" ? ack.favorite : next;
+      paint(rec.favorite);
+      star.disabled = false;
+    }).catch(function () {
+      rec.favorite = prior;
+      paint(prior);
+      note.textContent = "Favorite failed";
+      star.disabled = false;
+    });
+  });
+  wrap.appendChild(star);
+  wrap.appendChild(note);
+  return wrap;
+}
+
+function _cardFavoriteAccessibleName(rec, favorite) {
+  const r = rec && typeof rec === "object" ? rec : {};
+  const kind = r.kind === "experiment" ? "experiment" : "generation";
+  const idTail = String(r.id == null ? "" : r.id).slice(-6);
+  const namePart = r.kind === "experiment" && r.name ? String(r.name) : "";
+  const timePart = namePart ? "" : _shortDateTime(r.startedAt);
+  let context = "";
+  if (namePart && idTail) context = namePart + " (" + idTail + ")";
+  else if (namePart) context = namePart;
+  else if (timePart && idTail) context = timePart + " (" + idTail + ")";
+  else if (timePart) context = timePart;
+  else if (idTail) context = idTail;
+  return (favorite ? "Remove " : "Add ") + kind +
+    (context ? " " + context : "") +
+    (favorite ? " from favorites" : " to favorites");
+}
+
+// Module-level Enter/Space activation for cards: interactive controls inside
+// the card keep their native activation, anything else fires the handler.
+// Same semantics as the feed's _cardKeydown.
+function _cardKeyActivate(e, handler) {
+  if (e.key === "Enter" || e.key === " ") {
+    if (e.target && e.target.closest && e.target.closest("button, input, select, textarea")) return;
+    e.preventDefault();
+    handler();
+  }
+}
+
 // ── Main render entry point ───────────────────────────────────────────────
 
 export function renderHistoryV2(state, context) {
@@ -639,30 +807,23 @@ export function renderHistoryV2(state, context) {
   }
 
   function renderGenerationCard(record) {
-    const feat = record.featuredOutput || {};
+    // Delegates to the shared buildHistoryCard with the options that
+    // reproduce this card's exact output (always-on status chip, preset +
+    // duration rows, bulk checkbox, feed testid/aria/click behavior).
     const metaParts = [];
     if (record.workflow) metaParts.push(record.workflow);
     if (record.preset) metaParts.push(record.preset);
     const metaText = metaParts.join(" \u00b7 ");
-    const timeText = _shortDateTime(record.startedAt);
-    const durText = record.durationMs != null ? _formatDuration(record.durationMs) : "";
-
     const selected = bulkMode && _isSelected(record);
-    const card = el("div", {
-      class: "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card" + (selected ? " comfymodal-studio-history-v2-card-selected" : ""),
-      "data-testid": "history-v2-generation-card",
-      "data-id": record.id,
-      tabindex: "0",
-      role: "button",
-      "aria-selected": bulkMode ? (selected ? "true" : "false") : "false",
-      "aria-label": "Open generation " + (record.id || "") + (metaText ? " — " + metaText : ""),
-      onclick: function () { bulkMode ? _toggleSelection(record) : openGeneration(record.id); },
-      onkeydown: function (e) { _cardKeydown(e, function () { bulkMode ? _toggleSelection(record) : openGeneration(record.id); }); },
-    }, [
-      _cardThumb(Object.assign({}, feat, {
-        originalAvailable: !!(feat.originalAvailable || record.originalAvailable),
-      }), record.prompt || "Generation output"),
-      el("input", {
+    return buildHistoryCard(record, {
+      repo: repo,
+      testid: "history-v2-generation-card",
+      cardClass: "comfymodal-studio-history-v2-generation-card" + (selected ? " comfymodal-studio-history-v2-card-selected" : ""),
+      statusChipMode: "always",
+      showPreset: true,
+      showDuration: true,
+      favoriteEl: renderFavoriteStar(record),
+      checkbox: el("input", {
         type: "checkbox",
         class: "comfymodal-studio-history-v2-card-select",
         "data-testid": "history-v2-card-select",
@@ -672,20 +833,10 @@ export function renderHistoryV2(state, context) {
         onclick: function (e) { e.stopPropagation(); },
         onchange: function (e) { e.stopPropagation(); _toggleSelection(record); },
       }),
-      el("div", { class: "comfymodal-studio-history-v2-card-top" }, [
-        _statusChip(record.status),
-        renderFavoriteStar(record),
-      ]),
-      record.prompt
-        ? el("div", { class: "comfymodal-studio-history-v2-card-prompt", text: record.prompt })
-        : null,
-      metaText ? el("div", { class: "comfymodal-studio-history-v2-card-meta", text: metaText }) : null,
-      el("div", { class: "comfymodal-studio-history-v2-card-foot" }, [
-        timeText ? el("span", { class: "comfymodal-studio-history-v2-card-time", text: timeText }) : null,
-        durText ? el("span", { class: "comfymodal-studio-history-v2-card-time", text: durText }) : null,
-      ]),
-    ]);
-    return card;
+      ariaSelected: bulkMode ? (selected ? "true" : "false") : "false",
+      ariaLabel: "Open generation " + (record.id || "") + (metaText ? " — " + metaText : ""),
+      onClick: function () { bulkMode ? _toggleSelection(record) : openGeneration(record.id); },
+    });
   }
 
   function renderExperimentCard(record) {
