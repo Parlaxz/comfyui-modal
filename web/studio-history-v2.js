@@ -187,6 +187,21 @@ function _assetBadge(asset) {
     : null;
 }
 
+// Phase 11 Upscale card label (additive): "Upscale · VOSR2 ×4" when the
+// record carries upscale provenance, else null so the card renders exactly
+// as before. Reads optional fields only — never mutates the record.
+function _upscaleCardLabel(record) {
+  try {
+    const info = record && record.upscale && typeof record.upscale === "object" && !Array.isArray(record.upscale)
+      ? record.upscale : null;
+    if (!info) return null;
+    const raw = info.method != null ? String(info.method).toLowerCase()
+      : (info.upscale_method != null ? String(info.upscale_method).toLowerCase() : "");
+    const label = raw === "seedvr2" ? "SeedVR2" : (raw === "vosr2" ? "VOSR2" : (raw || "Upscale"));
+    return "Upscale · " + label + (info.scale != null ? " ×" + String(info.scale) : "");
+  } catch (err) { return null; }
+}
+
 function _assetPlaceholder(asset, className) {
   return el("div", {
     class: (className || "comfymodal-studio-history-v2-noimage")
@@ -646,6 +661,10 @@ export function renderHistoryV2(state, context) {
     const metaText = metaParts.join(" \u00b7 ");
     const timeText = _shortDateTime(record.startedAt);
     const durText = record.durationMs != null ? _formatDuration(record.durationMs) : "";
+    // Phase 11 Upscale provenance (additive): one line when the backend
+    // projects upscale info on the record. Null otherwise — cards without
+    // upscale info render exactly as before.
+    const upscaleText = _upscaleCardLabel(record);
 
     const selected = bulkMode && _isSelected(record);
     const card = el("div", {
@@ -680,6 +699,11 @@ export function renderHistoryV2(state, context) {
         ? el("div", { class: "comfymodal-studio-history-v2-card-prompt", text: record.prompt })
         : null,
       metaText ? el("div", { class: "comfymodal-studio-history-v2-card-meta", text: metaText }) : null,
+      upscaleText ? el("div", {
+        class: "comfymodal-studio-history-v2-card-upscale",
+        "data-testid": "history-v2-card-upscale",
+        text: upscaleText,
+      }) : null,
       el("div", { class: "comfymodal-studio-history-v2-card-foot" }, [
         timeText ? el("span", { class: "comfymodal-studio-history-v2-card-time", text: timeText }) : null,
         durText ? el("span", { class: "comfymodal-studio-history-v2-card-time", text: durText }) : null,

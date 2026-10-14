@@ -71,6 +71,35 @@ export async function getStudioRunStatus(apiBase, id) {
   return apiFetch(apiBase, `/experiments/${encodeURIComponent(id)}`);
 }
 
+// ── Phase 11 Upscale ────────────────────────────────────────────────────
+//
+// Explicit upscale entry point: POST /studio/upscale via the same apiFetch
+// transport as runStudioWorkflow. The body is the flat backend contract
+// {method, source_image, scale, seed?, tile_size?} with method exactly
+// "vosr2"|"seedvr2" — never a workflow id, never a mutated workflow.
+// The backend answers synchronously with a derived result candidate
+// (output file + output_paths + primary_asset_id + meta) served under
+// /studio/outputs/, which the caller materializes on the shared direct
+// path. Callers stay unchanged if the route ever moves — repoint this one
+// function.
+export async function runStudioUpscale(apiBase, payload) {
+  const data = await apiFetch(apiBase, "/studio/upscale", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (data && data.status === "error") {
+    console.error("[Studio upscale] backend execution failure", {
+      error_code: data.error_code || data.error?.code || "STUDIO_UPSCALE_ERROR",
+      operation: data.error?.operation || "studio_upscale",
+      detail: data.error?.detail || data._error_detail || data.message || "",
+      backend_error: data.error || null,
+      http_status: data._httpStatus || null,
+    });
+  }
+  return data;
+}
+
 /**
  * Submit a Studio queue batch and stream per-variant completions.
  * The route answers with NDJSON (one JSON object per line): prep-failure

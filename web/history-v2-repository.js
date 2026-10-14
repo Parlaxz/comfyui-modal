@@ -227,6 +227,12 @@ export function normalizeHistoryOutput(raw, index) {
     originalExportState: normalizeExportState(
       out.original_export_state != null ? out.original_export_state : out.originalExportState,
     ),
+    // Phase 11 Upscale provenance (additive): backend-projected derivation
+    // info for outputs produced by an upscale ({method, scale, seed,
+    // tile_size, res_h/res_w, source asset, timings}). Null when the backend
+    // projects none (older payloads, non-upscale outputs) so consumers omit
+    // the row instead of guessing. Never rewrites generation params.
+    upscale: _firstObject(out.upscale, out.upscale_info, out.upscaleInfo),
   };
 }
 
@@ -626,6 +632,11 @@ function _normalizeGeneration(raw) {
     runId: _firstString(raw.run_id, raw.runId, raw.id),
     params: params,
     timing: Object.keys(timing).length > 0 ? timing : null,
+    // Phase 11 Upscale provenance (additive, record level): {method, scale,
+    // seed, tile_size, res_h/res_w, source asset, timings}. Null when absent
+    // so cards/detail omit it. The original generation workflow and params
+    // are never rewritten — an upscale is a derived output/attempt.
+    upscale: _synthesizeUpscale(raw, extra, params),
   };
 }
 
@@ -746,6 +757,48 @@ function _firstString() {
     if (v != null && v !== "") return String(v);
   }
   return "";
+}
+
+// First plain-object argument, else null. Additive pass-through for
+// optional provenance objects (e.g. upscale) — absent stays null so the UI
+// omits the row instead of guessing.
+function _firstObject() {
+  for (let i = 0; i < arguments.length; i++) {
+    const v = arguments[i];
+    if (v && typeof v === "object" && !Array.isArray(v)) return v;
+  }
+  return null;
+}
+
+// Phase 11 Upscale record provenance (additive): prefers a nested upscale
+// object, else synthesizes one from the backend's flat meta keys
+// (upscale_method/scale/source_asset/...) so derived upscales surface even
+// when the record projects no nested object. Null when neither exists.
+function _synthesizeUpscale(raw, extra, params) {
+  const nested = _firstObject(
+    raw && raw.upscale, raw && (raw.upscale_info || raw.upscaleInfo),
+    extra && (extra.upscale || extra.upscale_info),
+    params && (params.upscale || params.upscale_info));
+  if (nested) return nested;
+  const r = raw && typeof raw === "object" ? raw : {};
+  const e = extra && typeof extra === "object" ? extra : {};
+  const p = params && typeof params === "object" ? params : {};
+  const method = _firstString(r.upscale_method, r.upscaleMethod, e.upscale_method, e.upscaleMethod, p.upscale_method, p.upscaleMethod);
+  if (!method) return null;
+  const out = { method: method, upscale_method: method };
+  const scale = r.scale != null ? r.scale : (e.scale != null ? e.scale : p.scale);
+  if (scale != null && scale !== "") out.scale = scale;
+  const seed = r.seed != null ? r.seed : (e.seed != null ? e.seed : p.seed);
+  if (seed != null && seed !== "") out.seed = seed;
+  const tile = r.tile_size != null ? r.tile_size : (e.tile_size != null ? e.tile_size : p.tile_size);
+  if (tile != null && tile !== "") out.tile_size = tile;
+  const src = _firstString(r.source_asset, r.sourceAsset, e.source_asset, e.sourceAsset, p.source_asset, p.sourceAsset);
+  if (src) out.source_asset = src;
+  const osize = r.output_size || r.outputSize || e.output_size || e.outputSize;
+  if (Array.isArray(osize) && osize.length >= 2) out.output_size = osize.slice(0, 2);
+  const timings = _firstObject(r.timings, e.timings);
+  if (timings) out.timings = timings;
+  return out;
 }
 
 function _stringArray() {

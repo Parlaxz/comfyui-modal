@@ -8041,6 +8041,60 @@ if _server:
                 }
             return web.json_response(error_payload, status=500)
 
+    @_server.routes.post("/comfymodal/studio/upscale")
+    async def studio_upscale(request: web.Request) -> web.Response:
+        """Upscale a source image with exactly one explicit method.
+
+        Phase 11 backend only: ``method`` is ``"vosr2"`` or ``"seedvr2"``
+        (no Auto).  Body: ``{method, source_image, scale, seed?,
+        tile_size?, tile_overlap?, vae_tile_size?}`` where ``source_image``
+        is a ComfyUI input filename.  Heavy inference runs on Modal when a
+        Modal workspace is active, otherwise the local adapter runs
+        fail-closed.  The stored workflow is never mutated; the result is
+        a derived result candidate (output file + output_paths +
+        primary_asset_id + meta) served at /comfymodal/studio/outputs/.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
+        try:
+            from studio_upscale_run import (
+                UpscaleRequestError,
+                UpscaleRunError,
+                handle_upscale_async,
+            )
+            import asyncio as _upscale_asyncio
+            result = await _upscale_asyncio.wait_for(
+                handle_upscale_async(
+                    body,
+                    workspace=_active_workspace() or {},
+                ),
+                timeout=1800.0,
+            )
+            return web.json_response(result, status=200)
+        except UpscaleRequestError as exc:
+            return web.json_response(
+                {"status": "error", "error_code": exc.error_code, "message": str(exc)},
+                status=400,
+            )
+        except UpscaleRunError as exc:
+            _log.warning("Studio upscale failed: %s", exc)
+            return web.json_response(
+                {"status": "error", "error_code": exc.error_code, "message": str(exc)},
+                status=exc.http_status,
+            )
+        except Exception as exc:
+            _log.exception("Studio upscale error")
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error_code": "STUDIO_UPSCALE_ERROR",
+                    "message": "Internal error processing Studio upscale. Retry or inspect the run details.",
+                },
+                status=500,
+            )
+
     # ── Studio run / experiment routes ─────────────────────────────────
     def _write_golden_profile_region(profile_path: Path, region: str) -> None:
         """Update the region flag in one config-owned Golden profile atomically."""

@@ -1063,6 +1063,14 @@ export function normalizeStudioRun(rawRun, apiBase) {
     // Advanced timing diagnostics (secondary to summary)
     advancedTiming: advancedTimingDiagnostics,
     _timingQuality: advancedTimingDiagnostics.timingQuality,
+
+    // Phase 11 Upscale provenance (additive, optional): {method, scale,
+    // seed, tile_size, res_h/res_w, source asset, timings}. Null for
+    // non-upscale runs and older records so every consumer renders as
+    // before. Never rewrites workflow identity, params, or controls.
+    upscale: (extra.upscale && typeof extra.upscale === "object" && !Array.isArray(extra.upscale))
+      ? extra.upscale
+      : ((run.upscale && typeof run.upscale === "object" && !Array.isArray(run.upscale)) ? run.upscale : null),
   };
 }
 

@@ -1,0 +1,34 @@
+# Phase 11 Upscale heavy-dependency manifest (NOT a pip install list for FAST).
+#
+# Methods: vosr2, seedvr2 — explicit only.  There is no "auto" method.
+#
+# The backends are upstream checkouts + weight bundles, NOT PyPI packages,
+# so no fabricated == pins are recorded here.  Every absence fails closed
+# with explicit VOSR2_UNAVAILABLE* / SEEDVR2_UNAVAILABLE* errors
+# (fail-closed precedent: tests/test_dependency_resolver.py,
+# tests/test_c9_fastsafetensors_integration.py).
+#
+# Foundation (already provided by comfyapp.py; not re-pinned here):
+#   nvidia/cuda:13.0.0-devel-ubuntu24.04, python 3.11,
+#   torch/torchvision/torchaudio via https://download.pytorch.org/whl/cu130
+#
+# vosr2 (explicit VOSR one-step upscaler, https://github.com/cswry/VOSR):
+#   repo checkout:  COMFYMODAL_VOSR2_REPO (inference_vosr_onestep.py)
+#                   or an importable vosr package
+#   weights (~7GB): COMFYMODAL_VOSR2_WEIGHTS or
+#                   <upscale_models>/VOSR {args.json, ema_model.safetensors,
+#                   bundled Qwen VAE + dinov2_vitl14}
+#   remote entry:   studio_upscale_vosr2
+#
+# seedvr2 (SeedVR2 3B one-step restorer, https://github.com/ByteDance-Seed/SeedVR):
+#   package:        importable seedvr with the SeedVR2 one-step API
+#   weights (~28GB): COMFYMODAL_SEEDVR2_WEIGHTS or
+#                   <upscale_models>/SeedVR2 {seedvr2_ema_3b.pth, ema_vae.pth}
+#   remote entry:   studio_upscale_seedvr2
+#   note:           target resolution derived from scale, sides snapped to /16
+#
+# Modal dispatch (config-owned; this repo never deploys):
+#   app env:        COMFYMODAL_UPSCALE_APP_NAME (default: config-owned app)
+#   route:          POST /comfymodal/studio/upscale
+#                   {method, source_image, scale, seed?,
+#                    tile_size?, tile_overlap?, vae_tile_size?}

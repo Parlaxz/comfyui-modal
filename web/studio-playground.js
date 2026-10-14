@@ -51,6 +51,10 @@ import {
   loadShellSelection,
   loadWorkflowMethods,
   saveWorkflowMethods,
+  loadUpscalePrefs,
+  saveUpscalePrefs,
+  UPSCALE_METHODS,
+  UPSCALE_METHOD_LABELS,
   SHELL_MODES,
   SHELL_SUBTOOLS,
   SHELL_PLACEHOLDERS,
@@ -61,7 +65,7 @@ import {
   projectRunToLegacy,
   LEGACY_TERMINAL_STATUSES,
 } from "./studio-playground-run.js";
-import { updateRunAnnotation, saveRunOutput, getMethodCompat } from "./studio-backend-api.js";
+import { updateRunAnnotation, saveRunOutput, getMethodCompat, runStudioUpscale } from "./studio-backend-api.js";
 import { createHistoryRepository } from "./history-v2-repository.js";
 import { requestHistoryRecordFocus } from "./studio-history-v2.js";
 
@@ -1167,7 +1171,9 @@ function renderControlPanel(state, context) {
     panel.appendChild(el("p", {
       class: "comfymodal-studio-control-note",
       "data-testid": "post-side-note",
-      text: "Post Processing runs in the local editor in the canvas area — Adjust, Color, Detail, Effects, Crop, and Heal controls live there.",
+      text: _shellSub === "upscale"
+        ? "Upscale runs remotely from the panel in the canvas area — pick VOSR2 or SeedVR2, then Run Upscale. The Studio image is used as-is; no workflow changes."
+        : "Post Processing runs in the local editor in the canvas area — Adjust, Color, Detail, Effects, Crop, and Heal controls live there.",
     }));
   } else {
     panel.appendChild(renderWorkflowSelector(state, context, actions));
@@ -4501,6 +4507,524 @@ function renderPostProcessShell(state, context, actions) {
   return shell;
 }
 
+// ── Phase 11 Upscale shell ──────────────────────────────────────────────
+// Post → Upscale is real: an explicit remote panel with exactly two
+// methods (VOSR2 / SeedVR2) plus a Run Upscale button. No generic
+// upscaler framework, and no third method choice anywhere in this UI.
+//
+// The Studio image (canvas → lastRunOutput → _selectedRun, via
+// _shelfCurrentImageUrl) is resolved to a bare ComfyUI input filename —
+// verified on-drive hits are reused only when bare, otherwise the pixels
+// are fetched → uploaded as a new input file — following the
+// _linkUrlAsSource fetch → upload pattern but WITHOUT commitShelfValue:
+// the selected workflow, shelf values, and stored workflow are never
+// mutated.
+// Results materialize through the shared _handleDirectRunResult path
+// (canvas + lastRunOutput + _selectedRun + saveRunResult + lineage), with
+// additive upscale provenance stamped on top. Generate/Edit flows are
+// untouched: upscale keeps panel-local busy/error state, never the shared
+// run controller or runState.
+function _upscaleState(state) {
+  var pg = state && state.playground;
+  if (!pg) return { busy: false, error: "", lastSourceUrl: "", lastResultUrl: "" };
+  if (!pg._upscale || typeof pg._upscale !== "object") {
+    pg._upscale = { busy: false, error: "", lastSourceUrl: "", lastResultUrl: "" };
+  }
+  return pg._upscale;
+}
+
+function _upscaleMethodLabel(method) {
+  try {
+    if (UPSCALE_METHOD_LABELS && UPSCALE_METHOD_LABELS[method]) return UPSCALE_METHOD_LABELS[method];
+  } catch (_e) {}
+  return "VOSR2";
+}
+
+function _upscaleSourceName(url) {
+  var s = String(url || "");
+  if (!s) return "";
+  var m = s.match(/[?&]filename=([^&]+)/);
+  if (m) return decodeURIComponent(m[1]);
+  m = s.match(/\/(?:studio\/outputs|assets)\/([^/?#]+)/);
+  if (m) return decodeURIComponent(m[1]);
+  if (s.length > 64) return s.slice(0, 61) + "…";
+  return s;
+}
+
+// Bare ComfyUI input filenames only: the upscale backend rejects slashes,
+// "..", and anything outside the input directory.
+function _isBareInputFilename(name) {
+  var s = String(name || "");
+  if (!s || s !== s.trim()) return false;
+  if (s.indexOf("/") !== -1 || s.indexOf("\\") !== -1 || s.indexOf("..") !== -1) return false;
+  if (/ \[(input|output|temp)\]$/.test(s)) return false;
+  return true;
+}
+
+async function _upscaleResolveSourceFile(state, url) {
+  // The upscale backend resolves source_image against the ComfyUI input
+  // directory only and rejects unsafe references (slashes, ".."). A
+  // verified hit is reused ONLY when it is a bare input filename;
+  // annotated output/temp references ("name [output]") live outside the
+  // input dir, so they fall through to fetch → upload as a new input file
+  // instead of 404ing server-side. Mirrors _linkUrlAsSource stages but
+  // never commits to the workflow (no shelf/store mutation).
+  var hit = null;
+  try { hit = await _resolveVerifiedCanvasFile(state, url); } catch (_e) { hit = null; }
+  if (hit && hit.filename && _isBareInputFilename(hit.filename)) return String(hit.filename);
+  var resp = null;
+  try {
+    resp = await fetch(url);
+  } catch (fetchErr) {
+    throw new Error("fetching the Studio image (" + String((fetchErr && fetchErr.message) || fetchErr) + ")");
+  }
+  if (!resp || !resp.ok) throw new Error("fetching the Studio image (HTTP " + (resp && resp.status) + ")");
+  var blob = null;
+  try {
+    blob = await resp.blob();
+  } catch (blobErr) {
+    throw new Error("reading the Studio image (" + String((blobErr && blobErr.message) || blobErr) + ")");
+  }
+  var mod = await import("./studio-field-blocks.js");
+  return await mod.uploadImageBlob(blob, mod.uniqueImageName("studio-upscale"));
+}
+
+function _upscaleStatusText(ust, prefs, sourceUrl) {
+  if (ust.busy) return "Upscaling with " + _upscaleMethodLabel(prefs.method) + "…";
+  if (ust.error) return ust.error;
+  if (ust.lastResultUrl) {
+    return "Done — " + _upscaleMethodLabel(prefs.method) + " ×" + prefs.scale
+      + ". Result is on the canvas; the source stays in lineage.";
+  }
+  if (!sourceUrl) return "Run Generate or Edit first — Upscale needs the Studio image.";
+  return "Ready — " + _upscaleMethodLabel(prefs.method) + " ×" + prefs.scale
+    + " on " + (_upscaleSourceName(sourceUrl) || "the Studio image") + ".";
+}
+
+function _renderUpscaleShell(state, context, actions) {
+  var shell = el("div", {
+    class: "comfymodal-studio-upscale-shell",
+    "data-testid": "upscale-shell",
+    style: "width:100%;display:flex;flex-direction:column;gap:12px;",
+  });
+  shell.appendChild(_renderUpscalePanel(state, context, actions));
+  shell.appendChild(renderCanvas(state, context, actions));
+  shell.appendChild(renderProgressSection(state, context));
+  shell.appendChild(renderHistoryCarousel(state, context));
+  return shell;
+}
+
+function _renderUpscalePanel(state, context, actions) {
+  var prefs = loadUpscalePrefs();
+  var ust = _upscaleState(state);
+  var sourceUrl = "";
+  try { sourceUrl = _shelfCurrentImageUrl(state) || ""; } catch (_e) { sourceUrl = ""; }
+
+  var panel = el("div", {
+    class: "comfymodal-studio-upscale-panel",
+    "data-testid": "upscale-panel",
+    style: "padding:12px;border:1px solid #2a2a2a;border-radius:8px;background:#0a0a0a;",
+  });
+  panel.appendChild(el("p", {
+    text: "Upscale",
+    style: "font-weight:var(--font-weight-semibold);margin:0 0 4px;",
+    "data-testid": "upscale-title",
+  }));
+  panel.appendChild(el("p", {
+    text: "Source: " + (_upscaleSourceName(sourceUrl) || "none — generate an image first"),
+    style: "font-size:var(--font-size-sm);color:var(--color-text-muted);margin:0 0 10px;",
+    "data-testid": "upscale-source",
+  }));
+
+  // Method: exactly VOSR2 | SeedVR2. Explicit radios, persisted default
+  // VOSR2. The choice is binary by construction — no third method exists.
+  var methodGroup = el("div", {
+    role: "radiogroup",
+    "aria-label": "Upscale method",
+    "data-testid": "upscale-method",
+    style: "display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px;",
+  });
+  [["vosr2", "VOSR2", "Single-image upscaler. The scale factor is applied directly."],
+   ["seedvr2", "SeedVR2", "Video-capable restorer. The scale is converted to target resolution (res_h × res_w) from the source size."]].forEach(function (entry) {
+    (function (value, label, desc) {
+      var radio = el("input", {
+        type: "radio",
+        name: "comfymodal-upscale-method",
+        value: value,
+        "data-testid": "upscale-method-" + value,
+        "aria-label": label,
+        title: desc,
+      });
+      if (prefs.method === value) radio.checked = true;
+      radio.addEventListener("change", function () {
+        if (!radio.checked) return;
+        var next = saveUpscalePrefs({ method: value });
+        try {
+          var hint = panel.querySelector('[data-testid="upscale-scale-hint"]');
+          if (hint) hint.textContent = _upscaleScaleHint(next.method);
+          var status = panel.querySelector('[data-testid="upscale-status"]');
+          if (status) status.textContent = _upscaleStatusText(_upscaleState(state), next, _safeUpscaleSource(state));
+        } catch (_e) {}
+      });
+      var lab = el("label", { style: "display:flex;gap:6px;align-items:flex-start;font-size:var(--font-size-sm);" });
+      lab.appendChild(radio);
+      var txt = el("span", {});
+      txt.appendChild(el("span", { text: label, style: "font-weight:var(--font-weight-semibold);" }));
+      txt.appendChild(el("span", { text: " — " + desc, style: "color:var(--color-text-muted);" }));
+      lab.appendChild(txt);
+      methodGroup.appendChild(lab);
+    })(entry[0], entry[1], entry[2]);
+  });
+  panel.appendChild(methodGroup);
+
+  function numberRow(testid, labelText, value, min, max, hintText) {
+    var row = el("div", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;" });
+    row.appendChild(el("label", {
+      text: labelText,
+      style: "font-size:var(--font-size-sm);min-width:88px;",
+    }));
+    var input = el("input", {
+      type: "number",
+      min: String(min),
+      max: String(max),
+      value: String(value),
+      "data-testid": testid,
+      "aria-label": labelText,
+      style: "width:88px;",
+    });
+    row.appendChild(input);
+    row.appendChild(el("span", {
+      text: hintText,
+      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);",
+      "data-testid": testid + "-hint",
+    }));
+    return { row: row, input: input };
+  }
+
+  // Scale: required by both upstreams. VOSR2 consumes the int directly;
+  // SeedVR2 maps it to res_h/res_w at submit (see _upscaleSubmit).
+  var scaleCtl = numberRow("upscale-scale", "Scale", prefs.scale, 1, 8, _upscaleScaleHint(prefs.method));
+  scaleCtl.input.addEventListener("change", function () {
+    saveUpscalePrefs({ scale: Number(scaleCtl.input.value) });
+  });
+  panel.appendChild(scaleCtl.row);
+
+  // Seed: justified — determinism and rerun parity (a fixed seed
+  // reproduces the result). Explicit int per the backend contract.
+  var seedCtl = numberRow("upscale-seed", "Seed", prefs.seed, 0, 2147483647,
+    "Fixed seed for reproducible results.");
+  seedCtl.input.addEventListener("change", function () {
+    saveUpscalePrefs({ seed: Number(seedCtl.input.value) });
+  });
+  panel.appendChild(seedCtl.row);
+
+  // Tile size: justified — VRAM guard for large VOSR2 outputs. Explicit
+  // tile edge in px per the backend contract; SeedVR2 ignores it.
+  var tileCtl = numberRow("upscale-tile-size", "Tile size", prefs.tileSize, 64, 2048,
+    "VOSR2 tile edge in px; lowers peak VRAM on large outputs. SeedVR2 ignores it.");
+  tileCtl.input.addEventListener("change", function () {
+    saveUpscalePrefs({ tileSize: Number(tileCtl.input.value) });
+  });
+  panel.appendChild(tileCtl.row);
+
+  var runBtn = el("button", {
+    type: "button",
+    class: "comfymodal-primary-btn",
+    text: ust.busy ? "Upscaling…" : "Run Upscale",
+    "data-testid": "upscale-run",
+    title: sourceUrl ? "Upscale the Studio image with " + _upscaleMethodLabel(prefs.method) : "Generate an image first",
+  });
+  runBtn.disabled = ust.busy || !sourceUrl;
+  runBtn.addEventListener("click", function () {
+    _upscaleSubmit(state, context, actions, panel);
+  });
+  panel.appendChild(runBtn);
+
+  panel.appendChild(el("p", {
+    text: _upscaleStatusText(ust, prefs, sourceUrl),
+    style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:8px 0 0;",
+    "data-testid": "upscale-status",
+    role: "status",
+  }));
+  return panel;
+}
+
+function _upscaleScaleHint(method) {
+  return method === "seedvr2"
+    ? "Scale maps to the target resolution inside SeedVR2."
+    : "VOSR2 applies this factor directly.";
+}
+
+function _safeUpscaleSource(state) {
+  try { return _shelfCurrentImageUrl(state) || ""; } catch (_e) { return ""; }
+}
+
+function _refreshUpscalePanel(state) {
+  // Panel-local refresh only: re-render the upscale panel subtree in place
+  // so Generate/Edit run state, shelf focus, and canvas overlays are never
+  // disturbed by upscale progress. The click handler always closes over a
+  // live context at submit time; refresh reuses the stashed one.
+  try {
+    var host = document.querySelector('[data-testid="upscale-shell"]');
+    var panel = host && host.isConnected ? host.querySelector('[data-testid="upscale-panel"]') : null;
+    if (!panel) {
+      try {
+        if (typeof window !== "undefined" && window.__studioApi
+          && typeof window.__studioApi.setPage === "function") {
+          window.__studioApi.setPage("playground");
+        }
+      } catch (_e2) {}
+      return;
+    }
+    var ctx = { apiBase: "/comfymodal" };
+    try {
+      var pg = state && state.playground;
+      if (pg && pg._upscaleContext && typeof pg._upscaleContext === "object") ctx = pg._upscaleContext;
+    } catch (_e3) {}
+    panel.replaceWith(_renderUpscalePanel(state, ctx, null));
+  } catch (_e) { /* best-effort */ }
+}
+
+async function _upscaleSubmit(state, context, actions, panel) {
+  var ust = _upscaleState(state);
+  if (ust.busy) return;
+  var prefs = loadUpscalePrefs();
+  if (UPSCALE_METHODS.indexOf(prefs.method) === -1) {
+    ust.error = "Pick VOSR2 or SeedVR2 first.";
+    _refreshUpscalePanel(state);
+    return;
+  }
+  var sourceUrl = _safeUpscaleSource(state);
+  if (!sourceUrl) {
+    ust.error = "Run Generate or Edit first — Upscale needs the Studio image.";
+    _refreshUpscalePanel(state);
+    return;
+  }
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  // Stash the context for panel-local refreshes (no full remount).
+  try { if (state && state.playground) state.playground._upscaleContext = context; } catch (_e) {}
+  ust.busy = true;
+  ust.error = "";
+  ust.lastSourceUrl = sourceUrl;
+  _refreshUpscalePanel(state);
+
+  function fail(message) {
+    ust.busy = false;
+    ust.error = String(message || "Upscale failed.").slice(0, 300);
+    _refreshUpscalePanel(state);
+  }
+
+  var filename = "";
+  try {
+    filename = await _upscaleResolveSourceFile(state, sourceUrl);
+  } catch (resolveErr) {
+    fail("Could not use the Studio image: " + ((resolveErr && resolveErr.message) || "unknown error"));
+    return;
+  }
+  if (!filename) {
+    fail("Could not use the Studio image: no file behind the canvas URL.");
+    return;
+  }
+
+  var t0 = Date.now();
+  // Flat backend contract (POST /studio/upscale): method + input filename
+  // + scale + seed, plus tile keys for VOSR2 only. SeedVR2 maps scale to
+  // its target resolution internally. tile_overlap/vae_tile_size ride
+  // backend defaults — only seed + tile_size are exposed (see panel).
+  var payload = {
+    method: prefs.method,
+    source_image: filename,
+    scale: prefs.scale,
+    seed: prefs.seed,
+    request_id: (typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : "upscale-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2)),
+  };
+  if (prefs.method === "vosr2") payload.tile_size = prefs.tileSize;
+  var upscaleInfo = {
+    method: prefs.method,
+    scale: prefs.scale,
+    seed: prefs.seed,
+    tile_size: prefs.method === "vosr2" ? prefs.tileSize : null,
+    source_asset: filename,
+    source_url: sourceUrl,
+  };
+  var data = null;
+  try {
+    data = await runStudioUpscale(apiBase, payload);
+  } catch (reqErr) {
+    fail("Upscale request failed: " + ((reqErr && reqErr.message) || "transport error"));
+    return;
+  }
+  if (!data) {
+    fail("Upscale request failed: empty response from the backend.");
+    return;
+  }
+  if (data.status === "error") {
+    fail("Upscale failed: " + String(data.message || (data.error && (data.error.detail || data.error.message)) || "backend error"));
+    return;
+  }
+  // Direct result: already completed — materialize on the shared path.
+  if (_upscaleHasOutputs(data)) {
+    data.direct_run = true;
+    _materializeUpscaleResult(state, context, actions, data, upscaleInfo, sourceUrl, t0);
+    return;
+  }
+  // Scheduler path: bounded panel-local poll for the terminal outputs, then
+  // the same materializer. Never touches the shared run controller.
+  var submittedId = data.runId || data.experimentId || data.run_id || data.experiment_id || "";
+  try {
+    var polled = await _pollUpscaleResult(apiBase, submittedId);
+    if (polled) {
+      polled.direct_run = true;
+      _materializeUpscaleResult(state, context, actions, polled, upscaleInfo, sourceUrl, t0);
+      return;
+    }
+  } catch (pollErr) {
+    fail("Upscale submitted (" + (submittedId || "no id") + ") but the result never landed: "
+      + ((pollErr && pollErr.message) || "poll timed out") + " — check History.");
+    return;
+  }
+  fail("Upscale submitted (" + (submittedId || "no id") + ") but returned no outputs — check History.");
+}
+
+function _upscaleHasOutputs(data) {
+  if (!data || typeof data !== "object") return false;
+  if (Array.isArray(data.output_paths) && data.output_paths.length > 0) return true;
+  if (Array.isArray(data.outputs) && data.outputs.length > 0) return true;
+  if (data.primary_asset_id || (data.meta && data.meta.primary_asset_id)) return true;
+  if (data.output_path) return true;
+  return false;
+}
+
+// Bounded panel-local poll for a submitted upscale: mirrors the legacy
+// getStudioRunStatus snapshot/event shape (cell.completed payloads carry
+// primary_asset_id or output_paths). Resolves a direct-style result, null
+// on timeout, and rejects only on a terminal backend error.
+async function _pollUpscaleResult(apiBase, id) {
+  if (!id) return null;
+  var deadline = Date.now() + 5 * 60 * 1000;
+  for (;;) {
+    if (Date.now() >= deadline) return null;
+    await new Promise(function (r) { setTimeout(r, 3000); });
+    var data = null;
+    try {
+      data = await getStudioRunStatus(apiBase, id);
+    } catch (_e) { continue; }
+    if (!data) continue;
+    if (data.status && data.status !== "ok") {
+      throw new Error(String(data.message || data.error || "backend error").slice(0, 200));
+    }
+    var snapshot = data.snapshot || {};
+    var events = Array.isArray(data.events) ? data.events : [];
+    var hit = null;
+    for (var i = 0; i < events.length; i++) {
+      var ev = events[i] || {};
+      if (ev.type !== "cell.completed" || !ev.payload) continue;
+      var p = ev.payload || {};
+      if (p.primary_asset_id || (Array.isArray(p.output_paths) && p.output_paths.length > 0)) {
+        hit = p;
+        break;
+      }
+    }
+    if (hit) {
+      return {
+        status: "ok",
+        runId: id,
+        experimentId: id,
+        output_paths: Array.isArray(hit.output_paths) ? hit.output_paths : [],
+        primary_asset_id: hit.primary_asset_id || "",
+        meta: hit.meta || {},
+        timings: hit.timings || data.timings || {},
+        completed_at: hit.completed_at || new Date().toISOString(),
+      };
+    }
+    var counters = snapshot.counters || {};
+    if (snapshot.status === "failed" || snapshot.status === "error"
+      || counters.failed > 0) {
+      throw new Error("backend run failed");
+    }
+  }
+}
+
+function _materializeUpscaleResult(state, context, actions, result, upscaleInfo, sourceUrl, t0_ms) {
+  var ust = _upscaleState(state);
+  // Additive provenance for History + session restore. Never rewrites the
+  // original generation workflow: the request carried no workflow identity
+  // and the stamp rides in meta/upscale alongside the backend's own flat
+  // meta keys (upscale_method/scale/source_asset/...), both key styles
+  // carried so every reader resolves them.
+  try {
+    result.meta = result.meta && typeof result.meta === "object" ? result.meta : {};
+    var bm = result.meta;
+    var prov = Object.assign({}, upscaleInfo, {
+      upscale_method: bm.upscale_method || upscaleInfo.method,
+      scale: bm.scale != null ? bm.scale : upscaleInfo.scale,
+      seed: bm.seed != null ? bm.seed : upscaleInfo.seed,
+      tile_size: bm.tile_size != null ? bm.tile_size : upscaleInfo.tile_size,
+      tile_overlap: bm.tile_overlap != null ? bm.tile_overlap : null,
+      vae_tile_size: bm.vae_tile_size != null ? bm.vae_tile_size : null,
+      source_asset: bm.source_asset || upscaleInfo.source_asset,
+      source_size: bm.source_size || null,
+      output_size: bm.output_size || null,
+      backend: bm.backend || null,
+      at: new Date().toISOString(),
+      duration_ms: Math.max(0, Date.now() - (t0_ms || Date.now())),
+    });
+    var timings = (bm.timings && typeof bm.timings === "object")
+      ? bm.timings
+      : ((result.timings && typeof result.timings === "object") ? result.timings : null);
+    if (timings) prov.timings = timings;
+    result.meta.upscale = prov;
+  } catch (_e) {}
+  var controls = { prompt: "", negative_prompt: "", source_image: sourceUrl };
+  var handled = false;
+  try {
+    handled = _handleDirectRunResult(result, state, context, actions, controls, null);
+  } catch (_e) { handled = false; }
+  ust.busy = false;
+  if (!handled) {
+    ust.error = "Upscale finished but the result could not be shown — check History.";
+    _refreshUpscalePanel(state);
+    return;
+  }
+  // Stamp the same provenance onto the materialized run and re-save so the
+  // session restore (localStorage latest run) and any History projection of
+  // this record carry method/scale/source/timings additively.
+  try {
+    var pg = state.playground;
+    var nr = pg && pg._selectedRun;
+    if (nr && typeof nr === "object") {
+      var prov = result.meta.upscale;
+      nr.upscale = prov;
+      try {
+        nr.extra = nr.extra && typeof nr.extra === "object" ? nr.extra : {};
+        nr.extra.upscale = prov;
+      } catch (_e2) {}
+      try {
+        var sel = resolveSelectionResultKey(state, pg._workflowRun, {
+          presetId: result.meta && (result.meta.studio_preset_id || result.meta.preset_id),
+          featureId: result.meta && (result.meta.studio_feature_id || result.meta.feature_id),
+        });
+        if (sel && sel.presetId && sel.featureId) saveRunResult(sel.presetId, sel.featureId, nr);
+      } catch (_e3) {}
+      try {
+        var outUrl = (nr.imageUrl || pg.lastRunOutput || "");
+        if (outUrl) ust.lastResultUrl = String(outUrl);
+      } catch (_e4) {}
+    }
+  } catch (_e5) {}
+  ust.error = "";
+  _refreshUpscalePanel(state);
+  // A full remount is unnecessary: _handleDirectRunResult already painted
+  // the canvas via _setCanvasImage. Refresh only if the panel is gone.
+  try {
+    if (!document.querySelector('[data-testid="upscale-panel"]')) {
+      if (context && context.setPage) context.setPage("playground");
+    }
+  } catch (_e6) {}
+}
+
 function renderWorkspace(state, context) {
   // Shelf: the right-side workspace is the single result panel (output
   // canvas, progress, metadata, recent filmstrip) — never a movable card.
@@ -4526,9 +5050,13 @@ function renderWorkspace(state, context) {
   var submenu = renderToolSubmenu(state, context, wsActions);
   if (submenu) workspace.appendChild(submenu);
 
-  // Post Processing mounts the existing local engine; the Upscale category
-  // is an honest later-phase placeholder and falls through to the canvas.
-  if (activeModeOf(state) === "post" && activeSubtoolOf(state) !== "upscale") {
+  // Post Processing mounts the existing local engine, except Upscale:
+  // Phase 11 mounts the explicit VOSR2/SeedVR2 remote panel instead.
+  if (activeModeOf(state) === "post" && activeSubtoolOf(state) === "upscale") {
+    workspace.appendChild(_renderUpscaleShell(state, context, wsActions));
+    return workspace;
+  }
+  if (activeModeOf(state) === "post") {
     var _ppShell = renderPostProcessShell(state, context, wsActions);
     workspace.appendChild(_ppShell);
     // The engine resets its tool on every mount: apply the selected
@@ -4929,9 +5457,10 @@ function renderCanvas(state, context, actions) {
   }
 
   const outputUrl = _canvasImageUrl(state);
-  // Phase 1 shell placeholders (References/Layout/Guidance/Upscale): an
+  // Later-phase placeholders (References/Guidance): an
   // honest disabled notice above the normal canvas, so the current image
-  // stays visible and no stale controls appear.
+  // stays visible and no stale controls appear. (Phase 11: Upscale is real
+  // and renders its own shell — it is no longer a placeholder.)
   var _shellSub = activeSubtoolOf(state);
   if (_isPlaceholderSubtool(_shellSub)) {
     var _shellLabel = STUDIO_SUBTOOL_LABELS[_shellSub] || _shellSub;
@@ -6800,7 +7329,7 @@ export const STUDIO_TOOLS = Object.freeze([
   { id: "outpaint", label: "Expand", icon: "⛶", title: "Expand" },
   { id: "sketch", label: "Draw", icon: "✎", title: "Sketch" },
   { id: "postprocess", label: "Post Processing", icon: "◑", title: "TinyLuma-based photo finishing" },
-  { id: "upscale", label: "Upscale", icon: "⤢", title: "Upscale workflow (placeholder)", isPlaceholder: true },
+  { id: "upscale", label: "Upscale", icon: "⤢", title: "Upscale (VOSR2 / SeedVR2)" },
 ]);
 
 const _TOOL_ALIASES = Object.freeze({
@@ -8094,7 +8623,7 @@ function _setActiveSubtool(state, context, actions, mode, subtool) {
 }
 
 function _postSubmenuNote(subtool) {
-  if (subtool === "upscale") return "Upscale arrives in a later phase — execution is disabled.";
+  if (subtool === "upscale") return "Upscale runs remotely — pick VOSR2 or SeedVR2 below, then Run Upscale. Your workflow and values are untouched.";
   return "Finishing editor lives in the canvas below — pick the Studio image there, or upload your own. Shortcuts: \\ compare · C crop · J heal · W white balance · Ctrl+Z/Y undo/redo.";
 }
 
@@ -8157,8 +8686,8 @@ function _focusPostCategory(subtool, root) {
 
 // Post category switches stay in place: the mounted engine keeps its
 // recipe, canvas, undo/redo, and compare state instead of remounting.
-// Only crossing the Upscale boundary remounts (Upscale is a canvas
-// placeholder, not the finishing editor). Ordinary categories share one
+// Only crossing the Upscale boundary remounts (Upscale is the remote
+// method panel, not the finishing editor). Ordinary categories share one
 // gate, so no gate refresh is needed in place — the remount rebuilds it.
 function _selectPostCategory(state, context, subtool) {
   var pg = state && state.playground;
@@ -9270,7 +9799,9 @@ function renderWorkspaceTopBar(state, context, actions) {
   var reason = el("div", { class: "comfymodal-studio-topbar-reason" });
   var batchApplying = !!pg._batchApplying;
   // Phase 1 shell gate (Post local engine / later-phase placeholder): no
-  // workflow execution from this view. In-flight runs keep their busy UI.
+  // workflow execution from this view. Phase 11: Post/Upscale runs through
+  // its own Run Upscale panel button — the shared gate stays parked with
+  // that pointer. In-flight runs keep their busy UI.
   var _shellGate = _shellRunGate(state);
   var _runBusy = batchApplying
     || (runState && (runState.status === "running" || runState.status === "submitted"

@@ -148,6 +148,8 @@ PYTEST_STYLE_FILES: list[Path] = [
     ROOT / "tests" / "test_portability_fixtures.py",
     # G10 derived report cache (module-level test functions)
     ROOT / "tests" / "test_portability_cache.py",
+    # Phase 11 Upscale backend contract (pure; no I/O, no heavy imports)
+    ROOT / "tests" / "test_studio_upscale_contract.py",
 ]
 
 # Studio-owned standalone Node unit tests (deterministic, no browser).
@@ -222,6 +224,11 @@ NODE_UNIT_FILES: list[Path] = [
     # History toolbar "Open folder": button adjacency to Clear all and the
     # shared /comfymodal/open-folder POST (default + stored save folder)
     ROOT / "tests" / "studio_history_open_folder_unit.mjs",
+    # Phase 11 Upscale contract: explicit vosr2|seedvr2 (no auto), filename
+    # input, {method,source,scale} payload, fail-closed dep errors,
+    # materialization/provenance shapes, placeholder honesty, Generate/Edit
+    # unaffected (pure; no browser, no network).
+    ROOT / "tests" / "studio_phase11_upscale_unit.mjs",
 ]
 
 # Intentionally excluded (documented in STUDIO_TEST_GATE.md):

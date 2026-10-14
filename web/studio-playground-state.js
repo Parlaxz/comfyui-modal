@@ -202,6 +202,11 @@ export function saveRunResult(presetId, featureId, runData) {
       favorite: !!runData.favorite,
       note: runData.note || "",
       noteUpdatedAt: runData.noteUpdatedAt || null,
+      // Phase 11 Upscale provenance (additive, optional): {method, scale,
+      // seed, tile_size, res_h/res_w, source asset, timings}. Null for
+      // non-upscale runs and older entries so restores render as before.
+      upscale: runData.upscale && typeof runData.upscale === "object" && !Array.isArray(runData.upscale)
+        ? runData.upscale : null,
       error: runData.error || null,
       rawTiming: runData.rawTiming || null,
       advancedTiming: runData.advancedTiming || null,
@@ -844,20 +849,26 @@ export const SHELL_SUBTOOLS = Object.freeze({
 // Later-phase placeholders: visible but with no execution path. Simple
 // membership list — labels live with the caller. Single source for the
 // shell run gate shared by the playground topbar and experiment submits.
-export const SHELL_PLACEHOLDERS = Object.freeze(["references", "guidance", "upscale"]);
+// Phase 11: Upscale is real (explicit VOSR2/SeedVR2 panel under Post), so
+// it is no longer a placeholder. references/guidance stay honest disabled
+// views with execution gated off.
+export const SHELL_PLACEHOLDERS = Object.freeze(["references", "guidance"]);
 
 /**
  * Honest execution gate for views with no runnable workflow path: Post
  * (local engine) and later-phase placeholders. Returns the user-facing
  * reason, or null when the normal workflow path applies. Unknown input
  * fails open (null) so callers never block on a not-yet-restored shell.
+ * Phase 11: Post/Upscale executes through its own Run Upscale panel button,
+ * never the workflow path — so the shared workflow-run gate stays parked
+ * here with a pointer, while the panel submits independently.
  * @param {string} mode
  * @param {string} subtool
  * @returns {string|null}
  */
 export function shellGateReason(mode, subtool) {
   if (mode === "post") {
-    if (subtool === "upscale") return "Upscale arrives in a later phase — execution is disabled.";
+    if (subtool === "upscale") return "Upscale runs from the Run Upscale button in the panel below.";
     if (SHELL_SUBTOOLS.post.indexOf(subtool) !== -1) {
       return "Post Processing runs locally — use Save or Export in the editor below.";
     }
@@ -1105,4 +1116,94 @@ export function saveWorkflowMethods(workflowId, patch) {
   } catch (e) {
     // Ignore
   }
+}
+
+// ── Phase 11 Upscale prefs (Post → Upscale) ─────────────────────────────
+//
+// Exactly two explicit methods, no generic framework, no third method. The
+// method is persisted so the panel reopens on the last choice; the default
+// is VOSR2. Running always requires an explicit Run click — nothing runs
+// on panel open or method switch.
+
+export const UPSCALE_METHODS = Object.freeze(["vosr2", "seedvr2"]);
+
+export const UPSCALE_METHOD_LABELS = Object.freeze({
+  vosr2: "VOSR2",
+  seedvr2: "SeedVR2",
+});
+
+const UPSCALE_PREFS_KEY = "comfymodal.studio.upscale.v1";
+
+function _defaultUpscalePrefs() {
+  // Defaults mirror the backend contract (POST /studio/upscale): VOSR2,
+  // scale 4, explicit seed 0 (no random sentinel — the backend requires an
+  // int in [0, 2^31-1]), VOSR2 tile edge 512 (backend requires
+  // [64, 2048]; SeedVR2 ignores tile keys).
+  return { method: "vosr2", scale: 4, seed: 0, tileSize: 512 };
+}
+
+function _sanitizeUpscaleInt(value, fallback, min, max) {
+  var n = Number(value);
+  if (!isFinite(n)) return fallback;
+  n = Math.round(n);
+  if (n < min || n > max) return fallback;
+  return n;
+}
+
+function _sanitizeUpscalePrefs(raw) {
+  var base = _defaultUpscalePrefs();
+  if (!raw || typeof raw !== "object") return base;
+  if (UPSCALE_METHODS.indexOf(raw.method) !== -1) base.method = raw.method;
+  base.scale = _sanitizeUpscaleInt(raw.scale, base.scale, 1, 8);
+  // Seed is an explicit int in [0, 2^31-1] per the backend contract.
+  base.seed = _sanitizeUpscaleInt(raw.seed, base.seed, 0, 2147483647);
+  // Tile edge in [64, 2048] per the backend contract (VOSR2 only).
+  base.tileSize = _sanitizeUpscaleInt(raw.tileSize != null ? raw.tileSize : raw.tile_size, base.tileSize, 64, 2048);
+  return base;
+}
+
+/**
+ * Load the persisted Upscale panel prefs (explicit method + params).
+ * @returns {{method: string, scale: number, seed: number, tileSize: number}}
+ */
+export function loadUpscalePrefs() {
+  try {
+    if (typeof localStorage === "undefined") return _defaultUpscalePrefs();
+    var raw = localStorage.getItem(UPSCALE_PREFS_KEY);
+    if (!raw) return _defaultUpscalePrefs();
+    return _sanitizeUpscalePrefs(JSON.parse(raw));
+  } catch (e) {
+    return _defaultUpscalePrefs();
+  }
+}
+
+/**
+ * Merge-patch known Upscale pref keys and persist. Unknown keys and any
+ * method outside VOSR2/SeedVR2 are ignored — only those two persist.
+ * @param {object} patch
+ * @returns {{method: string, scale: number, seed: number, tileSize: number}}
+ */
+export function saveUpscalePrefs(patch) {
+  var next = _sanitizeUpscalePrefs(loadUpscalePrefs());
+  if (patch && typeof patch === "object") {
+    if (Object.prototype.hasOwnProperty.call(patch, "method")
+      && UPSCALE_METHODS.indexOf(patch.method) !== -1) {
+      next.method = patch.method;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "scale")) {
+      next.scale = _sanitizeUpscaleInt(patch.scale, next.scale, 1, 8);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "seed")) {
+      next.seed = _sanitizeUpscaleInt(patch.seed, next.seed, 0, 2147483647);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "tileSize")
+      || Object.prototype.hasOwnProperty.call(patch, "tile_size")) {
+      var tv = Object.prototype.hasOwnProperty.call(patch, "tileSize") ? patch.tileSize : patch.tile_size;
+      next.tileSize = _sanitizeUpscaleInt(tv, next.tileSize, 64, 2048);
+    }
+  }
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(UPSCALE_PREFS_KEY, JSON.stringify(next));
+  } catch (e) { /* best-effort */ }
+  return next;
 }

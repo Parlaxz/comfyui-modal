@@ -257,7 +257,7 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await fx.assertNoConsoleErrors(ALLOW);
   });
 
-  test("T7 — RUN stays disabled in Post; Upscale is an honest placeholder", async ({ page }) => {
+  test("T7 — Post Upscale is a real panel: method radios, scale, Run Upscale, no Auto", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);
     await openPostprocess(page);
@@ -269,14 +269,24 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await expect(runBtn).toBeDisabled({ timeout: 10000 });
     await expect(page.locator('[data-testid="shell-gate-reason"]')).toContainText("Post Processing runs locally");
 
-    // Upscale category: editor unmounts, placeholder notice + disabled run.
+    // Upscale category: real Phase 11 remote panel, not a placeholder.
     await clickPostSubtool(page, "upscale");
-    await expect(page.locator('[data-testid="shell-placeholder"]')).toBeVisible({ timeout: 10000 });
-    await expect(page.locator('[data-testid="shell-placeholder"]')).toContainText("Upscale");
+    const panel = page.locator('[data-testid="upscale-panel"]');
+    await expect(panel).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('[data-testid="upscale-method-vosr2"]')).toBeVisible();
+    await expect(page.locator('[data-testid="upscale-method-seedvr2"]')).toBeVisible();
+    await expect(page.locator('[data-testid="upscale-scale"]')).toBeVisible();
+    await expect(page.locator('[data-testid="upscale-run"]')).toContainText("Run Upscale");
+    // Exactly two explicit methods — no third/Auto choice in the panel.
+    await expect(panel).not.toContainText("Auto");
+    // No placeholder notice: the finishing editor unmounts, the upscale
+    // shell mounts instead.
+    await expect(page.locator('[data-testid="shell-placeholder"]')).toHaveCount(0);
     await expect(page.locator(PP_WS)).toHaveCount(0);
+    // Shared workflow run stays parked with a pointer to the panel button.
     await expect(runBtn).toBeDisabled({ timeout: 10000 });
-    await expect(page.locator('[data-testid="shell-gate-reason"]')).toContainText("Upscale arrives in a later phase");
-    await expect(page.locator('[data-testid="submenu-post-note"]')).toContainText("Upscale arrives in a later phase");
+    await expect(page.locator('[data-testid="shell-gate-reason"]')).toContainText("Run Upscale");
+    await expect(page.locator('[data-testid="submenu-post-note"]')).toContainText("Run Upscale");
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });

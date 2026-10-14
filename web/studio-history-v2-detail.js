@@ -70,6 +70,7 @@ export function historyAttemptPurposeLabel(mode) {
   const key = mode == null ? "" : String(mode).toLowerCase();
   if (key === "original") return "Original";
   if (key === "preview" || key === "data_saver" || key === "data-saver" || key === "datasaver") return "Data Saver";
+  if (key === "upscale") return "Upscale";
   return "Run";
 }
 
@@ -1049,6 +1050,53 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     ]);
   }
 
+  // Phase 11 Upscale provenance row builder. Returns null when neither the
+  // record nor its featured output carries upscale info, so non-upscale
+  // generations render exactly as before. Purely additive: reads optional
+  // fields, never mutates the record or its workflow/params.
+  function _buildUpscaleSection(record) {
+    if (!record || typeof record !== "object") return null;
+    var feat = record.featuredOutput && typeof record.featuredOutput === "object" ? record.featuredOutput : {};
+    var info = (record.upscale && typeof record.upscale === "object" && !Array.isArray(record.upscale))
+      ? record.upscale
+      : ((feat.upscale && typeof feat.upscale === "object" && !Array.isArray(feat.upscale)) ? feat.upscale : null);
+    if (!info) return null;
+    function row(key, value) {
+      if (value == null || value === "") return null;
+      return el("div", { class: "comfymodal-studio-history-v2-row" }, [
+        el("span", { class: "comfymodal-studio-history-v2-row-key", text: key }),
+        el("span", { class: "comfymodal-studio-history-v2-row-value", text: String(value) }),
+      ]);
+    }
+    var method = info.method != null ? String(info.method).toLowerCase()
+      : (info.upscale_method != null ? String(info.upscale_method).toLowerCase() : "");
+    var methodLabel = method === "seedvr2" ? "SeedVR2" : (method === "vosr2" ? "VOSR2" : (method || "Upscale"));
+    var target = (info.res_h != null && info.res_w != null)
+      ? (String(info.res_w) + " × " + String(info.res_h))
+      : ((Array.isArray(info.output_size) && info.output_size.length >= 2)
+        ? (String(info.output_size[0]) + " × " + String(info.output_size[1])) : null);
+    var timings = (info.timings && typeof info.timings === "object" && Object.keys(info.timings).length > 0)
+      ? Object.keys(info.timings).length + " stage(s)" : null;
+    var duration = info.duration_ms != null ? _formatDuration(info.duration_ms)
+      : ((info.timings && typeof info.timings === "object" && info.timings.total_ms != null)
+        ? _formatDuration(info.timings.total_ms) : null);
+    var sec = _section("Upscale", [
+      row("Method", methodLabel),
+      row("Scale", info.scale != null ? "×" + String(info.scale) : null),
+      target ? row("Target", target) : null,
+      row("Seed", info.seed != null ? String(info.seed) : null),
+      row("Tile size", info.tile_size != null ? String(info.tile_size) : (info.tileSize != null ? String(info.tileSize) : null)),
+      row("Source", info.source_asset != null ? String(info.source_asset) : (info.source_url != null ? String(info.source_url) : null)),
+      row("Backend", info.backend != null ? String(info.backend) : null),
+      row("Upscaled at", info.at != null ? _shortDateTime(info.at) : null),
+      duration ? row("Duration", duration) : null,
+      timings ? row("Timings", timings) : null,
+    ]);
+    if (!sec) return null;
+    sec.setAttribute("data-testid", "history-v2-upscale");
+    return sec;
+  }
+
   // Full-width overflow sections: attempt history, errors, and the Generate
   // Original action sit below the timing flow, spanning the overlay body.
   // (The Run / Run Data / Metadata right column and the zoom stage both come
@@ -1056,6 +1104,11 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
   // implementation here.)
   function buildOverflowSections(record) {
     const sections = [];
+    // Phase 11 Upscale provenance (additive): rendered only when the backend
+    // projects upscale info on the record or its featured output. Derived
+    // output — the original generation workflow/params are never rewritten.
+    const upscaleSec = _buildUpscaleSection(record);
+    if (upscaleSec) { upscaleSec.classList.add("comfymodal-studio-history-v2-overflow-section"); sections.push(upscaleSec); }
     const attempts = Array.isArray(record.attempts) ? record.attempts : [];
     if (attempts.length > 0) {
       const sec = _section("Attempts", attempts.map(function (a, i) {
