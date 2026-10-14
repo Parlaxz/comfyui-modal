@@ -551,6 +551,9 @@ def _golden_history_meta(
     studio_method: Mapping[str, Any] | None = None,
     studio_style: Mapping[str, Any] | None = None,
     studio_references: Mapping[str, Any] | None = None,
+    workflow_id: str = "",
+    workflow_version_id: str = "",
+    workflow_hash: str = "",
 ) -> dict[str, Any]:
     controls_map = controls if isinstance(controls, Mapping) else {}
     actual_method = method or profile.target["method"]
@@ -569,6 +572,16 @@ def _golden_history_meta(
         "negative_prompt": str(controls_map.get("negative_prompt") or ""),
         "studio_workflow_id": str(controls_map.get("_workflow_id") or ""),
     }
+    # Phase 8: workflow/version identity + stored graph hash so the V2
+    # request-snapshot gate passes and the record projects the normalized
+    # studio_references companion (absent on legacy records — never
+    # synthesized).
+    if workflow_id:
+        meta["workflow_id"] = str(workflow_id)
+    if workflow_version_id:
+        meta["workflow_version_id"] = str(workflow_version_id)
+    if workflow_hash:
+        meta["workflow_hash"] = str(workflow_hash)
     # Phase 3: explicit generic-method provenance (plain JSON only).
     if isinstance(studio_method, Mapping):
         try:
@@ -623,6 +636,9 @@ def _begin_golden_history(
     studio_method: Mapping[str, Any] | None = None,
     studio_style: Mapping[str, Any] | None = None,
     studio_references: Mapping[str, Any] | None = None,
+    workflow_id: str = "",
+    workflow_version_id: str = "",
+    workflow_hash: str = "",
 ) -> tuple[str, str]:
     """Open the nonterminal History record BEFORE the run is dispatched.
 
@@ -646,7 +662,7 @@ def _begin_golden_history(
             kind="playground_run",
             prompt_id=request_id,
             status="running",
-            meta=_golden_history_meta(request_id, profile, controls, method, studio_method, studio_style, studio_references),
+            meta=_golden_history_meta(request_id, profile, controls, method, studio_method, studio_style, studio_references, workflow_id, workflow_version_id, workflow_hash),
         )
         if not isinstance(record, dict):
             return "", ""
@@ -1018,6 +1034,9 @@ async def run_golden_workflow(
               ),
             studio_style=_g_style,
             studio_references=_g_ref_companion,
+            workflow_id=str(workflow_id or ""),
+            workflow_version_id=str(version_id or ""),
+            workflow_hash=str(((bundle or {}).get("version") or {}).get("graph_hash") or ""),
         )
         handle = (
             handle_factory(profile, workspace)

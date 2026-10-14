@@ -1740,6 +1740,53 @@ def _active_node_ids(
         return set()
 
 
+def _expand_autogrow_template(
+    container: str, options: Any, container_required: bool,
+) -> list[dict[str, Any]]:
+    """Expand a ``COMFY_AUTOGROW_V3`` template into dotted child slots.
+
+    Returns ``[]`` unless ``options["template"]`` declares ``names`` with an
+    IMAGE-typed per-name input. Children serialize as
+    ``"<container>.<name>"``; required only up to template ``min``.
+    Never raises; never invents names outside the declared template.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        opts = options if isinstance(options, dict) else {}
+        tpl = opts.get("template")
+        if not isinstance(tpl, dict):
+            return out
+        names = tpl.get("names")
+        if not isinstance(names, list) or not names:
+            return out
+        required_spec = (tpl.get("input") or {}).get("required")
+        inner_type = ""
+        try:
+            if isinstance(required_spec, dict) and required_spec:
+                first = next(iter(required_spec.values()))
+                inner_type, _ = _parse_type_spec(first)
+        except Exception:
+            inner_type = ""
+        if str(inner_type or "").upper() not in _IMAGE_TYPE_NAMES:
+            return out
+        try:
+            min_n = int(tpl.get("min", 0) or 0)
+        except (TypeError, ValueError):
+            min_n = 0
+        for idx, child in enumerate(names):
+            cname = str(child or "")
+            if not cname:
+                continue
+            out.append({
+                "socket": f"{container}.{cname}",
+                "required": bool(container_required) and idx < max(int(min_n), 0),
+                "options": {},
+            })
+    except Exception:
+        pass
+    return out
+
+
 def _image_slots_from_schema(
     declared: dict[str, tuple[str, dict[str, Any], bool]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1749,8 +1796,17 @@ def _image_slots_from_schema(
     schema: numeric suffixes order numerically (never lexically); a lone
     IMAGE socket whose options carry ``autogrow``/``dynamic``/``max`` is
     expandable up to that max (else reported as expandable-unbounded).
+
+    New-style ``COMFY_AUTOGROW_V3`` containers declare their slots in
+    ``options["template"]`` (``names`` + per-name input spec) and serialize
+    in the executable prompt as dotted ``"<container>.<slot>"`` inputs.
+    Such containers expand to one slot per template name (numeric order);
+    the bare container itself is never a slot. Children are required only
+    up to the template ``min`` (min 0 means all optional).
     """
     slots: list[dict[str, Any]] = []
+    expanded_base: str = ""
+    expanded_max: Any = None
     try:
         for name, (type_name, options, required) in declared.items():
             if str(type_name or "").upper() in _IMAGE_TYPE_NAMES:
@@ -1759,6 +1815,15 @@ def _image_slots_from_schema(
                     "required": bool(required),
                     "options": dict(options or {}),
                 })
+                continue
+            for child in _expand_autogrow_template(str(name), options, bool(required)):
+                slots.append(child)
+                expanded_base = str(name)
+        # An expanded container replaces its bare socket: executable graphs
+        # address children (never the container itself).
+        if expanded_base:
+            slots = [s for s in slots if str(s.get("socket", "")) != expanded_base]
+            expanded_max = len(slots)
     except Exception:
         pass
     slots.sort(key=lambda s: _slot_order_key(str(s.get("socket", ""))))
@@ -1766,7 +1831,10 @@ def _image_slots_from_schema(
     try:
         if not slots:
             return [], capacity
-        if len(slots) == 1:
+        if expanded_base:
+            capacity = {"kind": "autogrow", "count": len(slots),
+                        "max": expanded_max, "base": expanded_base}
+        elif len(slots) == 1:
             options = slots[0].get("options") or {}
             autogrow = bool(
                 options.get("autogrow") or options.get("dynamic")

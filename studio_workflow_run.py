@@ -815,14 +815,18 @@ def _resolve_execution_target(
     ui_graph: Any,
     node_id: str,
     input_name: str,
+    node_def_provider: Any = None,
 ) -> tuple[str, str] | None:
     """Resolve a stored mapping target to its executable prompt key.
 
     Direct hits pass through. Subgraph UI ids resolve without guessing:
     outer containers via the subgraph ``inputNode`` mapping (needs
     ``ui_graph``) and inner-local ids via a unique ``":<id>"`` suffix match
-    against the executable prompt. Returns ``(node_id, input_name)`` or None.
-    Never raises.
+    against the executable prompt. Dotted expanded-autogrow children
+    (``"<container>.<slot>"``, e.g. Qwen ``images.image_1``) resolve when
+    the container is schema-declared: the mutator writes the dotted key,
+    which is exactly how ComfyUI serializes those inputs. Returns
+    ``(node_id, input_name)`` or None. Never raises.
     """
     try:
         if not node_id or not input_name:
@@ -832,6 +836,24 @@ def _resolve_execution_target(
             inputs = node.get("inputs")
             if isinstance(inputs, dict) and input_name in inputs:
                 return (node_id, input_name)
+            # Expanded-autogrow children ("<container>.<slot>") absent as
+            # executable keys are still valid targets when the container is
+            # schema-declared: the mutator writes the dotted key, exactly
+            # how ComfyUI serializes those inputs. Uses the same Lane-A
+            # slot derivation as discovery (single source of truth).
+            if isinstance(inputs, dict) and "." in str(input_name or ""):
+                try:
+                    from studio_domain.graph import _image_slots_from_schema as _phase8_slots
+                    from studio_domain.graph import _declared_input_types as _phase8_declared
+                    _decl = _phase8_declared(
+                        str((node.get("class_type", "") or "")),
+                        node_def_provider,
+                    )
+                    _known = {str(s.get("socket", "")) for s in _phase8_slots(_decl)[0]}
+                    if str(input_name) in _known:
+                        return (node_id, input_name)
+                except Exception:
+                    pass
         if ":" in node_id:
             return None
         if ui_graph is not None:
@@ -1374,6 +1396,18 @@ def build_workflow_execution_plan(
     ``trace_ctx`` is accepted for signature parity with the legacy adapter;
     it is not consumed by plan construction.
     """
+    # Root for local image collection: the caller's node dir resolves
+    # <ComfyUI>/input via parent walk in standard installs, but under
+    # isolated --base-directory / junction layouts that walk finds no
+    # input dir. Prefer the LIVE ComfyUI base (folder_paths honors the
+    # process's actual --base-directory) whenever it exposes one.
+    try:
+        import folder_paths as _live_fp  # type: ignore[import-not-found]
+        _live_base = os.path.dirname(os.path.abspath(_live_fp.__file__))
+        if os.path.isdir(os.path.join(_live_base, "input")):
+            comfyui_root = _live_base
+    except Exception:
+        pass
     try:
         from comfymodal_runtime.contracts import (
             ExecutionOptions,
@@ -3919,9 +3953,15 @@ def _prepare_method_prep(bundle, method, bindings, images, node_dir):
                 )
             }
         targets = {}
+        try:
+            _req_service = _get_domain_service(node_dir)
+            _req_provider = getattr(_req_service, "_node_def_provider", None)
+        except Exception:
+            _req_provider = None
         for slot in ref_slots:
             target = _resolve_execution_target(
-                prompt, prompt, ui_graph, slot["node_id"], slot["socket"]
+                prompt, prompt, ui_graph, slot["node_id"], slot["socket"],
+                node_def_provider=_req_provider,
             )
             if target is None:
                 return {
@@ -3949,11 +3989,6 @@ def _prepare_method_prep(bundle, method, bindings, images, node_dir):
                         "so filenames never reach an IMAGE socket"
                     )
                 }
-        try:
-            _req_service = _get_domain_service(node_dir)
-            _req_provider = getattr(_req_service, "_node_def_provider", None)
-        except Exception:
-            _req_provider = None
         required = _reference_required_map(bundle, bindings, _req_provider)
         for index, slot in enumerate(ref_slots):
             if index < len(images):
@@ -4136,9 +4171,51 @@ def _build_reference_run_companion(
             "provenance": {"source": "mapping"},
         }
     try:
-        companion["images"] = list(images or [])
-        if card_ids:
-            companion["card_ids"] = list(card_ids)
+        ordered_images = list(images or [])
+        ordered_cards = list(card_ids or [])
+        companion["images"] = list(ordered_images)
+        if ordered_cards:
+            companion["card_ids"] = list(ordered_cards)
+        # History-grade entries: filename + positional card linkage + source
+        # provenance per applied image (the normalizer skips bare strings).
+        # Slots mirror the applied order (position = order).
+        try:
+            _bound = bindings if isinstance(bindings, dict) else {}
+            _all_slots = [s for s in (_bound.get("slots") or []) if isinstance(s, dict)]
+            def _skey(s):
+                try:
+                    return int(s.get("order", 0))
+                except (TypeError, ValueError):
+                    return 0
+            _all_slots.sort(key=lambda s: (_skey(s), str(s.get("node_id", "")), str(s.get("socket", ""))))
+            _applied = _all_slots[:len(ordered_images)] if ordered_images else []
+            _entries = []
+            _slot_out = []
+            for _idx, _name in enumerate(ordered_images):
+                _entry = {"filename": str(_name)}
+                _cid = ordered_cards[_idx] if _idx < len(ordered_cards) else ""
+                if _cid:
+                    _entry["card_id"] = str(_cid)
+                _entry["source"] = {"ref": "studio"}
+                _entries.append(_entry)
+                if _idx < len(_applied):
+                    _s = _applied[_idx]
+                    _slot_out.append({
+                        "node_id": str(_s.get("node_id", "") or ""),
+                        "socket": str(_s.get("socket", "") or ""),
+                        "order": _idx,
+                        "card_id": str(_cid or ""),
+                    })
+            companion["image_entries"] = _entries
+            if _slot_out:
+                companion["slots"] = _slot_out
+            _chain = _bound.get("chain")
+            if isinstance(_chain, dict) and _chain:
+                companion["chain"] = {k: _chain.get(k) for k in (
+                    "loader_node_id", "vae_encode_node_id",
+                    "reference_latent_node_id", "consumer_node_id") if _chain.get(k)}
+        except Exception:
+            pass
         if executing_workflow_id:
             companion["executing_workflow_id"] = str(executing_workflow_id)
             companion["executing_version_id"] = str(executing_version_id or "")

@@ -39,6 +39,9 @@ import {
   referenceSlotLabel,
   validateReferenceCards,
   buildStudioReferencesCompanion,
+  readReferenceEngagement,
+  promptCarriesReferences,
+  referenceBlockMessage,
 } from "../web/studio-workflow-run.js";
 import { createUploadGuard } from "../web/studio-field-blocks.js";
 import {
@@ -1022,6 +1025,126 @@ function slotsMapping(slots, method) {
   assert.equal(other.isCurrent(otherToken), true);
   assert.equal(guard.isCurrent(otherToken), false, "tokens are per-guard");
   section("18. upload guard staleness");
+}
+
+// ── 19. Canvas /prompt reference engagement reads ──────────────────────
+
+{
+  const sel = { workflowId: "wf_ref", workflowVersionId: "wv_ref" };
+
+  // Engaged via method alone (no cards).
+  const viaMethod = readReferenceEngagement(
+    sel,
+    { wf_ref: { referenceMethod: "conditioning_slots" } },
+    {}
+  );
+  assert.ok(viaMethod, "method chosen → engaged");
+  assert.equal(viaMethod.workflowId, "wf_ref");
+  assert.equal(viaMethod.versionId, "wv_ref");
+  assert.equal(viaMethod.method, "conditioning_slots");
+  assert.equal(viaMethod.cardCount, 0);
+  assert.deepEqual(viaMethod.files, []);
+
+  // Engaged via cards alone (no method chosen).
+  const viaCards = readReferenceEngagement(
+    sel,
+    { wf_ref: { referenceMethod: "" } },
+    { "wf_ref::wv_ref": [{ id: "a", file: "a.png", label: "" }] }
+  );
+  assert.ok(viaCards, "card present → engaged");
+  assert.equal(viaCards.method, "");
+  assert.equal(viaCards.cardCount, 1);
+  assert.deepEqual(viaCards.files, ["a.png"]);
+
+  // Cards under a different version do not engage this selection.
+  assert.equal(
+    readReferenceEngagement(sel, {}, { "wf_ref::wv_other": [{ id: "a", file: "a.png", label: "" }] }),
+    null,
+    "other-version cards do not engage"
+  );
+
+  // Empty: no method, no cards → null.
+  assert.equal(readReferenceEngagement(sel, {}, {}), null, "nothing engaged → null");
+  assert.equal(
+    readReferenceEngagement(sel, { wf_ref: { referenceMethod: "" } }, { "wf_ref::wv_ref": [] }),
+    null,
+    "empty method + empty cards → null"
+  );
+  assert.equal(readReferenceEngagement(null, {}, {}), null, "null selection → null");
+  assert.equal(
+    readReferenceEngagement({ workflowId: "", workflowVersionId: "wv_ref" }, {}, {}),
+    null,
+    "missing workflow id → null"
+  );
+
+  // Malformed blobs degrade to null and never throw.
+  assert.equal(readReferenceEngagement(sel, "junk", "junk"), null, "string blobs → null");
+  assert.equal(readReferenceEngagement(sel, null, null), null, "null blobs → null");
+  assert.equal(readReferenceEngagement(sel, { wf_ref: "junk" }, { "wf_ref::wv_ref": "junk" }), null,
+    "malformed entries → null");
+  assert.equal(readReferenceEngagement("junk", "junk", "junk"), null, "junk selection → null");
+  assert.equal(readReferenceEngagement(undefined, undefined, undefined), null, "undefined → null");
+  section("19. canvas reference engagement reads");
+}
+
+// ── 20. Canvas /prompt reference payload detection ──────────────────────
+
+{
+  assert.equal(
+    promptCarriesReferences({ extra_data: { studio_references: { method: "conditioning_slots" } } }),
+    true,
+    "extra_data.studio_references object → carries"
+  );
+  assert.equal(
+    promptCarriesReferences({ studio_references: { method: "dedicated" } }),
+    true,
+    "top-level studio_references object → carries"
+  );
+  assert.equal(promptCarriesReferences({ prompt: {} }), false, "plain body → absent");
+  assert.equal(promptCarriesReferences({}), false, "empty body → absent");
+  assert.equal(
+    promptCarriesReferences({ extra_data: { studio_references: null } }),
+    false,
+    "null reference payload → absent"
+  );
+  assert.equal(
+    promptCarriesReferences({ studio_references: null }),
+    false,
+    "null top-level payload → absent"
+  );
+  assert.equal(promptCarriesReferences(null), false, "null body → absent");
+  assert.equal(promptCarriesReferences("junk"), false, "string body → absent");
+  section("20. canvas reference payload detection");
+}
+
+// ── 21. Canvas reference block message ──────────────────────────────────
+
+{
+  const methodMsg = referenceBlockMessage({
+    workflowId: "wf_ref", versionId: "wv_ref",
+    method: "conditioning_slots", cardCount: 2, files: ["a.png", "b.png"],
+  });
+  assert.ok(methodMsg.includes("wf_ref"), "message names the workflow id");
+  assert.ok(methodMsg.includes("conditioning_slots"), "message names the method");
+  assert.ok(methodMsg.includes("2"), "message names the card count");
+  assert.ok(methodMsg.includes("Run from Studio References"), "message offers the Studio run remedy");
+  assert.ok(methodMsg.includes("clear the reference method/cards"), "message offers the clear remedy");
+
+  // No method chosen: message falls back to cards, still names id + remedies.
+  const cardsMsg = referenceBlockMessage({
+    workflowId: "wf_ref", versionId: "wv_ref", method: "", cardCount: 1, files: ["a.png"],
+  });
+  assert.ok(cardsMsg.includes("wf_ref"), "cards message names the workflow id");
+  assert.ok(cardsMsg.includes("1 reference card"), "singular card count reads honestly");
+  assert.ok(cardsMsg.includes("Run from Studio References"));
+  assert.ok(cardsMsg.includes("clear the reference method/cards"));
+  assert.equal(cardsMsg.includes("conditioning_slots"), false, "no method invented");
+
+  // Null engagement never throws and still offers both remedies.
+  const fallbackMsg = referenceBlockMessage(null);
+  assert.ok(fallbackMsg.includes("Run from Studio References"));
+  assert.ok(fallbackMsg.includes("clear the reference method/cards"));
+  section("21. canvas reference block message");
 }
 
 console.log("PASS: studio workflow run unit tests");

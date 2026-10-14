@@ -790,6 +790,8 @@ def _normalize_studio_references(meta: Any, workflow_hash: Any = None) -> Option
 
         card_ids = _clean_str_list(raw.get("card_ids", raw.get("cardIds")))
         images = _normalize_reference_images(raw.get("images"))
+        if not images:
+            images = _normalize_reference_images(raw.get("image_entries"))
         slots = _normalize_reference_slots(raw.get("slots", raw.get("slot_order")))
         chain = raw.get("chain", raw.get("chain_boundary"))
         chain = _plain_json_copy(chain) if isinstance(chain, dict) else {}
@@ -1270,6 +1272,8 @@ class HistoryV2ProductionWriter:
         detail = self._repo.get_generation(generation_id)
         if detail is None or detail.generation.request_snapshot_id is not None:
             return
+        if not workflow_hash and isinstance(meta, dict):
+            workflow_hash = meta.get("workflow_hash") or ""
         workflow_json = meta.get("workflow_json")
         if not isinstance(workflow_json, dict) and not workflow_hash:
             return

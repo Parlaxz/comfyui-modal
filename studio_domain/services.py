@@ -594,13 +594,23 @@ class WorkflowDomainService:
                 raise WorkflowDomainValidationError(
                     "dedicated reference method requires a dedicated target"
                 )
-            if not node_exists(executable, target) and not subgraph_node_present(
+            if node_exists(executable, target) or subgraph_node_present(
                 executable, ui_graph, target
             ):
-                raise WorkflowDomainValidationError(
-                    f"dedicated reference target node {target} not present in graph"
-                )
-            return method, normalized
+                return method, normalized
+            # A dedicated target may also be a stored workflow (selected
+            # explicitly through the workflow picker); the run path resolves
+            # and freezes its version at acceptance. Anything else stays
+            # rejected — never a guessed node.
+            try:
+                stored = self.store.get_workflow(target)
+            except Exception:
+                stored = None
+            if isinstance(stored, dict) and stored:
+                return method, normalized
+            raise WorkflowDomainValidationError(
+                f"dedicated reference target node {target} not present in graph"
+            )
         candidate_id = str(normalized.get("candidate_id", "") or "")
         if method == "conditioning_slots":
             slots = normalized.get("slots", [])
@@ -630,6 +640,18 @@ class WorkflowDomainService:
                 socket = str(slot.get("socket", ""))
                 kind = str(slot.get("kind", "reference"))
                 if kind == "source":
+                    continue
+                ev_slot = evidenced_slots.get((nid, socket)) if evidenced_slots else None
+                if isinstance(ev_slot, dict):
+                    # The candidate already evidenced this slot: a required
+                    # slot must be wired, while an optional one may bind an
+                    # isolated loader branch at run time (discovery marks it
+                    # writable). Trust that evidence instead of re-resolving.
+                    if bool(ev_slot.get("required")) and not bool(ev_slot.get("resolvable")):
+                        errors.append(
+                            f"reference slot socket {socket!r} on node {nid} "
+                            "is required but has no resolvable binding path"
+                        )
                     continue
                 target = resolve_binding_target(
                     executable, nid, socket, ui_graph=ui_graph,

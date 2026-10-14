@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -247,6 +249,99 @@ def test_sync_posts_return_pollable_status_and_preserve_refusal_outcomes(tmp_pat
     assert status_body["outcome"] == "destructive_publication_blocked"
     assert "refused" in status_body["message"].lower()
     assert calls == [("publish", [])]
+
+
+def _fake_nodes_module(monkeypatch, entries):
+    """Build a nodes-module stand-in; *entries* maps class name -> file path (or None).
+
+    Registers fake holder modules in ``sys.modules`` so
+    ``CustomNodeDiscovery.discover(..., nodes_module=...)`` resolves
+    ``__file__`` without importing Torch/ComfyUI.
+    """
+    mappings = {}
+    for index, (class_type, file) in enumerate(entries.items()):
+        module_name = f"_fake_nodes_holder_{class_type}_{index}"
+        cls = type(class_type, (), {"__module__": module_name})
+        mappings[class_type] = cls
+        holder = types.ModuleType(module_name)
+        if file is not None:
+            holder.__file__ = str(file)
+        monkeypatch.setitem(sys.modules, module_name, holder)
+    return types.SimpleNamespace(NODE_CLASS_MAPPINGS=mappings)
+
+
+def test_discovery_core_fallback_outside_passed_root(tmp_path, monkeypatch):
+    """Odd layout: core-ish module outside both the passed root and any pack dir ⇒ core."""
+    comfy = tmp_path / "ComfyUI"
+    pack = comfy / "custom_nodes" / "SomePack"
+    pack.mkdir(parents=True)
+    pack_nodes = pack / "nodes.py"
+    pack_nodes.write_text("NODE_CLASS_MAPPINGS = {}\n")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    core_file = elsewhere / "core_nodes.py"
+    core_file.write_text("x = 1\n")
+
+    nodes_module = _fake_nodes_module(monkeypatch, {
+        "PackNode": pack_nodes,
+        "LoadImage": core_file,
+    })
+
+    records, core = CustomNodeDiscovery().discover(comfy, nodes_module=nodes_module)
+
+    assert [r.name for r in records] == ["SomePack"]
+    assert records[0].classes == ["PackNode"]
+    assert "LoadImage" in core
+    assert "PackNode" not in core
+
+
+def test_discovery_normal_layout_unchanged(tmp_path, monkeypatch):
+    """Normal layout: pack classes stay with packs, core file under root stays core."""
+    comfy = tmp_path / "ComfyUI"
+    pack = comfy / "custom_nodes" / "SomePack"
+    pack.mkdir(parents=True)
+    pack_nodes = pack / "nodes.py"
+    pack_nodes.write_text("NODE_CLASS_MAPPINGS = {}\n")
+    core_file = comfy / "nodes.py"
+    core_file.write_text("x = 1\n")
+
+    nodes_module = _fake_nodes_module(monkeypatch, {
+        "PackNode": pack_nodes,
+        "VAEEncode": core_file,
+    })
+
+    records, core = CustomNodeDiscovery().discover(comfy, nodes_module=nodes_module)
+
+    assert [r.name for r in records] == ["SomePack"]
+    assert records[0].classes == ["PackNode"]
+    assert core == {"VAEEncode"}
+
+
+def test_discovery_missing_module_files_never_raise(tmp_path, monkeypatch):
+    """Modules with no resolvable file never raise and never classify."""
+    comfy = tmp_path / "ComfyUI"
+    pack = comfy / "custom_nodes" / "SomePack"
+    pack.mkdir(parents=True)
+    (pack / "nodes.py").write_text("NODE_CLASS_MAPPINGS = {}\n")
+
+    orphan_cls = type("OrphanNode", (), {"__module__": "_fake_nodes_missing_module"})
+    assert "_fake_nodes_missing_module" not in sys.modules
+    nofile_holder = types.ModuleType("_fake_nodes_nofile_module")
+    # No __file__ attribute at all.
+    if "__file__" in nofile_holder.__dict__:
+        del nofile_holder.__dict__["__file__"]
+    monkeypatch.setitem(sys.modules, "_fake_nodes_nofile_module", nofile_holder)
+    nofile_cls = type("NoFileNode", (), {"__module__": "_fake_nodes_nofile_module"})
+    nodes_module = types.SimpleNamespace(NODE_CLASS_MAPPINGS={
+        "OrphanNode": orphan_cls,
+        "NoFileNode": nofile_cls,
+    })
+
+    records, core = CustomNodeDiscovery().discover(comfy, nodes_module=nodes_module)
+
+    assert [r.name for r in records] == ["SomePack"]
+    assert core == set()
+    assert all(r.classes == [] for r in records)
 
 
 def test_sync_publish_lock_refusal_is_not_accepted(tmp_path, monkeypatch):

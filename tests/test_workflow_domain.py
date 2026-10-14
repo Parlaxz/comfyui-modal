@@ -1075,6 +1075,131 @@ class ReferenceDiscoveryTests(WorkflowDomainTestCase):
         self.assertEqual(len(bad), 1)
         self.assertTrue(any("image2" in r for r in bad[0]["reasons"]))
 
+    def test_expanded_autogrow_children_are_slots(self):
+        # New-style COMFY_AUTOGROW_V3 container: template names expand to
+        # dotted executable slots in numeric order; the bare container is
+        # never a slot. min=0 keeps every child optional.
+        from studio_domain.graph import discover_reference_candidates
+        extra = {
+            "Grow21": (
+                {
+                    "clip": ("CLIP",),
+                    "text": ("STRING",),
+                    "images": ("COMFY_AUTOGROW_V3", {
+                        "template": {
+                            "names": ["image_1", "image_2", "image_10"],
+                            "min": 0,
+                            "input": {"required": {"image": ("IMAGE",)}},
+                        },
+                    }),
+                },
+                {},
+            ),
+        }
+        prompt = {
+            "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c"}},
+            "2": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+            "3": {"class_type": "Grow21", "inputs": {
+                "clip": ["1", 0], "text": "x", "images.image_1": ["2", 0]}},
+            "4": {"class_type": "KSampler", "inputs": {
+                "model": ["9", 0], "positive": ["3", 0],
+                "negative": ["3", 0], "latent_image": ["5", 0]}},
+            "5": {"class_type": "EmptyLatentImage",
+                   "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+            "6": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]}},
+            "9": {"class_type": "UNETLoader", "inputs": {"unet_name": "u"}},
+        }
+        out = discover_reference_candidates(
+            prompt,
+            node_def_provider=self._node_defs(extra),
+            return_types_provider=self._returns({"Grow21": ["CONDITIONING"]}),
+            output_node_id="6",
+        )
+        cands = [c for c in out["candidates"] if c["node_id"] == "3"]
+        self.assertEqual(len(cands), 1)
+        cand = cands[0]
+        self.assertTrue(cand["compatible"])
+        self.assertEqual(
+            cand["slot_order"],
+            ["images.image_1", "images.image_2", "images.image_10"],
+        )
+        self.assertEqual(cand["capacity"]["kind"], "autogrow")
+        self.assertEqual(cand["capacity"]["count"], 3)
+        by_socket = {s["socket"]: s for s in cand["slots"]}
+        self.assertTrue(by_socket["images.image_1"]["resolvable"])
+        self.assertFalse(by_socket["images.image_2"].get("required"))
+        self.assertTrue(by_socket["images.image_2"]["writable"])
+        self.assertFalse(
+            [s for s in cand["slots"] if s["socket"] == "images"]
+        )
+
+    def test_expanded_optional_slots_save(self):
+        # Save-time validation trusts discovery evidence: wired plus
+        # optional-unlinked expanded slots persist without error, while a
+        # required-unwired slot still blocks (see
+        # test_required_unlinked_slot_still_blocks for discovery).
+        from studio_domain.graph import discover_reference_candidates
+        extra = {
+            "Grow21": (
+                {
+                    "clip": ("CLIP",),
+                    "text": ("STRING",),
+                    "images": ("COMFY_AUTOGROW_V3", {
+                        "template": {
+                            "names": ["image_1", "image_2"],
+                            "min": 0,
+                            "input": {"required": {"image": ("IMAGE",)}},
+                        },
+                    }),
+                },
+                {},
+            ),
+        }
+        prompt = {
+            "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "c"}},
+            "2": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+            "3": {"class_type": "Grow21", "inputs": {
+                "clip": ["1", 0], "text": "x", "images.image_1": ["2", 0]}},
+            "4": {"class_type": "KSampler", "inputs": {
+                "model": ["9", 0], "positive": ["3", 0],
+                "negative": ["3", 0], "latent_image": ["5", 0]}},
+            "5": {"class_type": "EmptyLatentImage",
+                   "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+            "6": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]}},
+            "9": {"class_type": "UNETLoader", "inputs": {"unet_name": "u"}},
+        }
+        out = discover_reference_candidates(
+            prompt,
+            node_def_provider=self._node_defs(extra),
+            return_types_provider=self._returns({"Grow21": ["CONDITIONING"]}),
+            output_node_id="6",
+        )
+        cands = [c for c in out["candidates"] if c["node_id"] == "3"]
+        self.assertEqual(len(cands), 1)
+        cand = cands[0]
+        service = WorkflowDomainService(self.root)
+        service._node_def_provider = self._node_defs(extra)
+        wf = service.create_workflow("ref")
+        version = service.create_version_from_capture(
+            wf["workflow_id"], make_capture(prompt))
+        entries, output_id = derive_mapping_candidates(
+            make_capture(prompt), node_def_provider=fake_node_def)
+        mapping = service.set_mapping(
+            version["workflow_version_id"],
+            entries={r: e.to_dict() for r, e in entries.items()},
+            output_node_id=output_id or "6",
+            reference_method="conditioning_slots",
+            reference_bindings={
+                "candidate_id": cand["candidate_id"],
+                "slots": cand["slots"],
+            },
+        )
+        self.assertEqual(mapping.get("reference_method"), "conditioning_slots")
+        self.assertEqual(
+            [s["socket"] for s in mapping.get("reference_bindings", {}).get("slots", [])],
+            ["images.image_1", "images.image_2"],
+        )
+
     def test_numeric_ordering_ten_after_two(self):
         from studio_domain.graph import discover_reference_candidates
         extra = {
@@ -1255,6 +1380,39 @@ class ReferenceDiscoveryTests(WorkflowDomainTestCase):
                 reference_method="conditioning_slots",
                 reference_bindings={"slots": [
                     {"node_id": "999", "socket": "image", "order": 0}]},
+            )
+
+    def test_dedicated_workflow_target_accepted(self):
+        # A dedicated target may be a stored workflow id (explicit user
+        # selection through the picker), not only a graph node. Unknown
+        # targets still fail closed.
+        service = WorkflowDomainService(self.root)
+        service._node_def_provider = self._node_defs()
+        target = service.create_workflow("dedicated-target")
+        wf = service.create_workflow("origin")
+        prompt = self._method1_prompt()
+        version = service.create_version_from_capture(
+            wf["workflow_id"], make_capture(prompt))
+        entries, output_id = derive_mapping_candidates(
+            make_capture(prompt), node_def_provider=fake_node_def)
+        kwargs = dict(
+            entries={r: e.to_dict() for r, e in entries.items()},
+            output_node_id=output_id or "6",
+        )
+        mapping = service.set_mapping(
+            version["workflow_version_id"],
+            reference_method="dedicated",
+            reference_bindings={"dedicated_target": target["workflow_id"]},
+            **kwargs,
+        )
+        self.assertEqual(mapping.get("reference_method"), "dedicated")
+        with self.assertRaises(WorkflowDomainValidationError):
+            service.create_mapping_revision(
+                version["workflow_version_id"],
+                entries={r: e.to_dict() for r, e in entries.items()},
+                output_node_id=output_id or "6",
+                reference_method="dedicated",
+                reference_bindings={"dedicated_target": "wf_missing"},
             )
 
     def test_renamed_classes_do_not_change_discovery(self):

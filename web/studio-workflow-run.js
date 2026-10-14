@@ -1039,3 +1039,110 @@ export function buildStudioReferencesCompanion(store, cards, prefs) {
     provenance: { source: "studio" },
   };
 }
+
+// ── Canvas /prompt fail-closed reference gate (Phase 8) ─────────────────
+//
+// Pure helpers for the fetchApi patch in web/modal-node.js. The ComfyUI
+// topbar RUN posts the raw canvas graph to POST /prompt, bypassing the
+// Studio shelf RUN (which carries studio_references). When references are
+// engaged for the selected workflow — a reference method is chosen OR at
+// least one reference card exists (mirroring _studioReferenceGate in
+// web/studio-playground.js) — a canvas /prompt without a reference payload
+// must fail closed with an honest error instead of silently running
+// without the configured references. All three functions are pure
+// (explicit args, no window/localStorage/DOM) and never throw.
+
+/**
+ * Read whether Studio References are engaged for the selected workflow.
+ * Engaged = a non-empty referenceMethod for the workflow id OR >= 1 card
+ * stored under "workflowId::versionId" (mirrors _studioReferenceGate).
+ * @param {{workflowId?: string, workflowVersionId?: string}|null} selection
+ * @param {object|null} methodsMap - { [workflowId]: { referenceMethod } }
+ * @param {object|null} referencesMap - { ["wid::ver"]: [{id,file,label}] }
+ * @returns {{workflowId: string, versionId: string, method: string, cardCount: number, files: string[]}|null}
+ */
+export function readReferenceEngagement(selection, methodsMap, referencesMap) {
+  try {
+    const workflowId = selection && typeof selection.workflowId === "string"
+      ? selection.workflowId
+      : "";
+    if (!workflowId) return null;
+    const versionId = selection && typeof selection.workflowVersionId === "string"
+      ? selection.workflowVersionId
+      : "";
+    const methodEntry = methodsMap && typeof methodsMap === "object"
+      ? methodsMap[workflowId]
+      : null;
+    const rawMethod = methodEntry && typeof methodEntry === "object"
+      && typeof methodEntry.referenceMethod === "string"
+      ? methodEntry.referenceMethod
+      : "";
+    const method = rawMethod.trim() ? rawMethod : "";
+    const key = workflowId + "::" + versionId;
+    const rawCards = referencesMap && typeof referencesMap === "object"
+      ? referencesMap[key]
+      : null;
+    const cards = Array.isArray(rawCards) ? rawCards : [];
+    if (!method && cards.length === 0) return null;
+    const files = [];
+    for (const card of cards) {
+      if (card && typeof card === "object"
+        && typeof card.file === "string" && card.file) {
+        files.push(card.file);
+      }
+    }
+    return { workflowId, versionId, method, cardCount: cards.length, files };
+  } catch (_e) {
+    return null;
+  }
+}
+
+/**
+ * True when an outgoing /prompt body already carries a reference payload.
+ * @param {*} parsed - parsed /prompt request body
+ * @returns {boolean}
+ */
+export function promptCarriesReferences(parsed) {
+  try {
+    if (!parsed || typeof parsed !== "object") return false;
+    const viaExtra = parsed.extra_data && typeof parsed.extra_data === "object"
+      ? parsed.extra_data.studio_references
+      : undefined;
+    if (viaExtra !== null && viaExtra !== undefined && typeof viaExtra === "object") return true;
+    const viaTop = parsed.studio_references;
+    if (viaTop !== null && viaTop !== undefined && typeof viaTop === "object") return true;
+    return false;
+  } catch (_e) {
+    return false;
+  }
+}
+
+/**
+ * Honest block message for a canvas /prompt stopped by the reference gate.
+ * Names the workflow id, the method (or "reference cards"), the card count,
+ * and both remedies (Run from Studio References, or clear method/cards).
+ * @param {{workflowId?: string, method?: string, cardCount?: number}|null} engagement
+ * @returns {string}
+ */
+export function referenceBlockMessage(engagement) {
+  try {
+    const eng = engagement && typeof engagement === "object" ? engagement : {};
+    const workflowId = typeof eng.workflowId === "string" && eng.workflowId
+      ? eng.workflowId
+      : "unknown";
+    const count = Number(eng.cardCount);
+    const cardCount = Number.isFinite(count) && count >= 0 ? Math.floor(count) : 0;
+    const method = typeof eng.method === "string" && eng.method
+      ? "method '" + eng.method + "'"
+      : "reference cards";
+    const cardWord = cardCount === 1 ? "1 reference card" : cardCount + " reference cards";
+    return "Studio References are engaged for workflow '" + workflowId + "' ("
+      + method + ", " + cardWord + ") but this canvas run carries no reference "
+      + "payload — blocked instead of silently running without references. "
+      + "Run from Studio References, or clear the reference method/cards and run again.";
+  } catch (_e) {
+    return "Studio References are engaged but this canvas run carries no reference "
+      + "payload — blocked instead of silently running without references. "
+      + "Run from Studio References, or clear the reference method/cards and run again.";
+  }
+}
