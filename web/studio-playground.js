@@ -1199,6 +1199,10 @@ function renderControlPanel(state, context) {
       state.playground._postProcessMount = mountPostprocessWorkspace(postHost, {
         sourceUrl: postSource,
         nativeSidebar: true,
+        // Global panel grid navigation: a panel in another category takes the
+        // same shell path as the top submenu buttons (single truth, and the
+        // Crop/Heal tool disarms through the existing toggle-off).
+        onRequestSubtool: function (sub) { _selectPostCategory(state, context, sub); },
       });
       panel.appendChild(postHost);
       _focusPostCategory(_shellSub, postHost);

@@ -611,15 +611,13 @@ var CSS = [
   ".pp-status{color:#8b8b94;font-size:11px;min-height:14px}",
   "@media (max-width:1100px){.pp-main{grid-template-columns:minmax(0,1fr) 264px}.pp-looks{display:none}.pp-looks.open{display:block;position:absolute;z-index:5;max-width:260px}}",
   "@media (max-width:800px){.pp-main{grid-template-columns:minmax(0,1fr)}.pp-insp{max-height:300px}}",
-  // ── Phase-4 FINAL POLISH: tabbed Post sidebar (native left rail only) ──
-  // One visible section at a time; tab state is a UI-only ws attribute
-  // (data-pp-tab), so switching tabs never rebuilds controls or touches the
-  // recipe/engine. Detail/Effects/Crop/Heal keep their coherent unfocused
-  // view (no tab grid); Crop/Heal also hide the cross-category Looks panel.
-  ".pp-native-sidebar .pp-tabs{position:sticky;top:0;z-index:3;display:grid;gap:4px;padding:8px 0;background:var(--color-bg-primary,#17191f);border-bottom:1px solid var(--color-border,#2b2d35)}",
-  ".pp-native-sidebar[data-post-category=adjust] .pp-tabs{grid-template-columns:repeat(2,minmax(0,1fr))}",
-  ".pp-native-sidebar[data-post-category=color] .pp-tabs{grid-template-columns:repeat(3,minmax(0,1fr))}",
-  ".pp-native-sidebar:not([data-post-category=adjust]):not([data-post-category=color]) .pp-tabs{display:none}",
+  // ── Phase-4 FLATTEN: one persistent panel grid (native left rail only) ──
+  // The same 11 panels in every Post view; panel state is a UI-only ws
+  // attribute (data-pp-tab), so switching panels never rebuilds controls or
+  // touches the recipe/engine. Crop/Heal keep their focused tool views and
+  // hide the cross-category Looks panel; the grid itself stays so any panel
+  // is one click away (the click navigates subtools and disarms the tool).
+  ".pp-native-sidebar .pp-tabs{position:sticky;top:0;z-index:3;display:grid;gap:4px;padding:8px 0;background:var(--color-bg-primary,#17191f);border-bottom:1px solid var(--color-border,#2b2d35);grid-template-columns:repeat(3,minmax(0,1fr))}",
   ".pp-native-sidebar .pp-tabs .pp-btn{min-height:28px;padding:4px 6px;font-size:var(--font-size-sm,12px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
   ".pp-native-sidebar .pp-tabs .pp-btn.on{border-color:var(--color-accent,#5a7fdb);background:var(--color-accent-muted,rgba(90,127,219,.16));color:var(--color-text-primary,#fff);font-weight:600}",
   ".pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-insp .pp-group,.pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-insp [data-pp-section=histogram],.pp-native-sidebar[data-post-category=adjust][data-pp-tab] .pp-looks{display:none}",
@@ -675,29 +673,28 @@ function itemKeyOf(it) {
   return "url:" + (it.url || "");
 }
 
-// ── Native sidebar section tabs (Phase-4 FINAL POLISH, presentation only) ──
-// Per-Post-subtool tab sets; each tab maps 1:1 to real engine UI (a group,
-// the live histogram, the presets section, or the LUT library). Detail /
-// Effects / Crop / Heal have no tab set: Detail and Effects show their one
-// coherent group directly, Crop/Heal show a focused tool view. Tab state is
-// UI-only (which section is visible) and lives in the module store per
-// subtool; it never rebuilds controls, so values always survive switching.
-var PP_TABS = {
-  adjust: [
-    { id: "light", label: "Light" },
-    { id: "looks", label: "Looks" },
-    { id: "histogram", label: "Histogram" },
-    { id: "output", label: "Output" },
-  ],
-  color: [
-    { id: "basic", label: "Basic" },
-    { id: "curves", label: "Curves" },
-    { id: "mixer", label: "Mixer" },
-    { id: "grading", label: "Grading" },
-    { id: "lut", label: "LUT" },
-    { id: "histogram", label: "Histogram" },
-  ],
-};
+// ── Native sidebar panel grid (Phase-4 FLATTEN, presentation only) ──
+// ONE persistent grid across Post: every major panel is one click away from
+// anywhere. Each panel maps to its owning engine category + section; a click
+// inside the live category only flips the UI-only data-pp-tab attribute, while
+// a click into another category presets the landing section and takes the
+// REAL shell path (opts.onRequestSubtool — the same subtool switch as the top
+// buttons), so submenu, category, and grid share one navigation truth. Tab
+// state lives in the module store per category; nothing rebuilds controls and
+// the recipe/engine are untouched, so values always survive switching.
+var PP_PANELS = [
+  { id: "light", label: "Light", cat: "adjust", tab: "light" },
+  { id: "color", label: "Color", cat: "color", tab: "basic" },
+  { id: "curves", label: "Curves", cat: "color", tab: "curves" },
+  { id: "detail", label: "Detail", cat: "detail", tab: null },
+  { id: "effects", label: "Effects", cat: "effects", tab: null },
+  { id: "looks", label: "Looks", cat: "adjust", tab: "looks" },
+  { id: "mixer", label: "Mixer", cat: "color", tab: "mixer" },
+  { id: "grading", label: "Grading", cat: "color", tab: "grading" },
+  { id: "lut", label: "LUT", cat: "color", tab: "lut" },
+  { id: "histogram", label: "Histogram", cat: "adjust", tab: "histogram" },
+  { id: "output", label: "Output", cat: "adjust", tab: "output" },
+];
 var PP_TAB_DEFAULTS = { adjust: "light", color: "basic" };
 
 export function mountPostprocessWorkspace(host, opts) {
@@ -736,55 +733,96 @@ export function mountPostprocessWorkspace(host, opts) {
   }
   window.__ppRecipe = null;
 
-  // Section tab bar (native sidebar only): a tiny bounded Post-specific
-  // selector at the top of the rail. Buttons reuse .pp-btn secondary styling
-  // with the existing .on active treatment. Clicking a tab only flips the
-  // UI-only data-pp-tab attribute (CSS shows that section); no control is
+  // Global panel grid (native sidebar only): the same bounded Post-specific
+  // buttons in every Post view. Buttons reuse .pp-btn secondary styling with
+  // the existing .on active treatment. Same-category clicks only flip
+  // data-pp-tab (CSS shows that section); cross-category clicks go through
+  // the shell so the top submenu stays truthful. Either way no control is
   // rebuilt and the recipe/engine are untouched, so values cannot reset.
   var tabsBar = null, tabBtns = {};
   if (opts.nativeSidebar) {
     tabsBar = el("div", { class: "pp-tabs", "data-testid": "pp-tabs" });
     ws.insertBefore(tabsBar, ws.firstChild);
   }
-  function ppTabOf(cat) {
+  function ppPanelById(id) {
+    for (var i = 0; i < PP_PANELS.length; i++) {
+      if (PP_PANELS[i].id === id) return PP_PANELS[i];
+    }
+    return null;
+  }
+  function ppActivePanelId() {
+    var cat = ws.getAttribute("data-post-category") || "adjust";
+    var tab = ws.getAttribute("data-pp-tab");
+    tab = tab === null ? null : tab;
+    for (var i = 0; i < PP_PANELS.length; i++) {
+      var p = PP_PANELS[i];
+      if (p.cat === cat && (p.tab || null) === tab) return p.id;
+    }
+    // Fallback keeps one panel visibly active (never a blank grid).
+    for (var j = 0; j < PP_PANELS.length; j++) {
+      if (PP_PANELS[j].cat === cat) return PP_PANELS[j].id;
+    }
+    return "light";
+  }
+  function ppRefreshPressed(activeId) {
+    Object.keys(tabBtns).forEach(function (k) {
+      var on = k === activeId;
+      tabBtns[k].classList.toggle("on", on);
+      tabBtns[k].setAttribute("aria-pressed", on ? "true" : "false");
+    });
+  }
+  function ppGoPanel(id) {
+    var p = ppPanelById(id);
+    if (!p) return;
+    var liveCat = ws.getAttribute("data-post-category") || "adjust";
     PP_STORE.ppTab = PP_STORE.ppTab || {};
-    var tabs = PP_TABS[cat];
-    if (!tabs) return null;
-    var id = PP_STORE.ppTab[cat] || PP_TAB_DEFAULTS[cat];
-    var known = tabs.some(function (t) { return t.id === id; });
-    return known ? id : PP_TAB_DEFAULTS[cat];
+    if (p.cat !== liveCat) {
+      // Cross-category: remember the landing section, then take the real
+      // shell path (same as the top buttons). The shell flips
+      // data-post-category, the observer below rebuilds this grid from the
+      // remembered tab — one shared navigation truth, no transient blank.
+      if (p.tab) PP_STORE.ppTab[p.cat] = p.tab;
+      if (typeof opts.onRequestSubtool === "function") {
+        opts.onRequestSubtool(p.cat);
+        return;
+      }
+      // Standalone mounts have no shell: set the attributes directly.
+      ws.setAttribute("data-post-category", p.cat);
+    }
+    if (p.tab) {
+      PP_STORE.ppTab[liveCat] = p.tab;
+      ws.setAttribute("data-pp-tab", p.tab);
+    } else {
+      ws.removeAttribute("data-pp-tab");
+    }
+    ppRefreshPressed(id);
   }
   function syncPpTabs() {
     if (!tabsBar) return;
     var cat = ws.getAttribute("data-post-category") || "adjust";
-    var tabs = PP_TABS[cat];
+    // Top-button switches land on the remembered section for tabbed
+    // categories; tool categories show their focused view (no tab). Always
+    // re-derive from memory: a tab remembered under another category must
+    // never linger here (its show-rule cannot match, hiding everything).
+    if (cat === "adjust" || cat === "color") {
+      PP_STORE.ppTab = PP_STORE.ppTab || {};
+      var mem = PP_STORE.ppTab[cat] || PP_TAB_DEFAULTS[cat];
+      if (mem) ws.setAttribute("data-pp-tab", mem);
+    }
+    if (cat !== "adjust" && cat !== "color") ws.removeAttribute("data-pp-tab");
     tabsBar.innerHTML = ""; tabBtns = {};
-    if (!tabs) { tabsBar.style.display = "none"; ws.removeAttribute("data-pp-tab"); return; }
     tabsBar.style.display = "";
-    var active = ppTabOf(cat);
-    ws.setAttribute("data-pp-tab", active);
-    tabs.forEach(function (t) {
+    var active = ppActivePanelId();
+    PP_PANELS.forEach(function (p) {
       var b = el("button", {
-        type: "button", class: "pp-btn" + (t.id === active ? " on" : ""),
-        "data-testid": "pp-tab-" + t.id, text: t.label, title: t.label,
+        type: "button", class: "pp-btn" + (p.id === active ? " on" : ""),
+        "data-testid": "pp-tab-" + p.id, text: p.label, title: p.label,
       });
-      b.setAttribute("aria-pressed", t.id === active ? "true" : "false");
-      (function (id) {
-        b.addEventListener("click", function () {
-          // Read the live category: the bar rebuilds on every category
-          // switch, but the click must still target the visible context.
-          var liveCat = ws.getAttribute("data-post-category") || "adjust";
-          PP_STORE.ppTab = PP_STORE.ppTab || {};
-          PP_STORE.ppTab[liveCat] = id;
-          ws.setAttribute("data-pp-tab", id);
-          Object.keys(tabBtns).forEach(function (k) {
-            var on = k === id;
-            tabBtns[k].classList.toggle("on", on);
-            tabBtns[k].setAttribute("aria-pressed", on ? "true" : "false");
-          });
-        });
-      })(t.id);
-      tabBtns[t.id] = b; tabsBar.appendChild(b);
+      b.setAttribute("aria-pressed", p.id === active ? "true" : "false");
+      (function (pid) {
+        b.addEventListener("click", function () { ppGoPanel(pid); });
+      })(p.id);
+      tabBtns[p.id] = b; tabsBar.appendChild(b);
     });
   }
   if (tabsBar && typeof MutationObserver !== "undefined") {
