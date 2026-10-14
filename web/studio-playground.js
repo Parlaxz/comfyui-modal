@@ -4769,9 +4769,159 @@ function _editorBaseImageUrl(state) {
   return "";
 }
 
+function _renderSketchEditor(state, context, actions, canvasEl) {
+  var box = el("div", {
+    class: "comfymodal-studio-paint-editor",
+    "data-testid": "sketch-editor",
+    style: "margin-top:10px;padding:10px;border:1px solid #2a2a2a;border-radius:8px;background:#0a0a0a;",
+  });
+  box.appendChild(el("p", {
+    text: "Sketch over the image. Save flattens strokes into the Source Image.",
+    style: "font-size:12px;color:#aaa;margin:0 0 8px;",
+    "data-testid": "sketch-editor-hint",
+  }));
+  var preview = el("p", {
+    class: "comfymodal-studio-control-note",
+    text: "Mask preview appears after painting.",
+    "data-testid": "sketch-mask-preview",
+  });
+  var loading = el("p", {
+    text: "Loading sketch editor…",
+    style: "font-size:12px;color:#888;margin:0 0 8px;",
+    "data-testid": "sketch-loading",
+  });
+  var engineHost = el("div", { style: "position:relative;min-height:360px;margin-bottom:8px;", "data-testid": "sketch-engine-host" });
+  var controlsHost = el("div", { style: "margin-bottom:8px;", "data-testid": "sketch-controls-host" });
+  var layersHost = el("div", { style: "margin-bottom:8px;", "data-testid": "sketch-layers-host" });
+  var ops = el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;" });
+  var clearBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Clear", "data-testid": "sketch-clear" });
+  var saveBtn = el("button", { type: "button", class: "comfymodal-primary-btn", text: "Save sketch", "data-testid": "sketch-save" });
+  saveBtn.disabled = true;
+  ops.appendChild(clearBtn);
+  ops.appendChild(saveBtn);
+  box.appendChild(engineHost);
+  box.appendChild(controlsHost);
+  box.appendChild(layersHost);
+  box.appendChild(ops);
+  box.appendChild(loading);
+  box.appendChild(preview);
+  var engine = null;
+  var layerStore = null;
+  var layersRoot = null;
+  var panelsHandle = null;
+  var session = null;
+  var pendingIdentity = null;
+  var pendingBase = "";
+  function destroySketch() {
+    try { if (panelsHandle && typeof panelsHandle.destroy === "function") panelsHandle.destroy(); } catch (_e) {}
+    try {
+      if (layersRoot && typeof layersRoot._destroyLayersPanel === "function") layersRoot._destroyLayersPanel();
+      else if (layersRoot && layersRoot.parentNode) layersRoot.parentNode.removeChild(layersRoot);
+    } catch (_e) {}
+    try { if (engine && typeof engine.destroy === "function") engine.destroy(); } catch (_e) {}
+    try { if (session && typeof session.destroy === "function") session.destroy(); } catch (_e) {}
+    panelsHandle = null; layersRoot = null; layerStore = null; engine = null; session = null;
+  }
+  function fallbackToLegacy() {
+    if (!box.isConnected || !box.parentNode) { destroySketch(); return; }
+    destroySketch();
+    try {
+      box.parentNode.replaceChild(_renderPaintEditor(state, "sketch", context, actions, canvasEl), box);
+    } catch (_e) {}
+  }
+  function onWinResizeSketch() {
+    if (!box.isConnected) { window.removeEventListener("resize", onWinResizeSketch); destroySketch(); return; }
+  }
+  window.addEventListener("resize", onWinResizeSketch);
+  clearBtn.addEventListener("click", function () {
+    if (!session) { preview.textContent = "Still loading…"; return; }
+    try {
+      session.reset();
+      if (panelsHandle && typeof panelsHandle.syncFromEngine === "function") panelsHandle.syncFromEngine();
+      preview.textContent = "Mask cleared.";
+    } catch (_e) { preview.textContent = "Clear failed — try again."; }
+  });
+  saveBtn.addEventListener("click", async function () {
+    if (!session) { preview.textContent = "Still loading…"; return; }
+    saveBtn.disabled = true;
+    preview.textContent = "Saving sketch…";
+    try { pendingIdentity = _selectionIdentity(_shelfStore(state)); } catch (_e) { pendingIdentity = null; }
+    try { pendingBase = _editorBaseImageUrl(state) || ""; } catch (_e) { pendingBase = ""; }
+    try {
+      await session.commit();
+    } catch (_e) { preview.textContent = "Save failed — try again."; }
+    finally { if (box.isConnected) saveBtn.disabled = false; }
+  });
+  (async function mountSketch() {
+    try {
+      var shellMod = await import("./studio-sketch-shell.js");
+      await import("./studio-sketch-engine.js");
+      await import("./studio-sketch-layers.js");
+      await import("./studio-sketch-panels.js");
+      if (!box.isConnected) { destroySketch(); window.removeEventListener("resize", onWinResizeSketch); return; }
+      var createEngine = (window.ComfyStudioSketchEngine && window.ComfyStudioSketchEngine.createSketchEngine) || window.createSketchEngine;
+      var createLayerStore = window.ComfyModalSketchLayers && window.ComfyModalSketchLayers.createLayerStore;
+      var mountPanels = window.ComfyModalSketchPanels && window.ComfyModalSketchPanels.mountSketchPanels;
+      var openSketch = shellMod && shellMod.openSketch;
+      if (typeof createEngine !== "function" || typeof createLayerStore !== "function" || typeof mountPanels !== "function" || typeof openSketch !== "function") {
+        throw new Error("sketch modules unavailable");
+      }
+      var shellMode = activeModeOf(state);
+      var mode = shellMode === "edit" ? "edit" : "generate";
+      var baseUrl = "";
+      try { baseUrl = _editorBaseImageUrl(state) || ""; } catch (_e) { baseUrl = ""; }
+      var baseImageUrl = mode === "edit" ? (baseUrl || null) : null;
+      engine = createEngine(engineHost, { width: 1024, height: 1024 });
+      if (baseImageUrl) {
+        try { await engine.setBaseImage(baseImageUrl); } catch (_e) {}
+        if (!box.isConnected) { destroySketch(); window.removeEventListener("resize", onWinResizeSketch); return; }
+      }
+      layerStore = createLayerStore(engine, { width: 1024, height: 1024 });
+      panelsHandle = mountPanels(controlsHost, engine, {});
+      layersRoot = layerStore.renderInto(layersHost);
+      session = openSketch({
+        mode: mode,
+        baseImageUrl: baseImageUrl,
+        engine: engine,
+        layerStore: layerStore,
+        width: 1024,
+        height: 1024,
+        onCommitted: function (filename) {
+          try {
+            if (_selectionIdentity(_shelfStore(state)) !== pendingIdentity) {
+              preview.textContent = "Workflow changed during save — value discarded.";
+              return;
+            }
+            commitShelfValue(state, context, actions, "source_image", filename);
+            _recordImageEdge(state, filename, pendingBase);
+            preview.textContent = "Sketch saved as Source Image: " + filename;
+            _refreshShelfSection(state, context, actions);
+            _syncEditorBaseImage(state);
+            _clearBoundMask(state, context, actions);
+            _setCanvasImage(state, _lineageDisplayUrl(filename), context);
+          } catch (_e) { preview.textContent = "Save failed — try again."; }
+        },
+      });
+      if (!box.isConnected) { destroySketch(); window.removeEventListener("resize", onWinResizeSketch); return; }
+      if (loading.parentNode) loading.parentNode.removeChild(loading);
+      if (panelsHandle && typeof panelsHandle.syncFromEngine === "function") {
+        try { panelsHandle.syncFromEngine(); } catch (_e) {}
+      }
+      saveBtn.disabled = false;
+    } catch (_e) {
+      fallbackToLegacy();
+    }
+  })();
+  return box;
+}
+
 function _renderToolEditor(state, context, actions, canvasEl) {
   var tool = activeToolOf(state);
-  if (tool === "inpaint" || tool === "sketch") return _renderPaintEditor(state, tool, context, actions, canvasEl);
+  if (tool === "sketch") {
+    try { return _renderSketchEditor(state, context, actions, canvasEl); }
+    catch (_e) { return _renderPaintEditor(state, tool, context, actions, canvasEl); }
+  }
+  if (tool === "inpaint") return _renderPaintEditor(state, tool, context, actions, canvasEl);
   // Phase 2: the same selection editor serves Edit/Select on I2I. The editor
   // keeps the "inpaint" id so testids, overlay clearing, and shelf save paths
   // stay stable; legacy dedicated inpaint workflows render through the branch
