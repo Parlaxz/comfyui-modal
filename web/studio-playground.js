@@ -272,6 +272,7 @@ import { renderLoadingState } from "./studio-loading.js";
 import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
 import { FIELD_BLOCKS } from "./studio-field-blocks.js";
 import { renderWorkflowPicker } from "./studio-workflow-picker.js";
+import { STYLE_CATALOG } from "./studio-style-catalog.js";
 import {
   loadShelfLayout,
   saveShelfLayout,
@@ -2763,6 +2764,24 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
     var _sm = _studioMethodForRun(state, store);
     if (_sm) payload.studio_method = _sm;
   } catch (_e) {}
+  // Phase 5: prompt-style composition. The user's prompt stays first and
+  // verbatim; the selected style fragment appends deterministically (see
+  // composeStylePrompt). studio_style carries user_prompt + style identity
+  // so History retains all three: user prompt, style, final prompt.
+  try {
+    var _sty = _studioStyleForRun(state, store);
+    if (_sty) {
+      payload.controls = payload.controls || {};
+      payload.controls.prompt = _sty.composed;
+      payload.studio_style = {
+        id: _sty.style.id,
+        title: _sty.style.title,
+        fragment: _sty.style.prompt_fragment,
+        user_prompt: _sty.userPrompt,
+        catalog_version: (STYLE_CATALOG && STYLE_CATALOG.version) || 0,
+      };
+    }
+  } catch (_e2) {}
   ctrl.mark("build_end");
   // Lineage ownership: stash the submitted source with the request. Poll-path
   // completion must attribute the output to what was actually submitted, not
@@ -6595,6 +6614,278 @@ function _methodMaskFile(state, store, prefs) {
   return "";
 }
 
+// Phase 5: visual prompt-style browser state. Global (not per-workflow):
+// a style is prompt-authoring preference. {selectedId:"", favorites:[]}.
+var STYLE_STORE_KEY = "comfymodal.studio.style.v1";
+function loadStyleSelection() {
+  var out = { selectedId: "", favorites: [] };
+  try {
+    var raw = localStorage.getItem(STYLE_STORE_KEY);
+    if (!raw) return out;
+    var j = JSON.parse(raw);
+    if (j && typeof j.selectedId === "string") out.selectedId = j.selectedId;
+    if (j && Array.isArray(j.favorites)) {
+      out.favorites = j.favorites.filter(function (x) { return typeof x === "string"; });
+    }
+  } catch (_e) {}
+  return out;
+}
+function saveStyleSelection(patch) {
+  try {
+    var cur = loadStyleSelection();
+    if (patch && typeof patch.selectedId === "string") cur.selectedId = patch.selectedId;
+    if (patch && Array.isArray(patch.favorites)) cur.favorites = patch.favorites;
+    localStorage.setItem(STYLE_STORE_KEY, JSON.stringify(cur));
+  } catch (_e) {}
+}
+function _styleCatalogStyles() {
+  try {
+    var list = STYLE_CATALOG && STYLE_CATALOG.styles;
+    return Array.isArray(list) ? list : [];
+  } catch (_e) { return []; }
+}
+function _styleById(id) {
+  var styles = _styleCatalogStyles();
+  for (var i = 0; i < styles.length; i++) {
+    if (styles[i] && String(styles[i].id) === String(id)) return styles[i];
+  }
+  return null;
+}
+// Deterministic composition: user prompt stays first and verbatim; the
+// style fragment appends after a separator. Empty user prompt + style
+// submits the fragment alone (still an honest, visible prompt).
+function composeStylePrompt(userPrompt, fragment) {
+  var user = String(userPrompt == null ? "" : userPrompt).trim();
+  var frag = String(fragment == null ? "" : fragment).trim();
+  if (!frag) return String(userPrompt == null ? "" : userPrompt);
+  if (!user) return frag;
+  return user + ", " + frag;
+}
+// Explicit style request for the current run, or null for a plain prompt.
+// Generate → Text only; the selected style must still exist in the catalog.
+function _studioStyleForRun(state, store) {
+  try {
+    if (!state || !store || !store.workflowId) return null;
+    if (activeToolOf(state) !== "t2i") return null;
+    if (activeModeOf(state) !== "generate") return null;
+    if (activeSubtoolOf(state) !== "text") return null;
+    var sel = loadStyleSelection();
+    if (!sel.selectedId) return null;
+    var style = _styleById(sel.selectedId);
+    if (!style || !style.prompt_fragment) return null;
+    var cv = (store && store.controlValues) || {};
+    var userPrompt = cv.prompt == null ? "" : String(cv.prompt);
+    return {
+      style: style,
+      userPrompt: userPrompt,
+      composed: composeStylePrompt(userPrompt, style.prompt_fragment),
+    };
+  } catch (_e) { return null; }
+}
+function _renderStyleBrowser(state, context, actions, entries, promptRole) {
+  try {
+    if (!state) return null;
+    if (activeToolOf(state) !== "t2i") return null;
+    if (activeModeOf(state) !== "generate") return null;
+    if (activeSubtoolOf(state) !== "text") return null;
+    if (!promptRole) return null;
+    var styles = _styleCatalogStyles();
+    if (!styles.length) return null;
+    var sel0 = loadStyleSelection();
+    if (sel0.selectedId && !_styleById(sel0.selectedId)) {
+      saveStyleSelection({ selectedId: "" });
+      sel0.selectedId = "";
+    }
+    var box = el("div", {
+      class: "comfymodal-studio-style-browser",
+      "data-testid": "style-browser",
+      style: "margin:8px 0;",
+    });
+    var head = el("div", {
+      style: "display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;",
+    });
+    head.appendChild(el("span", {
+      text: "Prompt Style",
+      style: "font-size:12px;color:#aaa;",
+    }));
+    var selName = el("span", {
+      "data-testid": "style-selected-name",
+      style: "font-size:12px;color:var(--color-text, #ddd);",
+    });
+    head.appendChild(selName);
+    var noneBtn = el("button", {
+      type: "button", class: "comfymodal-secondary-btn",
+      text: "None",
+      "data-testid": "style-none",
+      title: "Clear the selected style (plain prompt)",
+    });
+    head.appendChild(noneBtn);
+    box.appendChild(head);
+    var tools = el("div", { style: "display:flex;gap:8px;margin-bottom:6px;" });
+    var search = el("input", {
+      type: "search", placeholder: "Search styles…",
+      "data-testid": "style-search",
+      class: "comfymodal-input comfymodal-studio-text-input",
+      style: "flex:2;min-width:0;",
+    });
+    var cats = ["All"];
+    styles.forEach(function (s) {
+      if (s && s.category && cats.indexOf(s.category) === -1) cats.push(s.category);
+    });
+    var catSel = el("select", {
+      "data-testid": "style-category",
+      class: "comfymodal-input",
+      style: "flex:1;min-width:0;",
+      title: "Filter by category",
+    });
+    cats.forEach(function (c) {
+      var o = document.createElement("option");
+      o.value = c;
+      o.textContent = c === "All" ? "All categories" : c;
+      catSel.appendChild(o);
+    });
+    tools.appendChild(search);
+    tools.appendChild(catSel);
+    box.appendChild(tools);
+    var grid = el("div", {
+      "data-testid": "style-grid",
+      style: "display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px;",
+    });
+    box.appendChild(grid);
+    var details = el("p", {
+      "data-testid": "style-details",
+      class: "comfymodal-studio-control-note",
+      style: "font-size:11px;color:#888;margin:6px 0 0;",
+    });
+    box.appendChild(details);
+    var effLine = el("p", {
+      "data-testid": "style-effective-prompt",
+      class: "comfymodal-studio-control-note",
+      style: "font-size:11px;color:#888;margin:4px 0 0;overflow-wrap:anywhere;",
+    });
+    box.appendChild(effLine);
+    function currentPromptText() {
+      try {
+        var store = _shelfStore(state);
+        var cv = (store && store.controlValues) || {};
+        return cv.prompt == null ? "" : String(cv.prompt);
+      } catch (_e) { return ""; }
+    }
+    function paintSelection() {
+      var sel = loadStyleSelection();
+      var st = sel.selectedId ? _styleById(sel.selectedId) : null;
+      selName.textContent = st ? ("Selected: " + st.title) : "No style (plain prompt)";
+      details.textContent = st
+        ? (st.title + " — " + (st.description || "") + (st.tags && st.tags.length ? " [" + st.tags.join(", ") + "]" : ""))
+        : "Pick a style card to append its fragment to your prompt at run time.";
+      effLine.textContent = st
+        ? ("Effective prompt: " + composeStylePrompt(currentPromptText(), st.prompt_fragment))
+        : "";
+      Array.prototype.forEach.call(grid.querySelectorAll('[data-testid^="style-card-"]'), function (card) {
+        var on = !!st && card.getAttribute("data-style-id") === st.id;
+        card.classList.toggle("is-selected", on);
+        card.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+    }
+    function applyFilter() {
+      var q = String(search.value || "").trim().toLowerCase();
+      var cat = String(catSel.value || "All");
+      Array.prototype.forEach.call(grid.children, function (card) {
+        var s = _styleById(card.getAttribute("data-style-id"));
+        var show = !!s;
+        if (show && cat !== "All" && s.category !== cat) show = false;
+        if (show && q) {
+          var hay = (s.title + " " + s.category + " " + (s.description || "") + " " + (s.tags || []).join(" ")).toLowerCase();
+          if (hay.indexOf(q) === -1) show = false;
+        }
+        card.style.display = show ? "" : "none";
+      });
+    }
+    styles.forEach(function (s) {
+      var card = el("button", {
+        type: "button",
+        class: "comfymodal-studio-style-card",
+        "data-testid": "style-card-" + s.id,
+        "data-style-id": s.id,
+        title: s.title + " — " + (s.description || ""),
+        style: "display:flex;flex-direction:column;gap:4px;padding:6px;border:1px solid var(--color-border, #333);border-radius:8px;background:transparent;cursor:pointer;text-align:left;",
+      });
+      var hue = Number(s.hue);
+      if (!isFinite(hue)) hue = 210;
+      card.appendChild(el("span", {
+        "data-testid": "style-swatch-" + s.id,
+        style: "display:block;height:44px;border-radius:6px;background:linear-gradient(135deg,hsl(" + hue + ",60%,42%),hsl(" + ((hue + 40) % 360) + ",65%,26%));",
+      }));
+      var row = el("span", { style: "display:flex;align-items:center;gap:4px;" });
+      row.appendChild(el("span", {
+        text: s.title,
+        style: "font-size:11px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+      }));
+      var fav = el("span", {
+        text: "★",
+        "data-testid": "style-fav-" + s.id,
+        title: "Toggle favorite",
+        style: "font-size:12px;cursor:pointer;color:#666;flex:none;",
+      });
+      row.appendChild(fav);
+      card.appendChild(row);
+      card.appendChild(el("span", {
+        text: s.category || "",
+        style: "font-size:10px;color:#888;",
+      }));
+      fav.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        ev.preventDefault();
+        try {
+          var cur = loadStyleSelection();
+          var i = cur.favorites.indexOf(s.id);
+          if (i === -1) cur.favorites.push(s.id);
+          else cur.favorites.splice(i, 1);
+          saveStyleSelection({ favorites: cur.favorites });
+          fav.style.color = i === -1 ? "#e8b93e" : "#666";
+        } catch (_e) {}
+      });
+      try {
+        if (loadStyleSelection().favorites.indexOf(s.id) !== -1) fav.style.color = "#e8b93e";
+      } catch (_e) {}
+      card.addEventListener("click", function () {
+        try { saveStyleSelection({ selectedId: s.id }); } catch (_e) {}
+        paintSelection();
+      });
+      grid.appendChild(card);
+    });
+    noneBtn.addEventListener("click", function () {
+      try { saveStyleSelection({ selectedId: "" }); } catch (_e) {}
+      paintSelection();
+    });
+    search.addEventListener("input", applyFilter);
+    catSel.addEventListener("change", applyFilter);
+    // Keep the effective-prompt preview honest as the user types, without
+    // rebuilding the section (which would drop search focus). Delegated on
+    // the shelf section: prompt inputs render under different testids per
+    // workflow (input-prompt, shelf-input-prompt), so match any textarea.
+    try {
+      var shelfSec = box.closest ? box.closest('[data-testid="shelf-section"]') : null;
+      var listenTarget = shelfSec || document;
+      listenTarget.addEventListener("input", function (ev) {
+        try {
+          var t = ev && ev.target;
+          if (!t || String(t.tagName || "").toLowerCase() !== "textarea") return;
+          if (!effLine.isConnected) return;
+          var sel = loadStyleSelection();
+          var st = sel.selectedId ? _styleById(sel.selectedId) : null;
+          effLine.textContent = st
+            ? ("Effective prompt: " + composeStylePrompt(t.value, st.prompt_fragment))
+            : "";
+        } catch (_e) {}
+      });
+    } catch (_e) {}
+    paintSelection();
+    applyFilter();
+    return box;
+  } catch (_e) { return null; }
+}
+
 // Explicit method request for the current shell, or null for a plain run.
 // Generic methods only ever apply on the I2I engine; legacy tools run native.
 function _studioMethodForRun(state, store) {
@@ -10419,6 +10710,15 @@ function _populateShelfSection(section, state, context, actions) {
     var promptCard = _shelfFieldCard(state, context, actions, entries, promptRole, null, true);
     if (promptCard) section.appendChild(promptCard);
   }
+
+  // Phase 5: visual prompt-style browser under Generate → Text only. The
+  // user's prompt stays the source of truth; a selected style deterministically
+  // appends its fragment at submit time (see _studioStyleForRun) and the
+  // effective prompt is previewed honestly below the grid.
+  try {
+    var _styleSection = _renderStyleBrowser(state, context, actions, entries, promptRole);
+    if (_styleSection) section.appendChild(_styleSection);
+  } catch (_eStyle) {}
 
   var layout = _shelfLayoutFor(entries, promptRole);
   var fieldsBox = el("div", {

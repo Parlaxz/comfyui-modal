@@ -549,6 +549,7 @@ def _golden_history_meta(
     controls: Mapping[str, Any] | None,
     method: str = "",
     studio_method: Mapping[str, Any] | None = None,
+    studio_style: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     controls_map = controls if isinstance(controls, Mapping) else {}
     actual_method = method or profile.target["method"]
@@ -571,6 +572,12 @@ def _golden_history_meta(
     if isinstance(studio_method, Mapping):
         try:
             meta["studio_method"] = json.loads(json.dumps(dict(studio_method)))
+        except Exception:
+            pass
+    # Phase 5: style provenance (user prompt + style identity + fragment).
+    if isinstance(studio_style, Mapping):
+        try:
+            meta["studio_style"] = json.loads(json.dumps(dict(studio_style)))
         except Exception:
             pass
     return meta
@@ -605,6 +612,7 @@ def _begin_golden_history(
     controls: Mapping[str, Any] | None,
     method: str = "",
     studio_method: Mapping[str, Any] | None = None,
+    studio_style: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Open the nonterminal History record BEFORE the run is dispatched.
 
@@ -628,7 +636,7 @@ def _begin_golden_history(
             kind="playground_run",
             prompt_id=request_id,
             status="running",
-            meta=_golden_history_meta(request_id, profile, controls, method, studio_method),
+            meta=_golden_history_meta(request_id, profile, controls, method, studio_method, studio_style),
         )
         if not isinstance(record, dict):
             return "", ""
@@ -742,6 +750,7 @@ async def run_golden_workflow(
     event_store: GoldenStageEventStore = EVENT_STORE,
     handle_factory: Callable[[GoldenProfile, Mapping[str, Any] | None], Any] | None = None,
     studio_method: Mapping[str, Any] | None = None,
+    studio_style: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve controls, submit the selected Golden method, and retain events."""
     request_id = validate_request_id(request_id)
@@ -778,12 +787,18 @@ async def run_golden_workflow(
         _prepare_studio_method,
         _resolve_dedicated_override,
         _sanitize_studio_method,
+        _sanitize_studio_style,
         _tolerated_method_base_errors,
         _transfer_values_with_method_mask,
     )
     _g_method, _g_method_error = _sanitize_studio_method(studio_method)
     if _g_method_error:
         return {"status": "error", "message": _g_method_error}
+    # Phase 5: style provenance is validated but never blocks or alters
+    # execution; a malformed companion fails loudly, never silently dropped.
+    _g_style, _g_style_error = _sanitize_studio_style(studio_style)
+    if _g_style_error:
+        return {"status": "error", "message": _g_style_error}
     _g_base_errors = _tolerated_method_base_errors(merged["errors"], _g_method)
     if _g_base_errors:
         return {
@@ -929,11 +944,12 @@ async def run_golden_workflow(
                  "box": _g_method_ctx.get("box"), "origin": _g_method_ctx.get("origin"),
                  "pads": _g_method_ctx.get("pads"),
                  "orig_size": _g_method_ctx.get("orig_size"),
-                 "wh_overridden": _g_method_ctx.get("wh_overridden", False),
-                 "injection": _g_method_ctx.get("injection"),
-                 "override": _g_method_ctx.get("override", "")}
-                if isinstance(_g_method_ctx, dict) else None
-            ),
+                  "wh_overridden": _g_method_ctx.get("wh_overridden", False),
+                  "injection": _g_method_ctx.get("injection"),
+                  "override": _g_method_ctx.get("override", "")}
+                  if isinstance(_g_method_ctx, dict) else None
+              ),
+            studio_style=_g_style,
         )
         handle = (
             handle_factory(profile, workspace)

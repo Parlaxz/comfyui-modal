@@ -1757,6 +1757,14 @@ async def _modern_save_history_success(
             meta["studio_method"] = _plain_copy(_sm)
     except Exception:
         pass
+    # Phase 5: style provenance rides in meta the same way. Provenance
+    # only; execution never reads it.
+    try:
+        _ss = capture.get("studio_style")
+        if isinstance(_ss, dict):
+            meta["studio_style"] = _plain_copy(_ss)
+    except Exception:
+        pass
 
     replay_meta = _build_plan_replay_meta(
         plan, modal_options=capture.get("modal_options")
@@ -2095,6 +2103,7 @@ async def _workflow_v2_run(
     trace_ctx: dict[str, Any] | None,
     _method_ctx: dict[str, Any] | None = None,
     _prompt_mutator: Any = None,
+    _studio_style: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """V2 direct single-run via the PlaygroundService (injectable hooks).
 
@@ -2327,6 +2336,19 @@ async def _workflow_v2_run(
             capture["studio_method"] = dict(trace["studio_method"])
         except Exception:
             pass
+        # Phase 5: style provenance stamp alongside the method stamp.
+        # Independent block so styled plain runs (no method ctx) are stamped
+        # too, and the method post-step dispatch above is never affected.
+        if isinstance(_studio_style, dict):
+            try:
+                trace = normalized.get("trace")
+                if not isinstance(trace, dict):
+                    trace = {}
+                    normalized["trace"] = trace
+                trace["studio_style"] = dict(_studio_style)
+                capture["studio_style"] = dict(_studio_style)
+            except Exception:
+                pass
 
     # ── Modern History success preparation/commit (the first history write
     #    happens only after every fallible metadata/output check passed) ──
@@ -2436,6 +2458,41 @@ def _sanitize_studio_method(raw):
                 return None, "save a mask in Edit → Select first"
             clean["params"] = {"mask_file": mask_file.strip()}
     return clean, None
+
+
+def _sanitize_studio_style(raw):
+    """Validate a request studio_style companion. Returns (style|None, error|None).
+
+    Canonical shape:
+      {"id": str, "title": str, "fragment": str, "user_prompt": str,
+       "catalog_version": int}
+    Provenance only: it never alters execution. Unknown keys are stripped;
+    anything else fails loudly — never a silent drop of the record.
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, "studio_style must be an object"
+    style_id = raw.get("id", "")
+    fragment = raw.get("fragment", "")
+    if not isinstance(style_id, str) or not style_id.strip():
+        return None, "studio_style.id must be a non-empty string"
+    if not isinstance(fragment, str) or not fragment.strip():
+        return None, "studio_style.fragment must be a non-empty string"
+    title = raw.get("title", "")
+    user_prompt = raw.get("user_prompt", "")
+    if not isinstance(title, str) or not isinstance(user_prompt, str):
+        return None, "studio_style.title and user_prompt must be strings"
+    version = raw.get("catalog_version", 0)
+    if isinstance(version, bool) or not isinstance(version, int):
+        return None, "studio_style.catalog_version must be an int"
+    return {
+        "id": style_id.strip(),
+        "title": title.strip(),
+        "fragment": fragment.strip(),
+        "user_prompt": user_prompt,
+        "catalog_version": version,
+    }, None
 
 
 def _tolerated_method_base_errors(errors, method):
@@ -2843,6 +2900,7 @@ async def handle_workflow_run_async(
     modal_options: dict[str, Any] | None = None,
     workspace: dict[str, Any] | None = None,
     studio_method: dict[str, Any] | None = None,
+    studio_style: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Async handler for a single Studio Workflow run.
 
@@ -2873,6 +2931,11 @@ async def handle_workflow_run_async(
         _method, _method_error = _sanitize_studio_method(studio_method)
         if _method_error:
             return {"status": "error", "message": _method_error}
+        # ── Phase 5: style provenance is validated but never blocks or
+        #    alters execution; a malformed companion fails loudly.
+        _style, _style_error = _sanitize_studio_style(studio_style)
+        if _style_error:
+            return {"status": "error", "message": _style_error}
         _base_errors = _tolerated_method_base_errors(merged["errors"], _method)
         if _base_errors:
             return {
@@ -2988,6 +3051,7 @@ async def handle_workflow_run_async(
             bundle, _effective_merged, _preset_id, node_dir,
             _effective_modal_options, _selected_gpu, workspace, trace_ctx,
             _method_ctx=_method_ctx, _prompt_mutator=_prompt_mutator,
+            _studio_style=_style,
         )
     except Exception as exc:
         _log.warning("Workflow run failed: %s", exc)
