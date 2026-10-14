@@ -2,9 +2,9 @@
 /**
  * studio-sketch-panels.js — Sketch tool/color/settings sidebar panels (Phase 6).
  *
- * Sidebar-style adaptation of ComfySketch ColorWheelPanel / SizeOpacityWidget /
- * ToolbarPanel behavior: plain stacked sidebar DOM, no floating/draggable
- * panels, no new global state architecture.
+ * Native dark Studio sidebar presentation of the sketch panels. Docked only:
+ * plain stacked sidebar DOM, no floating/draggable panels, no new global
+ * state architecture.
  *
  * This module OWNS the tool bar, brush settings, color swatches and canvas
  * zoom/undo controls, and DRIVES the sketch engine exclusively through its
@@ -21,7 +21,7 @@
  *   engine.setBgColor(css)        // secondary slot (engine state: bgColor;
  *                                 // the composite backdrop is separate and
  *                                 // is never driven from these panels)
- *   engine.setFillTolerance(n)
+ *   engine.setFillTolerance(n) or engine.setTolerance(n)
  *   engine.undo() / engine.redo()
  *   engine.zoomIn() / engine.zoomOut() / engine.fit() / engine.setZoom(1)
  *   engine.getState() -> { tool, brushSize, opacity, hardness, color,
@@ -89,7 +89,63 @@
   function installStyles(doc) {
     if (!doc || doc.getElementById("sketch-panels-style")) return;
     var style = doc.createElement("style"); style.id = "sketch-panels-style";
-    style.textContent = '.sketch-panels{--panel-bg:rgba(249,249,249,0.95);--ink:#262626;--muted:#737373;--line:#ccc;color:var(--ink);font:11px/1.3 system-ui,sans-serif;background:transparent;display:flex;flex-direction:column;gap:8px;padding:8px;box-sizing:border-box}.sketch-panels-section{background:var(--panel-bg);border:1px solid #ccc;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);padding:9px}.sketch-panels-heading{text-transform:uppercase;letter-spacing:.1em;font-size:10px;font-weight:700;color:#666;border-bottom:1px solid #ccc;padding:0 2px 6px;margin-bottom:8px}.sketch-panels-tools{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.sketch-panels-tool,.sketch-panels-btn,.sketch-panels-mini{border:1px solid #ccc;background:#e8e8e8;color:#444;border-radius:4px;min-height:28px;cursor:pointer;font:inherit;display:inline-flex;align-items:center;justify-content:center;gap:4px}.sketch-panels-tool{flex-direction:column;font-size:9px;padding:5px 2px}.sketch-panels-tool.is-active{background:#dbeeff;border-color:#79aee0;color:#145586;box-shadow:inset 0 0 0 1px #fff}.sketch-icon{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}.sketch-panels-row{display:flex;align-items:center;gap:8px;margin:8px 0}.sketch-panels-label{display:flex;align-items:center;justify-content:space-between;gap:7px;width:100%;color:#555}.sketch-panels-slider,.comfysketch-slider{appearance:none;-webkit-appearance:none;flex:1;height:4px;background:#ccc;border-radius:2px;outline:none}.sketch-panels-slider::-webkit-slider-thumb,.comfysketch-slider::-webkit-slider-thumb{appearance:none;width:10px;height:10px;border:0;border-radius:50%;background:#555}.sketch-panels-slider::-moz-range-thumb,.comfysketch-slider::-moz-range-thumb{width:10px;height:10px;border:0;border-radius:50%;background:#555}.sketch-panels-val{min-width:34px;text-align:right;color:#666;font-variant-numeric:tabular-nums}.sketch-panels-swatches{display:flex;align-items:center;gap:6px;margin:2px 0 10px}.sketch-panels-swatch{width:25px;height:25px;border:1px solid #999;border-radius:3px;cursor:pointer;font-size:8px;color:#555;text-shadow:0 1px #fff;box-shadow:0 1px 2px #bbb}.sketch-panels-swatch.is-fg{z-index:2;border:2px solid #fff;outline:1px solid #888}.sketch-panels-swatch.is-bg{margin-left:-12px;margin-top:10px}.sketch-panels-mini{padding:3px 7px;min-height:25px}.sketch-panels-color{width:0;height:0;position:absolute;opacity:0}.sketch-panels-hex,.sketch-panels-number{box-sizing:border-box;border:1px solid #ccc;border-radius:4px;background:#fff;color:#333;padding:5px 6px;font:11px monospace}.sketch-panels-hex{flex:1}.sketch-panels-colorbox{position:relative;width:100%;height:128px;margin:2px auto 10px;display:flex;justify-content:center}.sketch-panels-colorbox canvas{position:absolute;width:128px;height:128px;cursor:crosshair}.sketch-panels-presets{display:grid;grid-template-columns:repeat(8,1fr);gap:4px}.sketch-panels-preset{height:16px;border:1px solid #bbb;border-radius:3px;cursor:pointer;padding:0}.sketch-panels-zoomrow,.sketch-panels-histrow{display:flex;align-items:center;gap:5px}.sketch-panels-zoomlabel{flex:1;text-align:center;font-variant-numeric:tabular-nums;color:#555}.sketch-panels-btn{flex:1;padding:5px}.sketch-panels-btn:disabled{opacity:.4;cursor:not-allowed}.sketch-panels button:focus-visible,.sketch-panels input:focus-visible{outline:2px solid #4285c5;outline-offset:1px}';
+    // Native dark Studio sidebar treatment. Tokens mirror
+    // web/studio-styles.js: panel #111 on sidebar #0d0d0d, 1px #2a2a2a
+    // borders, 12px type, 11px uppercase section headers in #888, muted
+    // helper #888, secondary buttons (#1a1a1a / #333 / #aaa), accent
+    // var(--color-accent, #5a7fdb) for selected states, accent-color
+    // sliders. Docked only — no position:fixed/absolute, no floats.
+    style.textContent = [
+      ".sketch-panels{color:#d0d0d0;font:12px/1.45 system-ui,-apple-system,sans-serif;background:transparent;display:flex;flex-direction:column;gap:4px;padding:0;box-sizing:border-box;max-width:100%;}",
+      ".sketch-panels-section{background:#111;border:1px solid #2a2a2a;border-radius:4px;padding:8px;margin-bottom:4px;box-sizing:border-box;max-width:100%;}",
+      ".sketch-panels-heading{font-size:11px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:.05em;margin:0 0 6px;padding:0;}",
+      ".sketch-panels-tools{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;}",
+      ".sketch-panels-tool,.sketch-panels-btn,.sketch-panels-mini{background:#1a1a1a;color:#aaa;border:1px solid #333;border-radius:6px;min-height:28px;cursor:pointer;font:inherit;font-size:11px;display:inline-flex;align-items:center;justify-content:center;gap:4px;padding:4px 6px;transition:background .15s,color .15s,border-color .15s;box-sizing:border-box;max-width:100%;}",
+      ".sketch-panels-tool{flex-direction:column;font-size:9px;padding:5px 2px;min-height:40px;}",
+      ".sketch-panels-tool:hover,.sketch-panels-btn:hover,.sketch-panels-mini:hover{background:#222;color:#d0d0d0;}",
+      ".sketch-panels-tool:focus-visible,.sketch-panels-btn:focus-visible,.sketch-panels-mini:focus-visible{outline:2px solid var(--color-accent,#5a7fdb);outline-offset:1px;}",
+      ".sketch-panels-tool.is-active{background:var(--color-accent-muted,rgba(90,127,219,.16));border-color:var(--color-accent,#5a7fdb);color:#fff;}",
+      ".sketch-panels-tool:disabled,.sketch-panels-btn:disabled,.sketch-panels-mini:disabled{opacity:.45;cursor:default;}",
+      ".sketch-icon{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0;}",
+      ".sketch-panels-tool.is-active .sketch-icon{stroke:#fff;}",
+      ".sketch-panels-row{display:flex;align-items:center;gap:8px;margin:6px 0;max-width:100%;}",
+      ".sketch-panels-row:last-child{margin-bottom:0;}",
+      ".sketch-panels-label{display:flex;align-items:center;gap:6px;width:100%;color:#a0a0a0;font-size:11px;font-weight:500;}",
+      ".sketch-panels-slider,.comfysketch-slider{flex:1;min-width:0;accent-color:var(--color-accent,#5a7fdb);height:16px;background:transparent;cursor:pointer;}",
+      ".sketch-panels-slider:disabled,.comfysketch-slider:disabled{opacity:.4;cursor:default;}",
+      ".sketch-panels-val{min-width:38px;text-align:right;color:#888;font-size:11px;font-variant-numeric:tabular-nums;}",
+      ".sketch-panels-swatches{display:flex;align-items:center;gap:4px;margin:6px 0;}",
+      ".sketch-panels-swatch{width:30px;height:24px;border-radius:4px;border:1px solid #333;cursor:pointer;padding:0;font-size:0;flex-shrink:0;box-sizing:border-box;}",
+      ".sketch-panels-swatch.is-active{outline:2px solid var(--color-accent,#5a7fdb);outline-offset:1px;}",
+      ".sketch-panels-swatch:focus-visible{outline:2px solid var(--color-accent,#5a7fdb);outline-offset:1px;}",
+      ".sketch-panels-mini{min-width:26px;}",
+      ".sketch-panels-colorbox{display:flex;gap:8px;align-items:flex-start;justify-content:flex-start;margin:4px 0;}",
+      ".sketch-panels-colorbox canvas{width:96px;height:96px;border:1px solid #333;border-radius:4px;background:#0a0a0a;cursor:crosshair;touch-action:none;}",
+      ".sketch-panels-color{width:28px;height:24px;padding:0;border:1px solid #333;border-radius:4px;background:#0a0a0a;cursor:pointer;flex-shrink:0;}",
+      ".sketch-panels-hex{flex:1;min-width:0;background:#0a0a0a;border:1px solid #2a2a2a;color:#d0d0d0;border-radius:3px;padding:4px 6px;font-size:11px;font-family:ui-monospace,monospace;box-sizing:border-box;}",
+      ".sketch-panels-hex:focus{border-color:var(--color-accent,#5a7fdb);outline:none;}",
+      ".sketch-panels-presets{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:3px;margin:6px 0 0;}",
+      ".sketch-panels-preset{aspect-ratio:1;border:1px solid #333;border-radius:3px;cursor:pointer;padding:0;min-width:0;}",
+      ".sketch-panels-preset:hover{border-color:var(--color-accent,#5a7fdb);}",
+      ".sketch-panels-preset:focus-visible{outline:2px solid var(--color-accent,#5a7fdb);outline-offset:1px;}",
+      ".sketch-panels-number{width:52px;background:#0a0a0a;border:1px solid #2a2a2a;color:#d0d0d0;border-radius:3px;padding:3px 6px;font-size:11px;box-sizing:border-box;}",
+      ".sketch-panels-number:focus{border-color:var(--color-accent,#5a7fdb);outline:none;}",
+      ".sketch-panels-zoomrow{display:flex;align-items:center;gap:4px;}",
+      ".sketch-panels-zoomlabel{flex:1;text-align:center;color:#888;font-size:11px;font-variant-numeric:tabular-nums;min-width:40px;}",
+      ".sketch-panels-histrow{display:flex;gap:4px;margin-top:4px;}",
+      ".sketch-panels-histrow .sketch-panels-btn{flex:1;}",
+      ".sketch-panels-help{font-size:11px;color:#888;margin:2px 0 0;line-height:1.4;}",
+      ".sketch-panels-advanced-toggle{display:flex;align-items:center;gap:4px;width:100%;margin-top:6px;padding:5px 8px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:3px;cursor:pointer;font:inherit;font-size:10px;font-weight:600;color:#a0a0a0;text-transform:uppercase;letter-spacing:.04em;text-align:left;box-sizing:border-box;}",
+      ".sketch-panels-advanced-toggle:hover{background:#1a1a1a;color:#d0d0d0;}",
+      ".sketch-panels-advanced-toggle:focus-visible{outline:2px solid var(--color-accent,#5a7fdb);outline-offset:1px;}",
+      ".sketch-panels-advanced-toggle .arrow{font-size:8px;flex-shrink:0;transition:transform .2s;}",
+      '.sketch-panels-advanced-toggle[aria-expanded="true"] .arrow{transform:rotate(90deg);}',
+      ".sketch-panels-advanced-body{display:flex;flex-direction:column;gap:4px;padding:6px 0 0 8px;margin:4px 0 0 4px;border-left:1px solid #2a2a2a;}",
+      '.sketch-panels-advanced-body[hidden]{display:none;}',
+      ".sketch-panels-rgbrow{display:flex;align-items:center;gap:4px;}",
+      ".sketch-panels-rgbrow .sketch-panels-number{width:44px;}",
+      ".sketch-panels-rgbrow .sketch-panels-val{min-width:12px;}",
+    ].join("");
     (doc.head || doc.documentElement).appendChild(style);
   }
 
@@ -196,13 +252,17 @@
     var tolInput = null;
     var wheelCanvas = null;
     var svCanvas = null;
+    var advToggle = null;
+    var advBody = null;
+    var rgbInputs = null;
+    var hslInputs = null;
     var hue = 0;
     var sat = 0;
     var val = 0;
     var unsubscribe = null;
 
     var root = doc.createElement("div");
-    root.className = "sketch-panels";
+    root.className = "sketch-panels sketch-panels--dark";
     root.setAttribute("data-sketch-panels", "1");
 
     function el(tag, cls, text) {
@@ -213,7 +273,9 @@
     }
 
     function section(title) {
-      var s = el("div", "sketch-panels-section");
+      // Keep legacy section/heading classes; ADD the Studio control-group
+      // class so the sidebar cascade treats these as native sections.
+      var s = el("div", "sketch-panels-section comfymodal-studio-control-group");
       var h = el("div", "sketch-panels-heading", title);
       s.appendChild(h);
       root.appendChild(s);
@@ -247,11 +309,16 @@
       var activeColor = state.slot === "bg" ? state.bg : state.fg;
       if (colorPicker) colorPicker.value = normHex(activeColor, DEFAULT_FG);
       if (hexInput && doc.activeElement !== hexInput) hexInput.value = normHex(activeColor, DEFAULT_FG);
+      paintAdvInputs(activeColor);
     }
 
     function hexToRgb(hex) {
       var h = normHex(hex, "#000000").slice(1);
       return { r: parseInt(h.slice(0, 2), 16), g: parseInt(h.slice(2, 4), 16), b: parseInt(h.slice(4, 6), 16) };
+    }
+    function rgbToHex(r, g, b) {
+      function q(n) { return clampNum(Math.round(Number(n)), 0, 255, 0).toString(16).padStart(2, "0"); }
+      return ("#" + q(r) + q(g) + q(b)).toLowerCase();
     }
     function rgbToHsv(rgb) {
       var r = rgb.r / 255, g = rgb.g / 255, b = rgb.b / 255, max = Math.max(r,g,b), min = Math.min(r,g,b), d = max-min, h = 0;
@@ -264,14 +331,58 @@
       function q(n){return Math.round((n+m)*255).toString(16).padStart(2,"0");}
       return "#"+q(r)+q(g)+q(b);
     }
+    function rgbToHsl(rgb) {
+      var r = rgb.r / 255, g = rgb.g / 255, b = rgb.b / 255;
+      var max = Math.max(r, g, b), min = Math.min(r, g, b), h = 0, s = 0, l = (max + min) / 2;
+      var d = max - min;
+      if (d) {
+        s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        if (max === r) h = ((g - b) / d) % 6;
+        else if (max === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h *= 60;
+        if (h < 0) h += 360;
+      }
+      return { h: h, s: s * 100, l: l * 100 };
+    }
+    function hslToHex(h, s, l) {
+      h = ((Number(h) % 360) + 360) % 360;
+      s = clampNum(Number(s), 0, 100, 0) / 100;
+      l = clampNum(Number(l), 0, 100, 0) / 100;
+      var c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = l - c / 2;
+      var r = 0, g = 0, b = 0;
+      if (h < 60) { r = c; g = x; } else if (h < 120) { r = x; g = c; } else if (h < 180) { g = c; b = x; }
+      else if (h < 240) { g = x; b = c; } else if (h < 300) { r = x; b = c; } else { r = c; b = x; }
+      function q(n) { return Math.round((n + m) * 255).toString(16).padStart(2, "0"); }
+      return ("#" + q(r) + q(g) + q(b)).toLowerCase();
+    }
+    function paintAdvInputs(activeColor) {
+      var hex = normHex(activeColor, null);
+      if (!hex) return;
+      var rgb = hexToRgb(hex);
+      var hsl = rgbToHsl(rgb);
+      if (rgbInputs) {
+        if (doc.activeElement !== rgbInputs.r) rgbInputs.r.value = String(rgb.r);
+        if (doc.activeElement !== rgbInputs.g) rgbInputs.g.value = String(rgb.g);
+        if (doc.activeElement !== rgbInputs.b) rgbInputs.b.value = String(rgb.b);
+      }
+      if (hslInputs) {
+        if (doc.activeElement !== hslInputs.h) hslInputs.h.value = String(Math.round(hsl.h));
+        if (doc.activeElement !== hslInputs.s) hslInputs.s.value = String(Math.round(hsl.s));
+        if (doc.activeElement !== hslInputs.l) hslInputs.l.value = String(Math.round(hsl.l));
+      }
+    }
     function drawColorCanvases() {
       if (!wheelCanvas || !svCanvas) return;
-      var size=128, ctx=wheelCanvas.getContext("2d"), sctx=svCanvas.getContext("2d"), cx=64, cy=64;
-      ctx.clearRect(0,0,size,size); for(var a=0;a<360;a++){var g=ctx.createLinearGradient(0,0,128,0);g.addColorStop(0,"hsl("+a+",100%,50%)");g.addColorStop(1,"hsl("+(a+1)+",100%,50%)");ctx.strokeStyle=g;ctx.lineWidth=12;ctx.beginPath();ctx.arc(cx,cy,51,(a-1)*Math.PI/180,a*Math.PI/180);ctx.stroke();}
-      // SAME angle convention as the segments above: hue a is drawn at canvas
-      // angle a (0 = east, increasing clockwise as canvas y grows downward).
-      ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(cx,cy,51,(hue-1)*Math.PI/180,hue*Math.PI/180);ctx.stroke();
-      sctx.clearRect(0,0,size,size); var grad=sctx.createLinearGradient(20,0,108,0);grad.addColorStop(0,"#fff");grad.addColorStop(1,"hsl("+hue+",100%,50%)");sctx.fillStyle=grad;sctx.fillRect(22,22,84,84);var black=sctx.createLinearGradient(0,22,0,106);black.addColorStop(0,"transparent");black.addColorStop(1,"#000");sctx.fillStyle=black;sctx.fillRect(22,22,84,84);sctx.strokeStyle="#fff";sctx.lineWidth=2;sctx.beginPath();sctx.arc(22+sat*84,106-val*84,4,0,Math.PI*2);sctx.stroke();
+      try {
+        var size=128, ctx=wheelCanvas.getContext("2d"), sctx=svCanvas.getContext("2d"), cx=64, cy=64;
+        if (!ctx || !sctx) return;
+        ctx.clearRect(0,0,size,size); for(var a=0;a<360;a++){var g=ctx.createLinearGradient(0,0,128,0);g.addColorStop(0,"hsl("+a+",100%,50%)");g.addColorStop(1,"hsl("+(a+1)+",100%,50%)");ctx.strokeStyle=g;ctx.lineWidth=12;ctx.beginPath();ctx.arc(cx,cy,51,(a-1)*Math.PI/180,a*Math.PI/180);ctx.stroke();}
+        // SAME angle convention as the segments above: hue a is drawn at canvas
+        // angle a (0 = east, increasing clockwise as canvas y grows downward).
+        ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(cx,cy,51,(hue-1)*Math.PI/180,hue*Math.PI/180);ctx.stroke();
+        sctx.clearRect(0,0,size,size); var grad=sctx.createLinearGradient(20,0,108,0);grad.addColorStop(0,"#fff");grad.addColorStop(1,"hsl("+hue+",100%,50%)");sctx.fillStyle=grad;sctx.fillRect(22,22,84,84);var black=sctx.createLinearGradient(0,22,0,106);black.addColorStop(0,"transparent");black.addColorStop(1,"#000");sctx.fillStyle=black;sctx.fillRect(22,22,84,84);sctx.strokeStyle="#fff";sctx.lineWidth=2;sctx.beginPath();sctx.arc(22+sat*84,106-val*84,4,0,Math.PI*2);sctx.stroke();
+      } catch (_e) { /* canvas is best-effort (e.g. headless tests) */ }
     }
     function setColorFromHsv() { driveColor(hsvToHex(hue,sat,val), state.slot); drawColorCanvases(); }
     function colorPoint(ev, canvas) {
@@ -382,6 +493,7 @@
           try { eng.setColor(hex); } catch (_e) { /* non-fatal */ }
         }
       }
+      var hsv = rgbToHsv(hexToRgb(hex)); hue = hsv.h; sat = hsv.s; val = hsv.v;
       paintSwatches();
     }
 
@@ -413,8 +525,12 @@
 
     function driveTolerance(n) {
       state.tolerance = Math.round(clampNum(n, 0, 255, 32));
+      // Exact public API is setFillTolerance; accept the documented
+      // setTolerance alias only as a fallback for older engines.
       if (typeof eng.setFillTolerance === "function") {
         try { eng.setFillTolerance(state.tolerance); } catch (_e) { /* non-fatal */ }
+      } else if (typeof eng.setTolerance === "function") {
+        try { eng.setTolerance(state.tolerance); } catch (_e) { /* non-fatal */ }
       }
       if (tolInput && tolInput.value !== String(state.tolerance)) tolInput.value = String(state.tolerance);
     }
@@ -457,7 +573,7 @@
 
     // ---- build: tool bar ----
 
-    var toolSec = section("Tools");
+    var toolSec = section("TOOLS");
     var toolGrid = el("div", "sketch-panels-tools");
     toolGrid.setAttribute("role", "toolbar");
     toolGrid.setAttribute("aria-label", "Sketch tools");
@@ -480,7 +596,7 @@
 
     // ---- build: brush settings ----
 
-    var setSec = section("Brush");
+    var setSec = section("BRUSH");
     function sliderRow(labelText, min, max, step, testid, onInput) {
       var row = el("div", "sketch-panels-row");
       var lab = el("label", "sketch-panels-label", labelText);
@@ -519,19 +635,15 @@
       hardnessSlider.title = applicable ? "Brush hardness" : "Hardness applies to Brush/Pencil only";
     }
 
-    // ---- build: color (docked adaptation of ComfySketch ColorWheelPanel) ----
+    // ---- build: color (compact; advanced HSV/HSL/RGB collapsible) ----
 
-    var colSec = section("Color");
-    var colorBox = el("div", "sketch-panels-colorbox");
-    wheelCanvas = doc.createElement("canvas"); wheelCanvas.width = 128; wheelCanvas.height = 128; wheelCanvas.setAttribute("aria-label", "Hue wheel");
-    svCanvas = doc.createElement("canvas"); svCanvas.width = 128; svCanvas.height = 128; svCanvas.setAttribute("aria-label", "Saturation and value square");
-    colorBox.appendChild(wheelCanvas); colorBox.appendChild(svCanvas); colSec.appendChild(colorBox);
-    bindColorCanvas(wheelCanvas); bindColorCanvas(svCanvas);
+    var colSec = section("COLOR");
     var swRow = el("div", "sketch-panels-swatches");
     fgSwatch = el("button", "sketch-panels-swatch is-fg", "FG");
     fgSwatch.type = "button";
     fgSwatch.title = "Foreground color (click to edit)";
     fgSwatch.setAttribute("data-testid", "sketch-fg-swatch");
+    fgSwatch.setAttribute("aria-label", "Foreground color (click to edit)");
     fgSwatch.addEventListener("click", function () {
       state.slot = "fg";
       paintSwatches();
@@ -540,19 +652,22 @@
     bgSwatch.type = "button";
     bgSwatch.title = "Background color (click to edit)";
     bgSwatch.setAttribute("data-testid", "sketch-bg-swatch");
+    bgSwatch.setAttribute("aria-label", "Background color (click to edit)");
     bgSwatch.addEventListener("click", function () {
       state.slot = "bg";
       paintSwatches();
     });
-    var swapBtn = el("button", "sketch-panels-mini"); swapBtn.innerHTML = icon("swap");
+    var swapBtn = el("button", "sketch-panels-mini comfymodal-secondary-btn"); swapBtn.innerHTML = icon("swap");
     swapBtn.type = "button";
     swapBtn.title = "Swap FG/BG (X)";
     swapBtn.setAttribute("data-testid", "sketch-swap-colors");
+    swapBtn.setAttribute("aria-label", "Swap FG/BG");
     swapBtn.addEventListener("click", swapFgBg);
-    var resetBtn = el("button", "sketch-panels-mini"); resetBtn.innerHTML = icon("reset");
+    var resetBtn = el("button", "sketch-panels-mini comfymodal-secondary-btn"); resetBtn.innerHTML = icon("reset");
     resetBtn.type = "button";
     resetBtn.title = "Reset black/white (D)";
     resetBtn.setAttribute("data-testid", "sketch-reset-colors");
+    resetBtn.setAttribute("aria-label", "Reset black/white");
     resetBtn.addEventListener("click", resetFgBg);
     swRow.appendChild(fgSwatch);
     swRow.appendChild(swapBtn);
@@ -569,7 +684,7 @@
     colorPicker.value = DEFAULT_FG;
     colorPicker.addEventListener("input", function () {
       driveColor(colorPicker.value, state.slot);
-      var hsv = rgbToHsv(hexToRgb(colorPicker.value)); hue = hsv.h; sat = hsv.s; val = hsv.v; drawColorCanvases();
+      drawColorCanvases();
       if (hexInput) hexInput.value = normHex(colorPicker.value, DEFAULT_FG);
     });
     hexInput = doc.createElement("input");
@@ -582,7 +697,7 @@
     hexInput.value = DEFAULT_FG;
     hexInput.addEventListener("change", function () {
       driveColor(hexInput.value, state.slot);
-      var hsv = rgbToHsv(hexToRgb(normHex(hexInput.value, DEFAULT_FG))); hue = hsv.h; sat = hsv.s; val = hsv.v; drawColorCanvases();
+      drawColorCanvases();
     });
     colRow.appendChild(colorPicker);
     colRow.appendChild(hexInput);
@@ -591,7 +706,7 @@
     var presetRow = el("div", "sketch-panels-presets");
     ["#000000","#ffffff","#e53935","#fb8c00","#fdd835","#43a047","#1e88e5","#8e24aa","#795548","#90a4ae","#f48fb1","#26a69a"].forEach(function (color) {
       var p = el("button", "sketch-panels-preset"); p.type = "button"; p.style.background = color; p.title = color; p.setAttribute("aria-label", "Use " + color);
-      p.addEventListener("click", function () { driveColor(color, state.slot); var hsv = rgbToHsv(hexToRgb(color)); hue = hsv.h; sat = hsv.s; val = hsv.v; drawColorCanvases(); });
+      p.addEventListener("click", function () { driveColor(color, state.slot); drawColorCanvases(); });
       presetRow.appendChild(p);
     });
     colSec.appendChild(presetRow);
@@ -615,12 +730,77 @@
     tolRow.appendChild(tolLab);
     colSec.appendChild(tolRow);
 
+    // Advanced color: full HSV wheel + SV square + HSL/RGB inputs, collapsed
+    // by default so the COLOR section stays compact.
+    advToggle = doc.createElement("button");
+    advToggle.type = "button";
+    advToggle.className = "sketch-panels-advanced-toggle";
+    advToggle.setAttribute("data-testid", "sketch-advanced-color-toggle");
+    advToggle.setAttribute("aria-expanded", "false");
+    advToggle.setAttribute("aria-controls", "sketch-advanced-color-body");
+    advToggle.innerHTML = '<span class="arrow">\u25b6</span><span>Advanced color</span>';
+    advBody = el("div", "sketch-panels-advanced-body");
+    advBody.id = "sketch-advanced-color-body";
+    advBody.setAttribute("hidden", "");
+    var colorBox = el("div", "sketch-panels-colorbox");
+    wheelCanvas = doc.createElement("canvas"); wheelCanvas.width = 128; wheelCanvas.height = 128; wheelCanvas.setAttribute("aria-label", "Hue wheel");
+    svCanvas = doc.createElement("canvas"); svCanvas.width = 128; svCanvas.height = 128; svCanvas.setAttribute("aria-label", "Saturation and value square");
+    colorBox.appendChild(wheelCanvas); colorBox.appendChild(svCanvas); advBody.appendChild(colorBox);
+    bindColorCanvas(wheelCanvas); bindColorCanvas(svCanvas);
+    function advNumRow(names, testidPrefix, onCommit) {
+      var row = el("div", "sketch-panels-rgbrow");
+      var inputs = {};
+      names.forEach(function (nm) {
+        var lab = el("label", "sketch-panels-label", nm.toUpperCase());
+        var inp = doc.createElement("input");
+        inp.type = "number";
+        inp.className = "sketch-panels-number";
+        inp.setAttribute("data-testid", testidPrefix + "-" + nm);
+        inp.value = "0";
+        inp.addEventListener("change", function () { onCommit(inputs); });
+        lab.appendChild(inp);
+        row.appendChild(lab);
+        inputs[nm] = inp;
+      });
+      advBody.appendChild(row);
+      return inputs;
+    }
+    rgbInputs = advNumRow(["r", "g", "b"], "sketch-color-rgb", function (ins) {
+      driveColor(rgbToHex(ins.r.value, ins.g.value, ins.b.value), state.slot);
+      drawColorCanvases();
+    });
+    // Compact range hints on the number inputs (kept as attributes only).
+    rgbInputs.r.min = "0"; rgbInputs.r.max = "255";
+    rgbInputs.g.min = "0"; rgbInputs.g.max = "255";
+    rgbInputs.b.min = "0"; rgbInputs.b.max = "255";
+    hslInputs = advNumRow(["h", "s", "l"], "sketch-color-hsl", function (ins) {
+      driveColor(hslToHex(ins.h.value, ins.s.value, ins.l.value), state.slot);
+      drawColorCanvases();
+    });
+    hslInputs.h.min = "0"; hslInputs.h.max = "360";
+    hslInputs.s.min = "0"; hslInputs.s.max = "100";
+    hslInputs.l.min = "0"; hslInputs.l.max = "100";
+    var advHint = el("div", "sketch-panels-help", "Wheel edits hue; square edits saturation/value.");
+    advBody.appendChild(advHint);
+    advToggle.addEventListener("click", function () {
+      var open = advToggle.getAttribute("aria-expanded") === "true";
+      advToggle.setAttribute("aria-expanded", open ? "false" : "true");
+      if (open) advBody.setAttribute("hidden", "");
+      else {
+        advBody.removeAttribute("hidden");
+        drawColorCanvases();
+        paintAdvInputs(state.slot === "bg" ? state.bg : state.fg);
+      }
+    });
+    colSec.appendChild(advToggle);
+    colSec.appendChild(advBody);
+
     // ---- build: canvas controls (zoom + history; Clear/Save owned by shell) ----
 
-    var cvSec = section("Canvas");
+    var cvSec = section("CANVAS");
     var zoomRow = el("div", "sketch-panels-zoomrow");
     function miniBtn(text, title, testid, onClick) {
-      var b = el("button", "sketch-panels-mini", text);
+      var b = el("button", "sketch-panels-mini comfymodal-secondary-btn", text);
       b.type = "button";
       b.title = title;
       b.setAttribute("data-testid", testid);
@@ -638,12 +818,12 @@
     cvSec.appendChild(zoomRow);
 
     var histRow = el("div", "sketch-panels-histrow");
-    undoBtn = el("button", "sketch-panels-btn"); undoBtn.innerHTML = icon("undo", "Undo");
+    undoBtn = el("button", "sketch-panels-btn comfymodal-secondary-btn"); undoBtn.innerHTML = icon("undo", "Undo");
     undoBtn.type = "button";
     undoBtn.title = "Undo (Ctrl+Z)";
     undoBtn.setAttribute("data-testid", "sketch-undo");
     undoBtn.addEventListener("click", doUndo);
-    redoBtn = el("button", "sketch-panels-btn"); redoBtn.innerHTML = icon("redo", "Redo");
+    redoBtn = el("button", "sketch-panels-btn comfymodal-secondary-btn"); redoBtn.innerHTML = icon("redo", "Redo");
     redoBtn.type = "button";
     redoBtn.title = "Redo (Ctrl+Shift+Z)";
     redoBtn.setAttribute("data-testid", "sketch-redo");

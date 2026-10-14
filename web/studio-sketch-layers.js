@@ -150,6 +150,34 @@
       return i >= 0 ? layers[i] : null;
     }
 
+    // Unique display names. Defaults follow "Layer 1, Layer 2, ..." using
+    // the lowest unused number. Every live name counts (base row,
+    // overlays, renames, restored records) so a live name is never reused.
+    function isNameTaken(name, extra) {
+      var s = String(name);
+      for (var i = 0; i < layers.length; i++) {
+        if (layers[i] && String(layers[i].name) === s) return true;
+      }
+      if (extra) {
+        for (var j = 0; j < extra.length; j++) {
+          if (extra[j] && String(extra[j].name) === s) return true;
+        }
+      }
+      return false;
+    }
+
+    function nextDefaultLayerName(extra) {
+      var n = 1;
+      while (isNameTaken("Layer " + n, extra)) n++;
+      return "Layer " + n;
+    }
+
+    function uniqueNameFor(candidate, extra) {
+      var nm = String(candidate == null ? "" : candidate).trim();
+      if (nm && !isNameTaken(nm, extra)) return nm;
+      return nextDefaultLayerName(extra);
+    }
+
     function emit() {
       var snap = snapshot();
       for (var i = 0; i < listeners.length; i++) {
@@ -298,13 +326,14 @@
         } else {
           var created = {
             id: id,
-            name: id === BASE_ID ? (options.baseName || "Base") : ("Layer " + (k + 1)),
+            name: id === BASE_ID ? (options.baseName || "Base") : nextDefaultLayerName(next),
             canvas: byId[id],
             visible: true,
             opacity: 1,
             locked: id === BASE_ID,
           };
           if (activeRec) applyEngineRecordMeta(created, activeRec);
+          if (id !== BASE_ID) created.name = uniqueNameFor(created.name, next);
           try { if (created.canvas && created.canvas.dataset) created.canvas.dataset.layerId = id; } catch (_e1) {}
           next.push(created);
         }
@@ -393,9 +422,11 @@
         for (var i = 1; i < existing.length; i++) {
           var c = existing[i];
           if (!c || c === base.canvas) continue;
+          var hint = "";
+          try { hint = c && c.dataset && c.dataset.layerName ? String(c.dataset.layerName).trim() : ""; } catch (_e0) { hint = ""; }
           var layer = {
             id: nextId("layer"),
-            name: "Layer " + layers.length,
+            name: uniqueNameFor(hint, null),
             canvas: c,
             visible: true,
             opacity: 1,
@@ -449,7 +480,7 @@
         var canvas = makeCanvas(size.width, size.height);
         var layer = {
           id: nextId("layer"),
-          name: String(name || ("Layer " + layers.length)),
+          name: name ? String(name) : nextDefaultLayerName(),
           canvas: canvas,
           visible: true,
           opacity: 1,
@@ -560,9 +591,13 @@
         if (idx < 0) return null;
         var src = layers[idx];
         var canvas = copyCanvas(src.canvas, size.width, size.height);
+        var copyStem = (src.name || "Layer") + " copy";
+        var copyName = copyStem;
+        var copyN = 2;
+        while (isNameTaken(copyName)) { copyName = copyStem + " " + copyN; copyN++; }
         var layer = {
           id: nextId("layer"),
-          name: (src.name || "Layer") + " copy",
+          name: copyName,
           canvas: canvas,
           visible: src.visible !== false,
           opacity: clamp01(src.opacity == null ? 1 : src.opacity),
@@ -728,7 +763,7 @@
       renderInto: function (container) {
       if (!container || typeof document === "undefined") return null;
       if (!document.getElementById("sketch-layers-style")) {
-        var css = document.createElement("style"); css.id = "sketch-layers-style"; css.textContent = '.sketch-layers-panel{background:rgba(249,249,249,.95);border:1px solid #ccc;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.15);padding:8px;color:#222;font:10px/1.3 system-ui,sans-serif}.sketch-layers-head{display:flex;align-items:center;gap:5px;padding:2px 2px 7px;border-bottom:1px solid #ccc;margin-bottom:6px}.sketch-layers-title{font-size:11px;font-weight:600;flex:1}.sketch-layers-btn{background:#e8e8e8;border:1px solid #ccc;border-radius:4px;color:#444;cursor:pointer;font:10px system-ui;min-width:24px;min-height:24px}.sketch-layers-add{display:inline-flex;align-items:center;gap:3px}.sketch-layers-add:before{content:"";display:block;width:12px;height:12px;background:currentColor;mask:url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\'%3E%3Cpath d=\'M12 5v14M5 12h14\' stroke=\'black\' stroke-width=\'2\'/%3E%3C/svg%3E") center/contain no-repeat}.sketch-layers-list{display:flex;flex-direction:column;gap:4px}.sketch-layers-row{display:grid;grid-template-columns:22px minmax(0,1fr) 48px auto;align-items:center;gap:4px;padding:5px 3px;border:1px solid transparent;border-radius:4px}.sketch-layers-row.is-active{background:#dbeeff;border-color:#b8d8f2}.sketch-layers-row.is-base{background:#f1f1f1}.sketch-layers-eye,.sketch-layers-tools button{border:0;background:transparent;color:#555;padding:3px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}.sketch-layers-eye .sketch-icon,.sketch-layers-tools .sketch-icon{width:13px;height:13px}.sketch-layers-name{min-width:0;overflow:hidden}.sketch-layers-name-text{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:text}.sketch-layers-opacity{width:48px;height:3px;appearance:none;background:#ccc;border-radius:2px}.sketch-layers-opacity::-webkit-slider-thumb{appearance:none;width:8px;height:8px;border-radius:50%;background:#555}.sketch-layers-tools{display:flex;gap:0}.sketch-layers-delete{color:#a33!important}.sketch-layers-lock{display:inline-flex;color:#666;padding:3px}.sketch-layers-panel button:focus-visible,.sketch-layers-panel input:focus-visible{outline:2px solid #4285c5;outline-offset:1px}'; (document.head || document.documentElement).appendChild(css);
+        var css = document.createElement("style"); css.id = "sketch-layers-style"; css.textContent = '.sketch-layers-panel{background:#202024;border:1px solid #33333a;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.45);padding:6px;color:#c9c9d1;font:10px/1.3 system-ui,sans-serif}.sketch-layers-head{display:flex;align-items:center;gap:5px;padding:2px 2px 6px;border-bottom:1px solid #33333a;margin-bottom:5px}.sketch-layers-title{font-size:11px;font-weight:600;flex:1;color:#e4e4ea}.sketch-layers-btn{background:#2a2a31;border:1px solid #3d3d46;border-radius:4px;color:#c9c9d1;cursor:pointer;font:10px system-ui;min-width:24px;min-height:22px}.sketch-layers-add{display:inline-flex;align-items:center;gap:3px}.sketch-layers-add:before{content:"";display:block;width:12px;height:12px;background:currentColor;mask:url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 24 24\'%3E%3Cpath d=\'M12 5v14M5 12h14\' stroke=\'black\' stroke-width=\'2\'/%3E%3C/svg%3E") center/contain no-repeat}.sketch-layers-list{display:flex;flex-direction:column;gap:4px}.sketch-layers-row{display:grid;grid-template-columns:22px minmax(0,1fr) 48px auto;align-items:center;gap:4px;padding:3px 2px;border:1px solid transparent;border-radius:4px}.sketch-layers-row.is-active{background:#2c3d52;border-color:#4a6a94}.sketch-layers-row.is-base{background:rgba(255,255,255,.03)}.sketch-layers-eye,.sketch-layers-tools button{border:0;background:transparent;color:#9a9aa3;padding:2px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}.sketch-layers-eye .sketch-icon,.sketch-layers-tools .sketch-icon{width:13px;height:13px}.sketch-layers-name{min-width:0;overflow:hidden}.sketch-layers-name-text{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:text}.sketch-layers-opacity{width:48px;height:3px;appearance:none;background:#3d3d46;border-radius:2px}.sketch-layers-opacity::-webkit-slider-thumb{appearance:none;width:8px;height:8px;border-radius:50%;background:#9a9aa3}.sketch-layers-tools{display:flex;gap:0}.sketch-layers-delete{color:#e06c75!important}.sketch-layers-lock{display:inline-flex;color:#77787f;padding:3px}.sketch-layers-panel button:focus-visible,.sketch-layers-panel input:focus-visible{outline:2px solid #5b8dd9;outline-offset:1px}'; (document.head || document.documentElement).appendChild(css);
       }
         var root = document.createElement("div");
         root.className = "sketch-layers-panel";
