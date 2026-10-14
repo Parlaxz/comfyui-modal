@@ -5196,7 +5196,7 @@ function _renderSketchEditor(state, context, actions, canvasEl, where) {
         }
       } catch (_e3) {}
       layerStore = createLayerStore(engine, { width: _blankDims.width, height: _blankDims.height });
-      panelsHandle = mountPanels(controlsHost, engine, {});
+      panelsHandle = mountPanels(controlsHost, engine, { mode: mode });
       layersRoot = layerStore.renderInto(layersHost);
       session = openSketch({
         mode: mode,

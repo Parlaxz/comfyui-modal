@@ -790,7 +790,12 @@
             ".sketch-layers-opacity::-moz-range-thumb{width:8px;height:8px;border-radius:50%;background:#c9c9d1;cursor:pointer;border:0}",
             ".sketch-layers-tools{display:inline-flex;align-items:center;gap:0;flex:none}",
             ".sketch-layers-lock{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;color:#6a6a73}",
-            ".sketch-layers-lock .sketch-icon{width:12px;height:12px}"
+            ".sketch-layers-lock .sketch-icon{width:12px;height:12px}",
+            ".sketch-layers-name-text{background:transparent;border:0;color:inherit;font-size:10px;text-align:left;padding:0;margin:0;width:100%;cursor:pointer}",
+            ".sketch-layers-name-text:hover{color:#fff}",
+            ".sketch-layers-btn:disabled,.sketch-layers-eye:disabled{opacity:.35;cursor:default}",
+            ".sketch-layers-name-text:focus-visible,.sketch-layers-btn:focus-visible,.sketch-layers-eye:focus-visible,.sketch-layers-opacity:focus-visible{outline:1px solid #6a9fd8;outline-offset:1px}",
+            ".sketch-layers-rename{font-size:9px;padding:2px 4px}"
           ].join("");
         }
         var root = document.createElement("div");
@@ -817,116 +822,233 @@
           return b;
         }
 
-        function paint() {
-          while (root.firstChild) root.removeChild(root.firstChild);
-
-          var head = el("div", "sketch-layers-head");
-          head.setAttribute("data-testid", "sketch-layers-head");
-          head.appendChild(el("span", "sketch-layers-title", "Layers"));
-          var addBtn = btn("+ Add", "Add layer", function () { store.add(); });
-          addBtn.classList.add("sketch-layers-add");
-          addBtn.setAttribute("data-testid", "sketch-layers-add");
-          head.appendChild(addBtn);
-          var flatBtn = btn("Flatten", "Merge all layers onto base", function () { store.flatten(); });
-          flatBtn.classList.add("sketch-layers-flatten");
-          flatBtn.setAttribute("data-testid", "sketch-layers-flatten");
-          head.appendChild(flatBtn);
-          root.appendChild(head);
-
-          var list = el("div", "sketch-layers-list");
-          list.setAttribute("data-testid", "sketch-layers-list");
-          // Top-most layer first in the UI.
-          for (var i = layers.length - 1; i >= 0; i--) {
-            (function (layer, index) {
-              var row = el("div", "sketch-layers-row" + (layer.id === activeId ? " is-active" : "") + (isBase(layer) ? " is-base" : ""));
-              row.setAttribute("data-layer-id", layer.id);
-              row.setAttribute("data-testid", "sketch-layers-row");
-              row.setAttribute("data-active", layer.id === activeId ? "true" : "false");
-              row.addEventListener("click", function () { store.setActive(layer.id); });
-
-              var eye = btn("", "Toggle visibility", function () {
-                eye.innerHTML = icon(layer.visible === false ? "hidden" : "eye");
-                store.toggleVisibility(layer.id);
-              });
-              eye.innerHTML = icon(layer.visible === false ? "hidden" : "eye");
-              eye.classList.add("sketch-layers-eye");
-              eye.setAttribute("aria-pressed", layer.visible === false ? "false" : "true");
-              eye.setAttribute("data-testid", "sketch-layers-eye");
-              row.appendChild(eye);
-
-              var nameWrap = el("div", "sketch-layers-name");
-              var name = el("span", "sketch-layers-name-text", layer.name + (isBase(layer) ? " (base)" : ""));
-              name.title = isBase(layer) ? "Base image — locked, cannot delete" : "Double-click to rename";
-              name.setAttribute("data-testid", "sketch-layers-name");
-              nameWrap.appendChild(name);
-              nameWrap.addEventListener("dblclick", function () {
-                if (typeof window !== "undefined" && typeof window.prompt === "function") {
-                  var next = window.prompt("Rename layer", layer.name);
-                  if (next != null) store.rename(layer.id, next);
-                }
-              });
-              row.appendChild(nameWrap);
-
-              var slider = document.createElement("input");
-              slider.type = "range";
-              slider.min = "0";
-              slider.max = "1";
-              slider.step = "0.01";
-              slider.value = String(clamp01(layer.opacity == null ? 1 : layer.opacity));
-              slider.title = "Opacity";
-              slider.className = "sketch-layers-opacity";
-              slider.setAttribute("data-testid", "sketch-layers-opacity");
-              slider.setAttribute("aria-label", "Opacity for " + layer.name);
-              slider.addEventListener("click", function (ev) { ev.stopPropagation(); });
-              slider.addEventListener("input", function () {
-                store.setOpacity(layer.id, Number(slider.value));
-              });
-              // Avoid full re-render steal while dragging the slider: the
-              // store emits on input; paint() rebuilds rows which would drop
-              // the drag. Update only the engine + snapshot path by siding
-              // through setOpacity (needed for history), acceptable here.
-              row.appendChild(slider);
-
-              var tools = el("div", "sketch-layers-tools");
-              tools.setAttribute("data-testid", "sketch-layers-tools");
-              if (!isBase(layer)) {
-                var up = btn("", "Move up", function () { store.reorder(layer.id, "up"); });
-                up.innerHTML = icon("up");
-                up.setAttribute("data-testid", "sketch-layers-up");
-                tools.appendChild(up);
-                var down = btn("", "Move down", function () { store.reorder(layer.id, "down"); });
-                down.innerHTML = icon("down");
-                down.setAttribute("data-testid", "sketch-layers-down");
-                tools.appendChild(down);
-                var dup = btn("", "Duplicate", function () { store.duplicate(layer.id); });
-                dup.innerHTML = icon("duplicate");
-                dup.setAttribute("data-testid", "sketch-layers-dup");
-                tools.appendChild(dup);
-                var merge = btn("", "Merge down", function () { store.mergeDown(layer.id); });
-                merge.innerHTML = icon("merge");
-                merge.setAttribute("data-testid", "sketch-layers-merge");
-                tools.appendChild(merge);
-                var del = btn("", "Delete layer", function () { store.delete(layer.id); });
-                del.innerHTML = icon("delete");
-                del.classList.add("sketch-layers-delete");
-                del.setAttribute("data-testid", "sketch-layers-delete");
-                tools.appendChild(del);
-              } else {
-                var lock = el("span", "sketch-layers-lock");
-                lock.innerHTML = icon("lock");
-                lock.title = "Base is locked at the bottom";
-                lock.setAttribute("data-testid", "sketch-layers-lock");
-                tools.appendChild(lock);
-              }
-              row.appendChild(tools);
-              list.appendChild(row);
-            })(layers[i], i);
+        // Shared rename flow (prompt mechanism): used by the per-row Rename
+        // button (keyboard-accessible) and the name dblclick pointer
+        // affordance. No inline editor — the prompt stays canonical.
+        function promptRename(layerId) {
+          var target = find(layerId);
+          if (!target) return;
+          if (typeof window !== "undefined" && typeof window.prompt === "function") {
+            var next = window.prompt("Rename layer", target.name);
+            if (next != null) store.rename(target.id, next);
           }
-          root.appendChild(list);
         }
 
-        var off = store.subscribe(paint);
-        paint();
+        // Persistent panel nodes: head + list are built once and rows are
+        // keyed by layer id and updated in place, so store emits (opacity
+        // drags, selection changes) never rebuild row/input nodes, never
+        // move focus, and never reset list scroll.
+        var list = null;
+        var flatBtn = null;
+        var rowById = {};
+
+        function buildRow(layerId) {
+          var row = el("div", "sketch-layers-row");
+          row.setAttribute("data-layer-id", layerId);
+          row.setAttribute("data-testid", "sketch-layers-row");
+          row.setAttribute("data-active", "false");
+          row.addEventListener("click", function () { store.setActive(layerId); });
+
+          var eye = btn("", "Toggle visibility", function () { store.toggleVisibility(layerId); });
+          eye.classList.add("sketch-layers-eye");
+          eye.setAttribute("data-testid", "sketch-layers-eye");
+          row.appendChild(eye);
+
+          var nameWrap = el("div", "sketch-layers-name");
+          var nameBtn = el("button", "sketch-layers-name-text");
+          nameBtn.type = "button";
+          nameBtn.setAttribute("data-testid", "sketch-layers-name");
+          nameBtn.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            store.setActive(layerId);
+          });
+          nameWrap.appendChild(nameBtn);
+          nameWrap.addEventListener("dblclick", function () { promptRename(layerId); });
+          row.appendChild(nameWrap);
+
+          var slider = document.createElement("input");
+          slider.type = "range";
+          slider.min = "0";
+          slider.max = "1";
+          slider.step = "0.01";
+          slider.className = "sketch-layers-opacity";
+          slider.setAttribute("data-testid", "sketch-layers-opacity");
+          slider.addEventListener("click", function (ev) { ev.stopPropagation(); });
+          slider.addEventListener("input", function () {
+            store.setOpacity(layerId, Number(slider.value));
+          });
+          row.appendChild(slider);
+
+          var tools = el("div", "sketch-layers-tools");
+          tools.setAttribute("data-testid", "sketch-layers-tools");
+          function toolBtn(testid, glyph, label, fn, extraCls) {
+            var b = btn("", label, fn);
+            b.innerHTML = glyph;
+            b.setAttribute("data-testid", testid);
+            if (extraCls) b.classList.add(extraCls);
+            tools.appendChild(b);
+            return b;
+          }
+          var up = toolBtn("sketch-layers-up", icon("up"), "Move up", function () { store.reorder(layerId, "up"); });
+          var down = toolBtn("sketch-layers-down", icon("down"), "Move down", function () { store.reorder(layerId, "down"); });
+          var dup = toolBtn("sketch-layers-dup", icon("duplicate"), "Duplicate", function () { store.duplicate(layerId); });
+          var merge = toolBtn("sketch-layers-merge", icon("merge"), "Merge down", function () { store.mergeDown(layerId); });
+          var del = toolBtn("sketch-layers-delete", icon("delete"), "Delete layer", function () { store.delete(layerId); }, "sketch-layers-delete");
+          var renameBtn = el("button", "sketch-layers-btn sketch-layers-rename");
+          renameBtn.type = "button";
+          renameBtn.textContent = "Rename";
+          renameBtn.setAttribute("data-testid", "sketch-layers-rename");
+          renameBtn.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            promptRename(layerId);
+          });
+          tools.appendChild(renameBtn);
+          var lock = el("span", "sketch-layers-lock");
+          lock.innerHTML = icon("lock");
+          lock.title = "Base is locked at the bottom";
+          lock.setAttribute("data-testid", "sketch-layers-lock");
+          row.appendChild(tools);
+          return {
+            row: row, eye: eye, _eyeKey: null, nameBtn: nameBtn,
+            slider: slider, tools: tools, up: up, down: down, dup: dup,
+            merge: merge, del: del, renameBtn: renameBtn, lock: lock,
+          };
+        }
+
+        function updateRow(state, layer, idx, total) {
+          var nm = layer.name != null ? String(layer.name) : "layer";
+          var base = isBase(layer);
+          var isActive = layer.id === activeId;
+          state.row.className = "sketch-layers-row" + (isActive ? " is-active" : "") + (base ? " is-base" : "");
+          state.row.setAttribute("data-active", isActive ? "true" : "false");
+
+          // Eye (kept separate from the tools group): icon swaps only on
+          // visibility flips so the button node (and focus) is stable.
+          var vis = layer.visible !== false;
+          var eyeKey = vis ? "eye" : "hidden";
+          if (state._eyeKey !== eyeKey) {
+            state.eye.innerHTML = icon(eyeKey);
+            state._eyeKey = eyeKey;
+          }
+          var eyeLabel = (vis ? "Hide " : "Show ") + nm;
+          state.eye.setAttribute("aria-pressed", vis ? "true" : "false");
+          state.eye.setAttribute("aria-label", eyeLabel);
+          state.eye.title = eyeLabel;
+
+          // Name: real focusable control with button semantics — click (or
+          // Enter/Space) selects; selection announced via aria-pressed.
+          var nameLabel = nm + (base ? " (base)" : "");
+          if (state.nameBtn.textContent !== nameLabel) state.nameBtn.textContent = nameLabel;
+          state.nameBtn.setAttribute("aria-pressed", isActive ? "true" : "false");
+          state.nameBtn.setAttribute("aria-label", "Select " + nm);
+          state.nameBtn.title = base ? "Base image — locked, cannot delete" : "Select " + nm + " — double-click to rename";
+
+          // Opacity: never rewrite the value of the slider being dragged —
+          // the store echo of our own input event must not disturb the drag
+          // (or steal focus); update it once the drag moves elsewhere.
+          var targetVal = String(clamp01(layer.opacity == null ? 1 : layer.opacity));
+          try {
+            if (typeof document === "undefined" || document.activeElement !== state.slider) {
+              if (state.slider.value !== targetVal) state.slider.value = targetVal;
+            }
+          } catch (_e) {
+            try { state.slider.value = targetVal; } catch (_e2) { /* ignore */ }
+          }
+          var opLabel = "Opacity for " + nm;
+          state.slider.setAttribute("aria-label", opLabel);
+          state.slider.title = opLabel;
+
+          // Base shows the lock instead of the move/duplicate/merge/delete
+          // set; the Rename button stays for every row.
+          var actionBtns = [state.up, state.down, state.dup, state.merge, state.del];
+          for (var k = 0; k < actionBtns.length; k++) {
+            actionBtns[k].style.display = base ? "none" : "";
+          }
+          if (base) {
+            if (!state.lock.parentNode || state.lock.parentNode !== state.tools) state.tools.appendChild(state.lock);
+          } else if (state.lock.parentNode === state.tools) {
+            state.tools.removeChild(state.lock);
+          }
+
+          // Layer-specific accessible names + impossible actions disabled.
+          var upLabel = "Move up " + nm;
+          state.up.setAttribute("aria-label", upLabel);
+          state.up.title = upLabel;
+          state.up.disabled = base || idx >= total - 1; // top already
+          var downLabel = "Move down " + nm;
+          state.down.setAttribute("aria-label", downLabel);
+          state.down.title = downLabel;
+          state.down.disabled = base || idx <= 1; // above base: below is base
+          var dupLabel = "Duplicate " + nm;
+          state.dup.setAttribute("aria-label", dupLabel);
+          state.dup.title = dupLabel;
+          state.dup.disabled = !!base;
+          var mergeLabel = "Merge down " + nm;
+          state.merge.setAttribute("aria-label", mergeLabel);
+          state.merge.title = mergeLabel;
+          state.merge.disabled = base || idx <= 0; // base has nothing below
+          var delLabel = "Delete " + nm;
+          state.del.setAttribute("aria-label", delLabel);
+          state.del.title = delLabel;
+          state.del.disabled = !!base;
+          var renameLabel = "Rename " + nm;
+          state.renameBtn.setAttribute("aria-label", renameLabel);
+          state.renameBtn.title = renameLabel;
+        }
+
+        function sync() {
+          if (!list) return;
+          var savedTop = null;
+          try { savedTop = list.scrollTop; } catch (_e) { savedTop = null; }
+          var seen = {};
+          for (var a = layers.length - 1; a >= 0; a--) {
+            var layer = layers[a];
+            seen[layer.id] = true;
+            var state = rowById[layer.id] || (rowById[layer.id] = buildRow(layer.id));
+            updateRow(state, layer, a, layers.length);
+          }
+          for (var staleId in rowById) {
+            if (!seen[staleId]) {
+              try {
+                if (rowById[staleId].row.parentNode === list) list.removeChild(rowById[staleId].row);
+              } catch (_e2) { /* ignore */ }
+              delete rowById[staleId];
+            }
+          }
+          // Re-append in UI order (top-most first); appendChild moves live
+          // nodes without destroying them, so focus survives reorders.
+          for (var b = layers.length - 1; b >= 0; b--) {
+            list.appendChild(rowById[layers[b].id].row);
+          }
+          if (flatBtn) {
+            var single = layers.length <= 1;
+            flatBtn.disabled = single;
+            flatBtn.setAttribute("aria-disabled", single ? "true" : "false");
+            flatBtn.title = single ? "Nothing to flatten" : "Merge all layers onto base";
+          }
+          if (savedTop != null) {
+            try { list.scrollTop = savedTop; } catch (_e3) { /* ignore */ }
+          }
+        }
+
+        var head = el("div", "sketch-layers-head");
+        head.setAttribute("data-testid", "sketch-layers-head");
+        head.appendChild(el("span", "sketch-layers-title", "Layers"));
+        var addBtn = btn("+ Add", "Add layer", function () { store.add(); });
+        addBtn.classList.add("sketch-layers-add");
+        addBtn.setAttribute("data-testid", "sketch-layers-add");
+        head.appendChild(addBtn);
+        flatBtn = btn("Flatten", "Merge all layers onto base", function () { store.flatten(); });
+        flatBtn.classList.add("sketch-layers-flatten");
+        flatBtn.setAttribute("data-testid", "sketch-layers-flatten");
+        root.appendChild(head);
+
+        list = el("div", "sketch-layers-list");
+        list.setAttribute("data-testid", "sketch-layers-list");
+        root.appendChild(list);
+
+        var off = store.subscribe(sync);
+        sync();
         root._destroyLayersPanel = function () {
           try { off(); } catch (_e) { /* ignore */ }
           if (root.parentNode) root.parentNode.removeChild(root);

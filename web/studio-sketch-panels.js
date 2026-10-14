@@ -11,14 +11,13 @@
  *   TOOLS   — 4-column grid x 2 rows (8 tools), Lucide icons, selected state.
  *   BRUSH   — Size/Opacity/Hardness sliders only, tight rows; Hardness
  *             disabled (not hidden) where N/A so layout stays stable.
- *   COLOR   — SHORT by default: FG/BG swatches + swap/reset, picker + hex,
- *             one compact preset row, fill tolerance. Full HSV wheel + SV +
- *             HSL/RGB rows live behind a collapsed-by-default "Advanced Color"
- *             disclosure.
- *   CANVAS  — one mini-row: zoom out/label/in + Fit + 100%.
- *   HISTORY — compact backup undo/redo row (testids kept); the sticky action
- *             bar lives in the playground shelf footer (other lane), so a
- *             one-line helper labels these as backup to avoid confusion.
+   *   COLOR   — SHORT by default: drawing/secondary swatches + swap/reset,
+   *             picker + hex, one compact preset row, fill tolerance (visible
+   *             only when Fill is selected). Full HSV wheel + SV + HSL/RGB rows
+   *             live behind a collapsed-by-default "Advanced Color" disclosure.
+   *   CANVAS  — one mini-row: zoom out/label/in + Fit + 100%.
+   *   HISTORY — nodes kept hidden with testids intact for contract; the shelf
+   *             footer owns the single visible Undo/Redo/Clear/Save affordance.
  *
  * This module OWNS the tool bar, brush settings, color swatches and canvas
  * zoom/undo controls, and DRIVES the sketch engine exclusively through its
@@ -219,8 +218,10 @@
 
   /**
    * mountSketchPanels(container, engine, opts) -> { destroy(), syncFromEngine() }
-   * opts: { keyboard=true } — keyboard shortcuts attach to the container's
-   * owner document and ignore keystrokes inside editable fields.
+   * opts: { keyboard=true, mode='generate'|'edit' } — keyboard shortcuts
+   * attach to the container's owner document and ignore keystrokes inside
+   * editable fields; mode selects the mode-specific hint copy (default
+   * 'generate' when the caller passes nothing).
    */
   function mountSketchPanels(container, engine, opts) {
     var eng = engine || {};
@@ -281,6 +282,15 @@
     var root = doc.createElement("div");
     root.className = "sketch-panels sketch-panels--dark";
     root.setAttribute("data-sketch-panels", "1");
+
+    // P1-6 mode-specific hint copy. The shell mode is known by the caller;
+    // accept opts.mode when passed, else keep the generate text.
+    var shellMode = options.mode === "edit" ? "edit" : "generate";
+    var modeHint = el("div", "sketch-panels-help",
+      shellMode === "edit"
+        ? "Draw over the Source Image. Save Sketch applies the visible strokes."
+        : "Draw a sketch, then save it as the Source Image.");
+    root.appendChild(modeHint);
 
     function el(tag, cls, text) {
       var n = doc.createElement(tag);
@@ -456,6 +466,21 @@
 
     // ---- engine drivers (exact public setters only) ----
 
+    function syncToleranceVisibility() {
+      // P1-3: Fill tolerance is visible ONLY when Fill is selected. The
+      // input keeps its testid; hidden via attributes so contract text
+      // pins still match.
+      if (!tolRow) return;
+      var isFill = state.tool === "fill";
+      if (isFill) {
+        try { tolRow.removeAttribute("hidden"); } catch (_e) {}
+        tolRow.style.display = "";
+      } else {
+        try { tolRow.setAttribute("hidden", ""); } catch (_e) {}
+        tolRow.style.display = "none";
+      }
+    }
+
     function driveTool(id) {
       state.tool = id;
       if (typeof eng.setTool === "function") {
@@ -463,6 +488,7 @@
       }
       paintToolButtons();
       syncHardnessEnabled();
+      syncToleranceVisibility();
     }
 
     function driveSize(px) {
@@ -644,6 +670,31 @@
     var hardCtl = sliderRow("Hardness", 0, 100, 1, "sketch-brush-hardness", driveHardness);
     hardnessSlider = hardCtl.slider;
     hardnessVal = hardCtl.val;
+    // P1-3: Size+Opacity stay always visible; Hardness lives behind a
+    // collapsed "Brush options" disclosure (slider keeps its testid).
+    var brushToggle = doc.createElement("button");
+    brushToggle.type = "button";
+    brushToggle.className = "sketch-panels-advanced-toggle";
+    brushToggle.setAttribute("data-testid", "sketch-brush-options-toggle");
+    brushToggle.setAttribute("aria-expanded", "false");
+    brushToggle.setAttribute("aria-controls", "sketch-brush-options-body");
+    brushToggle.innerHTML = '<span class="arrow">\u25b6</span><span>Brush options</span>';
+    var brushBody = el("div", "sketch-panels-advanced-body");
+    brushBody.id = "sketch-brush-options-body";
+    brushBody.setAttribute("hidden", "");
+    try {
+      var hardRow = hardnessSlider && hardnessSlider.parentNode && hardnessSlider.parentNode.parentNode;
+      if (hardRow && hardRow.parentNode === setSec) setSec.removeChild(hardRow);
+      if (hardRow) brushBody.appendChild(hardRow);
+    } catch (_e) { /* keep hardness inline on failure */ }
+    brushToggle.addEventListener("click", function () {
+      var open = brushToggle.getAttribute("aria-expanded") === "true";
+      brushToggle.setAttribute("aria-expanded", open ? "false" : "true");
+      if (open) brushBody.setAttribute("hidden", "");
+      else brushBody.removeAttribute("hidden");
+    });
+    setSec.appendChild(brushToggle);
+    setSec.appendChild(brushBody);
 
     function syncHardnessEnabled() {
       if (!hardnessSlider) return;
@@ -658,27 +709,35 @@
     var swRow = el("div", "sketch-panels-swatches");
     fgSwatch = el("button", "sketch-panels-swatch is-fg", "FG");
     fgSwatch.type = "button";
-    fgSwatch.title = "Foreground color (click to edit)";
+    fgSwatch.title = "Drawing color (click to edit)";
     fgSwatch.setAttribute("data-testid", "sketch-fg-swatch");
-    fgSwatch.setAttribute("aria-label", "Foreground color (click to edit)");
+    fgSwatch.setAttribute("aria-label", "Drawing color (click to edit)");
     fgSwatch.addEventListener("click", function () {
       state.slot = "fg";
       paintSwatches();
+      try {
+        if (colorPicker && typeof colorPicker.showPicker === "function") colorPicker.showPicker();
+        else if (colorPicker && typeof colorPicker.click === "function") colorPicker.click();
+      } catch (_e) { /* picker open is best-effort */ }
     });
     bgSwatch = el("button", "sketch-panels-swatch is-bg", "BG");
     bgSwatch.type = "button";
-    bgSwatch.title = "Background color (click to edit)";
+    bgSwatch.title = "Secondary color (click to edit)";
     bgSwatch.setAttribute("data-testid", "sketch-bg-swatch");
-    bgSwatch.setAttribute("aria-label", "Background color (click to edit)");
+    bgSwatch.setAttribute("aria-label", "Secondary color (click to edit)");
     bgSwatch.addEventListener("click", function () {
       state.slot = "bg";
       paintSwatches();
+      try {
+        if (colorPicker && typeof colorPicker.showPicker === "function") colorPicker.showPicker();
+        else if (colorPicker && typeof colorPicker.click === "function") colorPicker.click();
+      } catch (_e) { /* picker open is best-effort */ }
     });
     var swapBtn = el("button", "sketch-panels-mini comfymodal-secondary-btn"); swapBtn.innerHTML = icon("swap");
     swapBtn.type = "button";
-    swapBtn.title = "Swap FG/BG (X)";
+    swapBtn.title = "Swap drawing/secondary colors (X)";
     swapBtn.setAttribute("data-testid", "sketch-swap-colors");
-    swapBtn.setAttribute("aria-label", "Swap FG/BG");
+    swapBtn.setAttribute("aria-label", "Swap drawing and secondary colors");
     swapBtn.addEventListener("click", swapFgBg);
     var resetBtn = el("button", "sketch-panels-mini comfymodal-secondary-btn"); resetBtn.innerHTML = icon("reset");
     resetBtn.type = "button";
@@ -746,6 +805,7 @@
     tolLab.appendChild(tolInput);
     tolRow.appendChild(tolLab);
     colSec.appendChild(tolRow);
+    syncToleranceVisibility();
 
     // Advanced color: full HSV wheel + SV square + HSL/RGB inputs, collapsed
     // by default so the COLOR section stays SHORT in the narrow rail.
@@ -848,10 +908,16 @@
     histRow.appendChild(undoBtn);
     histRow.appendChild(redoBtn);
     cvSec.appendChild(histRow);
-    // Backup label so this compact row is not confused with the shelf footer
-    // sticky action bar (other lane owns the primary undo/redo there).
-    var histHint = el("div", "sketch-panels-help", "Backup — main undo/redo live in the shelf footer.");
+    var histHint = el("div", "sketch-panels-help", "");
     cvSec.appendChild(histHint);
+    // P1-5: ONE persistent action affordance lives in the shelf footer
+    // (other lane). This backup row + helper stay in the DOM with testids
+    // and engine wiring intact, but hidden so they never render a second
+    // affordance.
+    try { histRow.setAttribute("hidden", ""); } catch (_e) {}
+    histRow.style.display = "none";
+    try { histHint.setAttribute("hidden", ""); } catch (_e) {}
+    histHint.style.display = "none";
 
     container.appendChild(root);
 
@@ -895,6 +961,7 @@
       paintZoom();
       paintUndoRedo();
       syncHardnessEnabled();
+      syncToleranceVisibility();
     }
 
     // Subscribe for active-state sync (exact hook only).
