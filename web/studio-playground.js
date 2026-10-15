@@ -15047,7 +15047,8 @@ function _populateShelfSection(section, state, context, actions) {
   // shelf host (populated by _rehomePaintControlsToShelf on full renders,
   // preserved live across shelf-only refreshes via _keepPaintHost).
   try {
-    if (activeToolOf(state) === "inpaint" || _isSelectOnI2I(state)) {
+    if (activeToolOf(state) === "inpaint" || _isSelectOnI2I(state)
+      || (activeModeOf(state) === "edit" && activeSubtoolOf(state) === "select")) {
       if (_keepPaintHost && _keepPaintHost.firstChild) {
         section.appendChild(_keepPaintHost);
       } else {
@@ -15066,7 +15067,8 @@ function _populateShelfSection(section, state, context, actions) {
   // keying as Select via _keepExpandHost). The canvas keeps the image +
   // direct overlays only.
   try {
-    if (activeToolOf(state) === "outpaint" || _isExpandOnI2I(state)) {
+    if (activeToolOf(state) === "outpaint" || _isExpandOnI2I(state)
+      || (activeModeOf(state) === "edit" && activeSubtoolOf(state) === "expand")) {
       if (_keepExpandHost && _keepExpandHost.firstChild) {
         section.appendChild(_keepExpandHost);
       } else {

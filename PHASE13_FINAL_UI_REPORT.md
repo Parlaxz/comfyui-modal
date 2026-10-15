@@ -95,9 +95,13 @@ favorites keyboard button.
    already unified within each surface.
 3. History status *tones* sharing (labels shared) — documented. Reason: tone vocabularies differ
    per surface; sharing forces false uniformity.
-4. Live-browser screenshots + fresh-instance end-to-end smoke (§22/§29) — NOT performed.
-   Reason: server processes hang unbounded in this environment; all lanes bounded no-server.
-   Verification stands on static evidence + unit suites. Re-run when a bounded harness exists.
+4. Live-browser screenshots: CAPTURED post-phase via the deterministic fake harness
+   (`docs/phase13/after-{generate,select,sketch,post,history,layout}.png`, 1440x900, zero console
+   errors). The dedicated Select/Inpaint path additionally exposed a residual host-gating gap during
+   capture (controls fell back to center); fixed by extending the shelf-host condition to
+   Edit→Select / Edit→Expand regardless of tool id, verified in the final `after-select.png`
+   (Select controls in shelf, canvas image-only). Fresh-instance end-to-end smoke remains deferred —
+   verification stands on fake-harness evidence + unit suites. Re-run live when a bounded live harness exists.
 5. Narrow-viewport (200–333px shelf) wrap checks — untested live. Reason: same as 4.
 6. Pre-existing stale specs left alone: compare `A —`/`B —` prefixes (`:135–136`), queue-manager
    seven-tool rail. Reason: pre-date Phase 13, unrelated to changed copy.

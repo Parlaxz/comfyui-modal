@@ -993,13 +993,13 @@ export function planPresetHydration(state, targetContext) {
     const mapping = ctx.guidanceMapping != null ? ctx.guidanceMapping : null;
     if (!mapping || !mapping.record) {
       local.push(
-        _issue("guidance", "guidance_mapping_missing", "Guidance is engaged in the preset but this model has no confirmed mapping — requested mode restored, run stays blocked. Confirm a mapping manually to re-engage.", true)
+        _issue("guidance", "guidance_mapping_missing", "Guidance is engaged in the saved workflow but this model has no confirmed mapping — requested mode restored, run stays blocked. Confirm a mapping manually to re-engage.", true)
       );
       return { value, issues: local };
     }
     if (mapping.stale === true) {
       local.push(
-        _issue("guidance", "guidance_mapping_stale", "Guidance mapping changed since the preset was saved (" + String(mapping.staleDetail || "dependency changed") + ") — requested mode restored, run stays blocked. Review and reconfirm manually.", true)
+        _issue("guidance", "guidance_mapping_stale", "Guidance mapping changed since the saved workflow was saved (" + String(mapping.staleDetail || "dependency changed") + ") — requested mode restored, run stays blocked. Review and reconfirm manually.", true)
       );
       return { value, issues: local };
     }
