@@ -6351,12 +6351,12 @@ const qc = /* @__PURE__ */ rs("studio-operations", () => {
     return e.value.get(d);
   }
   function r(d) {
-    const h = Date.now(), y = $h();
+    const h = Date.now(), y = $h(), v = d.status === "pending" ? "pending" : "running";
     return e.value.set(y, {
       id: y,
       kind: d.kind,
       label: d.label,
-      status: d.status ?? "running",
+      status: v,
       progress: d.progress,
       message: d.message,
       startedAt: h,

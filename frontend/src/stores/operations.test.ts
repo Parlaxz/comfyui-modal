@@ -131,7 +131,9 @@ describe("useOperationsStore", () => {
     const id = store.start({ kind: "deploy", label: "D", status: "pending" });
     // @ts-expect-error - start() creates active operations only; terminal
     // entry runs through finish()/fail()/cancel().
-    store.start({ kind: "deploy", label: "X", status: "canceled" });
+    const invalid = store.start({ kind: "deploy", label: "X", status: "canceled" });
+    expect(store.get(invalid)!.status).toBe("running");
+    expect(store.get(invalid)!.finishedAt).toBeUndefined();
     // @ts-expect-error - patch() moves between active states only, never
     // into terminal state.
     store.patch(id, { status: "completed" });

@@ -140,11 +140,13 @@ export const useOperationsStore = defineStore("studio-operations", () => {
   function start(input: StartOperationInput): string {
     const now = Date.now();
     const id = newId();
+    const status: ActiveOperationStatus =
+      input.status === "pending" ? "pending" : "running";
     byId.value.set(id, {
       id,
       kind: input.kind,
       label: input.label,
-      status: input.status ?? "running",
+      status,
       progress: input.progress,
       message: input.message,
       startedAt: now,
