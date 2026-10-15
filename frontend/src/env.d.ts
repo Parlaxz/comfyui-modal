@@ -10,4 +10,5 @@ interface Window {
   _comfyModalOutputOptions?: Record<string, unknown>;
   __comfymodalOpenVueStudio?: (page?: string) => Promise<unknown>;
   __comfymodalCloseVueStudio?: () => void;
+  __comfymodalSetGraphInteractionEnabled?: (enabled: boolean) => void;
 }

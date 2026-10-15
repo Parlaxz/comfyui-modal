@@ -277,6 +277,7 @@ export async function openStudioVue(page) {
   // of any product contract.
   try {
     window.__comfymodalVueRouter = handle.router;
+    window.__comfymodalSetGraphInteractionEnabled = setGraphInteractionEnabled;
   } catch (_) {}
   return handle;
 }
