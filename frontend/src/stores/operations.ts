@@ -26,8 +26,11 @@
 // - Do NOT persist operation state (it is transient by design).
 //
 // Statuses are intentionally small: pending | running | completed |
-// failed | canceled. There is no transition engine — callers own their
-// lifecycle and simply report it via start/patch/finish/fail/cancel.
+// failed | canceled. There is no transition engine — but there IS one
+// canonical path into terminal state: finish() → completed, fail() →
+// failed, cancel() → canceled. start() creates active operations only and
+// patch() moves between active states only; neither accepts a terminal
+// status (enforced by ActiveOperationStatus, backed by a runtime guard).
 
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
@@ -50,6 +53,14 @@ export type OperationStatus =
   | "failed"
   | "canceled";
 
+/**
+ * The only statuses an operation may carry while active. Terminal statuses
+ * have exactly one canonical path each — finish()/fail()/cancel() — so
+ * they are not expressible here. Enforced primarily by TypeScript; the
+ * patch() runtime guard below backs it for plain-JS callers.
+ */
+export type ActiveOperationStatus = "pending" | "running";
+
 export interface OperationRecord {
   id: string;
   kind: OperationKind;
@@ -65,15 +76,20 @@ export interface OperationRecord {
 export interface StartOperationInput {
   kind: OperationKind;
   label: string;
-  status?: OperationStatus;
+  status?: ActiveOperationStatus;
   progress?: number;
   message?: string;
   workspaceId?: string;
 }
 
-export type PatchOperationInput = Partial<
-  Pick<OperationRecord, "kind" | "label" | "status" | "progress" | "message" | "workspaceId">
->;
+export interface PatchOperationInput {
+  kind?: OperationKind;
+  label?: string;
+  status?: ActiveOperationStatus;
+  progress?: number;
+  message?: string;
+  workspaceId?: string;
+}
 
 // Terminal statuses are final: completed | failed | canceled.
 // This is a single freeze guard, not a transition engine. It preserves one
@@ -82,10 +98,10 @@ export type PatchOperationInput = Partial<
 //   terminal status ⟺ finishedAt is set, and neither ever changes again.
 //
 // Without it, a late poll/fail call could regress a finished operation
-// (failed → completed), or a patch could resurrect one (completed →
-// running) with no finishedAt. First terminal wins; presentation fields
+// (failed → completed). First terminal wins; presentation fields
 // (message/progress) may still be patched afterwards, e.g. a deploy tail
-// arriving after the terminal poll.
+// arriving after the terminal poll. Status itself can only enter terminal
+// through finish()/fail()/cancel().
 const TERMINAL_STATUSES: ReadonlySet<OperationStatus> = new Set([
   "completed",
   "failed",
@@ -124,17 +140,15 @@ export const useOperationsStore = defineStore("studio-operations", () => {
   function start(input: StartOperationInput): string {
     const now = Date.now();
     const id = newId();
-    const status = input.status ?? "running";
     byId.value.set(id, {
       id,
       kind: input.kind,
       label: input.label,
-      status,
+      status: input.status ?? "running",
       progress: input.progress,
       message: input.message,
       startedAt: now,
-      // A record born terminal is already finished.
-      finishedAt: isTerminal(status) ? now : undefined,
+      finishedAt: undefined,
       workspaceId: input.workspaceId,
     });
     return id;
@@ -143,11 +157,14 @@ export const useOperationsStore = defineStore("studio-operations", () => {
   function patch(id: string, input: PatchOperationInput): void {
     const existing = byId.value.get(id);
     if (!existing) return;
-    const next = { ...existing, ...input };
-    // A terminal record keeps its status (and finishedAt) forever;
-    // presentation fields such as message/progress may still update.
-    if (isTerminal(existing.status)) {
-      next.status = existing.status;
+    const { status, ...rest } = input;
+    const next = { ...existing, ...rest };
+    // Status moves only between active states, and never out of terminal:
+    // terminal entry has one canonical path each (finish/fail/cancel), so
+    // a terminal value here is dropped, not applied. (The type system
+    // forbids it at compile time; this guards plain-JS callers.)
+    if (!isTerminal(existing.status) && status !== undefined && !isTerminal(status)) {
+      next.status = status;
     }
     byId.value.set(id, next);
   }

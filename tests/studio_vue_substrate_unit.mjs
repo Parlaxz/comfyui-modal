@@ -169,8 +169,20 @@ for (const kind of [
 ]) {
   assert.ok(operationsSrc.includes(`"${kind}"`), `OperationKind includes ${kind}`);
 }
+assert.ok(
+  operationsSrc.includes("type ActiveOperationStatus"),
+  "non-terminal status type exists",
+);
+assert.ok(
+  operationsSrc.includes("status?: ActiveOperationStatus"),
+  "start/patch accept active statuses only",
+);
 const latestSrc = readFile(path.join(SRC, "async", "latest.ts"));
 assert.ok(latestSrc.includes("run<T>(load"), "latest task takes the load per run");
+assert.ok(
+  latestSrc.includes("resolves the in-flight run stale"),
+  "explicit abort resolves stale, never rejects",
+);
 const pollingSrc = readFile(path.join(SRC, "async", "polling.ts"));
 assert.ok(pollingSrc.includes("pollUntil"), "polling primitive is pollUntil");
 assert.ok(pollingSrc.includes("done:"), "pollUntil uses the done predicate");

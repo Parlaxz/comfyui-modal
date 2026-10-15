@@ -44,18 +44,14 @@ async function applyFocus() {
   history.setFocus(id);
   // Same-page focus change: the adapter replaces (not pushes) history.
   await router.push({ name: "history", query: { focus: id } });
-  try {
-    const outcome = await detailTask.run((signal) => fakeDetailRead(id, signal));
-    if (outcome.stale) {
-      staleDrops.value += 1;
-      return;
-    }
-    committed.value = outcome.value;
-  } catch {
-    // Aborted superseded reads surface here only if the abort path wins
-    // the race before the generation check; count them as drops too.
+  // No AbortError catch needed: superseded or aborted reads resolve
+  // stale; only a genuine load failure would throw.
+  const outcome = await detailTask.run((signal) => fakeDetailRead(id, signal));
+  if (outcome.stale) {
     staleDrops.value += 1;
+    return;
   }
+  committed.value = outcome.value;
 }
 </script>
 

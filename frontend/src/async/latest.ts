@@ -5,19 +5,30 @@
 // AbortSignal fires (so fetch/XHR can cancel physically) AND its result is
 // marked stale even when physical cancellation is impossible.
 //
-// Three sharply distinct outcomes, never conflated:
-// - `{ stale: false, value }` — the newest read; commit it.
-// - `{ stale: true }`         — superseded by a newer read; ignore silently.
-//                               Never throws, so fire-and-forget reads are safe.
-// - throw                     — the CURRENT read failed, or the owner
-//                               explicitly aborted it via `abort()`.
-//                               Catch `AbortError` (by name) for explicit
-//                               cancellation; anything else is a real failure.
+// In this primitive, stale means exactly one thing:
 //
-// Explicit `abort()` always settles the in-flight run (rejecting with the
-// abort reason) even when `load` ignores the signal — it never hangs and
-// never resolves stale, because an explicitly aborted newest read was NOT
-// superseded by anything. Supersession always resolves stale, never throws.
+//   "this result must not commit"
+//
+// It is intentionally broader than "a newer request superseded this one."
+// Explicit owner cancellation (selection teardown, component teardown,
+// route change) is normal control flow for selection-bound reads, so an
+// explicitly aborted run also resolves stale — callers never need
+// repetitive AbortError catch blocks just to ignore an intentionally
+// canceled read. That guard-removal is the point of this module.
+//
+// Outcomes:
+// - `{ stale: false, value }` — the newest read; commit it.
+// - `{ stale: true }`         — superseded by a newer read, or explicitly
+//                               aborted by the owner. Ignore silently; never
+//                               throws, so fire-and-forget reads are safe.
+// - throw                     — a GENUINE failure from the current,
+//                               non-aborted invocation. Distinguishable from
+//                               staleness; the caller owns it.
+//
+// Explicit `abort()` always settles the in-flight run promptly as stale,
+// even when `load` ignores the signal — it never hangs. The optional
+// reason is passed into the AbortController for transport/debug purposes
+// only; it never surfaces to the caller.
 //
 // Intended future uses: selected workflow/version detail, History
 // focus/query, inventory refresh, source-image ingest ownership.
@@ -26,22 +37,17 @@
 // complete; latest-wins is for selection-bound reads).
 //
 // Deliberately NOT: retried, scheduled, prioritized, pooled,
-// middleware-wrapped, or mutation-aware. If you need those, you need a
-// different module.
+// middleware-wrapped, mutation-aware, or a generic cancellation/error
+// framework. If you need those, you need a different module.
 //
-// Example:
+// Example — no AbortError catch required:
 // ```ts
 // const task = createLatestTask()
-// try {
-//   const result = await task.run((signal) =>
-//     workflowsApi.getVersion(versionId, { signal }),
-//   )
-//   if (result.stale) return
-//   state.version = result.value
-// } catch (err) {
-//   if (err instanceof DOMException && err.name === "AbortError") return
-//   throw err
-// }
+// const result = await task.run((signal) =>
+//   workflowsApi.getVersion(versionId, { signal }),
+// )
+// if (result.stale) return
+// state.version = result.value
 // ```
 
 export type LatestOutcome<T> =
@@ -55,10 +61,10 @@ export interface LatestTask {
    */
   run<T>(load: (signal: AbortSignal) => Promise<T>): Promise<LatestOutcome<T>>;
   /**
-   * Abort the in-flight read, if any. The aborted run REJECTS with the
-   * abort reason (an `AbortError` DOMException by default) — it does not
-   * resolve stale, and it settles even if `load` ignores the signal.
-   * No-op when nothing is in flight.
+   * Abort the in-flight read, if any: aborts the underlying AbortSignal
+   * (passing `reason` through for transport/debug) and settles the run
+   * promptly as `{ stale: true }`, even if `load` ignores the signal.
+   * Never throws, never surfaces the reason. No-op when nothing runs.
    */
   abort: (reason?: unknown) => void;
   /** True while a read started by this task has not settled. */
@@ -68,7 +74,6 @@ export interface LatestTask {
 interface InFlight {
   controller: AbortController;
   superseded: boolean;
-  onAbort: () => void;
 }
 
 /**
@@ -80,10 +85,11 @@ interface InFlight {
  *   for the current result, even if its promise resolves normally, and it
  *   never throws.
  * - The superseded invocation's AbortSignal is aborted when supported.
- * - A failure from the CURRENT invocation rejects (distinguishable from
- *   staleness). A failure from a SUPERSEDED invocation resolves stale.
- * - Explicit `abort()` rejects the in-flight run with the abort reason,
- *   deterministically, whether or not `load` cooperates.
+ * - Explicit `abort()` resolves the in-flight run stale, promptly and
+ *   unconditionally — the abort reason stays inside the AbortController.
+ * - A genuine failure from the CURRENT, non-aborted invocation rejects
+ *   (distinguishable from staleness). A failure from a superseded or
+ *   aborted invocation resolves stale.
  */
 export function createLatestTask(): LatestTask {
   let generation = 0;
@@ -101,40 +107,36 @@ export function createLatestTask(): LatestTask {
         prev.controller.abort();
       }
       const controller = new AbortController();
-      const record: InFlight = {
-        controller,
-        superseded: false,
-        onAbort: () => {},
-      };
+      const record: InFlight = { controller, superseded: false };
       // Settles the race below when THIS invocation's signal fires, no
-      // matter what `load` does with (or without) the signal.
-      let rejectOnAbort!: (reason: unknown) => void;
-      const aborted = new Promise<never>((_resolve, reject) => {
-        rejectOnAbort = reject;
+      // matter what `load` does with (or without) the signal. Supersession
+      // and explicit abort take the same stale path by design.
+      let settleStale!: () => void;
+      const aborted = new Promise<LatestOutcome<T>>((resolve) => {
+        settleStale = () => resolve({ stale: true });
       });
-      // Prevent an unhandled rejection when `load` settles first: the race
-      // attaches handlers to both branches, and this no-op catch covers the
-      // window before the race subscribes... (race subscribes synchronously,
-      // so this is strictly belt-and-braces for abort() racing settle).
-      aborted.catch(() => {});
-      record.onAbort = () => {
-        rejectOnAbort(controller.signal.reason);
-      };
-      controller.signal.addEventListener("abort", record.onAbort, { once: true });
+      const onAbort = () => settleStale();
+      controller.signal.addEventListener("abort", onAbort, { once: true });
       inFlight = record;
       const finish = () => {
-        controller.signal.removeEventListener("abort", record.onAbort);
+        controller.signal.removeEventListener("abort", onAbort);
         if (inFlight === record) inFlight = null;
       };
       return (async (): Promise<LatestOutcome<T>> => {
         try {
-          const value = await Promise.race([load(controller.signal), aborted]);
-          if (mine !== generation || record.superseded || controller.signal.aborted) {
+          return await Promise.race([
+            load(controller.signal).then((value): LatestOutcome<T> => {
+              if (mine !== generation || record.superseded || controller.signal.aborted) {
+                return { stale: true };
+              }
+              return { stale: false, value };
+            }),
+            aborted,
+          ]);
+        } catch (err) {
+          if (record.superseded || mine !== generation || controller.signal.aborted) {
             return { stale: true };
           }
-          return { stale: false, value };
-        } catch (err) {
-          if (record.superseded || mine !== generation) return { stale: true };
           throw err;
         } finally {
           finish();
@@ -143,7 +145,8 @@ export function createLatestTask(): LatestTask {
     },
     abort: (reason?: unknown) => {
       // No-op when nothing is in flight. abort(undefined) keeps the
-      // default AbortError reason.
+      // default AbortError reason on the signal for transport/debug; the
+      // LatestTask outcome is stale either way.
       inFlight?.controller.abort(reason);
     },
     get pending() {

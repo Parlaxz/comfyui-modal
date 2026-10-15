@@ -1,6 +1,7 @@
 // operations store — focused unit tests.
-// Proves: start/patch/finish/fail/cancel/remove, operation isolation,
-// and no domain transition logic (the registry records; callers own lifecycle).
+// Proves: start/patch/finish/fail/cancel/remove, operation isolation, one
+// canonical terminal path (finish/fail/cancel only), and no domain
+// transition logic (the registry records; callers own lifecycle).
 import { beforeEach, describe, expect, it } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useOperationsStore } from "./operations";
@@ -73,14 +74,23 @@ describe("useOperationsStore", () => {
     expect(store.get(keep)!.label).toBe("keep");
   });
 
-  it("records caller-declared statuses without a transition engine", () => {
+  it("optional pending start stays active with no finishedAt", () => {
     const store = useOperationsStore();
-    // A caller may report pending first, then running — or jump straight to
-    // completed. The registry records; it never vetoes domain flow.
+    const id = store.start({ kind: "deploy", label: "Queued", status: "pending" });
+    const op = store.get(id)!;
+    expect(op.status).toBe("pending");
+    expect(op.finishedAt).toBeUndefined();
+    expect(store.active.map((o) => o.id)).toContain(id);
+  });
+
+  it("patch moves pending <-> running, never into terminal state", () => {
+    const store = useOperationsStore();
     const id = store.start({ kind: "workflow-import", label: "X", status: "pending" });
-    store.patch(id, { status: "completed" });
-    expect(store.get(id)!.status).toBe("completed");
+    store.patch(id, { status: "running" });
+    expect(store.get(id)!.status).toBe("running");
     expect(store.get(id)!.finishedAt).toBeUndefined();
+    store.patch(id, { status: "pending" });
+    expect(store.get(id)!.status).toBe("pending");
   });
 
   it("freezes terminal records: first terminal wins, never regresses", () => {
@@ -116,12 +126,20 @@ describe("useOperationsStore", () => {
     expect(op.progress).toBe(0.5);
   });
 
-  it("starting with a terminal status records finishedAt immediately", () => {
+  it("types reject terminal statuses on start and patch", () => {
     const store = useOperationsStore();
-    const id = store.start({ kind: "other", label: "O", status: "completed" });
-    const op = store.get(id)!;
-    expect(op.status).toBe("completed");
-    expect(typeof op.finishedAt).toBe("number");
-    expect(store.active.map((o) => o.id)).not.toContain(id);
+    const id = store.start({ kind: "deploy", label: "D", status: "pending" });
+    // @ts-expect-error - start() creates active operations only; terminal
+    // entry runs through finish()/fail()/cancel().
+    store.start({ kind: "deploy", label: "X", status: "canceled" });
+    // @ts-expect-error - patch() moves between active states only, never
+    // into terminal state.
+    store.patch(id, { status: "completed" });
+    // @ts-expect-error - same for the remaining terminal values.
+    store.patch(id, { status: "failed" });
+    // The rejected calls still execute at runtime (types are erased), where
+    // patch() drops terminal values; the valid record is unaffected.
+    expect(store.get(id)!.status).toBe("pending");
+    expect(store.get(id)!.finishedAt).toBeUndefined();
   });
 });
