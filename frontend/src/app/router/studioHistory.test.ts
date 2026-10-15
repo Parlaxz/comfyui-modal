@@ -13,26 +13,50 @@ function fakeWindow(hash = ""): StudioWindow & {
   firePopState: () => void;
   pushes: string[];
   replaces: string[];
+  goes: number[];
 } {
   const listeners = new Map<string, Set<() => void>>();
+  const entries = [hash];
+  let index = 0;
+  const hashOf = (url: string): string => {
+    const hashIndex = url.indexOf("#");
+    return hashIndex === -1 ? "" : url.slice(hashIndex);
+  };
+  const fire = (type: string) => {
+    listeners.get(type)?.forEach((fn) => fn());
+  };
   const win: StudioWindow & {
     firePopState: () => void;
     pushes: string[];
     replaces: string[];
+    goes: number[];
   } = {
     location: { hash, pathname: "/", search: "" },
     pushes: [],
     replaces: [],
+    goes: [],
     history: {
       pushState: (_d, _t, url) => {
         win.pushes.push(String(url));
-        const hashIndex = String(url).indexOf("#");
-        win.location.hash = hashIndex === -1 ? "" : String(url).slice(hashIndex);
+        entries.splice(index + 1);
+        entries.push(hashOf(String(url)));
+        index = entries.length - 1;
+        win.location.hash = entries[index];
       },
       replaceState: (_d, _t, url) => {
         win.replaces.push(String(url));
-        const hashIndex = String(url).indexOf("#");
-        win.location.hash = hashIndex === -1 ? "" : String(url).slice(hashIndex);
+        entries[index] = hashOf(String(url));
+        win.location.hash = entries[index];
+      },
+      go: (delta: number) => {
+        win.goes.push(delta);
+        const next = Math.min(entries.length - 1, Math.max(0, index + delta));
+        // Like a real session history, clamped-out-of-range traversal moves
+        // nowhere and fires no popstate.
+        if (next === index) return;
+        index = next;
+        win.location.hash = entries[index];
+        fire("popstate");
       },
     },
     addEventListener: (type, fn) => {
@@ -43,7 +67,7 @@ function fakeWindow(hash = ""): StudioWindow & {
       listeners.get(type)?.delete(fn);
     },
     firePopState: () => {
-      listeners.get("popstate")?.forEach((fn) => fn());
+      fire("popstate");
     },
   };
   return win;
@@ -135,6 +159,76 @@ describe("createStudioHashHistory", () => {
       expect(win.replaces).toEqual(["/#comfymodal=workflows"]);
       history.destroy();
     }
+  });
+
+  it("go() traverses the session stack and notifies like Back/Forward", () => {
+    const win = fakeWindow("#comfymodal=playground");
+    const history = createStudioHashHistory(win);
+    const seen: string[] = [];
+    const stop = history.listen((to) => seen.push(to));
+    history.push("/history");
+    history.push("/workflows");
+    expect(history.location).toBe("/workflows");
+    history.go(-1);
+    expect(win.goes).toEqual([-1]);
+    expect(history.location).toBe("/history");
+    expect(win.location.hash).toBe("#comfymodal=history");
+    history.go(-1);
+    expect(history.location).toBe("/playground");
+    // Clamped at the bottom: no traversal, no notification, no crash.
+    history.go(-5);
+    expect(history.location).toBe("/playground");
+    history.go(2);
+    expect(history.location).toBe("/workflows");
+    expect(seen).toEqual(["/history", "/playground", "/workflows"]);
+    stop();
+    history.destroy();
+  });
+
+  it("router.back()/forward()/go() funnel through the Studio history", async () => {
+    // router.back()/forward()/go() all funnel into history.go(delta)
+    // (verified against the installed vue-router build). Previously our
+    // go() was a no-op, so they silently did nothing. A spy proves the
+    // funnel; traversal itself is covered by the go() test above and by
+    // live Back/Forward browser validation.
+    const { createStudioRouter } = await import("./index");
+    const win = fakeWindow("");
+    const router = createStudioRouter({ win });
+    const calls: number[] = [];
+    const history = router.options.history;
+    const origGo = history.go.bind(history);
+    history.go = (delta: number) => {
+      calls.push(delta);
+      origGo(delta);
+    };
+    router.back();
+    router.forward();
+    router.go(-2);
+    expect(calls).toEqual([-1, 1, -2]);
+    // The funnelled traversals moved the fake session stack for real:
+    // "" -> back() clamps (no-op) -> forward() clamps (no-op) -> go(-2)
+    // clamps (no-op). A genuine two-entry walk is covered below.
+    expect(win.goes).toEqual([-1, 1, -2]);
+  });
+
+  it("a genuine two-entry walk traverses through router.back()/forward()", async () => {
+    const { createStudioRouter } = await import("./index");
+    const win = fakeWindow("#comfymodal=history");
+    const router = createStudioRouter({ win });
+    // Drive the underlying history directly (the router is not installed
+    // on an app in this environment; installation only adds rendering).
+    // listen() wires the win-level popstate exactly as install would.
+    const history = router.options.history;
+    const stop = history.listen(() => {});
+    history.push("/workflows");
+    expect(win.location.hash).toBe("#comfymodal=workflows");
+    history.go(-1);
+    expect(history.location).toBe("/history");
+    expect(win.location.hash).toBe("#comfymodal=history");
+    history.go(1);
+    expect(history.location).toBe("/workflows");
+    stop();
+    history.destroy();
   });
 
   it("listens and cleans up exactly once", () => {

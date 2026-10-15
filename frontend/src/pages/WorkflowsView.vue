@@ -3,8 +3,9 @@ import { ref } from "vue";
 import { Layers } from "@lucide/vue";
 import { useWorkflowsStore } from "../stores/workflows";
 import { pollUntil } from "../async/polling";
-import { studioButtonClass } from "../components/StudioButton";
-import { studioCardClass, studioPageClass } from "../components/studioPanels";
+import StudioButton from "../components/StudioButton.vue";
+import StudioCard from "../components/StudioCard.vue";
+import { studioPageClass } from "../components/studioPanels";
 
 // Phase-1 placeholder: the real Workflows port comes later. This view
 // proves the workflows store slice and gives the shared `poll` primitive
@@ -34,7 +35,7 @@ async function runLocalPoll() {
 
 <template>
   <section :class="studioPageClass()" data-testid="vue-page-workflows">
-    <div :class="studioCardClass('cmst:p-4')">
+    <StudioCard class="cmst:p-4">
       <h2 class="cmst:text-lg cmst:font-semibold cmst:flex cmst:items-center cmst:gap-2">
         <Layers class="cmst:size-5" aria-hidden="true" />
         Workflows (Phase-1 proof)
@@ -50,37 +51,37 @@ async function runLocalPoll() {
           placeholder="Workflow id"
           class="cmst:h-9 cmst:rounded-md cmst:border cmst:border-solid cmst:border-cmst-border cmst:bg-transparent cmst:px-3 cmst:text-sm"
         />
-        <button
-          type="button"
-          :class="studioButtonClass('secondary', 'sm')"
+        <StudioButton
+          variant="secondary"
+          size="sm"
           @click="workflows.select(selectedInput.trim() || null)"
         >
           Select
-        </button>
+        </StudioButton>
       </div>
       <p class="cmst:text-sm cmst:mt-2">
         Store selection: <strong>{{ workflows.selectedId ?? "none" }}</strong>
       </p>
-    </div>
+    </StudioCard>
 
-    <div :class="studioCardClass('cmst:p-4')">
+    <StudioCard class="cmst:p-4">
       <h3 class="cmst:text-sm cmst:font-semibold">polling demo (local only)</h3>
       <p class="cmst:text-sm cmst:opacity-80">
         Repeats a local status check until the completion predicate holds.
       </p>
       <div class="cmst:flex cmst:items-center cmst:gap-3 cmst:mt-3">
-        <button
-          type="button"
-          :class="studioButtonClass('outline', 'sm')"
+        <StudioButton
+          variant="outline"
+          size="sm"
           data-testid="vue-poll-run"
           @click="runLocalPoll"
         >
           Start local poll
-        </button>
+        </StudioButton>
         <span class="cmst:text-sm" data-testid="vue-poll-status">
           {{ pollStatus }} ({{ pollAttempts }} attempts)
         </span>
       </div>
-    </div>
+    </StudioCard>
   </section>
 </template>

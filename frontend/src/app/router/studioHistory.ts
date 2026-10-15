@@ -29,6 +29,8 @@ export interface StudioWindow {
   history: {
     pushState(data: unknown, title: string, url?: string | URL | null): void;
     replaceState(data: unknown, title: string, url?: string | URL | null): void;
+    /** Session-history traversal (back/forward/go all funnel through here). */
+    go(delta: number): void;
   };
   addEventListener(type: string, listener: () => void): void;
   removeEventListener(type: string, listener: () => void): void;
@@ -172,9 +174,15 @@ export function createStudioHashHistory(
       if (action === "push") writeHashRoute(win, target, "push");
       else if (action === "replace") writeHashRoute(win, target, "replace");
     },
-    go: () => {
-      // Back/Forward traversal belongs to the browser (popstate); the
-      // router never drives it programmatically in Studio.
+    go: (delta) => {
+      // Programmatic traversal (router.back()/forward()/go()) delegates to
+      // the browser session history. The resulting popstate flows through
+      // onPopState exactly like a Back/Forward button press, so the router
+      // updates from the same single code path. vue-router consumes the
+      // triggerListeners flag itself (pausing its own listeners); the
+      // native popstate cannot and must not be suppressed here, or router
+      // state would diverge from the URL.
+      win.history.go(delta);
     },
     listen: (callback) => {
       const wrapped = (to: string, from: string) => {

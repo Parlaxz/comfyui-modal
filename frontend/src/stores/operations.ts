@@ -75,6 +75,27 @@ export type PatchOperationInput = Partial<
   Pick<OperationRecord, "kind" | "label" | "status" | "progress" | "message" | "workspaceId">
 >;
 
+// Terminal statuses are final: completed | failed | canceled.
+// This is a single freeze guard, not a transition engine. It preserves one
+// invariant the whole UI can rely on:
+//
+//   terminal status ⟺ finishedAt is set, and neither ever changes again.
+//
+// Without it, a late poll/fail call could regress a finished operation
+// (failed → completed), or a patch could resurrect one (completed →
+// running) with no finishedAt. First terminal wins; presentation fields
+// (message/progress) may still be patched afterwards, e.g. a deploy tail
+// arriving after the terminal poll.
+const TERMINAL_STATUSES: ReadonlySet<OperationStatus> = new Set([
+  "completed",
+  "failed",
+  "canceled",
+]);
+
+function isTerminal(status: OperationStatus): boolean {
+  return TERMINAL_STATUSES.has(status);
+}
+
 let nextId = 0;
 
 function newId(): string {
@@ -103,15 +124,17 @@ export const useOperationsStore = defineStore("studio-operations", () => {
   function start(input: StartOperationInput): string {
     const now = Date.now();
     const id = newId();
+    const status = input.status ?? "running";
     byId.value.set(id, {
       id,
       kind: input.kind,
       label: input.label,
-      status: input.status ?? "running",
+      status,
       progress: input.progress,
       message: input.message,
       startedAt: now,
-      finishedAt: undefined,
+      // A record born terminal is already finished.
+      finishedAt: isTerminal(status) ? now : undefined,
       workspaceId: input.workspaceId,
     });
     return id;
@@ -120,12 +143,20 @@ export const useOperationsStore = defineStore("studio-operations", () => {
   function patch(id: string, input: PatchOperationInput): void {
     const existing = byId.value.get(id);
     if (!existing) return;
-    byId.value.set(id, { ...existing, ...input });
+    const next = { ...existing, ...input };
+    // A terminal record keeps its status (and finishedAt) forever;
+    // presentation fields such as message/progress may still update.
+    if (isTerminal(existing.status)) {
+      next.status = existing.status;
+    }
+    byId.value.set(id, next);
   }
 
   function settle(id: string, status: OperationStatus, message?: string): void {
     const existing = byId.value.get(id);
-    if (!existing) return;
+    // Unknown ids and already-terminal records are no-ops: first terminal
+    // wins, so late duplicate polls cannot regress finished work.
+    if (!existing || isTerminal(existing.status)) return;
     byId.value.set(id, {
       ...existing,
       status,

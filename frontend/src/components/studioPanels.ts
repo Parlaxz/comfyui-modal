@@ -1,15 +1,7 @@
-// StudioCard + PageShell — minimal shared panel primitives for the Phase-1
-// proof views. Deliberately plain Vue renderless-class helpers (not a
-// component framework): one panel look, one page layout, nothing more.
+// Studio page shell — the one shared page-layout helper for the Phase-1
+// proof views (vertical stack with breathing room). Card panels render
+// through the canonical `./StudioCard.vue` SFC, not through class helpers.
 import { cn } from "./cn";
-
-export function studioCardClass(extra?: string): string {
-  return cn(
-    "cmst:rounded-lg cmst:border cmst:border-solid cmst:border-cmst-border " +
-      "cmst:bg-cmst-surface cmst:text-cmst-fg cmst:shadow-sm",
-    extra,
-  );
-}
 
 export function studioPageClass(extra?: string): string {
   return cn(

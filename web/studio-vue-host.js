@@ -48,20 +48,20 @@ let _closeBtn = null;
 // opens over Studio while the ComfyUI graph must stay interactive; this
 // capability already exists at the host boundary:
 //
-//   setGraphInteractionEnabled(false) → background interactive (wizard open)
-//   setGraphInteractionEnabled(true)  → background inert (normal Studio)
+//   setGraphInteractionEnabled(true)  → graph interactive (wizard open):
+//                                        background NOT inert, modal NOT aria-modal
+//   setGraphInteractionEnabled(false) → normal Studio modal:
+//                                        background inert, modal aria-modal="true"
 //
 // It mirrors the settled `_syncModalWizardState` invariant in
 // modal-testing.js without coupling to it.
 export function setGraphInteractionEnabled(enabled) {
   _inertBackground(!enabled);
-  if (_root) {
-    const modal = _root.querySelector("[data-comfymodal-studio-modal]");
-    if (modal) {
-      if (enabled) modal.setAttribute("aria-modal", "true");
-      else modal.removeAttribute("aria-modal");
-    }
-  }
+  if (!_root) return;
+  const modal = _root.querySelector("[data-comfymodal-studio-modal]");
+  if (!modal) return;
+  if (enabled) modal.removeAttribute("aria-modal");
+  else modal.setAttribute("aria-modal", "true");
 }
 
 function _inertBackground(inert) {
@@ -158,11 +158,15 @@ function _ensureRoot() {
   _root.addEventListener("click", _backdropListener);
 
   if (!_wizardListenersRegistered) {
+    // Wizard-opening hands graph interaction BACK to ComfyUI (background
+    // must accept pointer input, Studio modal must not claim aria-modal);
+    // wizard-closed restores the normal inert modal. Same invariant as
+    // `_syncModalWizardState` in modal-testing.js.
     document.addEventListener("comfymodal:wizard-opening", () => {
-      setGraphInteractionEnabled(false);
+      setGraphInteractionEnabled(true);
     });
     document.addEventListener("comfymodal:wizard-closed", () => {
-      if (_isOpen) setGraphInteractionEnabled(true);
+      if (_isOpen) setGraphInteractionEnabled(false);
     });
     _wizardListenersRegistered = true;
   }
@@ -268,6 +272,12 @@ export async function openStudioVue(page) {
   }
 
   if (_closeBtn) _closeBtn.focus();
+  // Dev/test inspection handle: exposes the Studio router so browser
+  // validation can drive router.back()/forward()/go() directly. Not part
+  // of any product contract.
+  try {
+    window.__comfymodalVueRouter = handle.router;
+  } catch (_) {}
   return handle;
 }
 

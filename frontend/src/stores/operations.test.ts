@@ -82,4 +82,46 @@ describe("useOperationsStore", () => {
     expect(store.get(id)!.status).toBe("completed");
     expect(store.get(id)!.finishedAt).toBeUndefined();
   });
+
+  it("freezes terminal records: first terminal wins, never regresses", () => {
+    const store = useOperationsStore();
+    const done = store.start({ kind: "deploy", label: "D" });
+    store.finish(done, "ok");
+    const finishedAt = store.get(done)!.finishedAt;
+    expect(typeof finishedAt).toBe("number");
+    // Late duplicate terminal calls cannot regress finished work.
+    store.fail(done, "late boom");
+    store.cancel(done, "late cancel");
+    store.finish(done, "late ok");
+    expect(store.get(done)!.status).toBe("completed");
+    expect(store.get(done)!.message).toBe("ok");
+    expect(store.get(done)!.finishedAt).toBe(finishedAt);
+
+    const bad = store.start({ kind: "deploy", label: "E" });
+    store.fail(bad, "boom");
+    store.finish(bad, "actually fine");
+    expect(store.get(bad)!.status).toBe("failed");
+    expect(store.get(bad)!.message).toBe("boom");
+  });
+
+  it("patch cannot resurrect a terminal record, but may update its message", () => {
+    const store = useOperationsStore();
+    const id = store.start({ kind: "node-sync", label: "S" });
+    store.cancel(id);
+    store.patch(id, { status: "running", progress: 0.5, message: "tail arrived" });
+    const op = store.get(id)!;
+    expect(op.status).toBe("canceled");
+    expect(typeof op.finishedAt).toBe("number");
+    expect(op.message).toBe("tail arrived");
+    expect(op.progress).toBe(0.5);
+  });
+
+  it("starting with a terminal status records finishedAt immediately", () => {
+    const store = useOperationsStore();
+    const id = store.start({ kind: "other", label: "O", status: "completed" });
+    const op = store.get(id)!;
+    expect(op.status).toBe("completed");
+    expect(typeof op.finishedAt).toBe("number");
+    expect(store.active.map((o) => o.id)).not.toContain(id);
+  });
 });

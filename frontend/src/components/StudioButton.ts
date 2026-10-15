@@ -1,10 +1,12 @@
-// StudioButton — shadcn-vue-style button (cva variants, `cmst:` prefix).
+// StudioButton variants — shadcn-vue-style button (cva variants, `cmst:` prefix).
 //
 // Follows the shadcn-vue generated-component conventions (variant/size via
 // class-variance-authority, `cn()` merging) while using the Studio-scoped
 // Tailwind prefix so no class can collide with ComfyUI or old Studio CSS.
+//
+// The canonical Button is the `./StudioButton.vue` SFC, which applies these
+// variants. Render buttons through the SFC, not by hand-rolling classes.
 import { cva, type VariantProps } from "class-variance-authority";
-import { cn } from "./cn";
 
 export const studioButtonVariants = cva(
   "cmst:inline-flex cmst:items-center cmst:justify-center cmst:gap-2 cmst:whitespace-nowrap cmst:rounded-md cmst:text-sm cmst:font-medium cmst:transition-colors cmst:cursor-pointer cmst:disabled:pointer-events-none cmst:disabled:opacity-50 cmst:[&_svg]:size-4 cmst:[&_svg]:shrink-0 cmst:outline-none cmst:border cmst:border-solid",
@@ -32,11 +34,3 @@ export const studioButtonVariants = cva(
 );
 
 export type StudioButtonVariants = VariantProps<typeof studioButtonVariants>;
-
-export function studioButtonClass(
-  variant?: StudioButtonVariants["variant"],
-  size?: StudioButtonVariants["size"],
-  extra?: string,
-): string {
-  return cn(studioButtonVariants({ variant, size }), extra);
-}

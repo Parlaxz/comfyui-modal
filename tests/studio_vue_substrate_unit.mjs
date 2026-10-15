@@ -98,6 +98,19 @@ for (const f of sources) {
   assert.ok(!text.includes("testing-styles"), `${rel(f)}: no testing-styles import`);
   assert.ok(!text.includes(".comfymodal-"), `${rel(f)}: no copied old selectors`);
 }
+// Portalled UI must resolve the Studio-contained portal target through the
+// one obvious helper — never fall back to document.body.
+const srcText = sources.map(readFile).join("\n");
+assert.ok(
+  srcText.includes("getStudioPortalTarget"),
+  "portal target resolved through the canonical helper",
+);
+assert.ok(!srcText.includes("?? document.body"), "no ?? document.body fallback");
+assert.ok(!srcText.includes("|| document.body"), "no || document.body fallback");
+assert.ok(
+  readFile(path.join(SRC, "components", "portalTarget.ts")).includes("throw new Error"),
+  "missing portal target fails visibly",
+);
 section("Vue UI imports zero old Studio CSS");
 
 function rel(f) {
@@ -207,6 +220,28 @@ assert.ok(host.includes("studio.mjs"), "host loads the stable .mjs entry");
 assert.ok(host.includes("mountStudioPreview"), "host calls mountStudioPreview");
 assert.ok(host.includes("setGraphInteractionEnabled"), "wizard graph seam exposed");
 assert.ok(!host.includes("registerExtension"), "host bridge registers no extension");
+// Wizard polarity contract (mirrors `_syncModalWizardState`): the function
+// name is literal — enabled=true means the graph IS interactive.
+const openingBlock = host.slice(
+  host.indexOf("comfymodal:wizard-opening"),
+  host.indexOf("comfymodal:wizard-closed"),
+);
+assert.ok(
+  openingBlock.includes("setGraphInteractionEnabled(true)"),
+  "wizard-opening enables graph interaction",
+);
+assert.ok(
+  host.includes('if (_isOpen) setGraphInteractionEnabled(false);'),
+  "wizard-closed restores the inert modal",
+);
+assert.ok(
+  host.includes('if (enabled) modal.removeAttribute("aria-modal");'),
+  "enabled graph removes aria-modal from the Studio modal",
+);
+assert.ok(
+  host.includes('_inertBackground(!enabled);'),
+  "background inertness is the inverse of graph interaction",
+);
 section("host bridge owns mount-once lifecycle + portal target + graph seam");
 
 const entry = readFile(path.join(WEB, "modal-testing.js"));

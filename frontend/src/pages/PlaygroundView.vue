@@ -3,8 +3,9 @@ import { computed, ref } from "vue";
 import { FlaskConical, Play } from "@lucide/vue";
 import { usePlaygroundStore } from "../stores/playground";
 import { useOperationsStore } from "../stores/operations";
-import { studioButtonClass } from "../components/StudioButton";
-import { studioCardClass, studioPageClass } from "../components/studioPanels";
+import StudioButton from "../components/StudioButton.vue";
+import StudioCard from "../components/StudioCard.vue";
+import { studioPageClass } from "../components/studioPanels";
 
 // Phase-1 placeholder: the real Playground port comes later. This view
 // proves the playground store slice and demonstrates the operationStore
@@ -46,7 +47,7 @@ function runSyntheticOperation() {
 
 <template>
   <section :class="studioPageClass()" data-testid="vue-page-playground">
-    <div :class="studioCardClass('cmst:p-4')">
+    <StudioCard class="cmst:p-4">
       <h2 class="cmst:text-lg cmst:font-semibold cmst:flex cmst:items-center cmst:gap-2">
         <FlaskConical class="cmst:size-5" aria-hidden="true" />
         Playground (Phase-1 proof)
@@ -63,24 +64,24 @@ function runSyntheticOperation() {
         />
         Experiment mode (playground store)
       </label>
-    </div>
+    </StudioCard>
 
-    <div :class="studioCardClass('cmst:p-4')">
+    <StudioCard class="cmst:p-4">
       <h3 class="cmst:text-sm cmst:font-semibold">operationStore demo</h3>
       <p class="cmst:text-sm cmst:opacity-80">
         A synthetic local operation publishes presentation state into the
         shared registry. Active operations: {{ operations.active.length }}.
       </p>
       <div class="cmst:flex cmst:items-center cmst:gap-3 cmst:mt-3">
-        <button
-          type="button"
-          :class="studioButtonClass('default', 'sm')"
+        <StudioButton
+          variant="default"
+          size="sm"
           :disabled="runningDemoId !== null"
           @click="runSyntheticOperation"
         >
           <Play aria-hidden="true" />
           Run synthetic operation
-        </button>
+        </StudioButton>
         <span v-if="demoProgress !== null" class="cmst:text-sm" data-testid="vue-op-progress">
           {{ Math.round((demoProgress ?? 0) * 100) }}%
         </span>
@@ -91,6 +92,6 @@ function runSyntheticOperation() {
           — {{ op.status }}<span v-if="op.message"> — {{ op.message }}</span>
         </li>
       </ul>
-    </div>
+    </StudioCard>
   </section>
 </template>

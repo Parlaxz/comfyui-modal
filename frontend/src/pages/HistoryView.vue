@@ -4,8 +4,9 @@ import { useRouter } from "vue-router";
 import { History } from "@lucide/vue";
 import { useHistoryStore } from "../stores/history";
 import { createLatestTask } from "../async/latest";
-import { studioButtonClass } from "../components/StudioButton";
-import { studioCardClass, studioPageClass } from "../components/studioPanels";
+import StudioButton from "../components/StudioButton.vue";
+import StudioCard from "../components/StudioCard.vue";
+import { studioPageClass } from "../components/studioPanels";
 
 // Phase-1 placeholder: History V2 stays authoritative; the real History
 // port comes later. This view proves the history store slice and gives
@@ -60,7 +61,7 @@ async function applyFocus() {
 
 <template>
   <section :class="studioPageClass()" data-testid="vue-page-history">
-    <div :class="studioCardClass('cmst:p-4')">
+    <StudioCard class="cmst:p-4">
       <h2 class="cmst:text-lg cmst:font-semibold cmst:flex cmst:items-center cmst:gap-2">
         <History class="cmst:size-5" aria-hidden="true" />
         History (Phase-1 proof)
@@ -78,14 +79,14 @@ async function applyFocus() {
           class="cmst:h-9 cmst:rounded-md cmst:border cmst:border-solid cmst:border-cmst-border cmst:bg-transparent cmst:px-3 cmst:text-sm"
           data-testid="vue-history-focus-input"
         />
-        <button
-          type="button"
-          :class="studioButtonClass('secondary', 'sm')"
+        <StudioButton
+          variant="secondary"
+          size="sm"
           data-testid="vue-history-focus-apply"
           @click="applyFocus"
         >
           Load focus
-        </button>
+        </StudioButton>
       </div>
       <p class="cmst:text-sm cmst:mt-2">
         Store focus: <strong>{{ history.focusId ?? "none" }}</strong>
@@ -96,6 +97,6 @@ async function applyFocus() {
         Tip: click “Load focus” rapidly with different ids — only the newest
         read commits; older ones are dropped as stale.
       </p>
-    </div>
+    </StudioCard>
   </section>
 </template>

@@ -94,7 +94,7 @@ describe("createLatestTask", () => {
     await expect(p2).resolves.toEqual({ stale: false, value: "new" });
   });
 
-  it("explicit abort marks the in-flight read stale-capable", async () => {
+  it("explicit abort rejects with AbortError instead of resolving stale", async () => {
     const onAbort = vi.fn();
     const gate = deferred<string>();
     const task = createLatestTask();
@@ -104,9 +104,47 @@ describe("createLatestTask", () => {
     });
     task.abort();
     expect(onAbort).toHaveBeenCalledTimes(1);
-    gate.resolve("late");
-    // Aborted run was never superseded by a newer generation, but its own
-    // signal fired, so it must not present as current.
-    await expect(p).resolves.toEqual({ stale: true });
+    await expect(p).rejects.toMatchObject({ name: "AbortError" });
+    expect(task.pending).toBe(false);
+  });
+
+  it("explicit abort settles promptly even when load ignores the signal", async () => {
+    const task = createLatestTask();
+    // Never settles, never listens: without deterministic abort handling
+    // this run would hang forever and `pending` would stick.
+    const p = task.run(() => new Promise<string>(() => {}));
+    expect(task.pending).toBe(true);
+    task.abort();
+    await expect(p).rejects.toMatchObject({ name: "AbortError" });
+    expect(task.pending).toBe(false);
+  });
+
+  it("explicit abort passes a custom reason through", async () => {
+    const task = createLatestTask();
+    const p = task.run(() => new Promise<string>(() => {}));
+    const reason = new Error("owner-cancelled");
+    task.abort(reason);
+    await expect(p).rejects.toBe(reason);
+  });
+
+  it("abort with nothing in flight is a no-op", () => {
+    const task = createLatestTask();
+    expect(() => task.abort()).not.toThrow();
+    expect(task.pending).toBe(false);
+  });
+
+  it("a superseded run never throws, even for cooperating aborts", async () => {
+    const task = createLatestTask();
+    const p1 = task.run(
+      (signal) =>
+        new Promise<string>((_resolve, reject) => {
+          signal.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError")),
+          );
+        }),
+    );
+    const p2 = task.run(async () => "current");
+    await expect(p1).resolves.toEqual({ stale: true });
+    await expect(p2).resolves.toEqual({ stale: false, value: "current" });
   });
 });
