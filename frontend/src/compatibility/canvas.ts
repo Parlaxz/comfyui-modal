@@ -1,22 +1,55 @@
-// Modal Studio Vue substrate — canvas compatibility seam (Phase 1: contract only).
+// Modal Studio Vue substrate — one-way canvas compatibility projection.
 //
-// What this seam is for: the real settings-to-canvas compatibility
-// projection (output settings → web/modal-node.js `/prompt` interception
-// and canvas output preferences) is exercised in Phase 2, not here.
-//
-// Phase-1 rules, preserved from the old Studio:
+// The Vue settings/server authority projects only values proven to have
+// remaining non-Vue readers into the legacy canvas consumers. This is
+// one-way after successful server bootstrap; the canvas never writes back
+// into settingsStore. Phase-1 rules still preserved:
 // - web/modal-node.js, its `/prompt` interception, canvas output settings,
 //   and production/pass-through behavior are NOT migrated or broken.
 // - Existing localStorage/global compatibility behavior is NOT deleted.
-// - This module performs NO reads and NO writes in Phase 1; it only
-//   declares the shape the Phase-2 projection will fill, so the later
-//   port has one obvious place to implement it.
+// - Existing localStorage/global compatibility behavior is not deleted.
 
 /** Read-only view of canvas-relevant output preferences (Phase 2 fills this). */
 export interface CanvasCompatibilitySnapshot {
   outputFormat: string;
   quality: number | null;
   autoSaveLocal: boolean;
+}
+
+const OUTPUT_KEYS = {
+  outputFormat: "comfymodal_output_format",
+  quality: "comfymodal_quality",
+  autoSaveLocal: "comfymodal_auto_save_local",
+  saveFolder: "comfymodal_save_folder",
+  saveMetadataSidecar: "comfymodal_save_metadata_sidecar",
+} as const;
+
+export function projectCanvasCompatibility(settings: Record<string, unknown>): CanvasCompatibilitySnapshot {
+  const snapshot: CanvasCompatibilitySnapshot = {
+    outputFormat: String(settings.output_format ?? "original"),
+    quality: typeof settings.quality === "number" ? settings.quality : null,
+    autoSaveLocal: settings.auto_save_local === true,
+  };
+  if (typeof window === "undefined") return snapshot;
+  const options = {
+    output_format: snapshot.outputFormat,
+    quality: snapshot.quality ?? 75,
+    auto_save_local: snapshot.autoSaveLocal,
+    save_folder: String(settings.save_folder ?? ""),
+    save_metadata_sidecar: settings.save_metadata_sidecar !== false,
+  };
+  window._comfyModalOutputOptions = options;
+  try {
+    localStorage.setItem(OUTPUT_KEYS.outputFormat, options.output_format);
+    localStorage.setItem(OUTPUT_KEYS.quality, String(options.quality));
+    localStorage.setItem(OUTPUT_KEYS.autoSaveLocal, String(options.auto_save_local));
+    localStorage.setItem(OUTPUT_KEYS.saveFolder, options.save_folder);
+    localStorage.setItem(OUTPUT_KEYS.saveMetadataSidecar, String(options.save_metadata_sidecar));
+  } catch {
+    // Existing canvas consumers also tolerate unavailable storage.
+  }
+  window.dispatchEvent(new CustomEvent("comfymodal:output-preferences-changed", { detail: options }));
+  return snapshot;
 }
 
 /**

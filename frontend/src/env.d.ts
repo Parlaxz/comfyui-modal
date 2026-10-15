@@ -5,3 +5,9 @@ declare module "*.vue" {
   const component: DefineComponent<object, object, unknown>;
   export default component;
 }
+
+interface Window {
+  _comfyModalOutputOptions?: Record<string, unknown>;
+  __comfymodalOpenVueStudio?: (page?: string) => Promise<unknown>;
+  __comfymodalCloseVueStudio?: () => void;
+}

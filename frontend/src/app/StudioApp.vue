@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted } from "vue";
 import { RouterLink, RouterView, useRoute } from "vue-router";
 import {
   FlaskConical,
@@ -13,11 +13,18 @@ import { useMediaQuery } from "@vueuse/core";
 import { STUDIO_PAGES, STUDIO_PAGE_LABELS, type StudioPage } from "./router/studioRoute";
 import { useOperationsStore } from "../stores/operations";
 import { useSettingsStore } from "../stores/settings";
+import { useInfrastructureStore } from "../stores/infrastructure";
 import { cn } from "../components/cn";
 
 const route = useRoute();
 const operations = useOperationsStore();
 const settings = useSettingsStore();
+const infrastructure = useInfrastructureStore();
+
+onMounted(() => {
+  void settings.initialize();
+  void infrastructure.initialize();
+});
 
 // VueUse where it removes manual plumbing: a media query with no
 // matchMedia listener lifecycle of our own.
