@@ -731,26 +731,26 @@ export function validatePresetState(state) {
   const block = (section, code, message) => issues.push({ section, code, message, blocking: true });
   if (state == null) return { ok: true, issues, legacy: true };
   if (typeof state !== "object" || Array.isArray(state)) {
-    block("", "not_an_object", "Preset state must be an object.");
+    block("", "not_an_object", "Saved workflow state must be an object.");
     return { ok: false, issues };
   }
   if (typeof state.schema_version !== "number" || state.schema_version !== PRESET_SCHEMA_VERSION) {
-    block("", "schema_mismatch", "Unsupported preset schema_version (expected 1).");
+    block("", "schema_mismatch", "Unsupported saved workflow schema_version (expected 1).");
     return { ok: false, issues };
   }
   for (const key of Object.keys(state)) {
     if (key === "schema_version") continue;
     if (PRESET_SECTIONS.indexOf(key) === -1) {
-      block(key, "unknown_section", "Unknown preset section '" + key + "'.");
+      block(key, "unknown_section", "Unknown saved workflow section '" + key + "'.");
     }
   }
   // The backend requires every section — flag absent ones (load plans them
   // to neutral and reports; saves always emit all sections).
   for (const section of PRESET_SECTIONS) {
     if (!Object.prototype.hasOwnProperty.call(state, section)) {
-      block(section, "missing_section", "Preset section '" + section + "' is required.");
+      block(section, "missing_section", "Saved workflow section '" + section + "' is required.");
     } else if (state[section] == null || typeof state[section] !== "object" || Array.isArray(state[section])) {
-      block(section, "section_shape", "Preset section '" + section + "' must be an object.");
+      block(section, "section_shape", "Saved workflow section '" + section + "' must be an object.");
     }
   }
   // Scan within each section (never the root): section names themselves are
@@ -762,7 +762,7 @@ export function validatePresetState(state) {
     _scanImageLeakage(state[key], key, leaks);
   }
   for (const hit of leaks) {
-    block(hit.split(".")[0] || "", "image_key", "Image-bearing field '" + hit + "' must not be in a preset.");
+    block(hit.split(".")[0] || "", "image_key", "Image-bearing field '" + hit + "' must not be in a saved workflow.");
   }
   // Null control values are rejected server-side — catch them early.
   try {
@@ -784,7 +784,7 @@ export function validatePresetState(state) {
     size = Infinity;
   }
   if (size > PRESET_STATE_MAX_BYTES) {
-    block("", "too_large", "Preset state exceeds the 64KiB cap.");
+    block("", "too_large", "Saved workflow state exceeds the 64KiB cap.");
   }
   return { ok: issues.length === 0, issues };
 }
@@ -1031,7 +1031,7 @@ const PRESET_MAX_DESC_LEN = 2000;
  * trimmed, deduped, ≤ 20 entries of ≤ 80 chars (mirrors the backend
  * metadata validator; the server stays the authority). Images are never
  * part of the payload (note callers surface: "Images are not saved with
- * presets."). Returns {ok, payload} or {ok:false, error}.
+ * workflows."). Returns {ok, payload} or {ok:false, error}.
  */
 export function buildPresetSavePayload(input) {
   const src = input && typeof input === "object" ? input : {};
@@ -1045,13 +1045,13 @@ export function buildPresetSavePayload(input) {
     return { ok: false, error: "Description exceeds 2000 characters." };
   }
   const state = src.studio_state && typeof src.studio_state === "object" ? src.studio_state : null;
-  if (!state) return { ok: false, error: "Preset state is required." };
+  if (!state) return { ok: false, error: "Saved workflow state is required." };
   const validation = validatePresetState(state);
   if (!validation.ok) {
-    return { ok: false, error: (validation.issues[0] && validation.issues[0].message) || "Invalid preset state." };
+    return { ok: false, error: (validation.issues[0] && validation.issues[0].message) || "Invalid saved workflow state." };
   }
   if (presetStateByteSize(state) > PRESET_STATE_MAX_BYTES) {
-    return { ok: false, error: "Preset state exceeds the 64KiB cap." };
+    return { ok: false, error: "Saved workflow state exceeds the 64KiB cap." };
   }
   const tags = [];
   if (Array.isArray(src.tags)) {

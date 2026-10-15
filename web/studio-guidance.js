@@ -510,8 +510,11 @@ export function resolveGuidanceState(input) {
       runGateReason: "Guidance unavailable for this model — identity not verified",
       snapshot: { engaged: true, ready: false, reason: "identity_unresolvable" },
       headline: "Guidance unavailable for this model",
+      // GUI-01: headline + one detail. The exact identity lives in the
+      // separate identity field (behind a <details> on the shelf); the
+      // detail keeps only the actionable cause.
       detail:
-        "Loaded '" + filename + "', Identity: Not verified. No verified guidance " +
+        "Loaded '" + filename + "'. No verified guidance " +
         "mapping was found. Studio will not guess from the filename.",
       actions: [
         { id: "choose_mapping", label: "Choose mapping" },
@@ -535,10 +538,11 @@ export function resolveGuidanceState(input) {
       runGateReason: "Guidance unavailable for this model — no confirmed mapping",
       snapshot: { engaged: true, ready: false, reason: "no_confirmed_mapping" },
       headline: "Guidance unavailable for this model",
+      // GUI-01: headline + one detail (identity hash stays in the identity
+      // field, not duplicated here).
       detail:
-        "Loaded '" + (formatted.filename || "this model") + "', Identity: " +
-        (formatted.shortHash ? "sha256:" + formatted.shortHash : "Not verified") +
-        ". No verified guidance mapping was found. Studio will not guess from the filename.",
+        "No verified guidance mapping was found for this model identity. " +
+        "Studio will not guess from the filename.",
       actions: [
         { id: "choose_mapping", label: "Choose mapping" },
         { id: "cancel", label: "Cancel" },
@@ -610,36 +614,50 @@ export function resolveGuidanceState(input) {
   if (anchors && anchors.ok !== true) {
     const reason = _str(anchors.reason) || "incompatible_workflow";
     const candidates = Array.isArray(anchors.candidates) ? anchors.candidates : [];
-    if (reason === "multiple_samplers" && candidates.length > 0 && !anchorPick) {
+    // Confirm-path guard (P1): a selected anchorPick is validated against
+    // the presented candidates BEFORE any confirmation is offered. A pick
+    // that names a live candidate resolves the ambiguity — execution falls
+    // through to the guide-image/ready checks below instead of confirming
+    // an incompatible state. Unknown/stale picks stay incompatible.
+    const pickHit = anchorPick && candidates.some(function (c) {
+      return c && _str(c.node_id) === anchorPick;
+    });
+    if (pickHit) {
+      // Resolved: the validated pick answers the ambiguity — fall through
+      // to the guide-image/ready checks below (never confirm incompatible).
+    } else {
+      if (reason === "multiple_samplers" && candidates.length > 0 && !anchorPick) {
+        return {
+          state: "incompatible_workflow",
+          ready: false,
+          runGateReason: "Guidance anchor is ambiguous — confirm which sampler to guide",
+          snapshot: { engaged: true, ready: false, reason },
+          headline: "More than one generation sampler is present",
+          detail: _str(anchors.detail) || "Confirm which one to guide.",
+          actions: [
+            { id: "confirm_anchor", label: "Confirm anchor" },
+            { id: "cancel", label: "Cancel" },
+          ],
+          identity: formatted,
+          candidates,
+        };
+      }
       return {
         state: "incompatible_workflow",
         ready: false,
-        runGateReason: "Guidance anchor is ambiguous — confirm which sampler to guide",
+        runGateReason: "Guidance anchor not found: " + reason,
         snapshot: { engaged: true, ready: false, reason },
-        headline: "More than one generation sampler is present",
-        detail: _str(anchors.detail) || "Confirm which one to guide.",
+        headline: "Required guidance anchor not found",
+        // GUI-01: headline + one detail (was two sentences).
+        detail: (_str(anchors.detail) || "The workflow cannot take guidance structurally."),
         actions: [
-          { id: "confirm_anchor", label: "Confirm anchor" },
+          { id: "choose_workflow", label: "Choose another workflow" },
           { id: "cancel", label: "Cancel" },
         ],
         identity: formatted,
         candidates,
       };
     }
-    return {
-      state: "incompatible_workflow",
-      ready: false,
-      runGateReason: "Guidance anchor not found: " + reason,
-      snapshot: { engaged: true, ready: false, reason },
-      headline: "Required guidance anchor not found",
-      detail: (_str(anchors.detail) || "The workflow cannot take guidance structurally.") + " No fallback method was selected.",
-      actions: [
-        { id: "choose_workflow", label: "Choose another workflow" },
-        { id: "cancel", label: "Cancel" },
-      ],
-      identity: formatted,
-      candidates,
-    };
   }
 
   if (!guideImage) {
@@ -649,7 +667,9 @@ export function resolveGuidanceState(input) {
       runGateReason: "Guidance is confirmed but needs a guide image",
       snapshot: { engaged: true, ready: false, reason: "guide_image_missing" },
       headline: "Guidance ready",
-      detail: "Mapping confirmed for this model identity. Select a guide image to run with guidance.",
+      // GUI-01: headline + one detail (the mapping-confirmed state is
+      // already carried by headline + state).
+      detail: "Select a guide image to run with guidance.",
       actions: [
         { id: "change", label: "Change" },
         { id: "reconfirm", label: "Reconfirm" },
@@ -664,8 +684,9 @@ export function resolveGuidanceState(input) {
     runGateReason: null,
     snapshot: { engaged: true, ready: true },
     headline: "Guidance ready",
+    // GUI-01: headline + one detail (the sha stays in the identity field).
     detail:
-      "Guidance will condition this run (" + mode + ", sha256:" + (formatted.shortHash || "?") + ").",
+      "Guidance will condition this run (" + mode + ").",
     actions: [
       { id: "change", label: "Change" },
       { id: "reconfirm", label: "Reconfirm" },

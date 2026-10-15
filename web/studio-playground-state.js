@@ -847,6 +847,12 @@ export const SHELL_SUBTOOLS = Object.freeze({
 // Phase 9 implements Guidance, so only Upscale remains placeholder here.
 export const SHELL_PLACEHOLDERS = Object.freeze(["upscale"]);
 
+// GEN-03: single-sourced later-phase suffix. The playground's
+// placeholderCopy (web/studio-playground.js) composes the same sentence
+// from this constant, so the gate reason and the placeholder notice cannot
+// drift into near-identical paragraphs again.
+export const LATER_PHASE_SUFFIX = "arrives in a later phase — execution is disabled.";
+
 /**
  * Honest execution gate for views with no runnable workflow path: Post
  * (local engine) and later-phase placeholders. Returns the user-facing
@@ -858,7 +864,7 @@ export const SHELL_PLACEHOLDERS = Object.freeze(["upscale"]);
  */
 export function shellGateReason(mode, subtool) {
   if (mode === "post") {
-    if (subtool === "upscale") return "Upscale arrives in a later phase — execution is disabled.";
+    if (subtool === "upscale") return "Upscale " + LATER_PHASE_SUFFIX;
     if (SHELL_SUBTOOLS.post.indexOf(subtool) !== -1) {
       return "Post Processing runs locally — use Save or Export in the editor below.";
     }
@@ -867,7 +873,7 @@ export function shellGateReason(mode, subtool) {
   if (SHELL_PLACEHOLDERS.indexOf(subtool) !== -1) {
     if (mode === "generate" || mode === "edit") {
       var labels = { references: "References", layout: "Layout", guidance: "Guidance", upscale: "Upscale" };
-      return (labels[subtool] || subtool) + " arrives in a later phase — execution is disabled.";
+      return (labels[subtool] || subtool) + " " + LATER_PHASE_SUFFIX;
     }
     return null;
   }

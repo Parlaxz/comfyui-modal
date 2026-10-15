@@ -8,7 +8,7 @@
 //
 // All DOM via el() from studio-ui.js; no innerHTML with dynamic data.
 
-import { el } from "./studio-ui.js";
+import { el, STATUS_LABELS } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
 import { _formatDuration } from "./studio-run-normalizer.js";
 import {
@@ -32,15 +32,8 @@ import { buildConfiguredExportButton, exportResultNote } from "./history-v2-expo
 const CELL_DOWNLOAD_NOTE_TESTID = "history-v2-cell-download-note";
 const CELL_EXPORT_NOTE_TESTID = "history-v2-cell-export-note";
 
-const STATUS_LABELS = {
-  completed: "Completed",
-  completed_with_failures: "Completed with failures",
-  failed: "Failed",
-  canceled: "Canceled",
-  interrupted: "Interrupted",
-  running: "Running",
-  queued: "Queued",
-};
+// HST-02: STATUS_LABELS is shared from studio-ui.js (single import across
+// feed/detail/experiment). Per-file STATUS_TONES below stays local.
 
 const CELL_STATUS_ALIASES = {
   completed: "completed", complete: "completed", success: "completed", succeeded: "completed",
@@ -590,7 +583,8 @@ export async function renderExperimentDetail(experimentId, repo, callbacks) {
 
   function buildNotesSection(rec) {
     const sec = el("div", { class: "comfymodal-studio-history-v2-section" }, [
-      el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Note" }),
+      // HST-02: real heading (was a div).
+      el("h3", { class: "comfymodal-studio-history-v2-section-title", text: "Note" }),
     ]);
     const textarea = el("textarea", {
       class: "comfymodal-studio-history-v2-notes",
@@ -980,7 +974,7 @@ export async function renderExperimentDetail(experimentId, repo, callbacks) {
     const wf = cellWorkflowMeta(cell, rec);
     if (wf.workflow) pane.appendChild(_row("Workflow", wf.workflow));
     if (wf.version) pane.appendChild(_row("Version", wf.version));
-    if (wf.preset) pane.appendChild(_row("Preset", wf.preset));
+    if (wf.preset) pane.appendChild(_row("Saved workflow", wf.preset));
     const attemptCount = historyCellAttemptCount(cell);
     if (attemptCount > 0) {
       pane.appendChild(_row("Attempts", String(attemptCount)));

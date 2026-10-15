@@ -971,25 +971,37 @@
           }
 
           // Layer-specific accessible names + impossible actions disabled.
+          // SKT-02: one disabled convention (native disabled + title reason).
+          // Every disabled button names why in its title; enabled buttons
+          // keep the plain action title.
+          var upOff = base || idx >= total - 1; // top already
           var upLabel = "Move up " + nm;
           state.up.setAttribute("aria-label", upLabel);
-          state.up.title = upLabel;
-          state.up.disabled = base || idx >= total - 1; // top already
+          state.up.title = upOff
+            ? (base ? upLabel + " — base layer cannot move" : upLabel + " — already at top")
+            : upLabel;
+          state.up.disabled = upOff;
+          var downOff = base || idx <= 1; // above base: below is base
           var downLabel = "Move down " + nm;
           state.down.setAttribute("aria-label", downLabel);
-          state.down.title = downLabel;
-          state.down.disabled = base || idx <= 1; // above base: below is base
+          state.down.title = downOff
+            ? (base ? downLabel + " — base layer cannot move" : downLabel + " — already at bottom")
+            : downLabel;
+          state.down.disabled = downOff;
           var dupLabel = "Duplicate " + nm;
           state.dup.setAttribute("aria-label", dupLabel);
-          state.dup.title = dupLabel;
+          state.dup.title = base ? dupLabel + " — base layer cannot be duplicated" : dupLabel;
           state.dup.disabled = !!base;
+          var mergeOff = base || idx <= 0; // base has nothing below
           var mergeLabel = "Merge down " + nm;
           state.merge.setAttribute("aria-label", mergeLabel);
-          state.merge.title = mergeLabel;
-          state.merge.disabled = base || idx <= 0; // base has nothing below
+          state.merge.title = mergeOff
+            ? (base ? mergeLabel + " — base has nothing below" : mergeLabel + " — nothing to merge into")
+            : mergeLabel;
+          state.merge.disabled = mergeOff;
           var delLabel = "Delete " + nm;
           state.del.setAttribute("aria-label", delLabel);
-          state.del.title = delLabel;
+          state.del.title = base ? delLabel + " — base layer cannot be deleted" : delLabel;
           state.del.disabled = !!base;
           var renameLabel = "Rename " + nm;
           state.renameBtn.setAttribute("aria-label", renameLabel);
@@ -1022,8 +1034,9 @@
           }
           if (flatBtn) {
             var single = layers.length <= 1;
+            // SKT-02: same convention as row buttons (native disabled +
+            // title reason; no aria-disabled twin).
             flatBtn.disabled = single;
-            flatBtn.setAttribute("aria-disabled", single ? "true" : "false");
             flatBtn.title = single ? "Nothing to flatten" : "Merge all layers onto base";
           }
           if (savedTop != null) {

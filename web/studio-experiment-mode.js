@@ -27,7 +27,7 @@ import {
   formatExperimentProgress,
 } from "./studio-playground-run.js";
 import { loadModalOptions } from "./studio-output-preferences.js";
-import { renderEmptyState } from "./studio-ui.js";
+import { missingImageCopy, renderEmptyState } from "./studio-ui.js";
 
 // ── Experiment toggle ────────────────────────────────────────────────────
 
@@ -1131,7 +1131,7 @@ export function renderModernCellTile(cell, index, state, actions, context) {
   } else {
     var empty = document.createElement("div");
     empty.className = "comfymodal-studio-experiment-v2-cell-empty";
-    empty.textContent = status === "queued" ? "Queued" : "No image";
+    empty.textContent = status === "queued" ? "Queued" : missingImageCopy();
     tile.appendChild(empty);
   }
 
