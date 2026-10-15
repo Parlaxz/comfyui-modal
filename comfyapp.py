@@ -4182,7 +4182,9 @@ def collect_custom_node_dependency_files(node_path: str) -> dict[str, str]:
                     ".pt", ".pth", ".bin"}
     # Shared with custom_node_source_fingerprint so the dependency context
     # and the persisted generation hash exactly the same canonical inputs.
-    _IGNORE_DIRS = _CUSTOM_NODE_GENERATED_DIRS
+    # Directory pruning uses the shared publication-policy predicate directly
+    # (not an exact set-membership test) so suffixed build-output directories
+    # such as ``sam3.egg-info`` are pruned at any depth.
     _IGNORE_GENERATED_SUFFIXES = _CUSTOM_NODE_GENERATED_FILE_SUFFIXES
 
     files: dict[str, str] = {}
@@ -4246,7 +4248,10 @@ def collect_custom_node_dependency_files(node_path: str) -> dict[str, str]:
             files[rel] = hashlib.sha256(_canonical_dependency_bytes(path)).hexdigest()
         elif os.path.isdir(path):
             for dirpath, dirnames, filenames in os.walk(path):
-                dirnames[:] = sorted(d for d in dirnames if d not in _IGNORE_DIRS)
+                dirnames[:] = sorted(
+                    d for d in dirnames
+                    if not _publication_policy.is_excluded_dir_name(d)
+                )
                 for fn in sorted(filenames):
                     ext = os.path.splitext(fn)[1].lower()
                     lower_name = fn.lower()
@@ -8443,6 +8448,14 @@ _image_base = (
         add_python="3.11",
     )
     .entrypoint([])
+    .run_commands(
+        # Ubuntu 24.04 archives carry no python3.11-dev (system Python is
+        # 3.12). pycairo>=1.29 (ComfyUI_RaykoStudio) publishes Windows-only
+        # wheels, so the Linux image must compile it from source against
+        # CPython 3.11 headers; deadsnakes is the apt source for them.
+        "apt-get update && apt-get install -y software-properties-common && "
+        "add-apt-repository -y ppa:deadsnakes/ppa && apt-get update",
+    )
     .apt_install(
         "git",
         "libgl1",
@@ -8453,11 +8466,26 @@ _image_base = (
         "ffmpeg",
         "build-essential",
         "ninja-build",
+        # pycairo (ComfyUI_RaykoStudio) builds against the cairo C library
+        # via pkg-config; neither is present in the stock CUDA image.
+        "libcairo2-dev",
+        "pkg-config",
+        "python3.11-dev",
         # CUDA 13.0 on Ubuntu 24.04 supports both GCC 13 (default) and clang
         # as host compilers for nvcc.  We install clang as a reliable fallback
         # since the nvidia/cuda:13.0.0-devel-ubuntu24.04 image may not ship a
         # full GCC toolchain.
         "clang",
+    )
+    .run_commands(
+        # add_python="3.11" is a standalone interpreter whose sysconfig
+        # include dir is /install/include/python3.11, while deadsnakes
+        # headers land in /usr/include/python3.11. Expose them where the
+        # interpreter looks; the trailing ls fails the build fast if the
+        # headers are ever absent again.
+        "mkdir -p /install/include/python3.11 && "
+        "cp -r /usr/include/python3.11/. /install/include/python3.11/ && "
+        "ls /install/include/python3.11/Python.h",
     )
     .pip_install("comfy-cli==1.3.7", "httpx>=0.27.0")
     # Fetch only the pinned ComfyUI source.  Do not use ``comfy install`` here:
