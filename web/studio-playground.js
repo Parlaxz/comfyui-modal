@@ -9629,10 +9629,13 @@ function _refreshGuidanceMapping(state, context, actions) {
 
 // Installed node classes (object_info) for the preprocessor/loader/apply
 // dropdowns. Fail-soft: an unavailable list shows an honest note and skips
-// node-installedness checks instead of blocking or guessing.
+// node-installedness checks instead of blocking or guessing. A failed load
+// is terminal for this mount (no refetch): refetching on every shelf render
+// would ping-pong with the completion re-render forever when object_info
+// is unavailable.
 function _refreshGuidanceObjectInfo(state, context, actions) {
   var g = _guidanceOf(state);
-  if (!g || g.objectInfo || g.objectInfoInflight) return;
+  if (!g || g.objectInfo || g.objectInfoInflight || g.objectInfoFailed) return;
   g.objectInfoInflight = true;
   var done = function (info) {
     g.objectInfoInflight = false;
