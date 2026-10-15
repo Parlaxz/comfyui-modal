@@ -4,6 +4,7 @@ import { ensureTestingStyles } from "./testing-styles.js";
 import { ensureStudioStyles } from "./studio-styles.js";
 import { mountStudioShell } from "./studio-shell.js";
 import { parseStudioHash } from "./studio-routing.js";
+import { openStudioVue, closeStudioVue } from "./studio-vue-host.js";
 import { el, registerLayerHandler } from "./studio-ui.js";
 import {
   managerRebootAndWait,
@@ -856,6 +857,10 @@ app.registerExtension({
 
     window.open_testing_modal = open_testing_modal;
     window.close_testing_modal = close_testing_modal;
+    // Phase-1 Vue substrate preview entry (dev/test only — the production
+    // Studio above is untouched). Mounts the Vue app once and reuses it.
+    window.__comfymodalOpenVueStudio = openStudioVue;
+    window.__comfymodalCloseVueStudio = closeStudioVue;
     window.comfyModalTestingDiagnostics = comfyModalTestingDiagnostics;
 
     updateDiag("setupCompleted", true);

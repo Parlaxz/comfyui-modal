@@ -1,0 +1,79 @@
+/* Modal Studio Vue substrate — scoped design layer.
+ *
+ * Isolation strategy (no Shadow DOM):
+ * 1. `cmst` prefix on every generated class and theme variable, so no
+ *    Studio class can collide with ComfyUI or old Studio selectors.
+ * 2. NO preflight import: Tailwind's global reset is omitted entirely, so
+ *    surrounding ComfyUI receives zero reset damage. Studio base styles
+ *    below are scoped to `[data-studio-app]` / `[data-studio-portals]`
+ *    only — there are no broad element selectors in this file.
+ * 3. Cascade layers (`cmst-theme`, `cmst-utilities`): even inside Studio,
+ *    unlayered page styles win over ours, keeping override behavior sane.
+ *
+ * The Vue UI imports ZERO old Studio CSS (no studio-styles.js,
+ * no testing-styles.js, no copied selectors). Proven by test.
+ */
+
+@layer cmst-theme, cmst-base, cmst-utilities;
+
+@import "tailwindcss/theme.css" layer(cmst-theme) prefix(cmst);
+@import "tailwindcss/utilities.css" layer(cmst-utilities) prefix(cmst);
+
+/* Studio palette as Tailwind theme colors so `cmst:bg-cmst-primary`-style
+ * utilities are generated (still prefixed, still layered, still no
+ * preflight). The same values back the hand-written tokens below. */
+@theme {
+  --color-cmst-bg: #0f141b;
+  --color-cmst-surface: #171e27;
+  --color-cmst-fg: #e6ebf2;
+  --color-cmst-muted: #9aa6b5;
+  --color-cmst-border: #2b3542;
+  --color-cmst-primary: #4f7cff;
+  --color-cmst-primary-hover: #3d68e0;
+  --color-cmst-primary-fg: #ffffff;
+  --color-cmst-secondary: #222c38;
+  --color-cmst-secondary-hover: #2b3646;
+  --color-cmst-secondary-fg: #e6ebf2;
+}
+
+/* Studio-scoped design tokens. */
+@layer cmst-base {
+  [data-studio-app],
+  [data-studio-portals] {
+    --cmst-bg: #0f141b;
+    --cmst-surface: #171e27;
+    --cmst-fg: #e6ebf2;
+    --cmst-muted: #9aa6b5;
+    --cmst-border: #2b3542;
+    --cmst-primary: #4f7cff;
+    --cmst-primary-hover: #3d68e0;
+    --cmst-primary-fg: #ffffff;
+    --cmst-secondary: #222c38;
+    --cmst-secondary-hover: #2b3646;
+    --cmst-secondary-fg: #e6ebf2;
+
+    color-scheme: dark;
+    font-family:
+      ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    text-align: left;
+  }
+
+  /* Scoped base: only inside the Studio root, never global. */
+  [data-studio-app] h1,
+  [data-studio-app] h2,
+  [data-studio-app] h3,
+  [data-studio-app] p,
+  [data-studio-app] ul {
+    margin: 0;
+  }
+
+  [data-studio-app] button {
+    font: inherit;
+  }
+
+  [data-studio-app] a {
+    color: inherit;
+  }
+}

@@ -239,6 +239,10 @@ NODE_UNIT_FILES: list[Path] = [
     # mapping payload, structural anchors, installed-artifact listings,
     # generic provenance projection, no-family gate (DOM-free, plain node)
     ROOT / "tests" / "studio_guidance_unit.mjs",
+    # Phase 1 Vue substrate: Vite/WEB_DIRECTORY loader safety (.mjs + .css
+    # only), stable entry contract, zero old-CSS imports, six stores, five
+    # routes, fixed stack, host bridge + old Studio entry points intact.
+    ROOT / "tests" / "studio_vue_substrate_unit.mjs",
 ]
 
 # Intentionally excluded (documented in STUDIO_TEST_GATE.md):

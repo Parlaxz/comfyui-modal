@@ -1,5 +1,12 @@
 # Frontend modernization plan: endpoints → store → Vue port
 
+> **Superseded (Vue-migration architecture only):** `docs/VUE_MIGRATION_BLUEPRINT.md`
+> is the authoritative migration contract as of 2026-10-15. This file remains
+> for historical context — in particular its endpoint-consolidation catalog
+> (§1), which the blueprint does not replace. The vanilla-store (§2) and
+> worktree-Vue-port (§3) approach described here is superseded by the
+> blueprint's Phase 0–7 plan.
+
 Status: **plan only — no implementation yet.** Execute in a new git worktree, page by page.
 Prerequisite: backend phases 0A–0C landed (or explicitly deferred per page).
 
