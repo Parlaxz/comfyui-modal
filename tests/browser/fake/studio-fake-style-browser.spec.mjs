@@ -203,15 +203,19 @@ test.describe("Visual Style Browser (fake backend)", () => {
       const s = await readStyleStore(page);
       return !!(s && Array.isArray(s.favorites) && s.favorites.indexOf(favId) !== -1);
     }, { timeout: 10000 }).toBe(true);
-    const onColor = await fav.evaluate((n) => getComputedStyle(n).color);
-    expect(onColor).toBe("rgb(232, 185, 62)");
+    // The fav button carries the global secondary-btn 150ms color transition,
+    // so poll for the settled color rather than asserting mid-transition.
+    await expect.poll(async () => {
+      return fav.evaluate((n) => getComputedStyle(n).color);
+    }, { timeout: 10000 }).toBe("rgb(232, 185, 62)");
     await fav.click();
     await expect.poll(async () => {
       const s = await readStyleStore(page);
       return !!(s && Array.isArray(s.favorites) && s.favorites.indexOf(favId) !== -1);
     }, { timeout: 10000 }).toBe(false);
-    const offColor = await fav.evaluate((n) => getComputedStyle(n).color);
-    expect(offColor).toBe("rgb(102, 102, 102)");
+    await expect.poll(async () => {
+      return fav.evaluate((n) => getComputedStyle(n).color);
+    }, { timeout: 10000 }).toBe("rgb(102, 102, 102)");
     expectOnlySync404(bad);
     await fx.assertNoConsoleErrors(ALLOW);
   });

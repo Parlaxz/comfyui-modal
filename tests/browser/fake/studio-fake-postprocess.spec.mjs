@@ -395,9 +395,10 @@ test.describe("Post Processing workspace (fake backend)", () => {
     await expect(page.locator('[data-testid="shell-gate-reason"]')).toContainText("Post Processing runs locally");
 
     // Upscale category: editor unmounts, canvas-scoped placeholder notice + disabled run.
+    // POST-02: the canvas notice shares the single placeholder-notice component.
     await clickPostSubtool(page, "upscale");
-    await expect(page.locator('[data-testid="canvas-area"] [data-testid="shell-placeholder"]')).toBeVisible({ timeout: 10000 });
-    await expect(page.locator('[data-testid="canvas-area"] [data-testid="shell-placeholder"]')).toContainText("Upscale");
+    await expect(page.locator('[data-testid="canvas-area"] [data-testid="placeholder-notice"]')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('[data-testid="canvas-area"] [data-testid="placeholder-notice"]')).toContainText("Upscale");
     await expect(page.locator(PP_WS)).toHaveCount(0);
     await expect(runBtn).toBeDisabled({ timeout: 10000 });
     await expect(page.locator('[data-testid="shell-gate-reason"]')).toContainText("Upscale arrives in a later phase");
