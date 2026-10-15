@@ -23,6 +23,8 @@ import {
   getDeployLog,
   normalizeDeployStatus,
   isDeployInFlight,
+  isDeployUsableState,
+  pollDeployToTerminal,
   tailLines,
 } from "./studio-backend-api.js";
 
@@ -240,7 +242,9 @@ export function renderDeploymentSection(container, apiBase, bus) {
       return;
     }
     const s = state.status;
-    const kind = s.state === "ready" ? "ok"
+    // Usability truth owned by studio-backend-api.js (isDeployUsableState):
+    // deployed_unwarmed is terminal deploy success (warmup retired).
+    const kind = isDeployUsableState(s.state) ? "ok"
       : s.state === "error" ? "error"
       : isDeployInFlight(s.state) ? "warn"
       : "neutral";
@@ -468,22 +472,22 @@ export function renderDeploymentSection(container, apiBase, bus) {
     armStatusPoll();
 
     setLabel("Waiting for deploy\u2026");
-    const started = Date.now();
-    let ready = false;
-    while ((Date.now() - started) < REDEPLOY_POLL_TIMEOUT_MS) {
-      await new Promise((r) => setTimeout(r, STATUS_POLL_MS));
-      const s = await readStatus();
-      if (s.state === "ready") { ready = true; break; }
-      if (s.state === "error") {
-        state.redeployBusy = false;
-        state.deploying = false;
-        setLabel("Redeploy and Restart");
-        syncButtons();
-        appendBoundedResult(s.message || "Deploy failed.", "#e05050");
-        return;
-      }
+    // Shared bounded poll (studio-backend-api.js): usability truth owned
+    // there, so this wait can never drift from the shell gate again.
+    const terminal = await pollDeployToTerminal(readStatus, {
+      intervalMs: STATUS_POLL_MS,
+      timeoutMs: REDEPLOY_POLL_TIMEOUT_MS,
+    });
+    if (terminal.outcome === "error") {
+      const s = terminal.status || {};
+      state.redeployBusy = false;
+      state.deploying = false;
+      setLabel("Redeploy and Restart");
+      syncButtons();
+      appendBoundedResult(s.message || "Deploy failed.", "#e05050");
+      return;
     }
-    if (!ready) {
+    if (terminal.outcome !== "usable") {
       state.redeployBusy = false;
       state.deploying = false;
       setLabel("Deploy timed out");

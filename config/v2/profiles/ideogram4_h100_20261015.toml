@@ -1,0 +1,80 @@
+# v2ctl profile: ISOLATED Ideogram 4 Comfy UI Default on exact H100.
+#
+# Canonical workflow-selection + exact-placement experiment profile. It proves
+# a v2ctl run resolves workflow wf_81513286bb304e9f /
+# wv_f3baf54d8f784b64 ("Ideogram 4 Comfy UI Default") onto one pinned H100
+# with no fallback pool and an explicit cloud+region pin.
+#
+# Isolation contract (do NOT "fix" by sharing):
+# - unique testing app ideogram4-h100-profile-20261015: never the stable
+#   production app, never default stable-modal-comfy-v2-shadow, never a
+#   golden_p1 app. Legal Modal name (lowercase, digits, hyphens).
+# - gpu exactly "h100!": NO gpu_alt, NO gpu_fallbacks. Single-function
+#   deploy; a missing H100 fails loudly instead of sliding to another GPU.
+# - explicit COMFYMODAL_V2_CLOUD + COMFYMODAL_V2_REGION deploy pins
+#   (narrower than golden_p1's broad "us"; do NOT copy golden_p1's
+#   fallback pool or broad-us pin as-is).
+# - generic run_plan_stream method: the Golden serial method is hardcoded to
+#   its own reference workflow and cannot execute this Studio graph.
+#
+# Steps provenance: the stored graph "Default" preset is 20 steps
+# (.studio_workflows.json, node 98 "Default" preset). The task hard invariant
+# is 16 steps. v2ctl NEVER rewrites the graph: steps default to the graph
+# value unless the caller passes COMFYMODAL_V2_WORKFLOW_STEPS=16 explicitly,
+# and graph-default vs requested vs effective is recorded in dry-run output,
+# run manifests, and provenance. Real (non-dry-run) dispatch on this profile
+# additionally refuses any effective step count other than 16.
+#
+# Pinned graph invariants (recorded, never modified by v2ctl): sampler euler,
+# scheduler Ideogram4Scheduler, CFG 7 + CFGOverride 3 @ 70-100%,
+# DualModelGuider, 1024x1024, seed 71584314815009, models
+# ideogram4_int8_convrot + ideogram4_unconditional_int8_convrot.
+#
+# Revert: delete this file + the three COMFYMODAL_V2_WORKFLOW_* registry
+# flags. Nothing else references this profile.
+schema_version = 1
+name = "ideogram4_h100_20261015"
+extends = "production"
+owner = "ideogram-h100"
+
+[target]
+app = "ideogram4-h100-profile-20261015"
+class = "ModalRuntimeEntrypointV2"
+method = "run_plan_stream"
+
+[resources]
+gpu = "h100!"
+cpu = 4
+memory_mb = 16384
+min_containers = 0
+# Scaledown is in seconds: containers exit ~1s after use (cost-owned; every
+# run cold-starts by design, no idle H100 billing).
+scaledown_window = 1
+
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = ""
+# Exactly one request per invocation (never a hidden multi-run campaign).
+run_count = 1
+gap_seconds = 35.0
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# ── memory (deploy-baked; keep all three pinned to [resources].memory_mb) ──
+# Convention from source_race_h100/golden_p1: inherited production values
+# (8192) must not disagree with the 16384 override above.
+COMFYMODAL_V2_MEMORY_MB = "16384"
+COMFYMODAL_V2_MEMORY_REQUEST = "16384"
+COMFYMODAL_V2_BASELINE_MEMORY_REQUEST = "16384"
+# ── exact placement (deploy-baked; redeploy on change) ────────────────
+# Single region pin "us" (not "us-central"); no cloud pin. Matches the
+# Golden convention (golden_p1.toml): cloud pinning is not supported.
+COMFYMODAL_V2_REGION = "us"
+# ── canonical workflow selection (request-scoped; no redeploy on change) ─
+COMFYMODAL_V2_WORKFLOW_ID = "wf_81513286bb304e9f"
+COMFYMODAL_V2_WORKFLOW_VERSION_ID = "wv_f3baf54d8f784b64"
+# COMFYMODAL_V2_WORKFLOW_STEPS intentionally unset (= 0 = stored graph
+# default, 20 steps). The invariant run passes 16 explicitly per invocation.

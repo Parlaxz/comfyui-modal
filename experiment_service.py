@@ -915,6 +915,11 @@ class RunHistoryService:
             _atomic_write_text(log_path, log_text)
         if timings:
             _atomic_write_json(timing_path, timings)
+        # Single timing pipe: timing.json is the canonical store; the summary
+        # index column is a read projection of it, never an independent copy.
+        # Without this merge the index stores {} even when timing.json holds
+        # the run's full telemetry.
+        self._merge_timing_summary(run_dir, meta_obj)
         # Phase 7: upsert into summary index (best-effort, never blocks caller)
         self._index_try_upsert(meta_obj, str(meta_path))
         mirrored_generation_id = self._v2_try_mirror_record(meta_obj)
@@ -1009,6 +1014,11 @@ class RunHistoryService:
                         existing_timing = {}
                 existing_timing.update(timings)
                 _atomic_write_json(timing_path, existing_timing)
+
+            # Single timing pipe (see record_run): refresh the meta projection
+            # from the canonical timing.json before the index upsert, so the
+            # summary column always reflects what was just merged.
+            self._merge_timing_summary(run_dir, meta_obj)
 
         # Phase 7: upsert into summary index (best-effort, never blocks caller)
         self._index_try_upsert(meta_obj, str(meta_path))

@@ -53,7 +53,7 @@ def test_archive_matches_canonical_candidate_tree_and_modes(tmp_path):
 
     expected = {
         item.path: (
-            item.source_data if item.source_data is not None else item.data,
+            item.data,
             stat.S_IMODE(item.mode),
         )
         for item in files

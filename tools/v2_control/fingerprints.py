@@ -104,6 +104,11 @@ class FingerprintEngine:
             },
             "resources": {
                 "gpu": str(resources.gpu),
+                "gpu_alt": str(getattr(resources, "gpu_alt", "") or ""),
+                "gpu_fallbacks": [
+                    str(item)
+                    for item in (getattr(resources, "gpu_fallbacks", ()) or ())
+                ],
                 "cpu": int(resources.cpu),
                 "memory_mb": int(resources.memory_mb),
                 "min_containers": int(resources.min_containers),
@@ -206,6 +211,11 @@ class FingerprintEngine:
             },
             accelerator_inputs={
                 "gpu": str(resources.gpu),
+                "gpu_alt": str(getattr(resources, "gpu_alt", "") or ""),
+                "gpu_fallbacks": [
+                    str(item)
+                    for item in (getattr(resources, "gpu_fallbacks", ()) or ())
+                ],
                 "cpu": int(resources.cpu),
                 "memory_mb": int(resources.memory_mb),
             },

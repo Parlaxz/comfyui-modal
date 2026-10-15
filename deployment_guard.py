@@ -77,10 +77,18 @@ EXCLUDED_SIZE_DIRS: List[str] = [
     ".presets",
     ".preset_blobs",
     "MagicMock",
+    # Large local-only experiment/report dirs (never part of the image;
+    # listed explicitly so the source-context warning reflects deployable
+    # bytes instead of local archaeology).
+    "artifacts",
+    "unetClipExperimentsSeptember",
+    "golden_history",
+    ".repowise",
+    "comfymodal-data",
 ]
 
 EXCLUDED_SIZE_EXTENSIONS: Tuple[str, ...] = (
-    ".pyc", ".pyo", ".md", ".tmp",
+    ".pyc", ".pyo", ".md", ".tmp", ".bundle", ".rar",
 )
 
 

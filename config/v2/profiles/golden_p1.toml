@@ -13,7 +13,15 @@ class = "ModalRuntimeEntrypointV2"
 method = "run_golden_serial_stream"
 
 [resources]
-gpu = "rtx-pro-6000"
+gpu = "h100!"
+# Alt-order primary: one `modal deploy` binds TWO functions in the same app
+# (order A = [gpu] + pool on ModalRuntimeEntrypointV2, order B = [gpu_alt] +
+# pool on ModalRuntimeEntrypointV2Alt).  Runs swap functions via the active
+# GPU order with no redeploy.  Empty gpu_alt = single-function deploy.
+# The pool is shared: each order is its primary plus the pool members that
+# differ from it, capped at 4 total (primary + up to 3 fallbacks).
+gpu_alt = "rtx-pro-6000"
+gpu_fallbacks = ["rtx-pro-6000", "h100!", "h200", "a100-80gb"]
 cpu = 4
 memory_mb = 16384
 min_containers = 0

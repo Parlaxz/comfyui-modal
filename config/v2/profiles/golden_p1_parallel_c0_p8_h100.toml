@@ -53,7 +53,7 @@ method = "run_golden_parallel_stream"
 [environment]
 # Pin Golden containers to the US region ("us", not "us-central"); redeploy
 # is required because the previous unpinned deployment receipt is invalidated.
-COMFYMODAL_V2_REGION = "us-central"
+COMFYMODAL_V2_REGION = "us"
 # Phase B generic composition: enable the shared QD4 CLIP demand reader so
 # generic CLIPLoader nodes use the canonical clip_qd_load arm (self-contained
 # per call, immune to the poisoned M2 pool). Canonical note: the speculative

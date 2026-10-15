@@ -171,6 +171,8 @@ class ProtectedPolicy:
                     "COMFYMODAL_V2_APP_NAME",
                     "COMFYMODAL_V2_CLASS_NAME",
                     "COMFYMODAL_V2_GPU",
+                    "COMFYMODAL_V2_GPU_ALT",
+                    "COMFYMODAL_V2_GPU_FALLBACKS",
                     "COMFYMODAL_V2_MEMORY_MB",
                     "COMFYMODAL_V2_CPU_REQUEST",
                     "COMFYMODAL_V2_RESTORE_ONLY_APP_NAME",

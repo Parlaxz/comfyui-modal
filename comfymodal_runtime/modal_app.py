@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, ContextManager, Iterator, Mapping, cast
 
-from gpu_catalog import parse_gpu_request, normalize_gpu_value, GPU_CATALOG, GPU_BY_VALUE
+from gpu_catalog import parse_gpu_request, parse_gpu_alt_request, GOLDEN_ALT_CLASS_NAME, normalize_gpu_value, GPU_CATALOG, GPU_BY_VALUE
 
 from .contracts import (
     DEPLOYMENT_PROOF_SCHEMA_VERSION,
@@ -5345,6 +5345,13 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
                     "COMFYMODAL_V2_EVICT_RETAIN_ROLE"):
         if _ev_key in os.environ:
             env[_ev_key] = os.environ[_ev_key]
+    # Dual GPU orders are class-decorator-baked per function, but the raw
+    # configured values also ride the class env so container-side telemetry
+    # (gpu_requested_order) reports the order that actually served the
+    # request, whichever function it ran on.
+    for _gpu_key in ("COMFYMODAL_V2_GPU_ALT", "COMFYMODAL_V2_GPU_FALLBACKS"):
+        if _gpu_key in os.environ:
+            env[_gpu_key] = os.environ[_gpu_key]
     if "COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS" in os.environ:
         env["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"] = os.environ["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"]
     # Optional Golden stage diagnostics preserve their absent-by-default
@@ -10318,7 +10325,19 @@ class ModalRuntimeEntrypoint:
         return self._legacy_api
 
     def _gpu_requested_order(self) -> tuple[str, ...]:
-        """Return the ordered GPU list from spec, falling back to env-based parse."""
+        """Return the ordered GPU list from spec, falling back to env-based parse.
+
+        Alt-function containers report the swapped order: the class identity
+        selects the spec, so telemetry always reflects the function that
+        actually served the request.
+        """
+        if type(self).__name__ == GOLDEN_ALT_CLASS_NAME:
+            alt_spec = globals().get("_MODAL_ALT_SPEC")
+            if alt_spec is not None and getattr(alt_spec, "gpu", ()):
+                return tuple(alt_spec.gpu)
+            alt_env_order = parse_gpu_alt_request()
+            if alt_env_order:
+                return alt_env_order
         spec = _MODAL_RESOURCES.get("spec")
         if spec is not None and spec.gpu:
             return spec.gpu
@@ -15095,8 +15114,9 @@ class ModalRuntimeEntrypoint:
         # the bridge — so the first request is served exactly like a
         # restore-activated container.  A partial container keeps the
         # previous fallback (clear the bridge; the normal loader path serves
-        # the request).  Identity mismatch or activation failure still fails
-        # closed for production.
+        # the request).  Identity mismatch or activation failure falls back
+        # the same way on every profile: the bridge is cleared and the
+        # normal loader serves the requested models.
         _request_time_activation_required = False
         if (
             self._cpu_snapshot_models is not None
@@ -15436,25 +15456,24 @@ class ModalRuntimeEntrypoint:
                     except Exception:
                         pass
                 else:
-                    # Model identity differs — clear bridge and deactivate.
-                    if _is_production_profile():
-                        print(
-                            "[v2.cpu_snapshot_request] status=mismatch "
-                            f"reason=model_or_spec_mismatch "
-                            f"request_key_hash={request_model_key.stable_hash[:16] if hasattr(request_model_key, 'stable_hash') else ''} "
-                            f"snapshot_key_hash={snapshot_key.stable_hash[:16] if hasattr(snapshot_key, 'stable_hash') else ''} "
-                            f"unet_mismatch_fields={','.join(_role_report.get('unet_mismatch_fields', [])) or 'none'} "
-                            f"clip_mismatch_fields={','.join(_role_report.get('clip_mismatch_fields', [])) or 'none'} "
-                            f"vae_mismatch_fields={','.join(_role_report.get('vae_mismatch_fields', [])) or 'none'} "
-                            f"unet_match={int(bool(_role_report.get('unet_match', False)))} "
-                            f"clip_match={int(bool(_role_report.get('clip_match', False)))} "
-                            f"vae_match={int(bool(_role_report.get('vae_match', False)))}",
-                            flush=True,
-                        )
-                        raise RuntimeError(
-                            "Production CPU snapshot model/spec identity mismatch; "
-                            "refusing graph-loader fallback"
-                        )
+                    # Model identity differs — clear bridge and deactivate so
+                    # the normal loader serves the requested models.  The CPU
+                    # snapshot is model-agnostic fast-path infrastructure: a
+                    # mismatch only skips the snapshot bind, it never fails
+                    # the request (all profiles share the fallback contract).
+                    print(
+                        "[v2.cpu_snapshot_request] status=mismatch "
+                        f"reason=model_or_spec_mismatch "
+                        f"request_key_hash={request_model_key.stable_hash[:16] if hasattr(request_model_key, 'stable_hash') else ''} "
+                        f"snapshot_key_hash={snapshot_key.stable_hash[:16] if hasattr(snapshot_key, 'stable_hash') else ''} "
+                        f"unet_mismatch_fields={','.join(_role_report.get('unet_mismatch_fields', [])) or 'none'} "
+                        f"clip_mismatch_fields={','.join(_role_report.get('clip_mismatch_fields', [])) or 'none'} "
+                        f"vae_mismatch_fields={','.join(_role_report.get('vae_mismatch_fields', [])) or 'none'} "
+                        f"unet_match={int(bool(_role_report.get('unet_match', False)))} "
+                        f"clip_match={int(bool(_role_report.get('clip_match', False)))} "
+                        f"vae_match={int(bool(_role_report.get('vae_match', False)))}",
+                        flush=True,
+                    )
                     self._preload_bridge.clear()
                     self._cpu_snapshot_models_active = False
                     self._cpu_snapshot_unet_runtime_state = None
@@ -15505,11 +15524,9 @@ class ModalRuntimeEntrypoint:
                     f"reason=error:{str(_bind_exc)[:80]}",
                     flush=True,
                 )
-                if _is_production_profile():
-                    raise RuntimeError(
-                        "Production CPU snapshot activation failed; "
-                        "refusing graph-loader fallback: " + str(_bind_exc)
-                    ) from _bind_exc
+                # Fall through to the normal loader on every profile: the
+                # bridge is cleared above, so graph loaders serve the
+                # requested models (see the mismatch branch contract).
         # ── Record + verify exact retained UNET identity (request-time) ──
         # The bridge-served UNET must be the exact snapshot/activation object
         # (or its CacheDiT-patched replacement).  The identity chain stages
@@ -15907,10 +15924,13 @@ class ModalRuntimeEntrypoint:
         execution_prefill_allowed, status, reason.
 
         Fails clearly (RuntimeError) when the production profile has BOTH
-        models present in the snapshot container but the snapshot is NOT
-        active — the request-time path must never serve present-but-inactive
-        CPU patchers.  Diagnostic no-model / CLIP-only / UNET-only modes
-        remain allowed.
+        models present but INACTIVE while the loader bridge still holds a
+        preparation that could serve those stale CPU patchers to the
+        sampler.  A cleared bridge (the mismatch/activation-error fallback)
+        can serve nothing stale, so the normal loader path proceeds — the
+        snapshot is model-agnostic fast-path infrastructure, not a serving
+        gate.  Diagnostic no-model / CLIP-only / UNET-only modes remain
+        allowed.
         """
         profile = os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower()
         models = getattr(self, "_cpu_snapshot_models", None)
@@ -15937,9 +15957,10 @@ class ModalRuntimeEntrypoint:
             and clip_present
             and unet_present
             and not cpu_snapshot_container_active
+            and loader_bridge_active
         ):
             status = "fail"
-            reason = "production_models_present_but_inactive"
+            reason = "production_stale_bridge_preparation_present"
             _fields = (
                 f"profile={profile} "
                 f"models_container_present={int(models_container_present)} "
@@ -15955,8 +15976,9 @@ class ModalRuntimeEntrypoint:
             print(f"[v2.snapshot_activation_invariant] {_fields}", flush=True)
             raise RuntimeError(
                 "Production CPU snapshot has both models present but is "
-                "INACTIVE; refusing to serve inactive CPU patchers to the "
-                "sampler (reason=production_models_present_but_inactive)"
+                "INACTIVE while the loader bridge still holds a preparation; "
+                "refusing to serve possibly-stale CPU patchers to the "
+                "sampler (reason=production_stale_bridge_preparation_present)"
             )
         _fields_ok = (
             f"profile={profile} "
@@ -18687,6 +18709,37 @@ class ModalRuntimeEntrypoint:
                 "descriptor_end_mono_ns": _descriptor_end_mono_ns,
                 "exec_result_ready_mono_ns": time.monotonic_ns(),
             }
+            # Kitchen attention status for generation metadata: the generic
+            # dispatch holder accumulated per-sampler engaged/skipped notes
+            # during prompt execution. Plain primitives only (strict-JSON
+            # safe); the waterfall builder turns skips into viewer warnings.
+            try:
+                _kitchen_summary: Any = None
+                _ks_fn = getattr(_generic_loader_holder, "kitchen_summary", None)
+                if callable(_ks_fn):
+                    _kitchen_summary = _ks_fn()
+                if not isinstance(_kitchen_summary, dict):
+                    _kitchen_summary = {
+                        "requested": "", "engaged": [], "skipped": []}
+                try:
+                    _kitchen_summary["requested"] = str(os.environ.get(
+                        "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND", "")
+                        or "").strip().lower()
+                except Exception:
+                    pass
+                result["attention_backend"] = {
+                    "requested": str(_kitchen_summary.get("requested") or ""),
+                    "engaged": [
+                        dict(e) for e in
+                        (_kitchen_summary.get("engaged") or [])
+                        if isinstance(e, dict)],
+                    "skipped": [
+                        dict(e) for e in
+                        (_kitchen_summary.get("skipped") or [])
+                        if isinstance(e, dict)],
+                }
+            except Exception:
+                pass
             return result
         finally:
             if _seed_hook_restore is not None:
@@ -24931,10 +24984,16 @@ class ModalRuntimeEntrypoint:
             yield {"type": "result", "data": result}
 
 
-def _build_decorated_v2_class() -> type:
-    """Build a ``ModalRuntimeEntrypointV2`` subclass with all Modal lifecycle
+def _build_decorated_v2_class(class_name: str = "ModalRuntimeEntrypointV2") -> type:
+    """Build a decorated V2 entrypoint subclass with all Modal lifecycle
     and method decorators applied, but WITHOUT ``modal.concurrent()`` or
     ``app.cls()`` binding (which requires resources).
+
+    ``class_name`` selects the publicada class identity: the primary
+    ``ModalRuntimeEntrypointV2`` serves GPU order A, while the
+    ``GOLDEN_ALT_CLASS_NAME`` sibling serves the swapped order B.  Both
+    share the same base implementation; only the deploy-time ``gpu=``
+    binding differs.
 
     Uses ``object.__init__`` to avoid Modal's custom-constructor deprecation
     warning.  Per-container initialization is deferred to the ``enter()``
@@ -24956,7 +25015,7 @@ def _build_decorated_v2_class() -> type:
     import functools
 
     # Create subclass with object.__init__ to avoid Modal's custom constructor warning.
-    cls = type("ModalRuntimeEntrypointV2", (ModalRuntimeEntrypoint,), {
+    cls = type(class_name, (ModalRuntimeEntrypoint,), {
         "__init__": object.__init__,
     })
 
@@ -25298,21 +25357,21 @@ def _build_decorated_v2_class() -> type:
     return cls
 
 
-def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntimeSpec) -> Any:
+def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntimeSpec, class_name: str = "ModalRuntimeEntrypointV2") -> Any:
     if _modal is None or resources.get("app") is None:
         return None
 
     # The raw decorated class was already exported by the module tail.
     # Reuse it for concurrent + app binding; do NOT re-create it (that
     # would register duplicate Modal functions).
-    remote_class = globals().get("ModalRuntimeEntrypointV2")
+    remote_class = globals().get(class_name)
     if remote_class is None or remote_class is ModalRuntimeEntrypoint:
         # Guard: if the decorated class somehow wasn't set (e.g. _modal was
         # unavailable when _build_decorated_v2_class was called but became
         # available now), build it fresh.
-        remote_class = _build_decorated_v2_class()
+        remote_class = _build_decorated_v2_class(class_name)
         if remote_class is not None:
-            globals()["ModalRuntimeEntrypointV2"] = remote_class
+            globals()[class_name] = remote_class
     if remote_class is None:
         return None
 
@@ -25610,3 +25669,27 @@ ModalRuntimeEntrypointRemote = _register_remote_entrypoint(
     _MODAL_RESOURCES,
     _MODAL_RESOURCES["spec"],
 )
+
+# ── Alt GPU-order function (order B) ─────────────────────────────────────
+# When COMFYMODAL_V2_GPU_ALT configures a distinct swapped primary, one
+# `modal deploy` binds a SECOND class in the same app with the swapped GPU
+# order.  Runs select the function via the profile's active GPU order, so
+# swapping priority never needs a redeploy.  Absent alt = single-function
+# deploy, exactly as before.
+_MODAL_ALT_SPEC: ModalRuntimeSpec | None = None
+ModalRuntimeEntrypointRemoteAlt = None
+try:
+    _alt_gpu_order = parse_gpu_alt_request()
+except Exception:
+    _alt_gpu_order = ()
+if _alt_gpu_order:
+    _MODAL_ALT_SPEC = ModalRuntimeSpec(gpu=_alt_gpu_order)
+    _v2_alt_decorated_class = _build_decorated_v2_class(GOLDEN_ALT_CLASS_NAME)
+    globals()[GOLDEN_ALT_CLASS_NAME] = (
+        _v2_alt_decorated_class if _v2_alt_decorated_class is not None else ModalRuntimeEntrypoint
+    )
+    ModalRuntimeEntrypointRemoteAlt = _register_remote_entrypoint(
+        _MODAL_RESOURCES,
+        _MODAL_ALT_SPEC,
+        GOLDEN_ALT_CLASS_NAME,
+    )

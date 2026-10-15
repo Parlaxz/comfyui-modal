@@ -350,11 +350,12 @@ body.comfymodal-body-scroll-lock {
 }
 .comfymodal-studio-sync-notice-host[hidden] { display: none; }
 .comfymodal-studio-sync-notice {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px 12px;
-  padding: 9px 12px;
+  padding: 9px 36px 9px 12px;
   border: 1px solid #4a3a00;
   border-radius: 4px;
   background: #2a1a00;
@@ -378,8 +379,38 @@ body.comfymodal-body-scroll-lock {
 }
 .comfymodal-studio-sync-actions { margin-left: auto; }
 .comfymodal-studio-sync-actions .comfymodal-primary-btn { width: auto; padding: 6px 12px; font-size: 11px; }
+.comfymodal-studio-sync-toggle { width: auto; padding: 4px 10px; font-size: 11px; }
+.comfymodal-studio-sync-pending-list {
+  flex-basis: 100%;
+  margin: 4px 0 0;
+  padding: 6px 10px 6px 26px;
+  border: 1px solid #4a3a00;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.35);
+  color: #fde68a;
+  font-size: 11px;
+  line-height: 1.6;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.comfymodal-studio-sync-pending-list[hidden] { display: none; }
 .comfymodal-studio-sync-result { flex-basis: 100%; color: #d0d0d0; font-size: 11px; }
 .comfymodal-studio-sync-notice.mismatch .comfymodal-studio-sync-actions { margin-top: 8px; }
+.comfymodal-studio-sync-dismiss {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  padding: 2px 8px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.7;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.comfymodal-studio-sync-dismiss:hover { opacity: 1; background: rgba(255, 255, 255, 0.12); }
 
 /* ── Playground ──────────────────────────────────────────── */
 

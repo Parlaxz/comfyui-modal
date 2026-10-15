@@ -545,7 +545,14 @@ def build_source_identity(
 
 
 def build_archive(files: tuple[SemanticFile, ...]) -> bytes:
-    """Build a reproducible archive from the exact identity file set."""
+    """Build a reproducible archive from the exact identity file set.
+
+    Members carry the canonical publication bytes (``item.data``), not the
+    raw source bytes: the manifest digests that ``_remote_content_mismatch``
+    verifies against are computed over the canonical form, so packing raw
+    bytes makes verification fail deterministically for every file whose
+    canonical form differs (e.g. CRLF line endings on a Windows checkout).
+    """
     output = io.BytesIO()
     with gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed:
         with tarfile.open(fileobj=compressed, mode="w") as archive:
@@ -563,7 +570,7 @@ def build_archive(files: tuple[SemanticFile, ...]) -> bytes:
                 ):
                     raise ValueError(f"unsafe archive member path: {item.path!r}")
                 info = tarfile.TarInfo(normalized_path)
-                payload = item.source_data if item.source_data is not None else item.data
+                payload = item.data
                 info.size = len(payload)
                 info.mtime = 0
                 info.uid = info.gid = 0
@@ -577,7 +584,7 @@ def archive_content_digest(files: tuple[SemanticFile, ...]) -> str:
     """Return a stable cache key for archive bytes without rebuilding them."""
     digest = hashlib.sha256()
     for item in sorted(files, key=lambda item: item.path):
-        payload = item.source_data if item.source_data is not None else item.data
+        payload = item.data
         digest.update(item.path.encode("utf-8"))
         digest.update(b"\0")
         digest.update(str(stat.S_IMODE(item.mode)).encode("ascii"))

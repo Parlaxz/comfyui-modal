@@ -371,3 +371,109 @@ class TestArmOrdering:
         assert "qd4_gate_disabled" in results["195"]["reason"]
         assert "PoolPoisonedError" in results["195"]["reason"]
         assert asyncio.run(cache.get("195")) is None
+
+
+# ---------------------------------------------------------------------------
+# Sampler patcher resolution (direct model + guider fallback)
+# ---------------------------------------------------------------------------
+
+def _patcher():
+    return type("P", (), {"model_options": {}})()
+
+
+class _FakeGuider:
+    # Instance attributes, mirroring ComfyUI guiders
+    # (CFGGuider.__init__ sets self.model_patcher).
+    def __init__(self, patcher=None, **extra):
+        self.model_patcher = patcher if patcher is not None else _patcher()
+        for key, value in extra.items():
+            setattr(self, key, value)
+
+
+def _guider(patcher=None, **extra):
+    return _FakeGuider(patcher, **extra)
+
+
+class TestResolveSamplerPatchers:
+    def test_direct_model_resolves(self):
+        patcher = _patcher()
+        assert ggl._resolve_sampler_patchers({"model": [patcher]}) == [patcher]
+
+    def test_direct_model_scalar_resolves(self):
+        patcher = _patcher()
+        assert ggl._resolve_sampler_patchers({"model": patcher}) == [patcher]
+
+    def test_guider_fed_sampler_resolves_without_direct_model(self):
+        # Ideogram/Flux2 SamplerCustomAdvanced wiring: no "model" input,
+        # the patcher arrives via the guider.
+        patcher = _patcher()
+        inputs = {"guider": [_guider(patcher)], "noise": ["n", 0],
+                  "latent_image": ["l", 0]}
+        assert ggl._resolve_sampler_patchers(inputs) == [patcher]
+
+    def test_guider_model_attribute_fallback(self):
+        patcher = _patcher()
+        guid = type("G", (), {"model": patcher})()
+        assert ggl._resolve_sampler_patchers({"guider": [guid]}) == [patcher]
+
+    def test_dual_patcher_guiders_resolve_both_legs(self):
+        first, second = _patcher(), _patcher()
+        guid = _guider(first, uncond_model_patcher=second)
+        resolved = ggl._resolve_sampler_patchers({"guider": [guid]})
+        assert resolved == [first, second]
+
+    def test_guider_itself_is_never_scoped(self):
+        guid = _guider()
+        resolved = ggl._resolve_sampler_patchers({"guider": [guid]})
+        assert guid not in resolved
+        assert len(resolved) == 1
+
+    def test_no_patcher_resolves_empty(self):
+        assert ggl._resolve_sampler_patchers({"guider": [None]}) == []
+        assert ggl._resolve_sampler_patchers({"seed": [1]}) == []
+        assert ggl._resolve_sampler_patchers(None) == []
+
+    def test_never_raises_on_hostile_inputs(self):
+        class Exploding:
+            @property
+            def model_options(self):
+                raise RuntimeError("boom")
+        assert ggl._resolve_sampler_patchers({"model": [Exploding()]}) == []
+        assert ggl._resolve_sampler_patchers({"guider": [Exploding()]}) == []
+
+    def test_is_sampler_node_accepts_guider_fed(self):
+        class SamplerCustomAdvanced:
+            pass
+        inputs = {"guider": [_guider()], "noise": ["n", 0]}
+        assert ggl._is_sampler_node(SamplerCustomAdvanced(), inputs) is True
+
+    def test_is_sampler_node_rejects_selectors(self):
+        class KSamplerSelect:
+            pass
+        assert ggl._is_sampler_node(
+            KSamplerSelect(), {"sampler_name": ["euler"]}) is False
+
+
+class TestKitchenHolderNotes:
+    def test_engaged_and_skipped_survive_json_roundtrip(self):
+        import json
+        holder = ggl.GenericLoaderHolder()
+        holder.note_kitchen(node_id="30:3", node_class="KSampler",
+                            outcome="engaged", requested="comfy_kitchen",
+                            selected="attention_comfy_kitchen_int8", calls=256)
+        holder.note_kitchen(node_id="98:12",
+                            node_class="SamplerCustomAdvanced",
+                            outcome="skipped", requested="comfy_kitchen",
+                            reason="no_sampler_patcher_resolved")
+        summary = holder.kitchen_summary()
+        assert summary["requested"] == "comfy_kitchen"
+        assert summary["engaged"][0]["calls"] == 256
+        assert summary["skipped"][0]["reason"] == "no_sampler_patcher_resolved"
+        assert json.loads(json.dumps(summary)) == summary
+
+    def test_invalid_outcomes_ignored_and_never_raise(self):
+        holder = ggl.GenericLoaderHolder()
+        holder.note_kitchen(outcome="bogus")
+        holder.note_kitchen()
+        assert holder.kitchen_summary() == {
+            "requested": "", "engaged": [], "skipped": []}

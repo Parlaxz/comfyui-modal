@@ -42,6 +42,8 @@ _CLI_OPTION_KEYS = frozenset(
         "target.class",
         "target.method",
         "resources.gpu",
+        "resources.gpu_alt",
+        "resources.gpu_fallbacks",
         "resources.cpu",
         "resources.memory_mb",
         "resources.min_containers",
@@ -70,6 +72,8 @@ class Target:
 @dataclass
 class Resources:
     gpu: str
+    gpu_alt: str
+    gpu_fallbacks: tuple
     cpu: int
     memory_mb: int
     min_containers: int
@@ -149,6 +153,8 @@ class ResolvedConfig:
             },
             "resources": {
                 "gpu": self.resources.gpu,
+                "gpu_alt": self.resources.gpu_alt,
+                "gpu_fallbacks": list(self.resources.gpu_fallbacks),
                 "cpu": self.resources.cpu,
                 "memory_mb": self.resources.memory_mb,
                 "min_containers": self.resources.min_containers,
@@ -337,6 +343,17 @@ class ConfigResolver:
         return Resources(
             gpu=str(
                 cli_options.get("resources.gpu", profile_resources.get("gpu", ""))
+            ),
+            gpu_alt=_normalize_gpu_alt(
+                cli_options.get(
+                    "resources.gpu_alt", profile_resources.get("gpu_alt", "")
+                )
+            ),
+            gpu_fallbacks=_normalize_gpu_fallbacks(
+                cli_options.get(
+                    "resources.gpu_fallbacks",
+                    profile_resources.get("gpu_fallbacks", []),
+                )
             ),
             cpu=_coerce_int(
                 cli_options.get("resources.cpu", profile_resources.get("cpu", 0)),
@@ -581,6 +598,41 @@ def _reject_unknown_cli_options(cli_options: dict) -> None:
     for key in cli_options:
         if key not in _CLI_OPTION_KEYS:
             raise FlagError(f"unknown cli option {key!r}; expected one of: {', '.join(sorted(_CLI_OPTION_KEYS))}")
+
+
+# -- GPU order normalization ---------------------------------------------------
+#
+# Deploy-baked dual GPU orders: order A = [gpu] + fallbacks, order B =
+# [gpu_alt] + fallbacks.  This module stays stdlib-only (no gpu_catalog
+# import: v2ctl runs without the repo root on sys.path), so normalization
+# here is lowercase/strip/dedupe only; Modal-canonical casing and catalog
+# validation happen at the Studio write boundary and deploy-side parsing.
+
+
+def _normalize_gpu_alt(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _normalize_gpu_fallbacks(value: object) -> tuple:
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return ()
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        normalized = str(item).strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+        if len(result) >= 4:
+            break
+    return tuple(result)
 
 
 def _coerce_bool(value: object, key: str) -> bool:

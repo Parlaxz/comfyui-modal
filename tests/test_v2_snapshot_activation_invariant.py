@@ -186,23 +186,47 @@ class SnapshotActivationInvariantTests(unittest.TestCase):
         self.assertIn("status=pass", line)
         self.assertIn("reason=ok", line)
 
-    def test_production_both_models_inactive_fails(self):
-        """Production + both models present + INACTIVE -> clear RuntimeError."""
+    def test_production_inactive_with_cleared_bridge_passes(self):
+        """Production + both models present + INACTIVE + cleared bridge is
+        the mismatch-fallback state: nothing stale can reach the sampler,
+        so the normal loader path proceeds without raising."""
         ep = _make_entrypoint(profile="production")
         ep._cpu_snapshot_models = self._models_container()
         ep._cpu_snapshot_models_active = False
+        self.assertIsNone(ep._preload_bridge._preparation)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = ep._enforce_snapshot_activation_invariant(request_id="req-inactive")
+        self.assertEqual(result["status"], "pass")
+        line = buf.getvalue()
+        self.assertIn("[v2.snapshot_activation_invariant]", line)
+        self.assertIn("cpu_snapshot_container_active=0", line)
+        self.assertIn("loader_bridge_active=0", line)
+
+    def test_production_inactive_with_stale_bridge_preparation_fails(self):
+        """Production + INACTIVE models + a live bridge preparation still
+        fails closed: the stale preparation could serve outdated patchers."""
+        ep = _make_entrypoint(profile="production")
+        _ensure_bridge_has_fake_nodes(ep._preload_bridge)
+        ep._cpu_snapshot_models = self._models_container()
+        ep._cpu_snapshot_models_active = False
+        ep._preload_bridge.use_ready_models(
+            model_key=ModelRestoreKey(unet_identity="old.safetensors", clip_identity="old-clip", clip_type="sd3"),
+            prefill_key=PrefillKey(),
+            model_spec=_make_snapshot_spec(),
+            unet=ep._cpu_snapshot_models.unet,
+            clip=ep._cpu_snapshot_models.clip,
+        )
+        self.assertIsNotNone(ep._preload_bridge._preparation)
         buf = io.StringIO()
         with redirect_stdout(buf):
             with self.assertRaises(RuntimeError) as ctx:
-                ep._enforce_snapshot_activation_invariant(request_id="req-inactive")
+                ep._enforce_snapshot_activation_invariant(request_id="req-stale-prep")
         msg = str(ctx.exception)
-        self.assertIn("INACTIVE", msg)
-        self.assertIn("inactive", msg.lower())
-        self.assertIn("present", msg.lower())
+        self.assertIn("stale", msg.lower())
         line = buf.getvalue()
         self.assertIn("status=fail", line)
-        self.assertIn("reason=production_models_present_but_inactive", line)
-        self.assertIn("cpu_snapshot_container_active=0", line)
+        self.assertIn("loader_bridge_active=1", line)
 
     def test_production_present_but_inactive_guard_clears_bridge_diagnostic(self):
         """Diagnostic profile with present-but-inactive models must NOT serve

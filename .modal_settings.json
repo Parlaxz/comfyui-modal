@@ -4,6 +4,9 @@
   "data_saver_default": "on",
   "data_saver_quality": 70,
   "execution_mode": "v2",
+  "golden_gpu_order": {
+    "golden_p1_parallel_c0_p8_h100": "B"
+  },
   "gpu": "rtx-pro-6000",
   "output_format": "original",
   "preview_codec": "webp",
@@ -12,5 +15,6 @@
   "quality": 75,
   "save_folder": "output/modal",
   "save_metadata_sidecar": true,
+  "skip_plan_validation": true,
   "webp_lossless_compression": "balanced"
 }

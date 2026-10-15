@@ -393,6 +393,38 @@ const SHELF_LAYOUT_KEY = "comfymodal.studio.shelf.layout.v1";
 const SHELF_VALUES_KEY = "comfymodal.studio.shelf.values.v1";
 const SHELF_EXPERIMENT_DRAFT_KEY = "comfymodal.studio.shelf.experiment.v1";
 const SKIP_TEXT_GENERATE_KEY = "comfymodal.studio.playground.skip-text-generate.v1";
+// Temporary escape hatch for plan-validation/dependency false negatives.
+// Global (not per-workflow): when set, Studio runs skip the host safety
+// gates. Server persists its own mirror via POST /comfymodal/config.
+export const SKIP_PLAN_VALIDATION_KEY = "comfymodal_skip_plan_validation";
+
+/**
+ * Whether the plan-validation escape hatch is enabled locally.
+ * @returns {boolean} false when nothing saved
+ */
+export function loadSkipPlanValidation() {
+  try {
+    if (typeof localStorage === "undefined") return false;
+    return localStorage.getItem(SKIP_PLAN_VALIDATION_KEY) === "1";
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Persist the plan-validation escape hatch. False removes the key so
+ * settings resets only need removeItem.
+ * @param {boolean} value
+ */
+export function saveSkipPlanValidation(value) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    if (value === true) localStorage.setItem(SKIP_PLAN_VALIDATION_KEY, "1");
+    else localStorage.removeItem(SKIP_PLAN_VALIDATION_KEY);
+  } catch (e) {
+    // Ignore
+  }
+}
 
 function _shelfValuesKey(workflowId, versionId) {
   return `${workflowId || ""}::${versionId || ""}`;

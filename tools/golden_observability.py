@@ -406,6 +406,56 @@ def is_workflow_contract_valid(value: Mapping[str, Any] | None) -> bool:
 validate_golden_workflow_contract = validate_workflow_contract
 
 
+def ideogram4_selection_failures(
+    value: Mapping[str, Any] | None,
+    *,
+    expected_workflow_id: str = "",
+    expected_workflow_version_id: str = "",
+) -> list[str]:
+    """Fail-closed proof for an exact-placement Ideogram workflow selection.
+
+    Reuses :func:`build_workflow_identity_matrix` so the legacy spellings a
+    v2ctl dry-run/run manifest carries (``workflow_hash``,
+    ``prompt_sha256``, ``compiled_workflow_hash``) are proven through the
+    same canonical hash domains as the Golden workflow contract.  Missing
+    hashes fail closed: an absent hash is never treated as "matches".
+    Expected ids are checked only when supplied, so the helper stays usable
+    without duplicating the single canonical constant block in
+    ``tools/v2_control/cli.py``.
+    """
+    failures: list[str] = []
+    if not isinstance(value, Mapping):
+        return ["ideogram workflow selection is missing"]
+    matrix = build_workflow_identity_matrix(value)
+    if not matrix.get("source_workflow_sha256"):
+        failures.append("ideogram workflow selection workflow_hash is missing")
+    if not matrix.get("request_prompt_sha256"):
+        failures.append("ideogram workflow selection prompt_sha256 is missing")
+    if not matrix.get("compiled_workflow_sha256"):
+        failures.append("ideogram workflow selection compiled_workflow_hash is missing")
+    if expected_workflow_id:
+        observed_id = str(value.get("workflow_id") or "").strip()
+        if not observed_id:
+            failures.append("ideogram workflow selection workflow_id is missing")
+        elif observed_id != expected_workflow_id:
+            failures.append(
+                "ideogram workflow selection workflow_id mismatch "
+                f"({observed_id!r} != {expected_workflow_id!r}); "
+                "refusing to fall back to another workflow"
+            )
+    if expected_workflow_version_id:
+        observed_version = str(value.get("workflow_version_id") or "").strip()
+        if not observed_version:
+            failures.append("ideogram workflow selection workflow_version_id is missing")
+        elif observed_version != expected_workflow_version_id:
+            failures.append(
+                "ideogram workflow selection workflow_version_id mismatch "
+                f"({observed_version!r} != {expected_workflow_version_id!r}); "
+                "refusing to fall back to another workflow version"
+            )
+    return failures
+
+
 def _timestamp(value: Mapping[str, Any]) -> int | None:
     """Return a timestamp in nanoseconds, preferring Golden wall time."""
     # Monotonic timestamps are useful for diagnostics, but cannot be compared

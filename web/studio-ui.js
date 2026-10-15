@@ -342,6 +342,84 @@ function _timingBucketForLabel(label) {
   return null;
 }
 
+function _timingSpanDuration(span, nowMs) {
+  if (!span || typeof span !== "object") return null;
+  var raw = span.durationMs != null ? span.durationMs
+    : span.duration_ms != null ? span.duration_ms : null;
+  var done = _timingNumber(raw);
+  if (done != null) return done;
+  // Live span: no duration yet — derive elapsed the same way the progress
+  // rows do (progressSpanView: nowMs - observedAtMs for started spans).
+  // Without this, every in-flight span was dropped and a running run kept
+  // showing "Diagnostics pending" despite rows ticking in the progress
+  // section.
+  if (span.phase === "started" && span.observedAtMs != null) {
+    var elapsed = Number(nowMs) - Number(span.observedAtMs);
+    if (Number.isFinite(elapsed) && elapsed > 0) return elapsed;
+  }
+  return null;
+}
+
+function _timingSpanLabel(span) {
+  if (!span || typeof span !== "object") return "";
+  var raw = span.label != null ? span.label : span.name;
+  var text = String(raw == null ? "" : raw).trim();
+  if (!text) return "";
+  // Same light humanization as the live progress rows: golden_ prefixes
+  // read as words, executor node detail ("CLIPTextEncode (node 98:24)")
+  // is preserved verbatim.
+  if (/^golden[_ ]+/i.test(text)) {
+    text = text.replace(/^golden[_ ]+/i, "").replace(/[_-]+/g, " ").trim();
+    text = text.replace(/\w\S*/g, function (w) { return w.charAt(0).toUpperCase() + w.slice(1); });
+  }
+  return text;
+}
+
+// Span breakdown fallback: the live progress rows (Restoring, CLIP load,
+// "CLIPTextEncode (node 98:24)", ...) live on nodeSpans / gantt.spans /
+// goldenProgress — shapes the bucket keys never fed. When buckets are
+// empty, rows above the noise floor render here so Diagnostics shows the
+// same breakdown instead of "Diagnostics pending".
+//
+// Floor for span rows: executor trivia (Int/MathExpression nodes at
+// 0-1ms) must never crowd the Diagnostics flow. Only spans above 50ms
+// render; anything below is measurement noise, not a pipeline stage.
+var _TIMING_SPAN_MIN_MS = 50;
+function _timingSpanEntries(root) {
+  var sources = [];
+  function pushSpans(list) {
+    if (Array.isArray(list) && list.length > 0) sources.push(list);
+  }
+  pushSpans(root.nodeSpans);
+  if (root.gantt && typeof root.gantt === "object") pushSpans(root.gantt.spans);
+  var goldenHolders = [root.goldenProgress, root.golden];
+  if (root.timing && typeof root.timing === "object") {
+    pushSpans(root.timing.nodeSpans);
+    if (root.timing.gantt && typeof root.timing.gantt === "object") pushSpans(root.timing.gantt.spans);
+    goldenHolders.push(root.timing.goldenProgress, root.timing.golden);
+  }
+  goldenHolders.forEach(function (golden) {
+    if (golden && typeof golden === "object") {
+      pushSpans(golden.nodeSpans);
+      if (golden.gantt && typeof golden.gantt === "object") pushSpans(golden.gantt.spans);
+    }
+  });
+  if (sources.length === 0) return [];
+  var nowMs = Date.now();
+  var byLabel = {};
+  sources.forEach(function (list) {
+    list.forEach(function (span) {
+      var label = _timingSpanLabel(span);
+      var duration = _timingSpanDuration(span, nowMs);
+      if (!label || duration == null || duration <= _TIMING_SPAN_MIN_MS) return;
+      if (byLabel[label] == null || duration > byLabel[label]) byLabel[label] = duration;
+    });
+  });
+  return Object.keys(byLabel).map(function (label, index) {
+    return { key: "span-" + index, label: label, group: "span-" + index, durationMs: byLabel[label] };
+  }).slice(0, 12);
+}
+
 function _timingFlowEntries(timing) {
   var root = timing && typeof timing === "object" ? timing : {};
   if (Array.isArray(root)) root = { stages: root };
@@ -401,25 +479,32 @@ function _timingFlowEntries(timing) {
   });
   if (totalMs == null) totalMs = stageTotal;
 
-  var entries = [];
-  _TIMING_BUCKETS.forEach(function (bucket) {
-    var sum = 0;
-    var seen = false;
-    bucket.flat.forEach(function (key) {
-      var part = _timingNumber(values[key]);
-      if (part != null) {
-        seen = true;
-        sum += part;
+  // Span breakdown first: per-node rows (nodeSpans / gantt spans) are the
+  // most detailed truthful source — the same rows the live progress
+  // section renders — so they win over the collapsed 7-bucket rollup
+  // whenever present. Buckets remain the view for records that carry only
+  // flat/stage timing with no span detail.
+  var entries = _timingSpanEntries(root);
+  if (entries.length === 0) {
+    _TIMING_BUCKETS.forEach(function (bucket) {
+      var sum = 0;
+      var seen = false;
+      bucket.flat.forEach(function (key) {
+        var part = _timingNumber(values[key]);
+        if (part != null) {
+          seen = true;
+          sum += part;
+        }
+      });
+      // Stages-array values fill buckets the flat keys never fed, so a
+      // record carrying both shapes is never double-counted.
+      if (!seen && bucketStageSums[bucket.key] != null) {
+        sum = bucketStageSums[bucket.key];
+        seen = sum > 0;
       }
+      if (seen && sum > 0) entries.push({ key: bucket.key, label: bucket.label, group: bucket.group, durationMs: sum });
     });
-    // Stages-array values fill buckets the flat keys never fed, so a
-    // record carrying both shapes is never double-counted.
-    if (!seen && bucketStageSums[bucket.key] != null) {
-      sum = bucketStageSums[bucket.key];
-      seen = sum > 0;
-    }
-    if (seen && sum > 0) entries.push({ key: bucket.key, label: bucket.label, group: bucket.group, durationMs: sum });
-  });
+  }
 
   // Last resort: the record carries timing data in shapes we do not model.
   // Show it humanized rather than claiming nothing was recorded.
@@ -429,6 +514,14 @@ function _timingFlowEntries(timing) {
       human = human.charAt(0).toUpperCase() + human.slice(1);
       entries.push({ key: "stage-" + index, label: human || stage.label, group: "legacy-" + index, durationMs: stage.durationMs });
     });
+  }
+  // Persisted terminal snapshots carry their own end-to-end total
+  // (spanTotalMs) since spans never feed the bucket keys above.
+  if (totalMs == null) {
+    totalMs = _timingNumber(root.spanTotalMs);
+    if (totalMs == null && root.goldenProgress && typeof root.goldenProgress === "object") {
+      totalMs = _timingNumber(root.goldenProgress.spanTotalMs);
+    }
   }
   return { entries: entries, totalMs: totalMs };
 }
@@ -1305,7 +1398,18 @@ export function buildViewerBody(opts = {}) {
   (opts.rightChildren || []).forEach(function (child) { if (child) right.appendChild(child); });
   body.appendChild(stage);
   body.appendChild(right);
-  body.appendChild(renderTimingFlow(opts.timing || {}, {
+  var rawTiming = opts.timing;
+  var bodyTiming = (rawTiming && typeof rawTiming === "object") ? rawTiming : {};
+  var bodyGolden = opts.goldenProgress;
+  var timingForFlow = bodyTiming;
+  if (bodyGolden && typeof bodyGolden === "object") {
+    if (Array.isArray(bodyTiming)) {
+      timingForFlow = { stages: bodyTiming, goldenProgress: bodyGolden };
+    } else if (!bodyTiming.goldenProgress) {
+      timingForFlow = (function () { var m = {}; Object.keys(bodyTiming).forEach(function (k) { m[k] = bodyTiming[k]; }); m.goldenProgress = bodyGolden; return m; })();
+    }
+  }
+  body.appendChild(renderTimingFlow(timingForFlow, {
     sectionClass: "comfymodal-studio-viewer-timing",
     testid: "viewer-timing",
     placeholderTestid: "viewer-timing-placeholder",
@@ -1358,10 +1462,19 @@ export function resolveViewerShellArgs(viewer, adapters) {
     : (variant === "Original"
       ? (feat.originalByteSize != null ? feat.originalByteSize : (feat.original_byte_size != null ? feat.original_byte_size : ""))
       : "");
+  var timing = v.timing && typeof v.timing === "object" ? v.timing : null;
+  // Live span breakdown passthrough: the progress rows live on
+  // goldenProgress / nodeSpans / gantt, which record timing never carries.
+  // Thread it through so Diagnostics renders the same breakdown instead of
+  // "Diagnostics pending" while/after a run.
+  var goldenProgress = (v.goldenProgress && typeof v.goldenProgress === "object") ? v.goldenProgress
+    : (timing && typeof timing.goldenProgress === "object") ? timing.goldenProgress
+    : (rec.goldenProgress && typeof rec.goldenProgress === "object") ? rec.goldenProgress : null;
   return {
     record: v.record,
     imageUrl: v.imageUrl,
-    timing: v.timing,
+    timing: timing,
+    goldenProgress: goldenProgress,
     variant: variant,
     format: format,
     fileSize: fileSize,
@@ -1435,6 +1548,7 @@ export function buildViewerShell(opts = {}) {
     record: opts.record,
     imageUrl: opts.imageUrl,
     timing: opts.timing,
+    goldenProgress: opts.goldenProgress,
     variant: opts.variant,
     format: opts.format,
     fileSize: opts.fileSize,
@@ -1454,6 +1568,7 @@ export function buildViewerShell(opts = {}) {
       record: record,
       imageUrl: extra.imageUrl != null ? extra.imageUrl : opts.imageUrl,
       timing: extra.timing != null ? extra.timing : opts.timing,
+      goldenProgress: extra.goldenProgress != null ? extra.goldenProgress : opts.goldenProgress,
       variant: extra.variant != null ? extra.variant : opts.variant,
       format: extra.format != null ? extra.format : opts.format,
       fileSize: extra.fileSize != null ? extra.fileSize : opts.fileSize,
@@ -2007,8 +2122,25 @@ export function buildSharedViewerOverlay(opts = {}) {
     imageUrl: opts.imageUrl || "",
     rightChildren: right,
     stageBadges: stageBadges,
-    timing: opts.timing || record.timing || record.timings || record.rawTiming || {},
+    timing: _viewerTimingWithSpans(opts, record),
   });
+}
+
+function _viewerTimingWithSpans(opts, record) {
+  var base = (opts && opts.timing) || (record && (record.timing || record.timings || record.rawTiming)) || {};
+  var golden = (opts && opts.goldenProgress)
+    || (record && record.goldenProgress)
+    || (base && base.goldenProgress) || null;
+  if (!golden) return base;
+  if (Array.isArray(base)) return { stages: base, goldenProgress: golden };
+  if (base && typeof base === "object" && base.goldenProgress) return base;
+  if (base && typeof base === "object" && !Array.isArray(base)) {
+    var merged = {};
+    Object.keys(base).forEach(function (k) { merged[k] = base[k]; });
+    merged.goldenProgress = golden;
+    return merged;
+  }
+  return { goldenProgress: golden };
 }
 
 /**

@@ -19,8 +19,8 @@ test.describe("queue UI verification", () => {
       await expect(page.locator('[data-testid="studio-tool-t2i"]')).toHaveAttribute("aria-pressed", "false");
       await expect(page.locator('[data-testid="tool-submenu-i2i"]')).toBeVisible();
       await page.locator('[data-testid="studio-tool-t2i"]').click();
-      await expect(page.locator('[data-testid="bg-fill-btn"]')).toBeVisible();
-      await expect(page.locator('[data-testid="bg-fill-picker"]')).toBeAttached();
+      await expect(page.locator('[data-testid="bg-fill-btn"]')).toBeHidden();
+      await expect(page.locator('[data-testid="bg-fill-picker"]')).toBeHidden();
 
       // Queue/experiment radio.
       const queueToggle = page.locator('[data-testid="queue-toggle"]');

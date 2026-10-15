@@ -25,7 +25,7 @@
 // are visible instead of silently showing demo data.
 
 import { createFixtureRepository } from "./history-v2-fixtures.js";
-import { publishStudioSync } from "./studio-sync.js";
+import { publishStudioSync, notifyRecentRunsDeleted } from "./studio-sync.js";
 
 // ── Public constants ─────────────────────────────────────────────────────
 
@@ -306,6 +306,28 @@ export function selectDetailAsset(output) {
   if (out.thumbUrl && out.originalUrl && !out.originalFailed) {
     return { kind: "original", url: out.originalUrl, label: "Original" };
   }
+  if (out.thumbUrl) return { kind: "thumbnail", url: out.thumbUrl, label: "Thumbnail" };
+  if (out.originalUrl || out.originalAvailable) return { kind: "original", url: "", label: "Original available" };
+  if (out.originalFailed) return { kind: "original-failed", url: "", label: "Original generation failed" };
+  return { kind: "none", url: "", label: "No image" };
+}
+
+// Full-resolution selection for the COMPARE view (explicit user action).
+// Order: Original (retained full bytes) > Data Saver (full-res display
+// derivative) > Thumbnail (capped 256px derivative).
+//
+// Unlike the feed/detail display policies — which deliberately avoid eager
+// Original bytes — compare opens only on an explicit click, so it resolves
+// the true full image from ALREADY-PROJECTED URLs (zero new fetches to
+// decide, bytes load only in the compare <img> itself). Grid/card rendering
+// must keep using selectFeedAsset/selectDetailAsset; only compare pick
+// descriptors use this selector.
+export function selectCompareAsset(output) {
+  const out = output && typeof output === "object" ? output : {};
+  if (out.originalUrl && !out.originalFailed) {
+    return { kind: "original", url: out.originalUrl, label: "Original" };
+  }
+  if (out.previewUrl) return { kind: "data_saver", url: out.previewUrl, label: "Data Saver" };
   if (out.thumbUrl) return { kind: "thumbnail", url: out.thumbUrl, label: "Thumbnail" };
   if (out.originalUrl || out.originalAvailable) return { kind: "original", url: "", label: "Original available" };
   if (out.originalFailed) return { kind: "original-failed", url: "", label: "Original generation failed" };
@@ -1767,6 +1789,7 @@ function _v2DeleteGeneration(apiBase, generationId) {
         if (res.ok) {
           const result = normalizeDeleteResponse(data || {}, base);
           publishStudioSync("history");
+          if (result && result.ok) notifyRecentRunsDeleted([id]);
           return result;
         }
         if (data && typeof data === "object") {
@@ -1794,6 +1817,7 @@ function _v2DeleteExperiment(apiBase, experimentId) {
   const url = apiBase + "/history-v2/experiments/" + encodeURIComponent(id);
   return _v2FetchJson(url, { method: "DELETE" }).then(function (data) {
     publishStudioSync("history");
+    notifyRecentRunsDeleted([id]);
     return data;
   });
 }
@@ -1809,6 +1833,7 @@ function _v2BulkDelete(apiBase, selection) {
     body: JSON.stringify({ generation_ids: generationIds, experiment_ids: experimentIds }),
   }).then(function (data) {
     publishStudioSync("history");
+    notifyRecentRunsDeleted([].concat(generationIds, experimentIds));
     return data;
   });
 }

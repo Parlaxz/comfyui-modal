@@ -954,6 +954,16 @@ def _default_modal_settings() -> dict:
         "execution_mode": MODE_V2,
         # ── F8: canonical selected GPU (persisted server authority) ──
         "gpu": _catalog_default_gpu(),
+        # ── Golden dual-GPU-order selection (run-time, never deploy-baked) ──
+        # Maps Golden profile name -> active order ("A" or "B").  Swapping the
+        # active order only swaps which already-deployed function the next
+        # run targets, so it applies immediately with no redeploy.  The orders
+        # themselves live in the profile TOML and remain deploy-baked.
+        "golden_gpu_order": {},
+        # ── Temporary escape hatch: skip host plan validation ──
+        # Fail-closed validation stays the default; this is strictly opt-out
+        # for false-negative triage (e.g. frontend-only Set/Get nodes).
+        "skip_plan_validation": False,
     }
 
 _pip_install_error = ""
@@ -2707,6 +2717,29 @@ async def _execute_job(item: tuple, item_id: int):
         _ws_mono = _origin_info.get("queue_worker_start_mono_ns") if isinstance(_origin_info, dict) else None
         if _ws_wall is not None and _ws_mono is not None:
             _v2_trace.emit_at("worker_start", wall_unix_ns=_ws_wall, monotonic_ns=_ws_mono, phase="local")
+        # Temporary escape hatch: skip host plan validation when opted out
+        # via per-request modal_options, the persisted Studio setting, or env.
+        # Default stays fail-closed.
+        _skip_plan_validation = (
+            bool(_mo.get("skip_plan_validation") is True)
+            or bool(_load_modal_settings().get("skip_plan_validation", False) is True)
+            or os.environ.get("COMFYMODAL_SKIP_PLAN_VALIDATION", "").strip().lower()
+            in ("1", "true", "on", "yes")
+        )
+        if _skip_plan_validation:
+            print("[comfyui-modal] plan validation SKIPPED via skip_plan_validation opt-out")
+        # ── Ideogram Studio-workflow injection (isolated profile only) ──
+        # Revert: delete ideogram_studio_injection.py + this block. Inactive
+        # requests return the input workflow untouched (zero behavior change);
+        # active requests either swap in the validated Studio graph
+        # (Ideogram 4 Comfy UI Default, steps=16) or raise GateError here —
+        # fail closed before plan build, never a silent fallback.
+        from ideogram_studio_injection import (
+            maybe_inject_ideogram_studio_workflow as _maybe_inject_studio,
+        )
+        execution_workflow, _studio_selection = _maybe_inject_studio(
+            execution_workflow, modal_options=_mo, trace=_v2_trace,
+        )
         _v2_plan = build_execution_plan(
             execution_workflow,
             prompt_id=prompt_id,
@@ -2719,7 +2752,7 @@ async def _execute_job(item: tuple, item_id: int):
             comfyui_root=_COMFYUI_ROOT,
             trace=_v2_trace,
             validate=False,
-            collect_validation_proof=True,
+            collect_validation_proof=not _skip_plan_validation,
         )
         _v2_trace.set_metadata(
             workflow_hash_prefix=_v2_plan.workflow_hash[:12],
@@ -5062,6 +5095,14 @@ if _server:
             "execution_mode_source": resolved["source"],
             "execution_mode_locked": resolved["locked"],
             "engine_migration_notice": _EXECUTION_MODE_MIGRATION_NOTICE,
+            # Temporary escape hatch for plan-validation false negatives.
+            "skip_plan_validation": bool(settings.get("skip_plan_validation", False)),
+            # Active Golden GPU order per profile (run-time selection).
+            "golden_gpu_order": (
+                dict(settings.get("golden_gpu_order") or {})
+                if isinstance(settings.get("golden_gpu_order"), dict)
+                else {}
+            ),
         })
 
     @_server.routes.post("/comfymodal/config")
@@ -5111,6 +5152,7 @@ if _server:
             "data_saver_default",
             "data_saver_codec",
             "data_saver_quality",
+            "skip_plan_validation",
         }
         _settings_update = {}
         for key in _setting_keys:
@@ -5170,6 +5212,11 @@ if _server:
                 ):
                     valid = False
                     _err_key = "data_saver_quality"
+            if "skip_plan_validation" in _settings_update and not isinstance(
+                _settings_update["skip_plan_validation"], bool
+            ):
+                valid = False
+                _err_key = "skip_plan_validation"
             if not valid:
                 return web.json_response(
                     {"status": "error", "message": f"invalid value for {_err_key}"}, status=400
@@ -5256,7 +5303,9 @@ if _server:
         mode = request.rel_url.query.get("mode", "deploy")
         if mode == "deploy":
             state = _deploy_status.get("state", "idle")
-            if state == "ready":
+            # deployed_unwarmed is terminal deploy success (warmup retired);
+            # it must count as healthy, otherwise health/sync gates 503 forever.
+            if state == "ready" or state == "deployed_unwarmed":
                 return web.json_response({"status": "ok", "mode": "deploy"})
             elif state == "deploying":
                 return web.json_response({"status": "deploying"}, status=503)
@@ -5396,11 +5445,32 @@ if _server:
     @_server.routes.get("/comfymodal/sync/status")
     async def modal_sync_status(request: web.Request) -> web.Response:
         """Get sync status: compare local models/custom_nodes with remote volumes."""
-        try:
-            # Get remote volume status
-            remote = await get_sync_status()
-        except Exception as e:
-            return web.json_response({"status": "error", "message": str(e)}, status=503)
+        import math
+
+        import remote_inventory as _remote_inventory
+
+        # Cached remote inventory (default 30s TTL) — avoids a Modal CPU
+        # round trip on every frontend poll.
+        _ttl_vals = [
+            request.query.get(_name)
+            for _name in ("max_age", "max-age", "ttl")
+            if request.query.get(_name) is not None
+        ]
+        if len(_ttl_vals) > 1 and len(set(_ttl_vals)) != 1:
+            return web.json_response({"status": "error", "message": "Provide only one inventory TTL/max-age value"}, status=400)
+        _raw = _ttl_vals[0] if _ttl_vals else None
+        if _raw in (None, ""):
+            _ttl_s = _remote_inventory.TTL_S
+        else:
+            try:
+                _ttl_s = float(_raw)
+            except (TypeError, ValueError):
+                return web.json_response({"status": "error", "message": "max_age must be a finite number of seconds"}, status=400)
+            if not math.isfinite(_ttl_s) or _ttl_s < 0 or _ttl_s > 86400:
+                return web.json_response({"status": "error", "message": "max_age must be between 0 and 86400 seconds"}, status=400)
+        remote = await _remote_inventory.get_inventory(ttl_s=_ttl_s)
+        if remote is None:
+            return web.json_response({"status": "error", "message": "remote inventory unavailable"}, status=503)
 
         # Scan local models
         models_root = os.path.join(_COMFYUI_ROOT, "models")
@@ -7712,6 +7782,7 @@ if _server:
                     profile_name=_batch_profile,
                     modal_options=(body or {}).get("modal_options"),
                     workspace=_golden_workspace(),
+                    gpu_order=_golden_gpu_order_for(_batch_profile),
                 ):
                     await _batch_response.write(
                         (_batch_json.dumps(_batch_event) + "\n").encode("utf-8")
@@ -7899,14 +7970,19 @@ if _server:
                             studio_method=(body or {}).get("studio_method"),
                             studio_style=(body or {}).get("studio_style"),
                             studio_references=(body or {}).get("studio_references"),
+                            gpu_order=_golden_gpu_order_for(_golden_profile),
                         ),
                         timeout=1800,
                     )
                 )
             except Exception as _golden_dispatch_error:
                 _log.warning("Golden Studio dispatch failed: %s", _golden_dispatch_error)
+                import traceback as _golden_tb
                 return web.json_response(
-                    {"status": "error", "message": str(_golden_dispatch_error)},
+                    {"status": "error", "message": (
+                        str(_golden_dispatch_error)
+                        + "\nTRACEBACK_DIAG:\n" + _golden_tb.format_exc()
+                    )},
                     status=500,
                 )
 
@@ -8118,6 +8194,93 @@ if _server:
                 pass
             raise
 
+    def _write_golden_profile_gpu(
+        profile_path: Path, gpu: str, gpu_alt: str, gpu_fallbacks: list
+    ) -> None:
+        """Update the GPU orders in one config-owned Golden profile atomically.
+
+        Writes ``[resources]`` ``gpu`` / ``gpu_alt`` / ``gpu_fallbacks``
+        preserving surrounding comments, blank lines, and newline style,
+        mirroring ``_write_golden_profile_region``.  Missing keys are
+        inserted at the end of the ``[resources]`` section (or in a new
+        section when absent entirely).
+        """
+        import tempfile
+
+        desired = (
+            ("gpu", '"%s"' % gpu),
+            ("gpu_alt", '"%s"' % gpu_alt),
+            (
+                "gpu_fallbacks",
+                "[%s]" % ", ".join('"%s"' % item for item in gpu_fallbacks),
+            ),
+        )
+        text = profile_path.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        section_start = None
+        section_end = len(lines)
+        pending = {key: value for key, value in desired}
+        for index, line in enumerate(lines):
+            section = re.match(r"^\s*\[([^]]+)\]", line)
+            if section:
+                if section_start is not None:
+                    section_end = index
+                    break
+                if section.group(1).strip() == "resources":
+                    section_start = index
+                continue
+            if section_start is not None and pending:
+                ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+                body = line[:-len(ending)] if ending else line
+                for key in list(pending):
+                    match = re.match(r"^(\s*" + re.escape(key) + r"\s*=)(.*)$", body)
+                    if match:
+                        rhs = match.group(2)
+                        comment = ""
+                        if "#" in rhs:
+                            comment = " " + rhs[rhs.index("#"):].strip()
+                        lines[index] = (
+                            match.group(1) + " " + pending.pop(key) + comment + ending
+                        )
+                        break
+
+        newline = "\r\n" if "\r\n" in text else "\n"
+        additions = "".join(
+            "%s = %s%s" % (key, pending[key], newline) for key, _ in desired if key in pending
+        )
+        if additions:
+            if section_start is not None:
+                prefix = "".join(lines[:section_end])
+                suffix = "".join(lines[section_end:])
+                if prefix and not prefix.endswith(("\n", "\r")):
+                    prefix += newline
+                updated = prefix + additions + suffix
+            else:
+                separator = newline if text and not text.endswith(("\n", "\r")) else ""
+                updated = (
+                    text + separator
+                    + "[resources]%s" % newline
+                    + additions
+                )
+        else:
+            updated = "".join(lines)
+
+        fd, temporary = tempfile.mkstemp(
+            dir=str(profile_path.parent), prefix=profile_path.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(updated)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, profile_path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
     @_server.routes.get("/comfymodal/studio/golden/profiles")
     async def studio_golden_profiles(request: web.Request) -> web.Response:
         """Return the config-owned, read-only Golden profile catalog."""
@@ -8184,6 +8347,188 @@ if _server:
             )
         return web.json_response({"status": "ok", "profile": name, "region": region})
 
+    @_server.routes.post("/comfymodal/studio/golden/gpu-order")
+    async def studio_golden_gpu_order(request: web.Request) -> web.Response:
+        """Persist the active GPU order for one Golden profile (run-time).
+
+        ``{"profile": name, "order": "A"|"B"}``.  This only swaps which
+        already-deployed function the next run targets, so it applies
+        immediately with no redeploy.  Selecting B for a profile with no
+        alt order is refused.
+        """
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response(
+                {"status": "error", "error": "expected a JSON body"}, status=400
+            )
+        raw_name = (body or {}).get("profile") if isinstance(body, dict) else None
+        name = raw_name.strip() if isinstance(raw_name, str) else ""
+        raw_order = (body or {}).get("order") if isinstance(body, dict) else None
+        order = raw_order.strip().upper() if isinstance(raw_order, str) else ""
+        if order not in ("A", "B"):
+            return web.json_response(
+                {"status": "error", "error": "order must be exactly 'A' or 'B'"},
+                status=400,
+            )
+        record = _golden_deploy_record(name) if name else None
+        if record is None:
+            return web.json_response(
+                {"status": "error", "error": "unknown Golden profile"}, status=400
+            )
+        if order == "B":
+            try:
+                from tools.v2_control.profile_catalog import catalog_golden_profiles
+            except Exception as exc:
+                return web.json_response(
+                    {"status": "error", "error": "could not read Golden catalog"},
+                    status=500,
+                )
+            alt = ""
+            for profile in catalog_golden_profiles():
+                if profile.name == name:
+                    alt = str((profile.resources or {}).get("gpu_alt") or "").strip()
+                    break
+            if not alt:
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": "profile has no alt GPU order; configure one and deploy first",
+                    },
+                    status=409,
+                )
+        try:
+            saved = dict(_load_modal_settings().get("golden_gpu_order") or {})
+            saved[name] = order
+            _save_modal_settings({"golden_gpu_order": saved})
+        except OSError as exc:
+            return web.json_response(
+                {"status": "error", "error": "could not persist GPU order"},
+                status=500,
+            )
+        return web.json_response({"status": "ok", "profile": name, "order": order})
+
+    @_server.routes.post("/comfymodal/studio/golden/gpu")
+    async def studio_golden_gpu(request: web.Request) -> web.Response:
+        """Persist one Golden profile's config-owned GPU orders.
+
+        ``{"profile": name, "gpu": primary, "gpu_alt": alt-or-"",
+        "gpu_fallbacks": [up-to-3]}``.  Values are validated against the
+        GPU catalog, written to the profile TOML ``[resources]`` section,
+        and the catalog cache is invalidated.  GPU orders are deploy-baked:
+        the profile reports undeployed afterwards and the next deploy binds
+        both functions at once.
+        """
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response(
+                {"status": "error", "error": "expected a JSON body"}, status=400
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"status": "error", "error": "expected a JSON body"}, status=400
+            )
+        raw_name = body.get("profile")
+        name = raw_name.strip() if isinstance(raw_name, str) else ""
+        if not name or any(token in name for token in ("/", "\\", "..")):
+            return web.json_response(
+                {"status": "error", "error": "unknown Golden profile"}, status=400
+            )
+        try:
+            from gpu_catalog import (
+                GPU_BY_VALUE,
+                MAX_GPU_FALLBACKS,
+                normalize_gpu_value,
+            )
+        except Exception:
+            return web.json_response(
+                {"status": "error", "error": "GPU catalog unavailable"}, status=500
+            )
+
+        def _check_gpu(value: object) -> str:
+            normalized = normalize_gpu_value(str(value or ""))
+            if not normalized or normalized not in GPU_BY_VALUE:
+                raise ValueError("unknown GPU: %r" % (value,))
+            return normalized
+
+        try:
+            gpu = _check_gpu(body.get("gpu"))
+        except ValueError as exc:
+            return web.json_response(
+                {"status": "error", "error": str(exc)}, status=400
+            )
+        raw_alt = body.get("gpu_alt", "")
+        alt = ""
+        if isinstance(raw_alt, str) and raw_alt.strip():
+            try:
+                alt = _check_gpu(raw_alt)
+            except ValueError as exc:
+                return web.json_response(
+                    {"status": "error", "error": str(exc)}, status=400
+                )
+        raw_fallbacks = body.get("gpu_fallbacks", [])
+        if isinstance(raw_fallbacks, str):
+            raw_fallbacks = [item for item in raw_fallbacks.split(",")]
+        if not isinstance(raw_fallbacks, (list, tuple)):
+            return web.json_response(
+                {"status": "error", "error": "gpu_fallbacks must be a list"},
+                status=400,
+            )
+        fallbacks: list[str] = []
+        for item in raw_fallbacks:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            try:
+                normalized = _check_gpu(item)
+            except ValueError as exc:
+                return web.json_response(
+                    {"status": "error", "error": str(exc)}, status=400
+                )
+            if normalized not in fallbacks:
+                fallbacks.append(normalized)
+        if len(fallbacks) > MAX_GPU_FALLBACKS:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "at most %d fallbacks" % MAX_GPU_FALLBACKS,
+                },
+                status=400,
+            )
+        # The primary must lead its own order; a fallback duplicating the
+        # primary (or the alt duplicating the primary with no other
+        # difference) adds no second function.
+        fallbacks = [item for item in fallbacks if item != gpu]
+        if alt and alt == gpu:
+            alt = ""
+
+        profiles_dir = Path(__file__).parent / "config" / "v2" / "profiles"
+        try:
+            from tools.v2_control.profiles import Profiles
+
+            if name not in Profiles(profiles_dir).available():
+                return web.json_response(
+                    {"status": "error", "error": "unknown Golden profile"}, status=400
+                )
+            profile_path = profiles_dir / (name + ".toml")
+            _write_golden_profile_gpu(profile_path, gpu, alt, fallbacks)
+            from tools.v2_control.profile_catalog import invalidate_catalog_cache
+
+            invalidate_catalog_cache()
+        except (OSError, TypeError, ValueError) as exc:
+            _log.warning("Golden profile GPU update failed: %s", exc)
+            return web.json_response(
+                {"status": "error", "error": "could not update Golden profile"},
+                status=500,
+            )
+        return web.json_response({
+            "status": "ok",
+            "profile": name,
+            "gpu": gpu,
+            "gpu_alt": alt,
+            "gpu_fallbacks": fallbacks,
+        })
+
     # Golden deploys are long-running (tens of seconds to minutes), so the UI
     # starts one and polls for the outcome instead of holding a request open.
     _golden_deploy_jobs: dict[str, dict] = {}
@@ -8202,6 +8547,21 @@ if _server:
                     "deployed": profile.deployed,
                 }
         return None
+
+    def _golden_gpu_order_for(profile_name: str) -> str:
+        """Active GPU order for one Golden profile (run-time selection).
+
+        Reads the server-owned ``golden_gpu_order`` map; anything other
+        than an explicit ``"B"`` means order A.  Never raises: run paths
+        must fail on the execution error, not on a settings read.
+        """
+        try:
+            saved = _load_modal_settings().get("golden_gpu_order") or {}
+            if isinstance(saved, dict) and str(saved.get(profile_name, "")).strip().upper() == "B":
+                return "B"
+        except Exception:
+            pass
+        return "A"
 
     @_server.routes.post("/comfymodal/studio/golden/deploy")
     async def studio_golden_deploy(request: web.Request) -> web.Response:
@@ -8249,6 +8609,7 @@ if _server:
                     cwd=str(Path(__file__).parent),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    env=_golden_deploy_child_env(),
                 )
                 out, _ = await proc.communicate()
                 job["exit_code"] = proc.returncode
@@ -8656,6 +9017,20 @@ except Exception as _cmfm_node_registration_error:  # pragma: no cover
     )
 
 
+def _golden_deploy_child_env():
+    """Environment for the v2ctl golden-deploy child process.
+
+    The child runs unbuffered so the merged stdout+stderr capture preserves
+    true chronological order. Without this, block-buffered stdout flushes at
+    exit AFTER unbuffered stderr, so an early ERROR line lands BEFORE the
+    preflight lines and the UI's last-line tail shows a stale stdout line
+    (e.g. "DEPLOYING TO=...") instead of the real failure.
+    """
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
 async def _start_golden_deploy_job(profile_name, record=None):
     """Start an asynchronous v2ctl deploy for one Golden profile.
 
@@ -8697,6 +9072,7 @@ async def _start_golden_deploy_job(profile_name, record=None):
                 cwd=str(Path(__file__).parent),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=_golden_deploy_child_env(),
             )
             out, _ = await proc.communicate()
             job["exit_code"] = proc.returncode

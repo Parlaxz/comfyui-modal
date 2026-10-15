@@ -850,10 +850,19 @@ class ReplayDispatchRequest:
     def __post_init__(self) -> None:
         if not self.generation_id or not self.attempt_id:
             raise ValueError("replay dispatch requires generation_id and attempt_id")
-        if self.mode not in ("original", "preview"):
+        # Attempt rows retain the legacy "preview" spelling (see
+        # HistoryV2Repository.add_attempt); accept every data_saver alias at
+        # this boundary and normalize to the stored spelling so downstream
+        # mode comparisons keep working after the preview -> data_saver rename.
+        raw_mode = str(self.mode or "").strip().lower()
+        if raw_mode in ("preview", "data_saver", "data-saver", "datasaver"):
+            object.__setattr__(self, "mode", "preview")
+        elif raw_mode == "original":
+            object.__setattr__(self, "mode", "original")
+        else:
             raise ValueError(
                 "replay dispatch mode must be the frozen semantic mode "
-                "(original or preview)"
+                "(original or preview/data_saver)"
             )
         if not isinstance(self.plan, ExecutionPlan):
             raise TypeError("replay dispatch requires a validated ExecutionPlan")

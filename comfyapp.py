@@ -8468,8 +8468,11 @@ _image_base = (
         "ninja-build",
         # pycairo (ComfyUI_RaykoStudio) builds against the cairo C library
         # via pkg-config; neither is present in the stock CUDA image.
+        # cmake is required by meson-driven native builds (cairo/pycairo
+        # fallback path reports "Did not find CMake" without it).
         "libcairo2-dev",
         "pkg-config",
+        "cmake",
         "python3.11-dev",
         # CUDA 13.0 on Ubuntu 24.04 supports both GCC 13 (default) and clang
         # as host compilers for nvcc.  We install clang as a reliable fallback
@@ -9329,9 +9332,18 @@ if not _INSIDE_MODAL_CONTAINER:
         """Deterministic JSON serialization matching the deployed file format."""
         return json.dumps(data, indent=2, sort_keys=True)
 
-    _BAKED_MANIFEST_DIR = os.path.join(_COMFYUI_MODAL_DIR, ".baked_custom_node_deps")
-    os.makedirs(_BAKED_MANIFEST_DIR, exist_ok=True)
-    _BAKED_MANIFEST_TEMP = os.path.join(_BAKED_MANIFEST_DIR, "custom_node_deps_baked.json")
+    # Keep the generated manifest outside the Modal source tree.  Modal snapshots
+    # local-file sources before/while importing this module; (re)writing a file
+    # under ``.baked_custom_node_deps`` during that lifecycle aborts the build
+    # ("modified during build process") whenever the bytes differ from the
+    # snapshot or the file appears after it.  Same precedent as
+    # ``_CANONICAL_PLAN_METADATA_HOST_PATH`` below.  The JSON bytes and the
+    # image destination (``/opt/comfymodal/custom_node_deps_baked.json``) are
+    # unchanged — only the host staging path moves.
+    _BAKED_MANIFEST_TEMP = os.path.join(
+        tempfile.gettempdir(),
+        f"comfymodal-custom-node-deps-baked-{os.getpid()}.json",
+    )
 
     def _maybe_write_baked_manifest(path: str, data: dict) -> None:
         """Write JSON *data* to *path* only if content differs or file is missing.

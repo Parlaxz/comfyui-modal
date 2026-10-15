@@ -1098,6 +1098,13 @@ export function resolveViewerInput(record, fallbackImageUrl) {
     originalAvailable: !!(feat.originalAvailable || rec.originalAvailable),
   }));
   const fallback = fallbackImageUrl != null && fallbackImageUrl !== "" ? String(fallbackImageUrl) : "";
+  const timing = rec.timing && typeof rec.timing === "object" ? rec.timing : {};
+  // Live span breakdown passthrough (see studio-ui.js renderTimingFlow):
+  // records never carry goldenProgress, but when one does (live run state
+  // projected as a record) preserve it so Diagnostics renders the same
+  // per-node breakdown as the progress section.
+  const goldenProgress = rec.goldenProgress && typeof rec.goldenProgress === "object" ? rec.goldenProgress
+    : timing.goldenProgress && typeof timing.goldenProgress === "object" ? timing.goldenProgress : null;
   return {
     record: Object.assign({}, rec, {
       controls: rec.controls,
@@ -1105,7 +1112,8 @@ export function resolveViewerInput(record, fallbackImageUrl) {
     }),
     output: output,
     imageUrl: output.url || fallback,
-    timing: rec.timing && typeof rec.timing === "object" ? rec.timing : {},
+    timing: timing,
+    goldenProgress: goldenProgress,
   };
 }
 
@@ -1180,4 +1188,150 @@ export function buildViewerRecordFromRun(run, imageUrl) {
     // record (Preview first — no thumbnail/original guesswork).
     featuredOutput: normalizeHistoryOutput({ preview_url: imageUrl || "" }, 0),
   });
+}
+
+// ── Terminal span snapshots (refresh-durable Diagnostics) ──────────────
+//
+// The live per-node breakdown (Restoring, CLIP load,
+// "CLIPTextEncode (node 98:24)", ...) exists only in page memory
+// (runState.goldenProgress). A refresh wipes it, and the durable History
+// record carries no timing — so Diagnostics falls back to "pending" for
+// every completed run. These helpers persist the terminal snapshot to
+// localStorage (same durable-browser-memory pattern the selection restore
+// uses) keyed by every run identity, and read it back for the viewer.
+//
+// Pure data functions: storage is injected ({getItem,setItem,removeItem})
+// so they stay testable without DOM. All storage access is best-effort —
+// callers wrap in try/catch and treat null as "no snapshot".
+
+var SPAN_SNAPSHOT_PREFIX = "comfymodal.studio.spans.v1:";
+var SPAN_SNAPSHOT_INDEX_KEY = "comfymodal.studio.spans.v1:index";
+var SPAN_SNAPSHOT_MAX_ENTRIES = 50;
+var SPAN_SNAPSHOT_MAX_ROWS = 24;
+
+function _spanSnapshotIds(ids) {
+  var seen = {};
+  var out = [];
+  (Array.isArray(ids) ? ids : [ids]).forEach(function (id) {
+    if (id == null || id === "") return;
+    var key = String(id);
+    if (seen[key]) return;
+    seen[key] = true;
+    out.push(key);
+  });
+  return out;
+}
+
+function _spanSnapshotNumber(value) {
+  if (value == null || value === "") return null;
+  var n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/**
+ * Freeze a live goldenProgress snapshot into a storable breakdown.
+ * Completed spans keep their duration; spans still marked started are
+ * frozen at their final observed elapsed (never fabricated, never zero).
+ * Returns null when nothing usable was recorded.
+ */
+export function extractSpanSnapshot(golden, totalMs, nowMs) {
+  if (!golden || typeof golden !== "object") return null;
+  var now = _spanSnapshotNumber(nowMs) != null ? Number(nowMs) : Date.now();
+  var sources = [];
+  if (Array.isArray(golden.nodeSpans) && golden.nodeSpans.length > 0) sources.push(golden.nodeSpans);
+  if (golden.gantt && typeof golden.gantt === "object"
+    && Array.isArray(golden.gantt.spans) && golden.gantt.spans.length > 0) sources.push(golden.gantt.spans);
+  if (sources.length === 0) return null;
+  var rows = [];
+  sources.forEach(function (list) {
+    list.forEach(function (span) {
+      if (!span || typeof span !== "object") return;
+      var raw = span.label != null ? span.label : span.name;
+      var label = String(raw == null ? "" : raw).trim();
+      if (!label) return;
+      var duration = _spanSnapshotNumber(
+        span.durationMs != null ? span.durationMs : span.duration_ms);
+      if (duration == null && String(span.phase || "") === "started" && span.observedAtMs != null) {
+        var elapsed = now - Number(span.observedAtMs);
+        if (Number.isFinite(elapsed) && elapsed > 0) duration = elapsed;
+      }
+      if (duration == null || duration <= 0) return;
+      rows.push({ label: label.slice(0, 120), durationMs: Math.round(duration) });
+    });
+  });
+  if (rows.length === 0) return null;
+  var total = _spanSnapshotNumber(totalMs);
+  return { v: 1, savedAt: new Date(now).toISOString(), spans: rows.slice(0, SPAN_SNAPSHOT_MAX_ROWS),
+    totalMs: total != null && total > 0 ? Math.round(total) : null };
+}
+
+/**
+ * Persist a snapshot under every given run identity. Most-recent-first
+ * index ordering; oldest entries are evicted past the cap. Returns true
+ * when at least one key was written.
+ */
+export function saveSpanSnapshot(storage, ids, snapshot) {
+  if (!storage || typeof storage.setItem !== "function" || !snapshot
+    || !Array.isArray(snapshot.spans) || snapshot.spans.length === 0) return false;
+  var keys = _spanSnapshotIds(ids);
+  if (keys.length === 0) return false;
+  var payload;
+  try {
+    payload = JSON.stringify(snapshot);
+  } catch (err) { return false; }
+  var wrote = false;
+  try {
+    keys.forEach(function (key) {
+      storage.setItem(SPAN_SNAPSHOT_PREFIX + key, payload);
+      wrote = true;
+    });
+    var index = [];
+    try { index = JSON.parse(storage.getItem(SPAN_SNAPSHOT_INDEX_KEY) || "[]") || []; } catch (err) { index = []; }
+    if (!Array.isArray(index)) index = [];
+    var seen = {};
+    var next = [];
+    keys.concat(index).forEach(function (key) {
+      if (seen[key]) return;
+      seen[key] = true;
+      next.push(key);
+    });
+    var evicted = next.slice(SPAN_SNAPSHOT_MAX_ENTRIES);
+    evicted.forEach(function (key) {
+      try { storage.removeItem(SPAN_SNAPSHOT_PREFIX + key); } catch (err) { /* best-effort */ }
+    });
+    storage.setItem(SPAN_SNAPSHOT_INDEX_KEY, JSON.stringify(next.slice(0, SPAN_SNAPSHOT_MAX_ENTRIES)));
+  } catch (err) { /* quota/privacy: keep whatever was written */ }
+  return wrote;
+}
+
+/**
+ * Load the first snapshot matching any of the given run identities.
+ * Returns a golden-like {nodeSpans, spanTotalMs} the viewer timing flow
+ * renders directly, or null.
+ */
+export function loadSpanSnapshot(storage, ids) {
+  if (!storage || typeof storage.getItem !== "function") return null;
+  var keys = _spanSnapshotIds(ids);
+  for (var i = 0; i < keys.length; i++) {
+    var raw = null;
+    try { raw = storage.getItem(SPAN_SNAPSHOT_PREFIX + keys[i]); } catch (err) { raw = null; }
+    if (!raw) continue;
+    try {
+      var parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.spans) || parsed.spans.length === 0) continue;
+      var nodeSpans = parsed.spans
+        .filter(function (row) {
+          return row && typeof row.label === "string" && row.label
+            && _spanSnapshotNumber(row.durationMs) > 0;
+        })
+        .map(function (row, index) {
+          return { key: "persisted-" + index, label: row.label,
+            durationMs: Math.round(Number(row.durationMs)), phase: "completed" };
+        });
+      if (nodeSpans.length === 0) continue;
+      var total = _spanSnapshotNumber(parsed.totalMs);
+      return { nodeSpans: nodeSpans, spanTotalMs: total != null && total > 0 ? total : null };
+    } catch (err) { /* corrupt entry: try the next identity */ }
+  }
+  return null;
 }

@@ -24,6 +24,7 @@ import { renderWorkflows } from "./studio-workflows.js";
 import { renderBackend } from "./studio-backend.js";
 import { renderSettings } from "./studio-settings.js";
 import { el } from "./studio-ui.js";
+import { isDeployExplicitlyNotReady, pollDeployToTerminal } from "./studio-backend-api.js";
 import {
   parseStudioHash,
   serializeStudioHash,
@@ -102,12 +103,103 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
   // every Studio page, not just Settings or Backend.
   const syncNotice = el("div", { class: "comfymodal-studio-sync-notice-host", hidden: true });
   let syncPollTimer = null;
+  let syncStatusInFlight = false;
+  let syncPollCleaned = false;
   let syncInFlight = false;
   let lastSyncResult = "";
   let lastSyncData = null;
   let lastSyncError = "";
   let lastSyncStatus = null;
   let redeployInFlight = false;
+  let syncNoticeDismissed = false;
+
+  // Gated sync-status poller: the status endpoint is an uncached Modal call,
+  // so background tabs must not poll. Mirrors the gated pattern in
+  // studio-workflows.js (remoteInventoryRefreshSeconds / inventoryPollEligible
+  // / reconcileInventoryPoller) and reuses the same localStorage key +
+  // allowed values (0,60,300,900,1800; default 300s). Manual triggers pass
+  // force=true to bypass the visibility gate.
+  const SYNC_REFRESH_KEY = "comfymodal_remote_inventory_refresh_interval_s";
+  const SYNC_REFRESH_DEFAULT_SECONDS = 300;
+  const SYNC_REFRESH_ALLOWED_SECONDS = new Set([0, 60, 300, 900, 1800]);
+
+  function syncRefreshSeconds() {
+    let raw = null;
+    try { raw = localStorage.getItem(SYNC_REFRESH_KEY); } catch (_) {}
+    const seconds = Number(raw);
+    return SYNC_REFRESH_ALLOWED_SECONDS.has(seconds)
+      ? seconds : SYNC_REFRESH_DEFAULT_SECONDS;
+  }
+
+  function studioOverlayVisible() {
+    const overlay = rootEl.closest ? rootEl.closest(".comfymodal-testing-overlay") : null;
+    if (!overlay || !overlay.isConnected) return false;
+    if (overlay.hidden || overlay.getAttribute("aria-hidden") === "true") return false;
+    try {
+      const style = getComputedStyle(overlay);
+      return style.display !== "none" && style.visibility !== "hidden";
+    } catch (_) {
+      return true;
+    }
+  }
+
+  function syncPollEligible() {
+    if (typeof document === "undefined") return false;
+    return rootEl.isConnected
+      && studioOverlayVisible()
+      && document.visibilityState === "visible"
+      && document.hasFocus();
+  }
+
+  function stopSyncPollTimer() {
+    if (syncPollTimer !== null) {
+      clearTimeout(syncPollTimer);
+      syncPollTimer = null;
+    }
+  }
+
+  function cleanupSyncPoller() {
+    if (syncPollCleaned) return;
+    syncPollCleaned = true;
+    stopSyncPollTimer();
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", reconcileSyncPoller);
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("focus", reconcileSyncPoller);
+      window.removeEventListener("blur", reconcileSyncPoller);
+    }
+  }
+
+  function reconcileSyncPoller() {
+    if (syncPollCleaned) return;
+    if (!rootEl.isConnected) {
+      cleanupSyncPoller();
+      return;
+    }
+    const seconds = syncRefreshSeconds();
+    if (!syncPollEligible() || seconds === 0) {
+      stopSyncPollTimer();
+      return;
+    }
+    if (syncPollTimer === null && !syncStatusInFlight) {
+      syncPollTimer = setTimeout(runSyncPoll, seconds * 1000);
+    }
+  }
+
+  async function runSyncPoll() {
+    syncPollTimer = null;
+    if (!syncPollEligible()) {
+      if (!rootEl.isConnected) cleanupSyncPoller();
+      return;
+    }
+    if (syncRefreshSeconds() === 0 || syncStatusInFlight) {
+      reconcileSyncPoller();
+      return;
+    }
+    await fetchSyncStatus(true);
+    reconcileSyncPoller();
+  }
 
   function shortHash(value) {
     return typeof value === "string" && value ? value.slice(0, 8) : "—";
@@ -132,8 +224,18 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
   }
 
   function renderSyncNotice(status) {
-    if (status !== undefined) lastSyncStatus = status;
-    const effective = status !== undefined ? status : lastSyncStatus;
+    if (status !== undefined) {
+      lastSyncStatus = status;
+      // Fresh poll data re-arms the banner so a dismissed error can
+      // reappear only when the backend reports a new state.
+      syncNoticeDismissed = false;
+    }
+    if (syncNoticeDismissed) {
+      while (syncNotice.firstChild) syncNotice.removeChild(syncNotice.firstChild);
+      syncNotice.hidden = true;
+      return;
+    }
+    const effective = lastSyncStatus;
     const dependency = effective && effective.dependency;
     const pending = Array.isArray(effective && effective.custom_nodes && effective.custom_nodes.pending)
       ? effective.custom_nodes.pending : [];
@@ -161,6 +263,15 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
       bannerAttrs.role = "alert";
     }
     const banner = el("section", bannerAttrs);
+    banner.appendChild(el("button", {
+      type: "button", class: "comfymodal-studio-sync-dismiss",
+      text: "×", title: "Dismiss", "aria-label": "Dismiss sync notice",
+      "data-testid": "sync-dismiss-button",
+      onclick: function () {
+        syncNoticeDismissed = true;
+        renderSyncNotice();
+      },
+    }));
     if (mismatch) {
       banner.appendChild(el("div", { class: "comfymodal-studio-sync-title", text: "Studio dependencies need syncing" }));
       banner.appendChild(el("div", { class: "comfymodal-studio-sync-copy", text: dependency.cause || "Dependency mismatch detected." }));
@@ -174,7 +285,49 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
       banner.appendChild(el("div", { class: "comfymodal-studio-sync-title", text: "Sync service unavailable" }));
       banner.appendChild(el("div", { class: "comfymodal-studio-sync-copy", text: lastSyncError }));
     } else if (pending.length) {
-      banner.appendChild(el("div", { class: "comfymodal-studio-sync-copy", text: `${pending.length} custom node(s) not yet published to the volume` }));
+      const pendingNames = pending.map(function (entry) {
+        if (typeof entry === "string") return entry;
+        if (entry && typeof entry === "object") {
+          const candidate = entry.name || entry.package || entry.id || entry.path;
+          if (typeof candidate === "string" && candidate) return candidate;
+        }
+        return String(entry);
+      }).filter(Boolean);
+      const previewNames = pendingNames.slice(0, 3).join(", ");
+      const remaining = pendingNames.length - Math.min(pendingNames.length, 3);
+      const copyText = pendingNames.length
+        ? `${pending.length} custom node(s) not yet published to the volume: ${previewNames}${remaining > 0 ? ` (+${remaining} more)` : ""}`
+        : `${pending.length} custom node(s) not yet published to the volume`;
+      banner.appendChild(el("div", { class: "comfymodal-studio-sync-copy", text: copyText }));
+      if (pendingNames.length) {
+        const listId = "comfymodal-sync-pending-list";
+        const toggle = el("button", {
+          type: "button", class: "comfymodal-secondary-btn comfymodal-studio-sync-toggle",
+          "data-testid": "dep-pending-toggle", "aria-expanded": "false", "aria-controls": listId,
+          text: `Show ${pendingNames.length} node(s)`,
+        });
+        const list = el("ul", {
+          class: "comfymodal-studio-sync-pending-list",
+          id: listId, "data-testid": "dep-pending-list", hidden: true,
+        });
+        pendingNames.forEach(function (name) {
+          list.appendChild(el("li", { text: name }));
+        });
+        toggle.onclick = function () {
+          const expanded = list.hidden === false;
+          if (expanded) {
+            list.hidden = true;
+            toggle.setAttribute("aria-expanded", "false");
+            toggle.textContent = `Show ${pendingNames.length} node(s)`;
+          } else {
+            list.hidden = false;
+            toggle.setAttribute("aria-expanded", "true");
+            toggle.textContent = "Hide details";
+          }
+        };
+        banner.appendChild(toggle);
+        banner.appendChild(list);
+      }
     }
     const actions = el("div", { class: "comfymodal-studio-sync-actions" });
     if (hasError && !mismatch && !pending.length) {
@@ -188,7 +341,7 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
         type: "button", class: "comfymodal-secondary-btn",
         text: "Retry",
         "data-testid": "sync-retry-button",
-        onclick: function () { lastSyncResult = ""; renderSyncNotice(); fetchSyncStatus(); },
+        onclick: function () { syncNoticeDismissed = false; lastSyncResult = ""; renderSyncNotice(); fetchSyncStatus(true); },
       }));
     } else {
       actions.appendChild(el("button", {
@@ -224,12 +377,12 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
     syncNotice.appendChild(banner);
   }
 
-  // Deploy-first gate: same server truth as studio-backend-deployment.js
-  // (ready means ready, error means error). In-flight states (deploying /
-  // starting / unknown, per isDeployInFlight in studio-backend-api.js) and
-  // inconclusive checks fall through to the normal sync attempt so transient
-  // deploys preserve current behavior; only an explicit error or an explicit
-  // non-ready state short-circuits. Direct fetch avoids module cycles.
+  // Deploy-first gate: readiness truth owned by studio-backend-api.js
+  // (isDeployUsableState / isDeployExplicitlyNotReady). deployed_unwarmed is
+  // terminal deploy success (warmup retired, 410 WARMUP_RETIRED), so only an
+  // explicit error or non-ready state short-circuits. readDeployState stays a
+  // local raw fetch: response envelope here is {state,message}, distinct from
+  // the normalized backend-api projection.
   async function readDeployState() {
     try {
       const response = await fetch(`${context.apiBase}/deploy/status`);
@@ -244,21 +397,10 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
     }
   }
 
-  function isDeployReadyState(state) {
-    return state === "ready";
-  }
-
-  function isDeployInFlightState(state) {
-    return state === "deploying" || state === "starting" || state === "unknown";
-  }
-
-  function isDeployExplicitlyNotReady(deploy) {
-    return Boolean(deploy)
-      && !isDeployReadyState(deploy.state)
-      && !isDeployInFlightState(deploy.state);
-  }
-
-  async function fetchSyncStatus() {
+  async function fetchSyncStatus(force = false) {
+    if (!force && !syncPollEligible()) return;
+    if (syncStatusInFlight) return;
+    syncStatusInFlight = true;
     try {
       const deploy = await readDeployState();
       if (isDeployExplicitlyNotReady(deploy)) {
@@ -280,12 +422,15 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
       // Keep the last known warning visible through transient poll failures.
       // Do NOT clear lastSyncError here: only a successful fetch or an
       // explicit non-OK response updates the error state.
+    } finally {
+      syncStatusInFlight = false;
     }
   }
 
   async function redeployFromSyncError() {
     if (redeployInFlight) return;
     redeployInFlight = true;
+    syncNoticeDismissed = false;
     renderSyncNotice();
     try {
       const response = await fetch(`${context.apiBase}/deploy`, { method: "POST" });
@@ -294,8 +439,23 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
       const deployStatus = data && data.status;
       if (deployStatus === "started" || deployStatus === "already_deploying") {
         lastSyncResult = deployStatus === "started"
-          ? "Redeploy started."
-          : "Redeploy already running — showing live status.";
+          ? "Redeploy started — polling deploy status…"
+          : "Redeploy already running — polling live status.";
+        renderSyncNotice();
+        // Shared bounded poll (studio-backend-api.js): without this the
+        // notice goes stale and never clears.
+        const terminal = await pollDeployToTerminal(readDeployState);
+        if (terminal.outcome === "usable") {
+          lastSyncResult = "Redeploy finished — refreshing sync status…";
+          renderSyncNotice();
+          await fetchSyncStatus(true);
+          if (!lastSyncError) lastSyncResult = "Redeploy finished.";
+        } else if (terminal.outcome === "timeout") {
+          lastSyncResult = "Redeploy timed out — check Manage Modal > Deployment log.";
+        } else {
+          const failed = terminal.status;
+          lastSyncResult = (failed && failed.message) || `Redeploy failed (${failed && failed.state}).`;
+        }
       } else {
         const detail = data && (data.message || data.error);
         let detailText = "";
@@ -317,6 +477,7 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
   async function syncCustomNodes(requestBody) {
     if (syncInFlight) return;
     syncInFlight = true;
+    syncNoticeDismissed = false;
     lastSyncResult = "Syncing dependencies and custom nodes…";
     lastSyncData = null;
     renderSyncNotice({ dependency: null, custom_nodes: { pending: [] } });
@@ -341,7 +502,7 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
       lastSyncResult = "Sync failed: unable to reach the Studio sync service.";
     } finally {
       syncInFlight = false;
-      await fetchSyncStatus();
+      await fetchSyncStatus(true);
       if (!syncNotice.firstChild) renderSyncNotice({ dependency: null, custom_nodes: { pending: [] } });
     }
   }
@@ -649,16 +810,26 @@ export function mountStudioShell(rootEl, context = {}, options = {}) {
   if (initialRoute.focus && initialRoute.page === "settings") {
     _scheduleSettingsSectionFocus(initialRoute.focus);
   }
-  fetchSyncStatus();
-  syncPollTimer = setInterval(fetchSyncStatus, 15000);
+  fetchSyncStatus(true);
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", reconcileSyncPoller);
+  }
+  if (typeof window !== "undefined") {
+    window.addEventListener("focus", reconcileSyncPoller);
+    window.addEventListener("blur", reconcileSyncPoller);
+  }
+  // The caller (modal-testing.js) appends the overlay to the host only after
+  // this mount returns, so rootEl.isConnected is false right now. Defer the
+  // first reconciliation past that mount (same as the workflows poller) so
+  // eligibility can succeed on the first pass instead of self-cleaning.
+  queueMicrotask(() => {
+    if (!syncPollCleaned) reconcileSyncPoller();
+  });
 
   const shellApi = {
     nav,
     destroy() {
-      if (syncPollTimer) {
-        clearInterval(syncPollTimer);
-        syncPollTimer = null;
-      }
+      cleanupSyncPoller();
       if (typeof window !== "undefined") {
         window.removeEventListener("hashchange", _handleHashChange);
       }

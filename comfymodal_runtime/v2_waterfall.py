@@ -2126,6 +2126,48 @@ def build_waterfall(
     if timing:
         result_view = {**result_view, "timing": dict(timing)}
     warnings: list[str] = []
+    # Kitchen attention non-engagement (generic runs): the remote result
+    # carries per-sampler engaged/skipped notes under "attention_backend"
+    # (see GenericLoaderHolder.kitchen_summary). Skips become viewer-facing
+    # warnings so a generation that silently ran native attention is
+    # visible in generation metadata and the Studio run detail. Engaged
+    # samplers produce no warning by design.
+    try:
+        _ab = result_view.get("attention_backend")
+        if isinstance(_ab, Mapping):
+            _ab_requested = str(_ab.get("requested") or "")
+            if _ab_requested == "comfy_kitchen":
+                _ab_skipped = _ab.get("skipped") or []
+                if isinstance(_ab_skipped, (list, tuple)):
+                    for _sk in _ab_skipped:
+                        if not isinstance(_sk, Mapping):
+                            continue
+                        warnings.append(
+                            "comfy_kitchen did not engage sampler "
+                            f"{_sk.get('node_id', '')} "
+                            f"({_sk.get('node_class', '')}): "
+                            f"{_sk.get('reason', '')}"
+                        )
+                # Engaged with zero attention calls means the backend scope
+                # installed but never fired: sampling ran fully native.
+                _ab_engaged = _ab.get("engaged") or []
+                if isinstance(_ab_engaged, (list, tuple)):
+                    for _en in _ab_engaged:
+                        if not isinstance(_en, Mapping):
+                            continue
+                        try:
+                            _en_calls = int(_en.get("calls", 0) or 0)
+                        except Exception:
+                            _en_calls = 0
+                        if _en_calls == 0:
+                            warnings.append(
+                                "comfy_kitchen engaged sampler "
+                                f"{_en.get('node_id', '')} "
+                                f"({_en.get('node_class', '')}) but recorded "
+                                "0 attention calls: backend had no effect"
+                            )
+    except Exception:
+        pass
     command_start = _command_boundary(command_start_unix_ms)
     response = _response_boundary(response_received_unix_ns)
     # The caller-return boundary is the exact execute_plan_return host event

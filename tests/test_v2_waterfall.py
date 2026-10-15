@@ -921,3 +921,69 @@ def test_tools_v2_waterfall_reexports_shared_api():
     ):
         assert hasattr(mod, name), f"tools.v2_waterfall missing {name}"
         assert name in mod.__all__
+
+
+def test_kitchen_skip_becomes_viewer_warning():
+    result = {
+        "trace": {"events": []},
+        "attention_backend": {
+            "requested": "comfy_kitchen",
+            "engaged": [],
+            "skipped": [{"node_id": "98:12",
+                         "node_class": "SamplerCustomAdvanced",
+                         "reason": "no_sampler_patcher_resolved"}],
+        },
+    }
+    report = build_waterfall(result=result, timing={}, wall_ms=100)
+    assert any("comfy_kitchen did not engage sampler 98:12" in warning
+               and "no_sampler_patcher_resolved" in warning
+               for warning in report.warnings)
+
+
+def test_kitchen_engaged_only_produces_no_warning():
+    result = {
+        "trace": {"events": []},
+        "attention_backend": {
+            "requested": "comfy_kitchen",
+            "engaged": [{"node_id": "30:3", "node_class": "KSampler",
+                         "selected": "attention_comfy_kitchen_int8",
+                         "calls": 256}],
+            "skipped": [],
+        },
+    }
+    report = build_waterfall(result=result, timing={}, wall_ms=100)
+    assert not [warning for warning in report.warnings
+                if "comfy_kitchen" in warning]
+
+
+def test_non_kitchen_backend_ignores_attention_status():
+    result = {
+        "trace": {"events": []},
+        "attention_backend": {
+            "requested": "sage",
+            "engaged": [],
+            "skipped": [{"node_id": "1", "node_class": "KSampler",
+                         "reason": "unexpected"}],
+        },
+    }
+    report = build_waterfall(result=result, timing={}, wall_ms=100)
+    assert not [warning for warning in report.warnings
+                if "comfy_kitchen" in warning]
+
+
+def test_kitchen_engaged_zero_calls_warns():
+    result = {
+        "trace": {"events": []},
+        "attention_backend": {
+            "requested": "comfy_kitchen",
+            "engaged": [{"node_id": "98:12",
+                         "node_class": "SamplerCustomAdvanced",
+                         "selected": "attention_comfy_kitchen_int8",
+                         "calls": 0, "patchers": 2, "models": ["Flux"]}],
+            "skipped": [],
+        },
+    }
+    report = build_waterfall(result=result, timing={}, wall_ms=100)
+    assert any("recorded 0 attention calls" in warning
+               and "98:12" in warning
+               for warning in report.warnings)

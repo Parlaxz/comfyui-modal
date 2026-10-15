@@ -41,6 +41,7 @@ copied:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 import json
@@ -150,6 +151,8 @@ class GenericLoaderHolder:
         self._sessions: list[Any] = []
         self._owners: list[Any] = []
         self._closed = False
+        self._kitchen: dict[str, Any] = {
+            "requested": "", "engaged": [], "skipped": []}
 
     def retain(self, session: Any, owners: Sequence[Any] | None = None) -> None:
         if session is not None:
@@ -157,6 +160,67 @@ class GenericLoaderHolder:
         for owner in list(owners or []):
             if owner is not None:
                 self._owners.append(owner)
+
+    def note_kitchen(
+        self,
+        *,
+        node_id: str = "",
+        node_class: str = "",
+        outcome: str = "",
+        requested: str = "",
+        selected: str = "",
+        calls: int = 0,
+        reason: str = "",
+        patchers: int = 0,
+        models: Any = (),
+    ) -> None:
+        """Record one sampler attention-backend outcome. Never raises.
+
+        Only JSON-safe primitives are retained so the summary can ride
+        the result payload into generation metadata and the Studio
+        viewer untouched by strict-JSON validation.
+        """
+        try:
+            outcome = str(outcome or "")
+            if outcome not in ("engaged", "skipped"):
+                return
+            if requested:
+                self._kitchen["requested"] = str(requested)
+            entry: dict[str, Any] = {
+                "node_id": str(node_id or ""),
+                "node_class": str(node_class or ""),
+            }
+            if outcome == "engaged":
+                entry["selected"] = str(selected or "")
+                try:
+                    entry["calls"] = int(calls or 0)
+                except Exception:
+                    entry["calls"] = 0
+                try:
+                    entry["patchers"] = int(patchers or 0)
+                except Exception:
+                    entry["patchers"] = 0
+                try:
+                    entry["models"] = [str(m)[:120] for m in list(models or [])][:4]
+                except Exception:
+                    entry["models"] = []
+                self._kitchen["engaged"].append(entry)
+            else:
+                entry["reason"] = str(reason or "")
+                self._kitchen["skipped"].append(entry)
+        except Exception:
+            pass
+
+    def kitchen_summary(self) -> dict[str, Any]:
+        """Plain-copy kitchen status for the result payload. Never raises."""
+        try:
+            return {
+                "requested": str(self._kitchen.get("requested") or ""),
+                "engaged": [dict(e) for e in self._kitchen.get("engaged", [])],
+                "skipped": [dict(e) for e in self._kitchen.get("skipped", [])],
+            }
+        except Exception:
+            return {"requested": "", "engaged": [], "skipped": []}
 
     def close(self) -> dict[str, Any]:
         """Release retained single owners. Never touches the dispatcher."""
@@ -2663,17 +2727,202 @@ def _kitchen_scope_for(patcher: Any, backend: str) -> Any:
     return attention_backend_scope(patcher, backend)
 
 
+def _record_kitchen_outcome(
+    active: Any,
+    *,
+    node_id: str = "",
+    node_class: str = "",
+    outcome: str = "",
+    requested: str = "comfy_kitchen",
+    selected: str = "",
+    calls: int = 0,
+    reason: str = "",
+    patchers: int = 0,
+    models: Any = (),
+) -> None:
+    """Record one kitchen outcome on all three channels. Never raises.
+
+    Trace event (existing ``generic_kitchen_attention`` contract) + stdout
+    line (existing formats, grep-stable) + request holder summary (feeds
+    generation metadata and the Studio viewer via the waterfall warnings).
+    ``patchers``/``models`` identify what was actually scoped: the diffusion
+    model class names behind each scoped patcher (introspection for
+    engaged-with-zero-calls diagnosis).
+    """
+    try:
+        outcome = str(outcome or "")
+        if outcome not in ("engaged", "skipped"):
+            return
+        try:
+            trace_emit = active.get("trace_emit") if isinstance(active, Mapping) else None
+        except Exception:
+            trace_emit = None
+        try:
+            safe_calls = int(calls or 0)
+        except Exception:
+            safe_calls = 0
+        try:
+            safe_patchers = int(patchers or 0)
+        except Exception:
+            safe_patchers = 0
+        try:
+            safe_models = [str(m)[:120] for m in list(models or [])][:4]
+        except Exception:
+            safe_models = []
+        fields: dict[str, Any] = {
+            "node_id": str(node_id or ""),
+            "requested": str(requested or "comfy_kitchen"),
+            "outcome": outcome,
+        }
+        if outcome == "engaged":
+            fields["selected"] = str(selected or "")
+            fields["calls"] = safe_calls
+            fields["patchers"] = safe_patchers
+            fields["models"] = safe_models
+        else:
+            fields["reason"] = str(reason or "")
+        _emit_trace(trace_emit, "generic_kitchen_attention", **fields)
+    except Exception:
+        pass
+    try:
+        if outcome == "engaged":
+            print(
+                f"[generic_kitchen_attention] node={node_id} "
+                f"outcome=engaged selected_callable={selected} calls={safe_calls}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[generic_kitchen_attention] node={node_id} "
+                f"outcome=skipped reason={reason}",
+                flush=True,
+            )
+    except Exception:
+        pass
+    try:
+        holder = active.get("holder") if isinstance(active, Mapping) else None
+        note = getattr(holder, "note_kitchen", None)
+        if callable(note):
+            note(
+                node_id=str(node_id or ""),
+                node_class=str(node_class or ""),
+                outcome=outcome,
+                requested=str(requested or "comfy_kitchen"),
+                selected=str(selected or ""),
+                calls=safe_calls,
+                reason=str(reason or ""),
+                patchers=safe_patchers,
+                models=safe_models,
+            )
+    except Exception:
+        pass
+
+
+def _is_model_patcher_like(obj: Any) -> bool:
+    """True for objects the attention scope can attach to. Never raises.
+
+    The scope writes into ``patcher.model_options`` and refuses a missing
+    options mapping, so options presence is the contract.  Guiders are
+    excluded (they carry ``model_patcher`` themselves and are resolved
+    one level down by :func:`_resolve_sampler_patchers`).
+    """
+    try:
+        if obj is None:
+            return False
+        if hasattr(obj, "model_patcher"):
+            return False
+        return getattr(obj, "model_options", None) is not None
+    except Exception:
+        return False
+
+
+def _resolve_sampler_patchers(input_data_all: Any) -> list[Any]:
+    """Distinct patcher-like objects feeding a sampler node. Never raises.
+
+    Resolution order: the direct ``model`` input first, then the ``guider``
+    input's patcher legs (``model_patcher``, ``model``, plus any other
+    patcher-like attribute held by the guider object, so dual-model
+    guiders are covered without naming their internals).  Guider-fed
+    samplers (Flux2/Ideogram ``SamplerCustomAdvanced`` + ``DualModelGuider``)
+    carry no direct ``model`` input, so without this fallback they silently
+    run native.  Capped and de-duplicated; never raises.
+    """
+    found: list[Any] = []
+
+    def _add(candidate: Any) -> None:
+        try:
+            if _is_model_patcher_like(candidate):
+                for existing in found:
+                    if existing is candidate:
+                        return
+                if len(found) < 4:
+                    found.append(candidate)
+        except Exception:
+            pass
+
+    try:
+        if not isinstance(input_data_all, dict):
+            return found
+        model = input_data_all.get("model")
+        if isinstance(model, (list, tuple)):
+            for item in model:
+                _add(item)
+        else:
+            _add(model)
+        guider = input_data_all.get("guider")
+        if isinstance(guider, (list, tuple)):
+            guiders: list[Any] = list(guider)
+        elif guider is None:
+            guiders = []
+        else:
+            guiders = [guider]
+        for guid in guiders:
+            if guid is None:
+                continue
+            for attr in ("model_patcher", "model"):
+                try:
+                    _add(getattr(guid, attr, None))
+                except Exception:
+                    pass
+            try:
+                values = list(vars(guid).values())
+            except Exception:
+                values = []
+            for value in values:
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        _add(item)
+                else:
+                    _add(value)
+    except Exception:
+        pass
+    return found
+
+
+def _is_sampler_executor_shaped(input_data_all: Any) -> bool:
+    """True for sampler nodes shaped like sampling executors. Never raises.
+
+    Used only to decide whether a sampler-named node that yielded no
+    patcher deserves a kitchen non-engagement warning.  Selectors, sigma
+    providers and SAMPLER-object wrappers take no latent/noise input and
+    stay silent; real executors always take ``latent_image`` or ``noise``.
+    """
+    try:
+        if not isinstance(input_data_all, dict):
+            return False
+        return "latent_image" in input_data_all or "noise" in input_data_all
+    except Exception:
+        return False
+
+
 def _is_sampler_node(obj: Any, input_data_all: Any) -> bool:
-    """True for sampler-like nodes carrying a model input. Never raises."""
+    """True for sampler-like nodes carrying a resolvable model patcher."""
     try:
         if "sampler" not in type(obj).__name__.lower():
             return False
         if not isinstance(input_data_all, dict):
             return False
-        model = input_data_all.get("model")
-        if isinstance(model, (list, tuple)):
-            return len(model) > 0 and model[0] is not None
-        return model is not None
+        return len(_resolve_sampler_patchers(input_data_all)) > 0
     except Exception:
         return False
 
@@ -2710,6 +2959,28 @@ async def _run_native_with_kitchen_option(
     node_id = str(unique_id)
     try:
         if not _is_sampler_node(obj, input_data_all):
+            # Kitchen non-engagement warning: a sampler-named, executor-shaped
+            # node (takes latent/noise) that yielded no patcher runs native
+            # even though the deployment requests comfy_kitchen. Selectors,
+            # sigma providers and SAMPLER-object wrappers take no latent or
+            # noise and stay silent here by design.
+            try:
+                _warn_policy = _kitchen_policy_backend()
+            except Exception:
+                _warn_policy = ""
+            if _warn_policy == "comfy_kitchen":
+                try:
+                    _warn_cls = type(obj).__name__
+                except Exception:
+                    _warn_cls = ""
+                if "sampler" in _warn_cls.lower() and _is_sampler_executor_shaped(
+                    input_data_all
+                ):
+                    _record_kitchen_outcome(
+                        active, node_id=node_id, node_class=_warn_cls,
+                        outcome="skipped",
+                        reason="no_sampler_patcher_resolved",
+                    )
             # Generic node wall for the single gantt: every non-sampler,
             # non-substituted node execution gets one span so nothing on
             # the critical path is invisible. Classes already covered by
@@ -2823,25 +3094,19 @@ async def _run_native_with_kitchen_option(
                 )
             finally:
                 _record_sampling_span()
-        model = input_data_all.get("model")
-        patcher = model[0] if isinstance(model, (list, tuple)) else model
         try:
-            scope = _kitchen_scope_for(patcher, "comfy_kitchen")
-        except Exception as setup_exc:
-            _emit_trace(
-                active.get("trace_emit"), "generic_kitchen_attention",
-                node_id=node_id, requested="comfy_kitchen",
-                outcome="skipped",
-                reason=f"scope_setup:{type(setup_exc).__name__}",
+            _sampler_cls = type(obj).__name__
+        except Exception:
+            _sampler_cls = ""
+        patchers = _resolve_sampler_patchers(input_data_all)
+        if not patchers:
+            # Defensive: _is_sampler_node gates on the same resolver, so
+            # this is unreachable in practice. Native fallback with an
+            # explicit skipped record instead of silent native.
+            _record_kitchen_outcome(
+                active, node_id=node_id, node_class=_sampler_cls,
+                outcome="skipped", reason="no_sampler_patcher_resolved",
             )
-            try:
-                print(
-                    f"[generic_kitchen_attention] node={node_id} "
-                    f"outcome=skipped reason=scope_setup:{type(setup_exc).__name__}",
-                    flush=True,
-                )
-            except Exception:
-                pass
             try:
                 return await original(
                     prompt_id, unique_id, obj, input_data_all,
@@ -2850,7 +3115,29 @@ async def _run_native_with_kitchen_option(
                 )
             finally:
                 _record_sampling_span()
-        with scope as scope_state:
+        failed_setup = False
+        with contextlib.ExitStack() as _scope_stack:
+            entered: list[Any] = []
+            for _patcher in patchers:
+                try:
+                    _scope = _kitchen_scope_for(_patcher, "comfy_kitchen")
+                    entered.append(_scope_stack.enter_context(_scope))
+                except Exception as setup_exc:
+                    failed_setup = True
+                    _record_kitchen_outcome(
+                        active, node_id=node_id, node_class=_sampler_cls,
+                        outcome="skipped",
+                        reason=f"scope_setup:{type(setup_exc).__name__}",
+                    )
+            if not entered:
+                try:
+                    return await original(
+                        prompt_id, unique_id, obj, input_data_all,
+                        execution_block_cb=execution_block_cb,
+                        pre_execute_cb=pre_execute_cb, v3_data=v3_data,
+                    )
+                finally:
+                    _record_sampling_span()
             try:
                 result = await original(
                     prompt_id, unique_id, obj, input_data_all,
@@ -2859,24 +3146,47 @@ async def _run_native_with_kitchen_option(
                 )
             finally:
                 _record_sampling_span()
-        try:
-            selected = str((scope_state or {}).get("selected_callable", ""))
-            calls = int((scope_state or {}).get("calls", 0) or 0)
-        except Exception:
-            selected, calls = "", 0
-        _emit_trace(
-            active.get("trace_emit"), "generic_kitchen_attention",
-            node_id=node_id, requested="comfy_kitchen",
-            outcome="engaged", selected=selected, calls=calls,
+        # NOTE: aggregation runs AFTER the ExitStack unwinds. The shared
+        # attention scope writes its final call count into the yielded
+        # state on context exit; reading earlier always observes 0.
+        _selected_names: list[str] = []
+        _total_calls = 0
+        for _state in entered:
+            try:
+                _name = str((_state or {}).get("selected_callable", ""))
+            except Exception:
+                _name = ""
+            try:
+                _count = int((_state or {}).get("calls", 0) or 0)
+            except Exception:
+                _count = 0
+            if _name and _name not in _selected_names:
+                _selected_names.append(_name)
+            _total_calls += _count
+        _scoped_models: list[str] = []
+        for _p in patchers:
+            try:
+                _scoped_models.append(type(_p.model).__name__)
+            except Exception:
+                try:
+                    _scoped_models.append(type(_p).__name__)
+                except Exception:
+                    pass
+        _record_kitchen_outcome(
+            active, node_id=node_id, node_class=_sampler_cls,
+            outcome="engaged", selected="+".join(_selected_names),
+            calls=_total_calls, patchers=len(entered),
+            models=_scoped_models,
         )
-        try:
-            print(
-                f"[generic_kitchen_attention] node={node_id} "
-                f"outcome=engaged selected_callable={selected} calls={calls}",
-                flush=True,
-            )
-        except Exception:
-            pass
+        if failed_setup:
+            try:
+                print(
+                    f"[generic_kitchen_attention] node={node_id} "
+                    f"outcome=partial patchers={len(entered)}/{len(patchers)}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         return result
     except Exception:
         _record_sampling_span()

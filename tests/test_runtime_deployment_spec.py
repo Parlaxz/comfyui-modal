@@ -65,6 +65,56 @@ class TestExclusionPredicate(unittest.TestCase):
     def test_excluded_infix_backup(self):
         self.assertTrue(is_excluded_name("comfyapp.py.v21610_backup"))
 
+    def test_excluded_dir_suffix_egg_info(self):
+        # Versioned setuptools build output (e.g. sam3.egg-info) must be
+        # excluded at any depth: SOURCES.txt/PKG-INFO regenerate on every
+        # pip install and would otherwise churn the dependency identity.
+        self.assertTrue(publication_policy.is_excluded_dir_name("sam3.egg-info"))
+        self.assertTrue(publication_policy.is_excluded_dir_name("my_package.egg-info"))
+        self.assertTrue(publication_policy.is_excluded_dir_name("SAM3.EGG-INFO"))
+        for path in (
+            "sam3.egg-info/SOURCES.txt",
+            "legitimate-node/src/sam3.egg-info/PKG-INFO",
+            "legitimate-node/src/sam3/sam3.egg-info/SOURCES.txt",
+        ):
+            self.assertTrue(publication_policy.is_excluded_path(path), path)
+            self.assertTrue(is_excluded_path(path), path)
+
+    def test_egg_info_suffix_does_not_overmatch(self):
+        # The dot is part of the suffix: real runtime names must still hash.
+        self.assertFalse(publication_policy.is_excluded_dir_name("sam3"))
+        self.assertFalse(publication_policy.is_excluded_dir_name("egg-info"))
+        self.assertFalse(publication_policy.is_excluded_dir_name("myegg-info"))
+        self.assertFalse(
+            publication_policy.is_excluded_path("legitimate-node/sam3/runtime.py")
+        )
+
+    def test_publication_walk_skips_egg_info_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node = root / "node-a"
+            node.mkdir()
+            (node / "runtime.py").write_text("runtime = True\n", encoding="utf-8")
+            egg_info = node / "src" / "sam3.egg-info"
+            egg_info.mkdir(parents=True)
+            (egg_info / "SOURCES.txt").write_text("stale\n", encoding="utf-8")
+            (egg_info / "PKG-INFO").write_text("stale\n", encoding="utf-8")
+
+            published = {
+                path.relative_to(root).as_posix()
+                for path in publication_policy.iter_publication_files(root)
+            }
+
+        self.assertEqual(published, {"node-a/runtime.py"})
+
+    def test_image_ignore_patterns_cover_egg_info_suffix(self):
+        patterns = (
+            publication_policy.image_ignore_patterns()
+            + publication_policy.image_ignore_patterns("**/")
+        )
+        self.assertIn("*.egg-info/", patterns)
+        self.assertIn("**/*.egg-info/", patterns)
+
     def test_excluded_exact_gitignore(self):
         self.assertTrue(is_excluded_name(".gitignore"))
 

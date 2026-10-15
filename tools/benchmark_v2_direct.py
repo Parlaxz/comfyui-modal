@@ -405,7 +405,16 @@ async def _ensure_full_node_registry() -> bool:
             ("enable_assets", False),
         ):
             setattr(_cli_args, _field, _value)
-        _prompt_server = server.PromptServer(asyncio.get_running_loop())
+        # Host main.py:533/541 constructs PromptServer(loop, asset_manager);
+        # older hosts take only (loop). Try the host's own default manager
+        # first (enable_assets=False is set above, so no DB needed).
+        try:
+            from app.assets.manager import default_asset_manager as _default_asset_manager
+            _prompt_server = server.PromptServer(
+                asyncio.get_running_loop(), _default_asset_manager()
+            )
+        except (ImportError, AttributeError):
+            _prompt_server = server.PromptServer(asyncio.get_running_loop())
         print(
             f"[v2.harness] prompt_server_mirror instance_set={server.PromptServer.instance is _prompt_server}",
             flush=True,

@@ -3606,6 +3606,16 @@ class GoldenSamplingDiagnostics:
         self.callback_available = True
 
         def timed_callback(*args: Any, **kwargs: Any) -> Any:
+            # ── Ideogram single-iteration CUDA profile step anchor ──
+            # Notify before the wrapped callback; observe-only, never raises.
+            try:
+                from comfymodal_runtime import ideogram_cuda_profile as _ideo_profile
+                _cb_index = args[0] if args else kwargs.get("i", kwargs.get("step", None))
+                _ideo_profile.notify_sampler_step(
+                    _cb_index if isinstance(_cb_index, int) and not isinstance(_cb_index, bool) else None
+                )
+            except Exception:
+                pass
             start_ns = time.monotonic_ns()
             try:
                 return callback(*args, **kwargs)
@@ -9254,6 +9264,15 @@ class GoldenSerialRunner:
             and str(self.prompt[unique_id].get("class_type")) == diagnostics.sampler_class
         ):
             inputs = diagnostics.wrap_sampler_inputs(inputs)
+        # ── Ideogram single-iteration CUDA profile: wrap an already-present
+        # sampler callback independently of diagnostics so step indices are
+        # observed even when GoldenSamplingDiagnostics is disabled.  Absent
+        # callbacks stay absent; never changes sampler inputs or order.
+        try:
+            from comfymodal_runtime import ideogram_cuda_profile as _ideo_profile
+            inputs = _ideo_profile.maybe_wrap_sampler_callback(inputs)
+        except Exception:
+            pass
         sampler_call = (
             self.sampler_target_id is not None
             and str(unique_id) == self.sampler_target_id
@@ -15617,6 +15636,7 @@ async def golden_sampling(session: GoldenSession) -> Any:
         sampling_start_event = None
         sampling_end_event = None
         sampling_profile_artifact = None
+        ideogram_profile = None
         sampler_invocation_start_ns = None
         sampler_invocation_end_ns = None
         sampler_boundary_source = None
@@ -15721,6 +15741,18 @@ async def golden_sampling(session: GoldenSession) -> Any:
 
             scope_started = False
             attention_scope_state: dict[str, Any] | None = None
+            # ── Ideogram single-iteration CUDA profile (flag-gated, observe-only) ──
+            # Armed around actual Golden sampling only: CLIP/load stages ran
+            # before golden_sampling and VAE/teardown run after, so they stay
+            # outside the capture.  Never raises; disabled by default.
+            try:
+                from comfymodal_runtime import ideogram_cuda_profile as _ideo_profile
+                ideogram_profile = _ideo_profile.arm_ideogram_profile(
+                    request_id=str(getattr(session.request, "request_id", "")),
+                    patcher=getattr(session, "patcher", None),
+                )
+            except Exception:
+                ideogram_profile = None
             try:
                 runner.begin_scope({"sampling"})
                 scope_started = True
@@ -15928,6 +15960,26 @@ async def golden_sampling(session: GoldenSession) -> Any:
             # The sampling scope is closed by the inner finally above.  Keep
             # this outer finally as the diagnostics/lifecycle boundary, but do
             # not close the same runner scope a second time.
+            # ── Ideogram single-iteration CUDA profile: stop+export once,
+            # outside the iteration wall (bounded export timeout; Kineto
+            # stalls documented).  Never raises: a profiling failure must
+            # never mask the sampler result or exception.
+            try:
+                from comfymodal_runtime import ideogram_cuda_profile as _ideo_profile
+                if ideogram_profile is not None:
+                    _ideo_artifact = _ideo_profile.finalize_ideogram_profile(
+                        ideogram_profile,
+                        attention={
+                            "requested_backend": requested_attention_backend,
+                            "scope_state": attention_scope_state,
+                        },
+                    )
+                    try:
+                        rec.event("ideogram_cuda_profile", **_ideo_artifact)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             pass
         _assert_runner_quiescence(runner)
         sampler_classes = [sc for _n, _c, sc in executed if sc == "sampling"]

@@ -18,6 +18,12 @@ import {
   validateMappedValues,
   mergeDefaultsAndOverrides,
   resolveRunnable,
+  resolveExecutionRunnable,
+  remoteMissingReasons,
+  remoteMissingModels,
+  parseRemoteMissingReason,
+  resolveRemoteExecutionRunnable,
+  isCustomNodeReason,
   buildRunPayload,
   modelCompatibility,
   saveWorkflowSelection,
@@ -60,6 +66,7 @@ import {
 import {
   exportManifestEndpointPath,
   importManifestQuery,
+  inventoryRefreshQuery,
   portabilityEndpointPath,
 } from "../web/studio-backend-api.js";
 
@@ -397,7 +404,8 @@ function makeSelectedStore(ctx = makeRunContext()) {
 
   const payload = buildRunPayload("/comfymodal", store, { execution_mode: "v2" }, { t0_perf_ms: 1 });
 
-  // Exact top-level keys.
+  // Exact top-level keys (workflow_type rides top-level; the modal_options
+  // escape-hatch key appears only when enabled, asserted in section 22).
   assert.deepEqual(
     Object.keys(payload).sort(),
     ["controls", "featureId", "metadata", "modal_options", "trace", "workflow_id", "workflow_type", "workflow_version_id"],
@@ -728,6 +736,13 @@ function g12Report() {
   assert.equal(exportManifestEndpointPath("wv1"), "/studio/workflows/versions/wv1/export");
   assert.equal(importManifestQuery(true), "?dry_run=1");
   assert.equal(importManifestQuery(false), "?dry_run=0");
+  // Omitted maxAge preserves the server default TTL (existing callers
+  // unchanged); explicit 0 forces a fresh read after a volume mutation.
+  assert.equal(inventoryRefreshQuery(), "");
+  assert.equal(inventoryRefreshQuery(null), "");
+  assert.equal(inventoryRefreshQuery(""), "");
+  assert.equal(inventoryRefreshQuery(0), "?max_age=0");
+  assert.equal(inventoryRefreshQuery(30), "?max_age=30");
   section("12. endpoint construction");
 }
 
@@ -1145,6 +1160,158 @@ function slotsMapping(slots, method) {
   assert.ok(fallbackMsg.includes("Run from Studio References"));
   assert.ok(fallbackMsg.includes("clear the reference method/cards"));
   section("21. canvas reference block message");
+}
+
+// ── 22. Plan-validation escape hatch ─────────────────────────────────────
+
+{
+  const gated = {
+    runnable: false,
+    reasons: [
+      "required custom node 'ComfyUI-KJNodes' not installed",
+      "missing model 'flux2-vae.safetensors' (vae)",
+    ],
+  };
+
+  // Off: fail-closed, identical object back (no remote selected).
+  const closed = resolveExecutionRunnable(gated, false);
+  assert.equal(closed, gated, "skip off keeps the gate fail-closed");
+
+  // Remote selected, skip off: only model reasons relax.
+  const remote = resolveExecutionRunnable(gated, true);
+  assert.equal(remote.runnable, false, "custom-node reason still blocks remote runs");
+  assert.deepEqual(remote.reasons, ["required custom node 'ComfyUI-KJNodes' not installed"]);
+
+  // Skip on: custom-node reasons relax, model reasons stay.
+  globalThis.localStorage.setItem("comfymodal_skip_plan_validation", "1");
+  try {
+    assert.equal(isCustomNodeReason("required custom node 'X' not installed"), true);
+    assert.equal(isCustomNodeReason("installed custom node 'X' (commit a) differs from required revision b"), true);
+    assert.equal(isCustomNodeReason("missing model 'x' (vae)"), false);
+    const skipped = resolveExecutionRunnable(gated, false);
+    assert.equal(skipped.runnable, false, "model reason still blocks when skipping");
+    assert.deepEqual(skipped.reasons, ["missing model 'flux2-vae.safetensors' (vae)"]);
+    const skippedOnly = resolveExecutionRunnable(
+      { runnable: false, reasons: ["required custom node 'ComfyUI-KJNodes' not installed"] },
+      false,
+    );
+    assert.equal(skippedOnly.runnable, true, "pack-only block lifts when skipping");
+    assert.deepEqual(skippedOnly.reasons, []);
+
+    // Payload carries the flag only when enabled (exact-keys contract).
+    const ctx = makeRunContext();
+    const store = makeSelectedStore(ctx);
+    const on = buildRunPayload("/comfymodal", store, { execution_mode: "v2" }, {});
+    assert.equal(on.modal_options.skip_plan_validation, true);
+  } finally {
+    globalThis.localStorage.removeItem("comfymodal_skip_plan_validation");
+  }
+
+    // Flag absent again: payload keeps its exact keys.
+    const ctx2 = makeRunContext();
+    const store2 = makeSelectedStore(ctx2);
+    const off = buildRunPayload("/comfymodal", store2, { execution_mode: "v2" }, {});
+    assert.equal("skip_plan_validation" in off.modal_options, false);
+    section("22. plan-validation escape hatch");
+}
+
+// ── 23. Remote volume absence re-blocks remote runs ───────────────────────
+
+{
+  const runnable = { runnable: true, reasons: [] };
+
+  // Unknown inventory fails open (previous behavior preserved).
+  const unknownStore = { runContext: { remote_inventory_available: false, remote_missing: [] } };
+  assert.deepEqual(remoteMissingReasons(unknownStore), []);
+  assert.equal(resolveRemoteExecutionRunnable(unknownStore, runnable, true), runnable);
+  assert.equal(resolveRemoteExecutionRunnable(unknownStore, runnable, false), runnable);
+
+  // Legacy bundle without the new fields also fails open.
+  assert.deepEqual(remoteMissingReasons({ runContext: {} }), []);
+  assert.deepEqual(remoteMissingReasons({ runContext: null }), []);
+
+  // Known absence blocks a locally-runnable remote run with verbatim reasons.
+  const blockedStore = {
+    runContext: {
+      remote_inventory_available: true,
+      remote_missing: ["remote model 'krea_model.safetensors' not in workspace volume (checkpoints)"],
+    },
+  };
+  assert.deepEqual(remoteMissingReasons(blockedStore), [
+    "remote model 'krea_model.safetensors' not in workspace volume (checkpoints)",
+  ]);
+  const blocked = resolveRemoteExecutionRunnable(blockedStore, runnable, true);
+  assert.equal(blocked.runnable, false);
+  assert.deepEqual(blocked.reasons, [
+    "remote model 'krea_model.safetensors' not in workspace volume (checkpoints)",
+  ]);
+
+  // Local runs never consult remote truth; non-runnable stays untouched.
+  assert.equal(resolveRemoteExecutionRunnable(blockedStore, runnable, false), runnable);
+  const alreadyBlocked = { runnable: false, reasons: ["missing mapping"] };
+  assert.equal(resolveRemoteExecutionRunnable(blockedStore, alreadyBlocked, true), alreadyBlocked);
+  section("23. remote volume absence re-blocks remote runs");
+}
+
+// ── 24. Structured remote-missing models drive the manifest install button ─
+
+{
+  // Unknown inventory fails open, like remoteMissingReasons.
+  assert.deepEqual(remoteMissingModels({ runContext: { remote_inventory_available: false } }), []);
+  assert.deepEqual(remoteMissingModels({ runContext: {} }), []);
+
+  // Reason-string parsing: exact shape only, never a guess.
+  assert.deepEqual(parseRemoteMissingReason(
+    "remote model 'qwen3vl_8b_fp8_scaled.safetensors' not in workspace volume (text_encoders)"
+  ), { filename: "qwen3vl_8b_fp8_scaled.safetensors", folder: "text_encoders" });
+  assert.equal(parseRemoteMissingReason("missing model 'x.safetensors' (clip)"), null);
+  assert.equal(parseRemoteMissingReason(""), null);
+  assert.equal(parseRemoteMissingReason(null), null);
+
+  // Structured bundle field passes through with manifest installability.
+  const structuredStore = {
+    runContext: {
+      remote_inventory_available: true,
+      remote_missing: [
+        "remote model 'qwen3vl_8b_fp8_scaled.safetensors' not in workspace volume (text_encoders)",
+        "remote model 'ghost.safetensors' not in workspace volume (vae)",
+      ],
+      remote_missing_models: [
+        { filename: "qwen3vl_8b_fp8_scaled.safetensors", folder: "text_encoders", manifest_key: "clip/qwen3vl_8b_fp8_scaled.safetensors", manifest_installable: true },
+        { filename: "ghost.safetensors", folder: "vae", manifest_key: "", manifest_installable: false },
+      ],
+    },
+  };
+  assert.deepEqual(remoteMissingModels(structuredStore), [
+    { filename: "qwen3vl_8b_fp8_scaled.safetensors", folder: "text_encoders", manifest_key: "clip/qwen3vl_8b_fp8_scaled.safetensors", manifest_installable: true },
+    { filename: "ghost.safetensors", folder: "vae", manifest_key: "", manifest_installable: false },
+  ]);
+
+  // An installable flag without a key is not installable (no silent no-op).
+  const keylessStore = {
+    runContext: {
+      remote_inventory_available: true,
+      remote_missing_models: [
+        { filename: "x.safetensors", folder: "clip", manifest_key: "", manifest_installable: true },
+      ],
+    },
+  };
+  assert.deepEqual(remoteMissingModels(keylessStore), [
+    { filename: "x.safetensors", folder: "clip", manifest_key: "", manifest_installable: false },
+  ]);
+
+  // Legacy bundle without the structured field falls back to parsed reasons
+  // that never claim installability (button stays hidden, text unchanged).
+  const legacyStore = {
+    runContext: {
+      remote_inventory_available: true,
+      remote_missing: ["remote model 'krea_model.safetensors' not in workspace volume (checkpoints)"],
+    },
+  };
+  assert.deepEqual(remoteMissingModels(legacyStore), [
+    { filename: "krea_model.safetensors", folder: "checkpoints", manifest_key: "", manifest_installable: false },
+  ]);
+  section("24. structured remote-missing models drive the manifest install button");
 }
 
 console.log("PASS: studio workflow run unit tests");

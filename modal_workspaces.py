@@ -15,6 +15,23 @@ TARGET_CONFIG_RELATIVE_PATH = Path("config") / "v2" / "modal_target.toml"
 REGISTRY_RELATIVE_PATH = Path("comfymodal") / "modal_workspaces.json"
 _ENVIRONMENT_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 
+#: Sentinel meaning "use the Studio active workspace, resolved at call time".
+#: Accepted spellings in ``config/v2/modal_target.toml`` are normalized to the
+#: canonical value below, so ``studio default`` / ``studio_default`` also work.
+STUDIO_DEFAULT_WORKSPACE_ID = "studio-default"
+_STUDIO_DEFAULT_ALIASES = frozenset({
+    "studio-default",
+    "studio_default",
+    "studio default",
+})
+
+
+def is_studio_default_workspace_id(value: object) -> bool:
+    """Return True when *value* requests the Studio active workspace."""
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower() in _STUDIO_DEFAULT_ALIASES
+
 
 @dataclass(frozen=True)
 class ModalTargetConfig:
@@ -194,11 +211,35 @@ def load_modal_target_config(repo_root: str | Path) -> ModalTargetConfig:
 
 
 def resolve_modal_destination(repo_root: str | Path) -> dict[str, Any]:
-    """Resolve config-owned destination and credentials from the shared registry."""
+    """Resolve config-owned destination and credentials from the shared registry.
+
+    When ``config/v2/modal_target.toml`` names the ``studio-default`` sentinel,
+    the Studio active workspace (from the shared registry) is the destination.
+    It is resolved at call time, so switching the Studio workspace switches the
+    deploy target without editing config. Receipts record the resolved workspace
+    id, so readiness stays per-workspace and fail-closed.
+    """
     root = Path(repo_root).resolve()
     target = load_modal_target_config(root)
     registry_path = resolve_workspace_registry_path(root)
     registry = load_workspace_registry(registry_path)
+    if is_studio_default_workspace_id(target.workspace_id):
+        active = get_active_workspace(registry)
+        if active is None:
+            raise ValueError("Studio default workspace is not set: no active workspace registered")
+        token_id = str(active.get("token_id") or "").strip()
+        token_secret = str(active.get("token_secret") or "").strip()
+        if not token_id or not token_secret:
+            raise ValueError("Studio default workspace has no credentials")
+        return {
+            "workspace_id": str(active.get("id") or "").strip(),
+            "workspace_label": str(active.get("label") or "").strip(),
+            "environment": target.environment,
+            "token_id": token_id,
+            "token_secret": token_secret,
+            "source": str(TARGET_CONFIG_RELATIVE_PATH).replace("\\", "/"),
+            "registry": str(registry_path),
+        }
     workspace = get_workspace(registry, target.workspace_id)
     if workspace is None:
         raise ValueError(f"configured Modal workspace {target.workspace_id!r} is not registered")

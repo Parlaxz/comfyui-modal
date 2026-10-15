@@ -48,6 +48,8 @@ function expectOnlySync404(bad) {
 
 // Generate → Text with a T2I workflow: the only shell where the style
 // browser renders (see _renderStyleBrowser guards in studio-playground.js).
+// The browser is a collapsed-by-default <details> accordion, so expand it
+// before asserting on the inner search/grid/cards.
 async function gotoGenerateText(page) {
   await expect(page.locator(STRIP)).toBeVisible({ timeout: 10000 });
   await page.locator(GEN_TOOL).click();
@@ -58,6 +60,9 @@ async function gotoGenerateText(page) {
   await expect(page.locator(WF)).toHaveValue("wf_text2img", { timeout: 10000 });
   await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 15000 });
   await expect(page.locator(BROWSER)).toBeVisible({ timeout: 10000 });
+  const open = await page.locator(BROWSER).evaluate((n) => n.hasAttribute("open"));
+  if (!open) await page.locator('[data-testid="style-browser-toggle"]').click();
+  await expect(page.locator(GRID)).toBeVisible({ timeout: 10000 });
 }
 
 function visibleCardCount(page) {
@@ -77,6 +82,25 @@ function readStyleStore(page) {
 }
 
 test.describe("Visual Style Browser (fake backend)", () => {
+  test("T0 — browser is a collapsed-by-default accordion", async ({ page }) => {
+    const fx = await setupFakeTest(page);
+    const bad = watch4xx(page);
+    await expect(page.locator(STRIP)).toBeVisible({ timeout: 10000 });
+    await page.locator(GEN_TOOL).click();
+    await page.locator(TEXT_SUBTOOL).click();
+    await page.locator(WF).selectOption("wf_text2img");
+    await expect(page.locator(BROWSER)).toBeVisible({ timeout: 10000 });
+    const tag = await page.locator(BROWSER).evaluate((n) => n.tagName.toLowerCase());
+    expect(tag).toBe("details");
+    const open = await page.locator(BROWSER).evaluate((n) => n.hasAttribute("open"));
+    expect(open).toBe(false);
+    await expect(page.locator(GRID)).toBeHidden({ timeout: 10000 });
+    await page.locator('[data-testid="style-browser-toggle"]').click();
+    await expect(page.locator(GRID)).toBeVisible({ timeout: 10000 });
+    expectOnlySync404(bad);
+    await fx.assertNoConsoleErrors(ALLOW);
+  });
+
   test("T1 — Generate → Text renders browser with 12 catalog cards", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const bad = watch4xx(page);

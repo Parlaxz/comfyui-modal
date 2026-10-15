@@ -639,6 +639,36 @@ class TestCollectCustomNodeDependencyFiles(unittest.TestCase):
         result = collect_custom_node_dependency_files(np)
         self.assertIn("requirements.txt", result)
 
+    def test_local_tree_ignores_egg_info_build_output(self):
+        from comfyapp import collect_custom_node_dependency_files
+        # Mimics comfyui_sam3's `./src/sam3` local requirement: the walked
+        # tree contains pip-regenerated sam3.egg-info metadata alongside
+        # real sources.  Only the metadata must be skipped.
+        np = self._make_node("node_egg", {
+            "requirements.txt": "-e ./src/sam3\n",
+            "src/sam3/__init__.py": "x=1\n",
+            "src/sam3/sam3.egg-info/SOURCES.txt": "stale\n",
+            "src/sam3/sam3.egg-info/PKG-INFO": "stale\n",
+        })
+        result = collect_custom_node_dependency_files(np)
+        self.assertIn("requirements.txt", result)
+        self.assertIn("src/sam3/__init__.py", result)
+        for rel in result:
+            self.assertNotIn("egg-info", rel)
+
+    def test_egg_info_churn_does_not_change_dependency_files(self):
+        from comfyapp import collect_custom_node_dependency_files
+        np = self._make_node("node_egg_stable", {
+            "requirements.txt": "-e ./src/sam3\n",
+            "src/sam3/__init__.py": "x=1\n",
+            "src/sam3/sam3.egg-info/SOURCES.txt": "v1\n",
+        })
+        before = collect_custom_node_dependency_files(np)
+        with open(os.path.join(np, "src", "sam3", "sam3.egg-info", "SOURCES.txt"), "w") as f:
+            f.write("v2-regenerated-by-pip\n")
+        after = collect_custom_node_dependency_files(np)
+        self.assertEqual(before, after)
+
     def test_ordinary_source_only_no_dependency_files(self):
         from comfyapp import collect_custom_node_dependency_files
         np = self._make_node("node_h", {"__init__.py": "print('hello')\n"})

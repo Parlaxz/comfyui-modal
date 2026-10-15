@@ -10,7 +10,7 @@
 
 import { el, registerLayerHandler, buildViewerShell, resolveViewerShellArgs } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
-import { _formatDuration, resolveViewerInput } from "./studio-run-normalizer.js";
+import { _formatDuration, resolveViewerInput, loadSpanSnapshot } from "./studio-run-normalizer.js";
 import {
   buildAddToCompareItem,
   openComparePair,
@@ -24,6 +24,7 @@ import {
   generateOriginalEligibility,
   isDataSaverKind,
   isTerminalAttemptStatus,
+  selectCompareAsset,
   selectDetailAsset,
   selectFeedAsset,
 } from "./history-v2-repository.js";
@@ -465,7 +466,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       // While a compare session is active, any eligible output image can
       // fill slot B (a further pick truthfully replaces B). Non-image
       // outputs expose nothing.
-      const outAsset = selectFeedAsset(out);
+      const outAsset = selectCompareAsset(out);
       if (outAsset.url) {
         const compareItem = buildAddToCompareItem({
           descriptor: _compareDescriptor(outAsset.url, "Output " + (index + 1), "output", currentRecord),
@@ -635,7 +636,8 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
   // ── Compare entries (I5, lightweight A/B) ─────────────────────────────
   //
   // Client-only transient session over EXISTING projected URLs. The plain
-  // "Compare" action preselects the displayed featured asset as A and
+  // "Compare" action preselects the FULL-resolution compare asset as A
+  // (selectCompareAsset: Original > Data Saver > Thumbnail) and
   // activates the compare tray (the user then picks B from any reachable
   // History output). Where a usable Original URL is ALREADY projected on
   // the record, "Compare with Original" offers the direct Preview↔Original
@@ -659,6 +661,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     const meta = _downloadFilenameMeta(record, feat.index != null ? feat.index : 0);
 
     const displayed = selectDetailAsset(feat);
+    const compareAsset = selectCompareAsset(feat);
     const previewBody = displayed.url
       ? el("div", { class: "comfymodal-studio-history-v2-slot-image" }, [
         el("img", {
@@ -708,7 +711,10 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       previewDownload,
       previewExport,
       // Lightweight A/B compare entry (I5): only for a usable managed image.
-      displayed.url
+      // The compare descriptor resolves the FULL-resolution URL (Original >
+      // Data Saver > Thumbnail) while the slot keeps showing the lightweight
+      // display variant — the compare view must never upscale a 256px thumb.
+      compareAsset.url
         ? el("button", {
           class: "comfymodal-secondary-btn",
           "data-testid": "history-v2-compare",
@@ -717,7 +723,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
           title: "Compare this image with another History output (client-side only)",
           onclick: function () {
             startCompare({
-              descriptor: _compareDescriptor(displayed.url, displayed.kind === "thumbnail" ? "Thumbnail" : (displayed.kind === "original" ? "Original" : "Data Saver"), displayed.kind, record),
+              descriptor: _compareDescriptor(compareAsset.url, compareAsset.kind === "thumbnail" ? "Thumbnail" : (compareAsset.kind === "original" ? "Original" : "Data Saver"), compareAsset.kind, record),
               invoker: document.activeElement,
             });
           },
@@ -726,7 +732,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       // Direct Preview↔Original pair — offered only when a usable Original
       // URL is ALREADY projected on the record; the click itself is what
       // may load Original bytes (explicit user action, like View Original).
-      displayed.url && feat.originalUrl && !feat.originalFailed
+      compareAsset.url && feat.originalUrl && !feat.originalFailed
         ? el("button", {
           class: "comfymodal-secondary-btn",
           "data-testid": "history-v2-compare-original",
@@ -738,7 +744,7 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
             // through its existing close path before opening compare.
             close();
             openComparePair({
-              a: _compareDescriptor(displayed.url, displayed.kind === "thumbnail" ? "Thumbnail" : "Data Saver", displayed.kind, record),
+              a: _compareDescriptor(compareAsset.url, compareAsset.kind === "thumbnail" ? "Thumbnail" : (compareAsset.kind === "original" ? "Original" : "Data Saver"), compareAsset.kind, record),
               b: _compareDescriptor(feat.originalUrl, "Original", "original", record),
               invoker: document.activeElement,
             });
@@ -1248,6 +1254,22 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     // Same shared resolver every full-size output surface uses: one record
     // projection, one image policy, one timing source.
     const viewer = resolveViewerInput(record);
+    // Refresh-durable fallback: terminal span snapshots persisted by the
+    // Playground (localStorage) render here when the durable record itself
+    // carries no timing — same breakdown the live run showed, surviving
+    // the refresh that wipes page memory.
+    if (!viewer.goldenProgress && (!viewer.timing || Object.keys(viewer.timing).length === 0)) {
+      try {
+        if (typeof localStorage !== "undefined" && localStorage) {
+          const persisted = loadSpanSnapshot(localStorage, [
+            record && record.id, record && record.runId, record && record.run_id,
+            record && record.experimentId, record && record.experiment_id,
+            record && record.generationId,
+          ]);
+          if (persisted) viewer.goldenProgress = persisted;
+        }
+      } catch (err) { /* placeholder remains truthful */ }
+    }
     const args = resolveViewerShellArgs(viewer, shellAdapters);
     sharedShell.render(args.record, args);
     // Lane D: saved studio references render as their own section inside

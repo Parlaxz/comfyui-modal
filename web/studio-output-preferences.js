@@ -367,6 +367,9 @@ export async function loadModalOptions(apiBase) {
       execution_mode: mode || "v2",
       golden_profile: typeof (config.golden_profile || config.profile_name || config.profile) === "string"
         ? (config.golden_profile || config.profile_name || config.profile) : null,
+      // Temporary escape hatch: server-persisted plan-validation opt-out
+      // rides every run's modal_options so Studio runs honor the toggle.
+      skip_plan_validation: config.skip_plan_validation === true,
     },
     buildModalOptions(source),
   );

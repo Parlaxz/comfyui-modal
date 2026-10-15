@@ -172,6 +172,19 @@ const SETTINGS_KEY_CONTRACT = {
       [readWeb("studio-workflows.js"), 'comfymodal_remote_inventory_refresh_interval_s'],
     ],
   },
+  "comfymodal_skip_plan_validation": {
+    // Temporary escape hatch: local key drives Studio execution gating
+    // synchronously; the server persists its own mirror for headless/API
+    // callers. Reset removes the local key and POSTs false (fail-closed).
+    classification: "value-setting",
+    evidence: [
+      [playgroundStateSource, 'SKIP_PLAN_VALIDATION_KEY = "comfymodal_skip_plan_validation"'],
+      [playgroundStateSource, 'localStorage.getItem(SKIP_PLAN_VALIDATION_KEY)'],
+      [playgroundStateSource, 'localStorage.setItem(SKIP_PLAN_VALIDATION_KEY, "1")'],
+      [settingsSource, 'loadSkipPlanValidation()'],
+      [settingsSource, 'saveSkipPlanValidation('],
+    ],
+  },
 };
 
 function parseModernSettingsKeys(source) {

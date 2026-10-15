@@ -2628,3 +2628,70 @@ change_requires = "run"
 runtime_exposed = false
 owner = "nic-audit"
 description = "Golden result image wire representation: bytes (default, raw PNG bytes in images[0].raw_bytes, no base64 expansion) or base64 (legacy images[0].data envelope for diagnosis). Run-scoped via the result_transport request key; image bytes and identity are identical either way."
+
+[[flag]]
+name = "COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE"
+type = "enum"
+default = "off"
+enum_values = ["off", "torch", "nsys"]
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "ideogram-cuda-profile"
+description = "Flag-gated single steady-state Ideogram iteration CUDA profiling (cond + uncond + CFG/guider/sampler). Disabled by default; observe-only, one request/iteration only. torch = re-scoped Kineto capture (shapes/memory/stacks off); nsys = NVTX ranges only, never run Torch/Kineto + nsys CUDA collection simultaneously."
+
+[[flag]]
+name = "COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_ITERATION"
+type = "int"
+default = "3"
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "ideogram-cuda-profile"
+description = "Zero-based sampler iteration captured by the Ideogram CUDA profile (default 3 = 4th of 16, after stabilization). Invalid or negative values fall back to 3."
+min = 0
+max = 1023
+
+[[flag]]
+name = "COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_BLOCK_RANGES"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "ideogram-cuda-profile"
+description = "Emit optional per-DiT-block COND/UNCOND record_function ranges (max 68) inside the captured Ideogram iteration only, when a stable shared DiT block seam is confirmed. Disabled by default."
+
+[[flag]]
+name = "COMFYMODAL_V2_WORKFLOW_ID"
+type = "string"
+default = ""
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "ideogram-h100"
+description = "Canonical Studio workflow id for exact-placement v2ctl runs (e.g. Ideogram 4 Comfy UI Default). Empty = no workflow selection. A non-empty value must equal the profile's canonical workflow id; v2ctl never falls back to another/default workflow."
+regex = "^wf_[0-9a-f]+$"
+
+[[flag]]
+name = "COMFYMODAL_V2_WORKFLOW_VERSION_ID"
+type = "string"
+default = ""
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "ideogram-h100"
+description = "Canonical Studio workflow version id for exact-placement v2ctl runs. Empty = no workflow selection. Must equal the canonical version for the selected workflow id; mismatch fails closed."
+regex = "^wv_[0-9a-f]+$"
+
+[[flag]]
+name = "COMFYMODAL_V2_WORKFLOW_STEPS"
+type = "int"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = false
+owner = "ideogram-h100"
+description = "Explicit sampler step override for the selected workflow. 0 = stored graph default (the graph is never silently rewritten); any positive value is an explicit request override recorded with graph-default vs requested vs effective provenance."
+min = 0
+max = 64

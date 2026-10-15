@@ -55,6 +55,48 @@ const MODEL_BUCKETS = {
   other: "checkpoints",
 };
 
+// Install folders offered by the Model Library "Download from URL" panel.
+// Mirrors local_placeholders.ALLOWED_MODEL_FOLDERS minus non-model roots;
+// the backend stays authoritative (it re-validates folder + filename).
+export const MODEL_DOWNLOAD_FOLDERS = [
+  "checkpoints",
+  "diffusion_models",
+  "unet",
+  "clip",
+  "text_encoders",
+  "vae",
+  "loras",
+  "controlnet",
+  "upscale_models",
+  "embeddings",
+  "clip_vision",
+  "style_models",
+  "vae_approx",
+  "hypernetworks",
+  "gligen",
+];
+
+/**
+ * Pure: infer a model filename from a pasted download URL.
+ * Strips query/hash (e.g. HuggingFace `?download=true`), takes the last
+ * path segment, and decodes percent-encoding. Returns "" when nothing
+ * usable remains — the caller then asks the user to type a filename.
+ */
+export function inferModelFilenameFromUrl(url) {
+  const raw = String(url == null ? "" : url).trim();
+  if (!raw) return "";
+  const noFrag = raw.split("#")[0];
+  const noQuery = noFrag.split("?")[0];
+  const path = noQuery.replace(/\\/g, "/");
+  const base = path.split("/").pop().trim();
+  if (!base || base === "." || base === "..") return "";
+  try {
+    return decodeURIComponent(base).trim();
+  } catch (e) {
+    return base;
+  }
+}
+
 let _searchTimer = null;
 
 function _fmtSize(bytes) {
@@ -289,6 +331,14 @@ export function renderModelLibraryView(opts) {
 
   root.appendChild(el("div", { class: "comfymodal-studio-workflows-toolbar" }, [searchIn, typeSel, stateSel]));
 
+  // ── Download from URL ───────────────────────────────────────────────────
+  // Top-level install field: paste any direct model link (e.g. a HuggingFace
+  // /resolve/ URL with ?download=true) and install it exactly like a
+  // source-less wizard dependency row — Queue install (async + polled) or
+  // Install now (synchronous single-item batch). Explicit click only; the
+  // backend downloads into the Modal workspace/volume, never the browser.
+  root.appendChild(renderUrlDownloadSection());
+
   // ── Model list ──────────────────────────────────────────────────────────
   const list = el("div", { class: "comfymodal-studio-model-list", "data-testid": "models-list" });
   if (md.loading && !md._loaded) {
@@ -319,6 +369,184 @@ export function renderModelLibraryView(opts) {
   return root;
 
   // ── Internal async handlers (closure-scoped) ────────────────────────────
+
+  // Top-level "paste a link" panel. Same install path as a wizard
+  // source-less dependency row: the URL goes to the EXISTING backend install
+  // routes (validation/sanitization live there). Nothing downloads on render.
+  function renderUrlDownloadSection() {
+    const section = el("div", {
+      class: "comfymodal-studio-section",
+      "data-testid": "models-url-section",
+    });
+    section.appendChild(el("div", { class: "comfymodal-studio-section-head" }, [
+      el("h3", { class: "comfymodal-studio-section-title", text: "Download from URL" }),
+    ]));
+    section.appendChild(el("p", {
+      class: "comfymodal-studio-dependencies-note",
+      text: "Paste a direct model link (HuggingFace /resolve/ links with ?download=true work). The file downloads on Modal — nothing is fetched in the browser.",
+    }));
+
+    let filenameTouched = false;
+    const urlIn = el("input", {
+      type: "text",
+      class: "comfymodal-studio-wf-input",
+      "data-testid": "models-url-input",
+      "aria-label": "Model download URL",
+      placeholder: "https://huggingface.co/\u2026/resolve/main/\u2026.safetensors?download=true",
+      oninput: () => {
+        if (!filenameTouched) filenameIn.value = inferModelFilenameFromUrl(urlIn.value);
+      },
+    });
+    const folderSel = el("select", {
+      class: "comfymodal-studio-model-picker",
+      "data-testid": "models-folder-select",
+      "aria-label": "Destination folder",
+    });
+    MODEL_DOWNLOAD_FOLDERS.forEach((f) => folderSel.appendChild(el("option", { value: f, text: f })));
+    folderSel.value = "diffusion_models";
+    const filenameIn = el("input", {
+      type: "text",
+      class: "comfymodal-studio-wf-input",
+      "data-testid": "models-filename-input",
+      "aria-label": "Destination filename",
+      placeholder: "model.safetensors (auto-filled from URL)",
+      oninput: () => { filenameTouched = true; },
+    });
+
+    const note = el("div", {
+      class: "comfymodal-studio-dialog-status",
+      "data-testid": "models-url-note",
+      style: "display:none;",
+    });
+    const showNote = (message, isError) => {
+      note.style.display = "block";
+      note.textContent = message;
+      note.classList.toggle("error", !!isError);
+    };
+    const progressFill = el("div", {
+      "data-testid": "models-url-install-progress-fill",
+      style: "height:100%;width:0%;background:#6a9fd8;transition:width 200ms ease;",
+    });
+    const progressTrack = el("div", {
+      "data-testid": "models-url-install-progress",
+      style: "display:none;height:6px;background:#2a2a2a;border-radius:3px;overflow:hidden;margin-top:4px;",
+    }, [progressFill]);
+    const progressLabel = el("div", {
+      "data-testid": "models-url-install-progress-label",
+      style: "display:none;font-size:10px;color:#f5a623;margin-top:2px;",
+    });
+    const showProgress = (pct, message) => {
+      const p = Math.max(0, Math.min(100, Number(pct) || 0));
+      progressTrack.style.display = "block";
+      progressFill.style.width = p + "%";
+      if (message) {
+        progressLabel.style.display = "block";
+        progressLabel.textContent = message;
+      }
+    };
+    const hideProgress = () => {
+      progressTrack.style.display = "none";
+      progressFill.style.width = "0%";
+      progressLabel.style.display = "none";
+      progressLabel.textContent = "";
+    };
+    const progressFromStatus = (last) => {
+      const pct = Number(last.pct ?? last.progress ?? 0) || 0;
+      const dl = last.downloaded_mb ?? last.downloadedMb;
+      const total = last.total_mb ?? last.totalMb;
+      showProgress(pct, (dl != null && total != null)
+        ? "Downloading\u2026 " + Math.round(pct) + "% (" + dl + " / " + total + " MB)"
+        : (pct ? "Downloading\u2026 " + Math.round(pct) + "%" : "Downloading\u2026"));
+    };
+    const readForm = () => {
+      const url = (urlIn.value || "").trim();
+      let filename = (filenameIn.value || "").trim();
+      if (!filename) filename = inferModelFilenameFromUrl(url);
+      return { url: url, filename: filename, savePath: folderSel.value || "" };
+    };
+    const validOrNote = (info) => {
+      if (!info.url || !/^https?:\/\//i.test(info.url)) {
+        showNote("Paste a model URL first (https://\u2026).", true);
+        return false;
+      }
+      if (!info.filename) {
+        showNote("Could not infer a filename from the URL \u2014 type one explicitly.", true);
+        return false;
+      }
+      return true;
+    };
+    const setBusy = (busy, label) => {
+      queueBtn.disabled = busy;
+      nowBtn.disabled = busy;
+      if (busy) {
+        queueBtn.textContent = "Queueing\u2026";
+        nowBtn.textContent = "Installing\u2026";
+      } else {
+        queueBtn.textContent = "Queue install";
+        nowBtn.textContent = "Install now";
+      }
+      if (label) { /* label kept for symmetry; buttons carry the state */ }
+    };
+
+    const queueBtn = el("button", {
+      class: "comfymodal-secondary-btn",
+      type: "button",
+      "data-testid": "models-url-queue",
+      text: "Queue install",
+      style: "font-size:10px;padding:4px 10px;width:auto;",
+      onclick: async () => {
+        const info = readForm();
+        if (!validOrNote(info)) return;
+        if (queueBtn.disabled) return;
+        setBusy(true);
+        showNote("Starting install\u2026", false);
+        showProgress(0, "Starting install\u2026");
+        const res = await queueModelInstall(apiBase, info, progressFromStatus);
+        hideProgress();
+        showNote(res.message, !res.ok);
+        if (res.ok) await reloadModelsList(apiBase, view, refresh);
+        setBusy(false);
+      },
+    });
+    const nowBtn = el("button", {
+      class: "comfymodal-secondary-btn",
+      type: "button",
+      "data-testid": "models-url-install-now",
+      text: "Install now",
+      style: "font-size:10px;padding:4px 10px;width:auto;",
+      onclick: async () => {
+        const info = readForm();
+        if (!validOrNote(info)) return;
+        if (nowBtn.disabled) return;
+        setBusy(true);
+        showNote("Installing\u2026", false);
+        progressTrack.style.display = "block";
+        progressFill.style.width = "100%";
+        progressLabel.style.display = "block";
+        progressLabel.textContent = "Installing\u2026";
+        const res = await installModelNow(apiBase, info);
+        hideProgress();
+        showNote(res.message, !res.ok);
+        if (res.ok) await reloadModelsList(apiBase, view, refresh);
+        setBusy(false);
+      },
+    });
+
+    section.appendChild(el("div", { class: "comfymodal-studio-backend-field" }, [
+      el("label", { text: "URL" }), urlIn,
+    ]));
+    section.appendChild(el("div", { class: "comfymodal-studio-editor-grid" }, [
+      el("div", { class: "comfymodal-studio-backend-field" }, [el("label", { text: "Folder" }), folderSel]),
+      el("div", { class: "comfymodal-studio-backend-field" }, [el("label", { text: "Filename" }), filenameIn]),
+    ]));
+    section.appendChild(el("div", { class: "comfymodal-studio-dialog-actions", style: "justify-content:flex-start;" }, [
+      queueBtn, nowBtn,
+    ]));
+    section.appendChild(note);
+    section.appendChild(progressTrack);
+    section.appendChild(progressLabel);
+    return section;
+  }
 
   async function handleRescan(apiBaseRef, viewRef, refreshRef, btn, rehashInput) {
     if (btn.disabled) return; // request dedupe: ignore clicks while in flight

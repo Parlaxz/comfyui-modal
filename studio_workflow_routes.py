@@ -711,6 +711,34 @@ def register_workflow_routes(
                         version["executable_prompt"] = (
                             _bundle.get("executable_prompt") or {}
                         )
+            # Remote-volume readiness for Golden runs: synchronous snapshot read
+            # only (no Modal round trip on this <500ms path). Unknown (None /
+            # malformed) fails open; a known dict snapshot — even empty — is
+            # truth and yields per-model remote-missing reasons the frontend
+            # remote gate surfaces instead of "Ready to run".
+            _remote_snapshot = remote_inventory.current()
+            _remote_available = isinstance(_remote_snapshot, dict)
+            _remote_missing: list[str] = []
+            # Structured remote-missing models with manifest installability
+            # ({filename, folder, manifest_key, manifest_installable}) so a
+            # run-gate warning can offer a one-click manifest install.
+            # Additive only: older clients keep reading remote_missing.
+            _remote_missing_models: list[dict[str, Any]] = []
+            if _remote_available and isinstance(version, dict):
+                try:
+                    if resolver is not None and hasattr(resolver, "remote_missing_reasons"):
+                        _remote_missing = list(
+                            resolver.remote_missing_reasons(version, _remote_snapshot) or []
+                        )
+                except Exception:
+                    _remote_missing = []
+                try:
+                    if resolver is not None and hasattr(resolver, "remote_missing_models"):
+                        _remote_missing_models = list(
+                            resolver.remote_missing_models(version, _remote_snapshot) or []
+                        )
+                except Exception:
+                    _remote_missing_models = []
             return web.json_response({
                 "status": "ok",
                 "workflow": workflow,
@@ -720,6 +748,9 @@ def register_workflow_routes(
                 "workflow_config": workflow_config,
                 "state": state,
                 "control_schema": control_schema,
+                "remote_inventory_available": _remote_available,
+                "remote_missing": _remote_missing,
+                "remote_missing_models": _remote_missing_models,
             })
         except (WorkflowNotFoundError, WorkflowVersionNotFoundError) as exc:
             return _json_error(404, str(exc))

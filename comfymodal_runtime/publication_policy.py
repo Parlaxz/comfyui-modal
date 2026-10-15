@@ -142,6 +142,13 @@ EXCLUDED_PREFIXES: tuple[str, ...] = (
     "before_v2_", "before_", "benchmark_", "trace_", "AUDIT_",
 )
 EXCLUDED_INFIXES: tuple[str, ...] = (".v21610_backup",)
+# Build-output directory suffixes matched at every depth.  An exact-name set
+# cannot cover versioned names such as ``sam3.egg-info``: setuptools/pip
+# regenerate SOURCES.txt/PKG-INFO inside these directories on every install,
+# so hashing them turns local installs into dependency-identity drift.
+EXCLUDED_DIR_SUFFIXES: tuple[str, ...] = (
+    ".egg-info",
+)
 GENERATED_JSON_PREFIXES: tuple[str, ...] = (
     "temp_", "_last_", "studio-", "clean_", "latest_benchmark_",
     ".modal_", ".model_", ".last_", ".profile_",
@@ -257,6 +264,7 @@ def is_excluded_dir_name(name: str) -> bool:
     return (
         lowered in {item.casefold() for item in EXCLUDED_DIR_NAMES}
         or lowered.startswith(tuple(prefix.casefold() for prefix in EXCLUDED_PREFIXES))
+        or lowered.endswith(tuple(suffix.casefold() for suffix in EXCLUDED_DIR_SUFFIXES))
         or any(infix.casefold() in lowered for infix in EXCLUDED_INFIXES)
         or is_local_clone_name(value)
     )
@@ -548,6 +556,7 @@ def image_ignore_patterns(prefix: str = "") -> list[str]:
         for prefix_name in EXCLUDED_PREFIXES
     )
     patterns.extend(f"{prefix}*{infix}*" for infix in EXCLUDED_INFIXES)
+    patterns.extend(f"{prefix}*{suffix}/" for suffix in EXCLUDED_DIR_SUFFIXES)
     patterns.extend(
         f"{prefix}{json_prefix}*{extension}"
         for json_prefix in GENERATED_JSON_PREFIXES

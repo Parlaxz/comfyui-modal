@@ -311,6 +311,14 @@ def _forward_post_hook(module: Any, args: tuple[Any, ...], output: Any) -> None:
     Only the first matching CUDA forward produces a record (one per request).
     Uses active diagnostics state['first_forward'] instead of module-global.
     """
+    # ── Ideogram single-iteration CUDA profile: close the forward range ──
+    # First so ranges close even on the early-return paths below.  Lazy
+    # import keeps this module cycle-free; observe-only, never raises.
+    try:
+        from comfymodal_runtime import ideogram_cuda_profile as _ideo_profile
+        _ideo_profile.observe_forward_post(module)
+    except Exception:
+        pass
     _ensure_context_vars()
     request_trace = _ACTIVE_REQUEST_TRACE.get() if _ACTIVE_REQUEST_TRACE is not None else None
     if request_trace is None:
@@ -424,6 +432,15 @@ def _forward_pre_hook(module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
     diffusion model (not just NextDiT) when installed via
     ``nn.Module.register_forward_pre_hook``.
     """
+    # ── Ideogram single-iteration CUDA profile: observe forward entry ──
+    # Independent of the trace/entry lookups below so the direct-invocation
+    # path is covered.  Lazy import keeps this module cycle-free;
+    # observe-only, never raises, returns None (inputs unchanged).
+    try:
+        from comfymodal_runtime import ideogram_cuda_profile as _ideo_profile
+        _ideo_profile.observe_forward_pre(module, args, kwargs)
+    except Exception:
+        pass
     _ensure_context_vars()
 
     request_trace = _ACTIVE_REQUEST_TRACE.get() if _ACTIVE_REQUEST_TRACE is not None else None
@@ -651,7 +668,9 @@ def install_nextdit_forward_pre_hook() -> bool:
             # The probe is an observer: a probe failure must never break
             # inference, so report it and always call the original forward.
             try:
-                _forward_pre_hook(self, args)
+                # Pass kwargs through so conditioning metadata (e.g.
+                # transformer_options["cond_or_uncond"]) stays observable.
+                _forward_pre_hook(self, args, kwargs)
             except Exception as _probe_exc:
                 print(f"[unet_probe] nextdit pre-hook error: "
                       f"{type(_probe_exc).__name__}: {str(_probe_exc)[:120]}", flush=True)

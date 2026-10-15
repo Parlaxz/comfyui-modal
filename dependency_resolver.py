@@ -405,6 +405,85 @@ def _basename_of_ref(filename: str) -> str:
     return filename.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+def _load_manifest_sources(library_root: Any) -> dict[str, list[dict[str, str]]]:
+    """Index master-manifest download URLs by lowercased basename.
+
+    The Model Library is not the only source of an installable URL: a model
+    already tracked in ``.model_manifest.json`` carries its own ``url`` and can
+    be installed through the existing model-install routes. Entries flagged
+    ``remove_on_swap`` or without a URL are not installable and are skipped.
+    Never raises; an unreadable manifest yields an empty index.
+    """
+    index: dict[str, list[dict[str, str]]] = {}
+    try:
+        path = Path(str(library_root)) / ".model_manifest.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return index
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return index
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            url = str(entry.get("url") or "").strip()
+            filename = str(entry.get("filename") or "").strip()
+            folder = str(entry.get("folder") or "").strip()
+        except Exception:
+            continue
+        if not url or not filename:
+            continue
+        if bool(entry.get("remove_on_swap", False)):
+            continue
+        key = _basename_of_ref(filename).casefold()
+        if not key:
+            continue
+        index.setdefault(key, []).append({"folder": folder, "url": url})
+    return index
+
+
+def _manifest_entry_for(
+    index: dict[str, list[dict[str, str]]], role: str, filename: str
+) -> dict[str, str]:
+    """Best manifest entry (``{folder, url}``) for a ``(role, filename)`` ref.
+
+    Alias-aware: a candidate whose folder is in the role's folder set
+    (``unet``/``diffusion_models``, ``clip``/``text_encoders``) wins. When the
+    role has a known folder set and no candidate matches it, return {}
+    so a same-basename file of another type is never installed into the
+    wrong folder. Roles without a known set fall back to the first
+    candidate. Never raises; missing data yields {}.
+    """
+    try:
+        candidates = index.get(_basename_of_ref(filename).casefold(), [])
+    except Exception:
+        return {}
+    if not candidates:
+        return {}
+    aliases = _role_alias_folders(role)
+    if aliases:
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if str(candidate.get("folder") or "").strip().lower() in aliases:
+                return candidate
+        return {}
+    first = candidates[0]
+    return first if isinstance(first, dict) else {}
+
+
+def _manifest_url_for(
+    index: dict[str, list[dict[str, str]]], role: str, filename: str
+) -> str:
+    """Best manifest URL for a ``(role, filename)`` ref, or "".
+
+    Thin wrapper over :func:`_manifest_entry_for`; see it for the
+    alias-aware matching rules.
+    """
+    return str(_manifest_entry_for(index, role, filename).get("url") or "")
+
+
 class _RemoteInventory:
     """Small normalized lookup over one raw volume-status payload."""
 
@@ -668,6 +747,11 @@ class DependencyResolver:
         required_models = dependency_metadata.get("required_models") or {}
         if not isinstance(required_models, dict):
             required_models = {}
+        # Manifest fallback: a missing model already tracked in the master
+        # manifest carries an installable URL even when the Model Library has
+        # no record/source for it. Load once per report so every missing row
+        # without a source can surface the existing Queue/Install actions.
+        manifest_sources = _load_manifest_sources(self.library_root)
         results: list[dict[str, Any]] = []
         for ref in refs:
             role = ref.get("role", "")
@@ -735,6 +819,11 @@ class DependencyResolver:
                 continue
             if records:
                 rec = self._most_recent(records)
+                sources = list(rec.get("source_urls") or [])
+                if not sources:
+                    manifest_url = _manifest_url_for(manifest_sources, role, filename)
+                    if manifest_url:
+                        sources = [manifest_url]
                 row = {
                         "key": f"{role}|{filename}",
                         "role": role,
@@ -745,12 +834,13 @@ class DependencyResolver:
                         "hash": rec.get("hash"),
                         "size": None,
                         "local_path": None,
-                        "source_urls": list(rec.get("source_urls") or []),
+                        "source_urls": sources,
                         "installed": False,
                     }
                 _apply_remote_model(row, remote_lookup, role, filename)
                 results.append(row)
                 continue
+            manifest_url = _manifest_url_for(manifest_sources, role, filename)
             row = {
                     "key": f"{role}|{filename}",
                     "role": role,
@@ -761,7 +851,7 @@ class DependencyResolver:
                     "hash": None,
                     "size": None,
                     "local_path": None,
-                    "source_urls": [],
+                    "source_urls": [manifest_url] if manifest_url else [],
                     "installed": False,
                 }
             _apply_remote_model(row, remote_lookup, role, filename)
@@ -1193,3 +1283,82 @@ class DependencyResolver:
         except Exception:
             pass
         return reasons
+
+    def remote_missing_reasons(
+        self, version: dict[str, Any], remote: Any = None
+    ) -> list[str]:
+        """Reasons for essential models absent from the remote volume snapshot.
+
+        Positive-only remote evidence stays untouched: ``None`` (never fetched
+        or fetch failed) and non-dict payloads mean unknown, never missing, so
+        the remote gate fails open exactly like today. A dict snapshot — even
+        one with zero models, i.e. an empty workspace volume — is known truth:
+        every essential ref without available remote content blocks with a
+        ``remote model ...`` reason that the ``missing model ...`` filter will
+        not strip.
+        """
+        if remote is None:
+            remote = remote_inventory.current()
+        if remote is None or not isinstance(remote, dict):
+            return []
+        try:
+            reasons: list[str] = []
+            for row in self.resolve_model_refs(version, remote=remote):
+                if row.get("nonessential"):
+                    continue
+                if row.get("remote_available") is True:
+                    continue
+                filename = row.get("filename")
+                if not isinstance(filename, str) or not filename:
+                    continue
+                reasons.append(
+                    f"remote model '{filename}' "
+                    f"not in workspace volume ({row.get('folder') or 'unknown'})"
+                )
+            return reasons
+        except Exception:
+            return []
+
+    def remote_missing_models(
+        self, version: dict[str, Any], remote: Any = None
+    ) -> list[dict[str, Any]]:
+        """Structured remote-missing models with manifest installability.
+
+        Same evidence as :meth:`remote_missing_reasons` (essential refs
+        without remote content; unknown inventory fails open with []), but
+        each entry carries ``{filename, folder, manifest_key,
+        manifest_installable}`` so a UI warning can offer a one-click
+        manifest install. ``manifest_key`` uses the manifest entry's own
+        folder (``folder/filename``), which is what the workspace-swap
+        install pipeline matches on — never the dependency role folder.
+        Never raises; failure yields [].
+        """
+        if remote is None:
+            remote = remote_inventory.current()
+        if remote is None or not isinstance(remote, dict):
+            return []
+        try:
+            manifest_sources = _load_manifest_sources(self.library_root)
+            models: list[dict[str, Any]] = []
+            for row in self.resolve_model_refs(version, remote=remote):
+                if row.get("nonessential"):
+                    continue
+                if row.get("remote_available") is True:
+                    continue
+                filename = row.get("filename")
+                if not isinstance(filename, str) or not filename:
+                    continue
+                role = str(row.get("role") or "")
+                entry = _manifest_entry_for(manifest_sources, role, filename)
+                manifest_folder = str(entry.get("folder") or "").strip()
+                manifest_url = str(entry.get("url") or "").strip()
+                installable = bool(manifest_folder and manifest_url)
+                models.append({
+                    "filename": filename,
+                    "folder": row.get("folder") or "unknown",
+                    "manifest_key": f"{manifest_folder}/{filename}" if installable else "",
+                    "manifest_installable": installable,
+                })
+            return models
+        except Exception:
+            return []

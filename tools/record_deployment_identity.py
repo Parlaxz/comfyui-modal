@@ -103,19 +103,30 @@ def _git_head(repo_root: str) -> str:
 
 
 def _load_active_workspace() -> dict:
-    """Load the active workspace credentials (same source as the deploy .bat)."""
-    if not os.path.isfile(_ACTIVE_WORKSPACES_FILE):
-        raise RuntimeError(f"workspace file not found: {_ACTIVE_WORKSPACES_FILE}")
-    with open(_ACTIVE_WORKSPACES_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    active_id = data.get("active_workspace_id")
-    if not active_id:
-        raise RuntimeError(".modal_workspaces.json has no active_workspace_id")
-    workspace = next((w for w in data.get("workspaces", []) if w.get("id") == active_id), None)
-    if not workspace:
-        raise RuntimeError(f"active workspace {active_id!r} not found in .modal_workspaces.json")
+    """Load the destination workspace credentials (same authority as deploy).
+
+    Resolves via ``modal_workspaces.resolve_modal_destination`` — the same
+    config-owned authority the v2ctl destination preflight and the deploy
+    backend use — NOT the legacy repo-root ``.modal_workspaces.json`` file,
+    whose active workspace silently disagreed (Testing 4) with the actual
+    deploy destination (Testing 7), causing ``AuthError:Token not found``
+    on the identity readback.
+    """
+    import modal_workspaces  # noqa: PLC0415 — lazy, mirrors source_probe.py
+
+    try:
+        dest = modal_workspaces.resolve_modal_destination(_REPO_ROOT)
+    except Exception as exc:
+        raise RuntimeError(f"cannot resolve Modal destination: {exc}") from exc
+    workspace = {
+        "id": dest.get("workspace_id", ""),
+        "label": dest.get("workspace_label", ""),
+        "token_id": dest.get("token_id", ""),
+        "token_secret": dest.get("token_secret", ""),
+        "environment": dest.get("environment", "(default)"),
+    }
     if not workspace.get("token_id") or not workspace.get("token_secret"):
-        raise RuntimeError(f"active workspace {active_id!r} is missing token_id/token_secret")
+        raise RuntimeError("resolved Modal destination has no credentials")
     return workspace
 
 

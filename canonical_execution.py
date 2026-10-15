@@ -775,6 +775,18 @@ class RunTrace:
 
 def _validate_class_types(workflow: dict, production_report: dict | None = None) -> None:
     """Local class-type existence check.  Skips compiler-rewritten node IDs."""
+    _virtual = sorted(
+        str(_nid)
+        for _nid, _spec in (workflow or {}).items()
+        if isinstance(_spec, dict)
+        and str(_spec.get("class_type", "")) in {"SetNode", "GetNode"}
+    )
+    if _virtual:
+        raise RuntimeError(
+            "frontend-only Set/Get nodes must be expanded before validation "
+            f"(nodes {', '.join(_virtual[:8])}): re-save via the Studio "
+            "workflow path or run Convert All Set/Get to Links on the canvas"
+        )
     try:
         import nodes as _validate_nodes
     except Exception:
@@ -1539,6 +1551,19 @@ def build_execution_plan(
     if trace:
         trace.emit("plan_build_start", phase="local", metadata={"prompt_id": prompt_id})
     source_workflow = copy.deepcopy(workflow or {})
+    # ── Ideogram Studio-workflow injection (isolated profile only) ──
+    # Revert: delete ideogram_studio_injection.py + this block. This is the
+    # single choke point every entry path funnels through (benchmark_direct,
+    # _execute_job, Studio). Inactive requests return the workflow untouched
+    # (zero behavior change); active requests either swap in the validated
+    # Studio graph (Ideogram 4 Comfy UI Default, steps=16) or raise GateError
+    # here — fail closed before validation, never a silent fallback.
+    from ideogram_studio_injection import (
+        maybe_inject_ideogram_studio_workflow as _maybe_inject_studio,
+    )
+    source_workflow, _studio_selection = _maybe_inject_studio(
+        source_workflow, modal_options=modal_options, trace=trace,
+    )
     source_hash = prompt_sha256(source_workflow)
     if validate:
         assert_valid_api_prompt_structure(source_workflow)

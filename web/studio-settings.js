@@ -21,10 +21,16 @@ import {
   loadGoldenProfileSelection,
   saveGoldenProfileSelection,
   clearGoldenProfileSelection,
+  loadSkipPlanValidation,
+  saveSkipPlanValidation,
+  SKIP_PLAN_VALIDATION_KEY,
 } from "./studio-playground-state.js";
 import {
   getGoldenProfileDeployStatus,
   setGoldenProfileRegion,
+  setGoldenProfileGpu,
+  setGoldenProfileGpuOrder,
+  deployFailureTail,
 } from "./studio-backend-api.js";
 
 // ΓöÇΓöÇ Constants ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -86,6 +92,7 @@ const MODERN_SETTINGS_KEYS = [
   "comfymodal-studio-panel-width",
   "comfymodal.studio.playground.carousel-cleared.v1",
   "comfymodal_remote_inventory_refresh_interval_s",
+  "comfymodal_skip_plan_validation",
 ];
 
 const HEAVY_TRACING_LEVELS = ["off", "summary", "detailed", "trace", "trace_verbose"];
@@ -477,12 +484,20 @@ export function renderSettings(state, context) {
       removeKeys(["comfymodal-studio-panel-width", "comfymodal.studio.playground.carousel-cleared.v1", REMOTE_INVENTORY_REFRESH_KEY, "comfymodal-studio-history-columns"]);
     },
     advanced: async () => {
-      removeKeys(["comfymodal_heavy_tracing"]);
+      removeKeys(["comfymodal_heavy_tracing", SKIP_PLAN_VALIDATION_KEY]);
       try {
         await fetch(apiBase + "/profile/level", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ level: "off" }),
+        });
+      } catch (_) {}
+      // Re-enable the safety gates server-side too (reset = fail-closed).
+      try {
+        await fetch(apiBase + "/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ skip_plan_validation: false }),
         });
       } catch (_) {}
     },
@@ -727,6 +742,50 @@ export function renderSettings(state, context) {
     tracingWrap.appendChild(el("div", { class: "comfymodal-studio-settings-hint", text: "Capture execution trace data. Applies after a ComfyUI restart." }));
     section.appendChild(tracingWrap);
 
+    // Plan validation escape hatch: local key drives execution gating
+    // synchronously (no run-context reload needed); the server persists its
+    // own mirror via POST /comfymodal/config for headless/API callers.
+    // Temporary triage for validation false negatives (e.g. frontend-only
+    // Set/Get nodes). Off by default; skipping can push bad graphs to Modal.
+    const skipValidation = el("input", {
+      type: "checkbox",
+      checked: loadSkipPlanValidation(),
+      class: "comfymodal-settings-checkbox",
+      "data-testid": "settings-skip-plan-validation",
+      "aria-label": "Skip plan validation",
+    });
+    skipValidation.addEventListener("change", () => {
+      const next = skipValidation.checked;
+      const prev = !next;
+      saveSkipPlanValidation(next);
+      const base = (context && context.apiBase) || "/comfymodal";
+      fetch(base + "/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skip_plan_validation: next }),
+      }).then((resp) => {
+        if (!resp.ok) throw new Error("skip_plan_validation rejected");
+        // Merge into the warm run-options cache so the next Run honors the
+        // toggle without waiting for a fresh GET /config.
+        try {
+          window.dispatchEvent(new CustomEvent("comfymodal:output-preferences-changed", {
+            detail: { skip_plan_validation: next },
+          }));
+        } catch (_) {}
+        publishStudioSync("settings");
+      }).catch(() => {
+        saveSkipPlanValidation(prev);
+        skipValidation.checked = prev;
+      });
+    });
+    const skipWrap = el("div", {
+      class: "comfymodal-settings-control",
+      "data-search": "skip plan validation safety gate escape hatch",
+    });
+    skipWrap.appendChild(settingsRow("Skip plan validation", skipValidation));
+    skipWrap.appendChild(el("div", { class: "comfymodal-studio-settings-hint", text: "Temporary only: bypass the host plan-validation gate that blocks runs on unknown node types. Invalid graphs fail remotely instead." }));
+    section.appendChild(skipWrap);
+
     // Runtime & Backend group
     const runtimeGroup = el("div", {
       class: "comfymodal-settings-group",
@@ -833,6 +892,30 @@ export function renderSettings(state, context) {
     refreshOutputsPrefs(apiBase);
     refreshProfileLevel(apiBase);
     refreshGoldenProfiles(apiBase);
+    refreshSkipPlanValidation(apiBase);
+  }
+
+  // ── Plan-validation escape hatch refresh ──
+  // Local key is the execution-gating authority, so it wins when present;
+  // the server value backfills an unset local key (fresh browser/profile).
+  function refreshSkipPlanValidation(base) {
+    const box = sectionsHost.querySelector('[data-testid="settings-skip-plan-validation"]');
+    if (!box) return;
+    if (loadSkipPlanValidation()) {
+      box.checked = true;
+      return;
+    }
+    fetch(base + "/config")
+      .then((r) => r.json())
+      .then((cfg) => {
+        if (cfg && cfg.skip_plan_validation === true) {
+          saveSkipPlanValidation(true);
+          box.checked = true;
+        } else {
+          box.checked = false;
+        }
+      })
+      .catch(() => {});
   }
 
   // ΓöÇΓöÇ H12 engine migration notice (server-backed, one-time) ΓöÇΓöÇ
@@ -1190,6 +1273,11 @@ export function renderSettings(state, context) {
   // Golden profiles are a server catalog, never a browser-authored list. The
   // browser may remember only the selected name; resources and deployment
   // metadata remain server truth and are deliberately not persisted.
+  // GPU option labels and the active order map ride the /config fetch so the
+  // GPU order controls render from the same server truth (cached at module
+  // scope so re-renders after region/GPU edits keep them without refetch).
+  let goldenGpuOptions = [];
+  let goldenGpuOrderMap = {};
   function refreshGoldenProfiles(base) {
     const host = sectionsHost.querySelector('[data-testid="settings-golden-profile-host"]');
     if (!host) return;
@@ -1218,6 +1306,10 @@ export function renderSettings(state, context) {
       if (!host.isConnected) return;
       goldenProfiles = catalog.profiles.filter((profile) => profile && typeof profile.name === "string" && profile.name);
       goldenProfilesError = null;
+      goldenGpuOptions = Array.isArray(config && config.available_gpus)
+        ? config.available_gpus.filter((o) => o && typeof o.value === "string" && o.value)
+        : [];
+      goldenGpuOrderMap = (config && typeof config.golden_gpu_order === "object" && config.golden_gpu_order) || {};
       const names = new Set(goldenProfiles.map((profile) => profile.name));
       const serverSelected = config && (config.golden_profile || config.profile_name || config.profile);
       const localSelected = loadGoldenProfileSelection();
@@ -1305,7 +1397,7 @@ export function renderSettings(state, context) {
         return;
       }
       if (payload && payload.state === "failed") {
-        const tail = String(payload.output || "").trim().split("\n").pop();
+        const tail = deployFailureTail(payload.output || "");
         status.textContent = "Deploy failed: " + (tail || "see v2ctl output");
         button.disabled = false;
         return;
@@ -1337,6 +1429,232 @@ export function renderSettings(state, context) {
       status.textContent = "Deploy failed: " + (error.message || "request failed");
       button.disabled = false;
     }
+  }
+
+  // ── Golden GPU orders ────────────────────────────────────────────────
+  // One deploy binds TWO functions (order A on the profile class, order B on
+  // the alt class).  Editing the orders is deploy-baked (save marks the
+  // profile undeployed; the next Deploy binds both functions at once), while
+  // the ACTIVE order radio is run-time state that applies to the next run
+  // with no redeploy.
+  // Profile TOML may spell a GPU in any case ("H100!" vs "h100!"); option
+  // values are lowercase catalog spellings, so all matching here is
+  // case-insensitive and selects resolve to the canonical option value.
+  function goldenGpuOptionFor(value) {
+    const want = String(value || "").trim().toLowerCase();
+    if (!want) return null;
+    return goldenGpuOptions.find((o) => String(o.value || "").toLowerCase() === want) || null;
+  }
+
+  function goldenGpuLabel(value) {
+    const found = goldenGpuOptionFor(value);
+    return (found && (found.label || found.value)) || String(value || "") || "—";
+  }
+
+  function goldenGpuOrderText(order) {
+    return (Array.isArray(order) ? order : [])
+      .map((value) => goldenGpuLabel(value))
+      .join(" → ") || "—";
+  }
+
+  function goldenGpuSelect(current, allowEmpty, testid, ariaLabel) {
+    const select = el("select", {
+      class: "comfymodal-input",
+      "data-testid": testid,
+      "aria-label": ariaLabel,
+    });
+    select.style.cssText = "width:100%;font-size:11px;padding:3px 6px;";
+    if (allowEmpty) {
+      select.appendChild(el("option", { value: "", text: "None" }));
+    }
+    goldenGpuOptions.forEach((o) => {
+      select.appendChild(el("option", { value: o.value, text: o.label || o.value }));
+    });
+    const matched = goldenGpuOptionFor(current);
+    if (matched) {
+      select.value = matched.value;
+    } else if (!allowEmpty && goldenGpuOptions.length) {
+      select.value = select.options[0].value;
+    }
+    return select;
+  }
+
+  function renderGoldenGpuOrders(host, base, selectedProfile) {
+    const wrap = el("div", {
+      class: "comfymodal-settings-control",
+      "data-search": "golden profile gpu graphics card fallback order active",
+      style: "display:flex;flex-direction:column;gap:6px;width:100%;margin-top:2px;",
+    });
+    const resources = (selectedProfile.resources && typeof selectedProfile.resources === "object")
+      ? selectedProfile.resources
+      : {};
+    const orderA = Array.isArray(selectedProfile.gpu_order_a) ? selectedProfile.gpu_order_a : [];
+    const orderB = Array.isArray(selectedProfile.gpu_order_b) ? selectedProfile.gpu_order_b : [];
+    const active = goldenGpuOrderMap[selectedProfile.name] === "B" && orderB.length ? "B" : "A";
+
+    const summaryA = el("p", {
+      class: "comfymodal-studio-settings-hint",
+      "data-testid": "settings-golden-profile-gpu-order-a",
+      text: "",
+      style: "margin:0;",
+    });
+    wrap.appendChild(summaryA);
+    let summaryB = null;
+    if (orderB.length) {
+      summaryB = el("p", {
+        class: "comfymodal-studio-settings-hint",
+        "data-testid": "settings-golden-profile-gpu-order-b",
+        text: "",
+        style: "margin:0;",
+      });
+      wrap.appendChild(summaryB);
+    }
+    // The radio swaps the ACTIVE function; the stored orders below never
+    // change on swap.  Repaint the summaries immediately so the swap is
+    // visible without waiting for a catalog refresh.
+    let shownActive = active;
+    const paintActive = () => {
+      summaryA.textContent = (shownActive === "B" ? "\u25CB Order A: " : "\u25CF Order A (active): ")
+        + goldenGpuOrderText(orderA);
+      summaryA.style.opacity = shownActive === "B" ? "0.65" : "1";
+      if (summaryB) {
+        summaryB.textContent = (shownActive === "B" ? "\u25CF Order B (active): " : "\u25CB Order B: ")
+          + goldenGpuOrderText(orderB);
+        summaryB.style.opacity = shownActive === "B" ? "1" : "0.65";
+      }
+    };
+    paintActive();
+
+    // Active order: run-time swap, no redeploy.
+    const activeRow = el("div", { style: "display:flex;align-items:center;gap:12px;" });
+    const radioName = "golden-gpu-active-" + selectedProfile.name;
+    const radioA = el("input", {
+      type: "radio", name: radioName, value: "A",
+      "data-testid": "settings-golden-profile-gpu-active-a",
+      "aria-label": "Use GPU order A",
+    });
+    const radioB = el("input", {
+      type: "radio", name: radioName, value: "B",
+      "data-testid": "settings-golden-profile-gpu-active-b",
+      "aria-label": "Use GPU order B",
+    });
+    radioA.checked = active !== "B";
+    radioB.checked = active === "B";
+    if (!orderB.length) radioB.disabled = true;
+    const orderError = el("p", {
+      class: "comfymodal-studio-settings-hint",
+      "data-testid": "settings-golden-profile-gpu-order-error",
+      text: "",
+      style: "margin:0;",
+    });
+    const applyActive = async (wanted) => {
+      orderError.textContent = "";
+      radioA.disabled = true;
+      radioB.disabled = true;
+      try {
+        const response = await setGoldenProfileGpuOrder(base, selectedProfile.name, wanted);
+        if (!response || response.status !== "ok") {
+          throw new Error((response && (response.error || response.message)) || "request failed");
+        }
+        goldenGpuOrderMap[selectedProfile.name] = wanted;
+        shownActive = wanted;
+        paintActive();
+        publishStudioSync("settings");
+        orderError.textContent = wanted === "B"
+          ? "Order B is active. Applies to the next run — no redeploy."
+          : "Order A is active. Applies to the next run — no redeploy.";
+      } catch (error) {
+        radioA.checked = shownActive !== "B";
+        radioB.checked = shownActive === "B";
+        orderError.textContent = "Could not switch GPU order: " + (error.message || "request failed");
+      } finally {
+        radioA.disabled = false;
+        radioB.disabled = !orderB.length;
+      }
+    };
+    radioA.addEventListener("change", () => { if (radioA.checked) applyActive("A"); });
+    radioB.addEventListener("change", () => { if (radioB.checked) applyActive("B"); });
+    activeRow.appendChild(el("label", {}, ["Order A ", radioA]));
+    activeRow.appendChild(el("label", {}, ["Order B ", radioB]));
+    if (!orderB.length) {
+      activeRow.appendChild(el("span", {
+        class: "comfymodal-studio-settings-hint",
+        text: "No order B configured.",
+      }));
+    }
+    wrap.appendChild(activeRow);
+    wrap.appendChild(orderError);
+
+    // Order editor: deploy-baked, saved to the profile TOML.  These are the
+    // STORED orders, not a view of the active one, so swapping the radio
+    // above never rewrites them.
+    const editor = el("div", { style: "display:flex;flex-direction:column;gap:6px;width:100%;" });
+    editor.appendChild(el("div", {
+      class: "comfymodal-studio-settings-hint",
+      text: "Stored orders (editing + Save marks the profile undeployed):",
+    }));
+    const primaryA = goldenGpuSelect(resources.gpu || (orderA[0] || ""), false,
+      "settings-golden-profile-gpu-primary-a", "Order A primary GPU");
+    editor.appendChild(el("div", { class: "comfymodal-studio-settings-hint", style: "margin:0;display:flex;align-items:center;gap:8px;" },
+      [el("label", {}, ["Primary A ", primaryA])]));
+    const primaryB = goldenGpuSelect(resources.gpu_alt || "", true,
+      "settings-golden-profile-gpu-primary-b", "Order B primary GPU (empty for a single function)");
+    editor.appendChild(el("div", { class: "comfymodal-studio-settings-hint", style: "margin:0;display:flex;align-items:center;gap:8px;" },
+      [el("label", {}, ["Primary B ", primaryB])]));
+    const storedFallbacks = Array.isArray(resources.gpu_fallbacks) ? resources.gpu_fallbacks : [];
+    const fallbackSelects = [];
+    for (let index = 0; index < 4; index += 1) {
+      const select = goldenGpuSelect(storedFallbacks[index] || "", true,
+        "settings-golden-profile-gpu-fallback-" + index, "Shared fallback " + (index + 1));
+      fallbackSelects.push(select);
+      editor.appendChild(el("div", { class: "comfymodal-studio-settings-hint", style: "margin:0;display:flex;align-items:center;gap:8px;" },
+        [el("label", {}, ["Fallback " + (index + 1) + " ", select])]));
+    }
+    const gpuError = el("p", {
+      class: "comfymodal-studio-settings-hint",
+      "data-testid": "settings-golden-profile-gpu-error",
+      text: "",
+      style: "margin:0;",
+    });
+    const saveButton = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": "settings-golden-profile-gpu-save",
+      text: "Save GPU orders",
+      title: "Save GPU orders to the profile (marks undeployed; deploy binds both functions)",
+    });
+    saveButton.addEventListener("click", async () => {
+      gpuError.textContent = "";
+      saveButton.disabled = true;
+      try {
+        const response = await setGoldenProfileGpu(
+          base,
+          selectedProfile.name,
+          primaryA.value,
+          primaryB.value,
+          fallbackSelects.map((select) => select.value).filter((value) => value),
+        );
+        if (!response || response.status !== "ok") {
+          throw new Error((response && (response.error || response.message)) || "request failed");
+        }
+        publishStudioSync("settings");
+        // Re-read the catalog so deploy state and derived orders are exact,
+        // not optimistic: new orders change the deploy fingerprint.
+        refreshGoldenProfiles(base);
+      } catch (error) {
+        gpuError.textContent = "Could not save GPU orders: " + (error.message || "request failed");
+        saveButton.disabled = false;
+      }
+    });
+    const saveRow = el("div", { style: "display:flex;align-items:center;gap:8px;" }, [saveButton]);
+    editor.appendChild(saveRow);
+    editor.appendChild(gpuError);
+    editor.appendChild(el("div", {
+      class: "comfymodal-studio-settings-hint",
+      text: "GPU orders are deploy-baked: saving marks the profile undeployed, and the next Deploy binds both functions at once. Switching the active order above never redeploys.",
+    }));
+    wrap.appendChild(editor);
+    host.appendChild(wrap);
   }
 
   function renderGoldenProfileHost(host, base, selected, deployState) {
@@ -1517,6 +1835,7 @@ export function renderSettings(state, context) {
         }
       });
       host.appendChild(regionRow);
+      renderGoldenGpuOrders(host, base, selectedProfile);
       host.appendChild(deployStatus);
       if (isDeploying) {
         startGoldenDeployPoll(base, selectedProfile.name, deployStatus, deployButton, host).catch((error) => {

@@ -641,6 +641,26 @@ class _FakeKitchenScope:
         return False
 
 
+class _ExitPopulatingScope:
+    """Mirrors the real attention_backend_scope protocol: the final call
+    count is written into the yielded state on context exit, not entry.
+    A reader that aggregates before unwind observes 0."""
+
+    def __init__(self, log, calls_at_exit):
+        self._log = log
+        self._calls_at_exit = calls_at_exit
+        self._state = {"selected_callable": "fake_kitchen_int8", "calls": 0}
+
+    def __enter__(self):
+        self._log.append("enter")
+        return self._state
+
+    def __exit__(self, *exc):
+        self._state["calls"] = self._calls_at_exit
+        self._log.append("exit")
+        return False
+
+
 class TestKitchenAttention:
     """Native sampling runs untouched; kitchen attention wraps it when the
     deployment selects comfy_kitchen. Setup failure degrades to bare
@@ -795,6 +815,142 @@ class TestKitchenAttention:
                 asyncio.run(fake.get_output_data(
                     "p1", "163", KSampler(), self._sampler_inputs(patcher)))
             assert log == ["enter", "exit"]
+        finally:
+            restore()
+            monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                               raising=False)
+
+    def test_guider_fed_sampler_engages(self, monkeypatch):
+        # Ideogram/Flux2 wiring: SamplerCustomAdvanced carries no direct
+        # model input; the patcher arrives via the guider.
+        calls = []
+        seen = {}
+
+        class SamplerCustomAdvanced:
+            pass
+
+        class FakeGuider:
+            def __init__(self, patcher):
+                self.model_patcher = patcher
+
+        fake, holder, sink, restore = _install(
+            monkeypatch, calls, {"clip": {"node_id": "195"}})
+        monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                           "comfy_kitchen")
+
+        def factory(patcher, backend):
+            seen["patcher"] = patcher
+            return _FakeKitchenScope(
+                [], {"selected_callable": "fake_kitchen_int8", "calls": 3})
+
+        monkeypatch.setattr(ggl, "_kitchen_scope_for", factory)
+        try:
+            patcher = type("P", (), {"model_options": {}})()
+            inputs = {"guider": [FakeGuider(patcher)], "noise": ["n", 0],
+                      "sampler": ["s", 0], "sigmas": ["g", 0],
+                      "latent_image": ["l", 0]}
+            out = asyncio.run(fake.get_output_data(
+                "p1", "98:12", SamplerCustomAdvanced(), inputs))
+            assert out[0] == "native-output"
+            assert seen["patcher"] is patcher
+            engaged = [m for n, m in sink
+                       if n == "generic_kitchen_attention"
+                       and m.get("outcome") == "engaged"]
+            assert len(engaged) == 1
+            assert engaged[0]["calls"] == 3
+            assert engaged[0]["patchers"] == 1
+            summary = holder.kitchen_summary()
+            assert summary["requested"] == "comfy_kitchen"
+            assert summary["engaged"][0]["node_id"] == "98:12"
+            assert summary["engaged"][0]["node_class"] == (
+                "SamplerCustomAdvanced")
+            assert summary["engaged"][0]["patchers"] == 1
+            assert summary["engaged"][0]["models"] == ["P"]
+        finally:
+            restore()
+            monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                               raising=False)
+
+    def test_executor_shaped_sampler_without_patcher_warns(self, monkeypatch):
+        # Sampler-named executor inputs (latent/noise) but no resolvable
+        # patcher: native fallback with an explicit skipped record so the
+        # generation metadata and Studio viewer show the miss.
+        calls = []
+
+        class SamplerCustomAdvanced:
+            pass
+
+        fake, holder, sink, restore = _install(
+            monkeypatch, calls, {"clip": {"node_id": "195"}})
+        monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                           "comfy_kitchen")
+        try:
+            inputs = {"noise": ["n", 0], "latent_image": ["l", 0]}
+            out = asyncio.run(fake.get_output_data(
+                "p1", "98:12", SamplerCustomAdvanced(), inputs))
+            assert out[0] == "native-output"
+            skipped = [m for n, m in sink
+                       if n == "generic_kitchen_attention"
+                       and m.get("outcome") == "skipped"]
+            assert len(skipped) == 1
+            assert skipped[0]["reason"] == "no_sampler_patcher_resolved"
+            summary = holder.kitchen_summary()
+            assert summary["skipped"][0]["node_id"] == "98:12"
+        finally:
+            restore()
+            monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                               raising=False)
+
+    def test_selector_without_latent_stays_silent(self, monkeypatch):
+        # KSamplerSelect is sampler-named but not an executor: no warning.
+        calls = []
+
+        class KSamplerSelect:
+            pass
+
+        fake, holder, sink, restore = _install(
+            monkeypatch, calls, {"clip": {"node_id": "195"}})
+        monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                           "comfy_kitchen")
+        try:
+            out = asyncio.run(fake.get_output_data(
+                "p1", "98:16", KSamplerSelect(), {"sampler_name": ["euler"]}))
+            assert out[0] == "native-output"
+            assert not [n for n, _m in sink
+                        if n == "generic_kitchen_attention"]
+            assert holder.kitchen_summary()["skipped"] == []
+        finally:
+            restore()
+            monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                               raising=False)
+
+    def test_calls_aggregate_after_scope_exit(self, monkeypatch):
+        # Regression: the shared scope writes its final call count on
+        # context exit. Aggregating before unwind always observes 0.
+        calls = []
+        log = []
+
+        fake, holder, sink, restore = _install(
+            monkeypatch, calls, {"clip": {"node_id": "195"}})
+        monkeypatch.setenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
+                           "comfy_kitchen")
+
+        def factory(patcher, backend):
+            return _ExitPopulatingScope(log, 256)
+
+        monkeypatch.setattr(ggl, "_kitchen_scope_for", factory)
+        try:
+            patcher = type("P", (), {"model_options": {}})()
+            out = asyncio.run(fake.get_output_data(
+                "p1", "163", KSampler(), self._sampler_inputs(patcher)))
+            assert out[0] == "native-output"
+            assert log == ["enter", "exit"]
+            engaged = [m for n, m in sink
+                       if n == "generic_kitchen_attention"
+                       and m.get("outcome") == "engaged"]
+            assert len(engaged) == 1
+            assert engaged[0]["calls"] == 256
+            assert holder.kitchen_summary()["engaged"][0]["calls"] == 256
         finally:
             restore()
             monkeypatch.delenv("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND",
@@ -1790,7 +1946,10 @@ class TestOverlapVaeTicket:
 
     @staticmethod
     def _sampler(obj_name="ClownsharKSampler_Beta"):
-        return type(obj_name, (), {})(), {"model": ["66", 0]}
+        # Dispatch-time inputs carry resolved objects (the executor resolves
+        # links before get_output_data); the model is a patcher-like object.
+        _patcher = type("OverlapPatcher", (), {"model_options": {}})()
+        return type(obj_name, (), {})(), {"model": [_patcher]}
 
     def test_match_ticket(self):
         class _T:

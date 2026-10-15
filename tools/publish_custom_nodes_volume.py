@@ -99,6 +99,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cn_root = _resolve_custom_nodes_root()
         workspace = _load_active_workspace()
+        # Downstream SDK helpers key everything by ``workspace["id"]`` while
+        # the config-owned destination shape carries ``workspace_id``. Carry
+        # both spellings so the destructive publish path (which reaches the
+        # publisher) does not crash with KeyError: 'id'.
+        if not workspace.get("id") and workspace.get("workspace_id"):
+            workspace["id"] = workspace["workspace_id"]
+        if not workspace.get("workspace_id") and workspace.get("id"):
+            workspace["workspace_id"] = workspace["id"]
 
         # Downstream SDK helpers receive the explicit workspace record.  Clear
         # ambient Modal profile/auth selection before any client is created.
@@ -150,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[v2.volume_publish] nodes={len({path.split('/', 1)[0] for path, _, _ in identity.files})}")
         decision_label = "skip_exact" if decision.skip else decision.action
         print(f"[custom_nodes.publish] decision={decision_label} reason={decision.reason} "
-              f"generation={identity.generation[:12]} schema={RECEIPT_SCHEMA_VERSION} "
+              f"generation={identity.content_generation[:12]} schema={RECEIPT_SCHEMA_VERSION} "
               f"policy={PACKAGING_POLICY_VERSION}")
         if decision.action == "blocked":
             delta = decision.destructive_delta or {}

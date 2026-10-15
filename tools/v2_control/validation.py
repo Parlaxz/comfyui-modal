@@ -57,6 +57,84 @@ def _golden_contract(config: Any) -> tuple[str, str, str, bool]:
         )
     return ("golden_p1_serial", "run_golden_serial_stream", "serial", True)
 
+
+def ideogram4_workflow_failures(
+    selection: Any,
+    *,
+    expected_workflow_id: str,
+    expected_workflow_version_id: str,
+    expected_steps: int | None = None,
+) -> list[str]:
+    """Fail-closed validation for an exact-placement Ideogram workflow selection.
+
+    ``selection`` is the ``workflow_selection`` mapping v2ctl resolves at
+    request time and persists in dry-run output, run manifests, and
+    provenance (see ``tools/v2_control/cli.py`` canonical block).  Hash
+    presence is proven through the observability identity matrix
+    (``workflow_hash``/``prompt_sha256``/``compiled_workflow_hash`` legacy
+    spellings); id/version mismatches never fall back to another workflow.
+    Steps provenance must show an explicit request override whenever the
+    effective value differs from the stored graph default: the graph is never
+    silently rewritten.
+    """
+    failures: list[str] = []
+    if not isinstance(selection, dict):
+        return ["ideogram workflow selection is missing"]
+    if not selection.get("active"):
+        return ["ideogram workflow selection is not active"]
+    failures.extend(
+        _ideogram4_selection_failures(
+            selection,
+            expected_workflow_id=expected_workflow_id,
+            expected_workflow_version_id=expected_workflow_version_id,
+        )
+    )
+    steps = selection.get("steps")
+    if not isinstance(steps, dict):
+        failures.append("ideogram workflow selection steps provenance is missing")
+        return failures
+    try:
+        graph_default = int(str(steps.get("graph_default")))
+        effective = int(str(steps.get("effective")))
+    except (TypeError, ValueError):
+        failures.append("ideogram workflow selection steps provenance is not numeric")
+        return failures
+    source = str(steps.get("source") or "")
+    if effective != graph_default and source != "explicit":
+        failures.append(
+            "ideogram workflow steps override is not explicit "
+            f"(graph_default={graph_default} effective={effective} source={source!r}); "
+            "the stored graph must never be silently rewritten"
+        )
+    if expected_steps is not None and effective != int(expected_steps):
+        failures.append(
+            f"ideogram workflow effective steps {effective} != required {int(expected_steps)}"
+        )
+    return failures
+
+
+def validate_ideogram4_run_manifest(
+    manifest: Any,
+    *,
+    expected_workflow_id: str,
+    expected_workflow_version_id: str,
+    expected_steps: int | None = None,
+) -> dict[str, Any]:
+    """Validate the ``workflow_selection`` block of a persisted run manifest.
+
+    Returns ``{"valid": bool, "reasons": [...]}``.  A manifest without the
+    block, with missing hashes, or with a non-canonical id/version is
+    invalid: validation fails closed and never substitutes another workflow.
+    """
+    selection = manifest.get("workflow_selection") if isinstance(manifest, dict) else None
+    reasons = ideogram4_workflow_failures(
+        selection,
+        expected_workflow_id=expected_workflow_id,
+        expected_workflow_version_id=expected_workflow_version_id,
+        expected_steps=expected_steps,
+    )
+    return {"valid": not reasons, "reasons": reasons}
+
 from .backend import detect_crash_loop
 from .errors import GateError
 from .experiment_evidence import (
@@ -70,11 +148,14 @@ from .experiment_evidence import (
 
 try:  # Keep direct-script/package imports usable in both test and CLI paths.
     from tools.golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
+    from tools.golden_observability import ideogram4_selection_failures as _ideogram4_selection_failures
 except ImportError:  # pragma: no cover - direct tools-script fallback
     try:
         from golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
+        from golden_observability import ideogram4_selection_failures as _ideogram4_selection_failures
     except ImportError:  # pragma: no cover - package-relative fallback
         from ..golden_observability import WORKFLOW_CONTRACT_MARKERS, workflow_contract_failures
+        from ..golden_observability import ideogram4_selection_failures as _ideogram4_selection_failures
 
 try:  # Canonical runtime selector; validation remains usable without runtime deps.
     from comfymodal_runtime.output_durability import (
@@ -132,6 +213,7 @@ def _bind_receipt_environment(extra_env: dict[str, str], receipt: Any) -> dict[s
     if isinstance(resources, dict):
         for env_name, resource_name in (
             ("COMFYMODAL_V2_GPU", "gpu"),
+            ("COMFYMODAL_V2_GPU_ALT", "gpu_alt"),
             ("COMFYMODAL_V2_CPU_REQUEST", "cpu"),
             ("COMFYMODAL_V2_MEMORY_MB", "memory_mb"),
             ("COMFYMODAL_V2_BASELINE_CPU_REQUEST", "cpu"),
@@ -139,6 +221,11 @@ def _bind_receipt_environment(extra_env: dict[str, str], receipt: Any) -> dict[s
         ):
             if resource_name in resources:
                 bound[env_name] = str(resources[resource_name])
+        fallbacks = resources.get("gpu_fallbacks", [])
+        if fallbacks:
+            bound["COMFYMODAL_V2_GPU_FALLBACKS"] = ",".join(
+                str(item) for item in fallbacks
+            )
     deploy_fp = str(_receipt_value(receipt, "deploy_fingerprint", ""))
     if not deploy_fp:
         raise GateError("deployment receipt has no deployment fingerprint")
@@ -310,8 +397,8 @@ def _experiment_identity(
         "method": str(getattr(target, "method", "") or ""),
     }
     identity["resources"] = {
-        name: getattr(resources, name, "")
-        for name in ("gpu", "cpu", "memory_mb", "min_containers", "scaledown_window")
+        name: getattr(resources, name, "" if name != "gpu_fallbacks" else ())
+        for name in ("gpu", "gpu_alt", "gpu_fallbacks", "cpu", "memory_mb", "min_containers", "scaledown_window")
     }
     return identity
 
@@ -2614,6 +2701,7 @@ def _receipt_identity_environment(receipt: Any) -> dict[str, str] | None:
     if isinstance(resources, dict):
         for env_name, resource_name in (
             ("COMFYMODAL_V2_GPU", "gpu"),
+            ("COMFYMODAL_V2_GPU_ALT", "gpu_alt"),
             ("COMFYMODAL_V2_CPU_REQUEST", "cpu"),
             ("COMFYMODAL_V2_MEMORY_MB", "memory_mb"),
             ("COMFYMODAL_V2_BASELINE_CPU_REQUEST", "cpu"),
@@ -2621,6 +2709,11 @@ def _receipt_identity_environment(receipt: Any) -> dict[str, str] | None:
         ):
             if resource_name in resources:
                 result[env_name] = str(resources[resource_name])
+        fallbacks = resources.get("gpu_fallbacks", [])
+        if fallbacks:
+            result["COMFYMODAL_V2_GPU_FALLBACKS"] = ",".join(
+                str(item) for item in fallbacks
+            )
     return result
 
 

@@ -304,6 +304,35 @@ def test_stale_string_override_for_number_control_falls_back_to_default():
     assert merged["values"]["cfg_scale"] == 8.0
 
 
+def test_model_unet_swap_accepted_despite_stale_enum_snapshot():
+    """Model-file controls skip stale enum membership gating (like images)."""
+    schema = {
+        "model_unet": {
+            "semantic_role": "model_unet",
+            "node_id": "194",
+            "input_name": "unet_name",
+            "control_kind": "file",
+            "required": True,
+            "enum_options": ["saved.safetensors"],
+        },
+    }
+    # Swap to another installed library basename: no errors.
+    assert swr.validate_workflow_controls(
+        {"model_unet": "other.safetensors"}, schema,
+    ) == []
+    merged = swr.merge_workflow_controls(
+        {"model_unet": "saved.safetensors"},
+        {"model_unet": "other.safetensors"},
+        schema,
+    )
+    assert merged["errors"] == []
+    assert merged["values"]["model_unet"] == "other.safetensors"
+    # Required/empty still rejected.
+    assert swr.validate_workflow_controls({"model_unet": "  "}, schema)
+    # Unknown roles still rejected.
+    assert swr.validate_workflow_controls({"nope": "x"}, schema)
+
+
 def test_numeric_string_override_for_number_control_preserved_verbatim():
     schema = {
         "cfg_scale": {

@@ -27,6 +27,8 @@ import {
   takeWorkflowHandoff,
   saveSkipTextGenerate,
   loadSkipTextGenerate,
+  loadSkipPlanValidation,
+  SKIP_PLAN_VALIDATION_KEY,
 } from "./studio-playground-state.js";
 
 // Re-export persistence so consumers only need this one module.
@@ -38,7 +40,21 @@ export {
   takeWorkflowHandoff,
   saveSkipTextGenerate,
   loadSkipTextGenerate,
+  loadSkipPlanValidation,
+  SKIP_PLAN_VALIDATION_KEY,
 };
+
+// Custom-node dependency reason prefixes (mirrors the backend resolver's
+// "required custom node ..." / "installed custom node ..." strings).
+const CUSTOM_NODE_REASON_PREFIXES = [
+  "required custom node ",
+  "installed custom node ",
+];
+
+export function isCustomNodeReason(reason) {
+  const text = String(reason || "");
+  return CUSTOM_NODE_REASON_PREFIXES.some((prefix) => text.startsWith(prefix));
+}
 
 // localStorage keys owned by studio-playground-state.js (kept in sync).
 export const PERSISTENCE_KEYS = {
@@ -482,6 +498,26 @@ export function isImageControlRole(key, entry) {
   return kind === "image";
 }
 
+const MODEL_FILE_ROLES = new Set([
+  "model_unet", "model", "unet", "clip", "vae", "model_clip", "model_vae",
+]);
+const MODEL_LOADER_INPUTS = new Set([
+  "ckpt_name", "clip_name", "clip_name1", "clip_name2", "unet_name", "vae_name",
+]);
+
+/**
+ * Model-loader file inputs carry a stale captured enum snapshot (local
+ * files at capture time), so membership must not gate a swap to another
+ * installed library model — same rationale as isImageControlRole.
+ * Required/non-empty checks still apply.
+ */
+export function isModelFileControlRole(key, entry) {
+  if (MODEL_FILE_ROLES.has(key)) return true;
+  if (!entry || typeof entry !== "object") return false;
+  if (entry.control_kind === "file" || entry.control_kind === "model") return true;
+  return MODEL_LOADER_INPUTS.has(entry.input_name);
+}
+
 /**
  * Validate mapped control values against the control schema. No coercion:
  * 0, 0.0, false and "" are preserved verbatim. Returns only schema-known
@@ -503,7 +539,7 @@ export function validateMappedValues(values, controlSchema) {
       continue;
     }
     const present = value !== undefined && value !== null;
-    if (!isImageControlRole(key, entry)
+    if (!isImageControlRole(key, entry) && !isModelFileControlRole(key, entry)
       && Array.isArray(entry.enum_options) && entry.enum_options.length && present) {
       if (!entry.enum_options.some((opt) => opt === value)) {
         errors.push({ field: key, message: `must be one of: ${entry.enum_options.join(", ")}` });
@@ -582,18 +618,120 @@ export function resolveRunnable(store) {
 }
 
 /**
+ * Remote-volume readiness from the run-context bundle
+ * (studio_workflow_routes run-context: remote_inventory_available +
+ * remote_missing, computed from the cached Modal volume snapshot with no
+ * extra round trip). Unknown inventory fails open ([]) exactly like the
+ * backend bundle gate; a known snapshot yields verbatim
+ * "remote model '...'" reasons the local "missing model ..." filter never
+ * strips.
+ * @param {object} store
+ * @returns {string[]}
+ */
+export function remoteMissingReasons(store) {
+  const ctx = (store && store.runContext) || {};
+  if (ctx.remote_inventory_available !== true) return [];
+  const missing = ctx.remote_missing;
+  if (!Array.isArray(missing)) return [];
+  return missing.map(String).filter((r) => r.length > 0);
+}
+
+/**
+ * Parse one "remote model '<file>' not in workspace volume (<folder>)"
+ * reason into {filename, folder}. Returns null when the text does not match
+ * (forward-compatible: unknown reason shapes never produce a button).
+ * Pure; unit-testable.
+ */
+export function parseRemoteMissingReason(reason) {
+  const m = String(reason || "").match(
+    /^remote model '([^']+)' not in workspace volume \(([^)]+)\)$/
+  );
+  if (!m) return null;
+  const filename = String(m[1] || "").trim();
+  const folder = String(m[2] || "").trim() || "unknown";
+  if (!filename) return null;
+  return { filename, folder };
+}
+
+/**
+ * Structured remote-missing models from the run-context bundle
+ * (studio_workflow_routes run-context: remote_missing_models, each
+ * {filename, folder, manifest_key, manifest_installable}). Older bundles
+ * without the field fall back to parsing remote_missing strings, yielding
+ * the same shape with manifest_installable:false and manifest_key:"" so
+ * callers never branch on bundle age — they only check
+ * manifest_installable. Unknown inventory fails open ([]) exactly like
+ * remoteMissingReasons. Pure; unit-testable.
+ * @param {object} store
+ * @returns {Array<{filename: string, folder: string, manifest_key: string, manifest_installable: boolean}>}
+ */
+export function remoteMissingModels(store) {
+  const ctx = (store && store.runContext) || {};
+  if (ctx.remote_inventory_available !== true) return [];
+  const structured = ctx.remote_missing_models;
+  if (Array.isArray(structured)) {
+    return structured
+      .filter((e) => e && typeof e === "object")
+      .map((e) => ({
+        filename: String(e.filename || "").trim(),
+        folder: String(e.folder || "").trim() || "unknown",
+        manifest_key: String(e.manifest_key || "").trim(),
+        manifest_installable: e.manifest_installable === true
+          && String(e.manifest_key || "").trim().length > 0,
+      }))
+      .filter((e) => e.filename.length > 0);
+  }
+  return remoteMissingReasons(store)
+    .map(parseRemoteMissingReason)
+    .filter(Boolean)
+    .map((e) => ({
+      filename: e.filename,
+      folder: e.folder,
+      manifest_key: "",
+      manifest_installable: false,
+    }));
+}
+
+/**
  * Keep the client gate aligned with the backend's authoritative bundle
  * resolver (studio_workflow_run.resolve_workflow_run_bundle with
  * remote_model_readiness=True). A remote Golden target resolves models in the
  * deployed Modal volume, so host-local "missing model ..." reasons must not
- * block it; every other reason stays fail-closed.
+ * block it; every other reason stays fail-closed. A KNOWN remote absence
+ * ("remote model ..." from the volume snapshot) still blocks: otherwise a
+ * workspace switch to a volume missing models reports "Ready to run".
  */
 export function resolveExecutionRunnable(gated, remoteSelected) {
-  if (!gated || gated.runnable || !remoteSelected) return gated;
+  if (!gated || gated.runnable) return gated;
+  const skipGates = loadSkipPlanValidation();
+  if (!remoteSelected && !skipGates) return gated;
   const reasons = Array.isArray(gated.reasons) ? gated.reasons : [];
-  const kept = reasons.filter((r) => !String(r).startsWith("missing model "));
+  let kept = reasons;
+  if (remoteSelected) {
+    kept = kept.filter((r) => !String(r).startsWith("missing model "));
+  }
+  if (skipGates) {
+    kept = kept.filter((r) => !isCustomNodeReason(r));
+  }
   if (kept.length === reasons.length) return gated;
   return { runnable: kept.length === 0, reasons: kept };
+}
+
+/**
+ * Remote-aware execution gate: local/remote decision plus the known remote
+ * volume absence. Call with the store so the run-context remote snapshot can
+ * re-block a locally-runnable workflow whose workspace volume is missing
+ * models. Unknown inventory fails open (returns the local decision).
+ * @param {object} store
+ * @param {{runnable: boolean, reasons: string[]}} execution
+ * @param {boolean} remoteSelected
+ * @returns {{runnable: boolean, reasons: string[]}}
+ */
+export function resolveRemoteExecutionRunnable(store, execution, remoteSelected) {
+  if (!remoteSelected || !execution || execution.runnable !== true) return execution;
+  const missing = remoteMissingReasons(store);
+  if (!missing.length) return execution;
+  return { runnable: false, reasons: missing };
 }
 
 // ΓöÇΓöÇ Run payload ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -613,16 +751,22 @@ export function buildRunPayload(apiBase, store, modalOptions, trace) {
   const { values } = validateMappedValues(store.controlValues || {}, schema);
   const version = store.runContext && store.runContext.version;
   const workflowType = resolveWorkflowType(store);
+  const outgoingOptions = {
+    ...(modalOptions && typeof modalOptions === "object" ? modalOptions : {}),
+    skip_text_generate: store.skipTextGenerate === true,
+  };
+  // Temporary escape hatch: present only when enabled so the payload
+  // contract keeps its exact keys otherwise.
+  if (loadSkipPlanValidation() || outgoingOptions.skip_plan_validation === true) {
+    outgoingOptions.skip_plan_validation = true;
+  }
   return {
     workflow_id: store.workflowId,
     workflow_version_id: store.workflowVersionId,
     featureId: resolveFeatureId(store),
     workflow_type: workflowType,
     controls: values,
-    modal_options: {
-      ...(modalOptions && typeof modalOptions === "object" ? modalOptions : {}),
-      skip_text_generate: store.skipTextGenerate === true,
-    },
+    modal_options: outgoingOptions,
     metadata: {
       source: "studio_playground",
       workflow_id: store.workflowId,

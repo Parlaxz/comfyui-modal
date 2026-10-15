@@ -6,16 +6,18 @@
 //
 // Data comes only from createHistoryRepository + listFeed with the same
 // query shape as the History page (search/statuses/kinds/favoriteOnly/
-// hasImage/sort/limit/cursor). Card thumbnails resolve through the feed
+// hasImage/sort/limit/cursor). Card thumbnails render through the feed
 // asset policy (thumbUrl then previewUrl, never an eager Original) via the
-// shared buildHistoryCard renderer from studio-history-v2.js.
+// shared buildHistoryCard renderer from studio-history-v2.js, while pick
+// descriptors resolve the full-resolution compare URL (Original first) so
+// the compare view never upscales a 256px thumbnail.
 //
 // Copy uses grounded plain words only: "Compare images", "Select A",
 // "Select B", "Use image", "Back", "Change A", "Change B", "Swap",
 // "Current canvas", "Current canvas (no image)".
 
 import { el, registerLayerHandler } from "./studio-ui.js";
-import { createHistoryRepository, selectFeedAsset } from "./history-v2-repository.js";
+import { createHistoryRepository, selectCompareAsset } from "./history-v2-repository.js";
 import { buildHistoryCard } from "./studio-history-v2.js";
 
 const PICKER_LIMIT = 24;
@@ -64,11 +66,13 @@ function _pickMeta(record) {
   return meta.length > 120 ? meta.slice(0, 120) : meta;
 }
 
-// A History record becomes a pick only when the feed policy resolves a
-// usable (non-Original) asset URL for it.
+// A History record becomes a pick only when the compare policy resolves a
+// usable full-resolution asset URL for it (Original > Data Saver > Thumbnail
+// from already-projected URLs — no eager fetch; card GRID rendering still
+// shows lightweight thumbs via buildHistoryCard).
 function _recordPick(record) {
   if (!record || typeof record !== "object") return null;
-  const asset = selectFeedAsset(record.featuredOutput || {});
+  const asset = selectCompareAsset(record.featuredOutput || {});
   if (!asset.url) return null;
   return {
     url: asset.url,

@@ -9,6 +9,7 @@ import {
   managerRebootAndWait,
   triggerGoldenProfileDeploy,
   getGoldenProfileDeployStatus,
+  deployFailureTail,
 } from "./studio-backend-api.js";
 import { loadGoldenProfileSelection } from "./studio-playground-state.js";
 
@@ -274,7 +275,7 @@ async function runTopnavRedeployStep(btn) {
       return { ok: true, message: "Deploy finished." };
     }
     if (payload && payload.state === "failed") {
-      const tail = String(payload.output || payload.message || "").trim().split("\n").pop();
+      const tail = deployFailureTail(payload.output || payload.message || "");
       const message = "Deploy failed: " + (tail || "see v2ctl output");
       if (btn) btn.title = message;
       return { ok: false, message };
@@ -288,12 +289,15 @@ async function handleTopnavRedeploy(btn) {
   if (!btn || btn.disabled || _topnavBusy) return;
   const originalTitle = btn.title;
   setTopnavBusy(btn, true);
-  const res = await runTopnavRedeployStep(btn);
-  setTopnavBusy(btn, false);
-  if (res && res.ok) {
-    btn.title = res.message || originalTitle;
+  try {
+    const res = await runTopnavRedeployStep(btn);
+    if (res && res.ok) {
+      btn.title = res.message || originalTitle;
+    }
+    // On failure runTopnavRedeployStep already set a descriptive title.
+  } finally {
+    setTopnavBusy(btn, false);
   }
-  // On failure runTopnavRedeployStep already set a descriptive title.
 }
 
 function handleTopnavHardReload() {

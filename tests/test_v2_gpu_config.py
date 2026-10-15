@@ -22,6 +22,8 @@ from gpu_catalog import (
     V2_DEFAULT_GPU,
     _dedupe_preserve_order,
     _normalize_gpu_name,
+    build_gpu_order,
+    parse_gpu_alt_request,
     parse_gpu_request,
 )
 from comfymodal_runtime.runtime_state import (
@@ -756,6 +758,45 @@ class TestAppClsContract(unittest.TestCase):
         """ModalRuntimeSpec defaults to cpu=16."""
         spec = ModalRuntimeSpec()
         self.assertEqual(spec.cpu, 16)
+
+
+class TestParseGpuAltRequest(unittest.TestCase):
+    """Swapped GPU order (order B) parsing from env vars."""
+
+    def setUp(self):
+        self._saved_env = {}
+        for key in ("COMFYMODAL_V2_GPU", "COMFYMODAL_V2_GPU_ALT", "COMFYMODAL_V2_GPU_FALLBACKS"):
+            self._saved_env[key] = os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, val in self._saved_env.items():
+            if val is not None:
+                os.environ[key] = val
+            else:
+                os.environ.pop(key, None)
+
+    def test_absent_alt_means_single_function(self):
+        self.assertEqual(parse_gpu_alt_request(), ())
+
+    def test_alt_builds_swapped_order_with_shared_tail(self):
+        os.environ["COMFYMODAL_V2_GPU"] = "h100!"
+        os.environ["COMFYMODAL_V2_GPU_ALT"] = "rtx-pro-6000"
+        os.environ["COMFYMODAL_V2_GPU_FALLBACKS"] = "rtx-pro-6000,h100!,h200,a100-80gb"
+        self.assertEqual(
+            parse_gpu_alt_request(),
+            ("RTX-PRO-6000", "H100!", "H200", "A100-80GB"),
+        )
+
+    def test_alt_matching_primary_means_single_function(self):
+        os.environ["COMFYMODAL_V2_GPU"] = "h100!"
+        os.environ["COMFYMODAL_V2_GPU_ALT"] = "h100!"
+        self.assertEqual(parse_gpu_alt_request(), ())
+
+    def test_build_gpu_order_caps_at_four_total(self):
+        self.assertEqual(
+            build_gpu_order("h100!", ["rtx-pro-6000", "h100!", "h200", "a100-80gb", "l40s"]),
+            ("H100!", "RTX-PRO-6000", "H200", "A100-80GB"),
+        )
 
 
 if __name__ == "__main__":

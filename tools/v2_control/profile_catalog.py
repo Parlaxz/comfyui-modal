@@ -51,11 +51,14 @@ class GoldenProfile:
 
     def to_dict(self) -> dict[str, Any]:
         region_flag = self.config.flag("COMFYMODAL_V2_REGION")
+        order_a, order_b = gpu_orders_for(self.resources)
         return {
             "name": self.name,
             "owner": self.owner,
             "target": dict(self.target),
             "resources": dict(self.resources),
+            "gpu_order_a": order_a,
+            "gpu_order_b": order_b,
             "region": str(region_flag.value or "") if region_flag is not None else "",
             "deployed": self.deployed,
         }
@@ -82,11 +85,42 @@ def _target(config: ResolvedConfig) -> dict[str, str]:
 
 
 def _resources(config: ResolvedConfig) -> dict[str, Any]:
+    fallbacks = getattr(config.resources, "gpu_fallbacks", ()) or ()
     return {
         "gpu": str(config.resources.gpu),
+        "gpu_alt": str(getattr(config.resources, "gpu_alt", "") or ""),
+        "gpu_fallbacks": [str(item) for item in fallbacks],
         "cpu": int(config.resources.cpu),
         "memory_mb": int(config.resources.memory_mb),
     }
+
+
+def gpu_orders_for(resources: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """Derive deploy-time order-A / order-B GPU lists from catalog resources.
+
+    Order A = [gpu] + tail-minus-gpu, order B = [gpu_alt] + tail-minus-alt,
+    each capped at 4 total (primary + up to 3 fallbacks).  Order B is empty
+    when no distinct alt primary is configured (single-function deploy).
+    Names stay in the normalized catalog-value spelling; Modal-canonical
+    casing is applied deploy-side by ``gpu_catalog``.
+    """
+    raw_fallbacks = resources.get("gpu_fallbacks") or []
+    tail: list[str] = []
+    for item in raw_fallbacks:
+        name = str(item).strip().lower()
+        if name and name not in tail:
+            tail.append(name)
+    primary = str(resources.get("gpu") or "").strip().lower()
+    alt = str(resources.get("gpu_alt") or "").strip().lower()
+    if not primary:
+        return tail[:4], []
+    order_a = ([primary] + [name for name in tail if name != primary])[:4]
+    if not alt:
+        return order_a, []
+    order_b = ([alt] + [name for name in tail if name != alt])[:4]
+    if order_b == order_a:
+        return order_a, []
+    return order_a, order_b
 
 
 def _receipt_resources(receipt: DeploymentReceipt) -> dict[str, Any] | None:
@@ -98,8 +132,11 @@ def _receipt_resources(receipt: DeploymentReceipt) -> dict[str, Any] | None:
     if not isinstance(raw, Mapping):
         return None
     try:
+        fallbacks = raw.get("gpu_fallbacks", [])
         return {
             "gpu": str(raw["gpu"]),
+            "gpu_alt": str(raw.get("gpu_alt", "") or ""),
+            "gpu_fallbacks": [str(item) for item in (fallbacks or [])],
             "cpu": int(raw["cpu"]),
             "memory_mb": int(raw["memory_mb"]),
         }
@@ -115,6 +152,10 @@ def _destination_record(root: Path) -> dict[str, str] | None:
     catalog resolves the same destination the deploy recorded.  An absent or
     unreadable destination is a fail-closed ``None``: readiness then cannot be
     proven rather than being assumed.
+
+    When the config names the ``studio-default`` sentinel, the Studio active
+    workspace (shared registry) is the destination, resolved at call time so a
+    Studio workspace switch retargets deploys without editing config.
     """
     target = root / "config" / "v2" / "modal_target.toml"
     try:
@@ -127,6 +168,42 @@ def _destination_record(root: Path) -> dict[str, str] | None:
     workspace_id = str(modal.get("workspace_id", "") or "")
     if not workspace_id:
         return None
+    try:
+        from modal_workspaces import (
+            get_active_workspace as _get_active,
+            is_studio_default_workspace_id as _is_studio_default,
+            load_workspace_registry as _load_registry,
+            resolve_workspace_registry_path as _registry_path,
+        )
+    except Exception:
+        _get_active = None  # type: ignore[assignment]
+        _is_studio_default = None  # type: ignore[assignment]
+        _load_registry = None  # type: ignore[assignment]
+        _registry_path = None  # type: ignore[assignment]
+    if (
+        _is_studio_default is not None
+        and _get_active is not None
+        and _load_registry is not None
+        and _registry_path is not None
+        and _is_studio_default(workspace_id)
+    ):
+        try:
+            registry = _load_registry(_registry_path(root))
+        except Exception:
+            return None
+        active = _get_active(registry)
+        if not isinstance(active, dict):
+            return None
+        active_id = str(active.get("id") or "").strip()
+        active_label = str(active.get("label") or "").strip()
+        if not active_id or not active_label:
+            return None
+        return {
+            "workspace_id": active_id,
+            "workspace_label": active_label,
+            "environment": str(modal.get("environment", "") or ""),
+            "source": "config/v2/modal_target.toml",
+        }
     return {
         "workspace_id": workspace_id,
         "workspace_label": str(modal.get("workspace_label", "") or ""),
@@ -211,9 +288,10 @@ def _catalog_signature(root: Path) -> tuple:
 
     The expensive part is per-profile receipt resolution, and the repository
     accumulates receipts indefinitely, so this is O(receipts) on every call.
-    Detects the only two ways the answer can change: a receipt being written
-    (directory mtime + file count move) and a profile being edited (its file
-    mtime moves).
+    Detects the ways the answer can change: a receipt being written
+    (directory mtime + file count move), a profile being edited (its file
+    mtime moves), the target config changing, and -- when the target names
+    the ``studio-default`` sentinel -- the Studio active workspace changing.
     """
     receipts = root / ".v2ctl" / "deployments"
     try:
@@ -239,7 +317,35 @@ def _catalog_signature(root: Path) -> tuple:
         sig_target = (target.stat().st_mtime_ns, target.stat().st_size)
     except OSError:
         sig_target = (0, 0)
-    return (sig_receipts, (count, newest), sig_target)
+    sig_studio_default: tuple = ("pinned",)
+    try:
+        raw = tomllib.loads(target.read_text(encoding="utf-8"))
+        modal = raw.get("modal") if isinstance(raw, dict) else None
+        wid = str(modal.get("workspace_id", "") or "") if isinstance(modal, dict) else ""
+        from modal_workspaces import (
+            get_active_workspace as _sig_active,
+            is_studio_default_workspace_id as _sig_is_default,
+            resolve_workspace_registry_path as _sig_registry_path,
+        )
+
+        if _sig_is_default(wid):
+            reg_path = _sig_registry_path(root)
+            try:
+                sig_reg_stat = reg_path.stat()
+                sig_reg = (sig_reg_stat.st_mtime_ns, sig_reg_stat.st_size)
+            except OSError:
+                sig_reg = (0, 0)
+            try:
+                from modal_workspaces import load_workspace_registry as _sig_load
+
+                active = _sig_active(_sig_load(reg_path))
+                sig_active = str(active.get("id") or "") if isinstance(active, dict) else ""
+            except Exception:
+                sig_active = ""
+            sig_studio_default = ("studio-default", sig_reg, sig_active)
+    except Exception:
+        pass
+    return (sig_receipts, (count, newest), sig_target, sig_studio_default)
 
 
 def invalidate_catalog_cache() -> None:

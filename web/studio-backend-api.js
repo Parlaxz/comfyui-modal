@@ -272,13 +272,28 @@ export async function saveRunOutput(apiBase, runId, payload) {
 // ── Studio Workflow API ──────────────────────────────────────────────────
 
 /**
+ * Query string for inventory-refresh freshness (pure; unit-testable).
+ * Omitted/blank maxAge preserves the server default TTL; an explicit
+ * number (0 forces a fresh read) is sent as max_age.
+ */
+export function inventoryRefreshQuery(maxAge) {
+  if (maxAge === null || maxAge === undefined || maxAge === "") return "";
+  const n = Number(maxAge);
+  if (!Number.isFinite(n)) return "";
+  return "?max_age=" + encodeURIComponent(String(maxAge));
+}
+
+/**
  * Ask the backend to refresh its cached remote inventory. The response is a
  * small status envelope; inventory contents remain server-side. Freshness is
  * owned by the server; browser polling cadence must not become cache policy.
+ * Pass maxAge=0 after a volume mutation so the next read sees the new
+ * files instead of the pre-mutation snapshot.
  * @param {string} apiBase
+ * @param {number} [maxAge] - optional freshness window in seconds
  */
-export async function refreshRemoteInventory(apiBase) {
-  return apiFetch(apiBase, "/studio/inventory/refresh");
+export async function refreshRemoteInventory(apiBase, maxAge) {
+  return apiFetch(apiBase, "/studio/inventory/refresh" + inventoryRefreshQuery(maxAge));
 }
 
 export async function listWorkflows(apiBase, opts = {}) {
@@ -1059,6 +1074,79 @@ export function isDeployInFlight(state) {
   return state === "deploying" || state === "starting" || state === "unknown";
 }
 
+/**
+ * Pure: deploy states that count as usable. Single owner for the readiness
+ * question — shell gate, deployment page, playground recovery, and health
+ * checks must all agree. deployed_unwarmed is terminal deploy success
+ * (warmup execution retired, WARMUP_RETIRED); it must not block sync.
+ */
+export function isDeployUsableState(state) {
+  return state === "ready" || state === "deployed_unwarmed";
+}
+
+/**
+ * Pure: explicit not-ready gate. Usable and in-flight states fall through;
+ * null/inconclusive deploys fall through so transient reads preserve current
+ * behavior. Only an explicit non-usable, non-in-flight state short-circuits.
+ */
+export function isDeployExplicitlyNotReady(deploy) {
+  return Boolean(deploy)
+    && !isDeployUsableState(deploy.state)
+    && !isDeployInFlight(deploy.state);
+}
+
+/**
+ * Shared bounded deploy poll. Single owner for the "wait for deploy"
+ * pattern used by every redeploy button. readStatus is an async
+ * () => ({ state, message }) reader (null on inconclusive reads);
+ * callers pass their own reader so fetch semantics stay local.
+ * Resolves { outcome: "usable"|"error"|"timeout", status }.
+ */
+export async function pollDeployToTerminal(readStatus, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const intervalMs = Number.isFinite(opts.intervalMs) && opts.intervalMs > 0 ? opts.intervalMs : 3000;
+  const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : 10 * 60 * 1000;
+  const started = Date.now();
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    let status = null;
+    try { status = await readStatus(); } catch { status = null; }
+    const state = status && typeof status.state === "string" ? status.state : "unknown";
+    if (isDeployInFlight(state) || !status) {
+      if (Date.now() - started >= timeoutMs) return { outcome: "timeout", status };
+      continue;
+    }
+    if (isDeployUsableState(state)) return { outcome: "usable", status };
+    return { outcome: "error", status };
+  }
+}
+
+/**
+ * Pure: most informative failure line from a deploy job's captured output.
+ *
+ * The backend merges the v2ctl child's stdout+stderr into one blob, so the
+ * raw last line is not always the error: progress rewrites use bare CR, and
+ * (before the unbuffered-child fix) block-buffered stdout could flush after
+ * unbuffered stderr. Scanning from the end for an explicit error line keeps
+ * a stale banner such as "DEPLOYING TO=..." from masquerading as the reason.
+ * Falls back to the last non-empty line; "" when there is nothing to show.
+ */
+export function deployFailureTail(output) {
+  const lines = String(output == null ? "" : output)
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  if (lines.length === 0) return "";
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (/^error\b/i.test(line) || /^traceback\b/i.test(line) || /error\s*:/i.test(line)) {
+      return line;
+    }
+  }
+  return lines[lines.length - 1];
+}
+
 /** Pure: last N lines of a log body. */
 export function tailLines(text, maxLines) {
   const n = Math.max(1, Number(maxLines) || 50);
@@ -1255,6 +1343,24 @@ export async function setGoldenProfileRegion(apiBase, profile, region) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ profile, region }),
+  });
+}
+
+export async function setGoldenProfileGpu(apiBase, profile, gpu, gpu_alt, gpu_fallbacks) {
+  if (!profile) return null;
+  return apiFetch(apiBase, "/studio/golden/gpu", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ profile, gpu, gpu_alt, gpu_fallbacks }),
+  });
+}
+
+export async function setGoldenProfileGpuOrder(apiBase, profile, order) {
+  if (!profile) return null;
+  return apiFetch(apiBase, "/studio/golden/gpu-order", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ profile, order }),
   });
 }
 

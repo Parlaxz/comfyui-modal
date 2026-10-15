@@ -76,6 +76,7 @@ globalThis.document = {
 };
 
 const compare = await import(pathToFileURL(path.join(WEB, "studio-image-compare.js")));
+const repo = await import(pathToFileURL(path.join(WEB, "history-v2-repository.js")));
 
 const DESC_A = { url: "/assets/a.png", label: "Preview", kind: "preview", meta: "Generation #abc123", alt: "preview" };
 const DESC_B = { url: "/assets/b.png", label: "Original", kind: "original", meta: "Generation #abc123" };
@@ -312,6 +313,72 @@ function freshModel() {
     "stale caller claim removed from the overlay docblock"
   );
   section("14. generic viewer helpers byte-markers intact; stale doc claims removed");
+}
+
+// ═══ 15. Compare resolves full-resolution URLs, never a 256px thumb ═════
+
+{
+  const out = (o) => Object.assign(
+    { thumbUrl: "", previewUrl: "", originalUrl: "", originalFailed: false },
+    o,
+  );
+  // Original-mode generation (thumb + original, no preview): compare must
+  // use the retained full bytes, not the 256px thumbnail.
+  assert.deepEqual(
+    repo.selectCompareAsset(out({ thumbUrl: "/thumb", originalUrl: "/orig" })),
+    { kind: "original", url: "/orig", label: "Original" },
+  );
+  // Data-saver generation: the preview IS the retained full image.
+  assert.deepEqual(
+    repo.selectCompareAsset(out({ thumbUrl: "/thumb", previewUrl: "/prev" })),
+    { kind: "data_saver", url: "/prev", label: "Data Saver" },
+  );
+  // Both variants projected (e.g. after Generate Original): true Original wins.
+  assert.deepEqual(
+    repo.selectCompareAsset(out({ thumbUrl: "/thumb", previewUrl: "/prev", originalUrl: "/orig" })),
+    { kind: "original", url: "/orig", label: "Original" },
+  );
+  // Failed originals never resolve (falls through to the display derivative).
+  assert.deepEqual(
+    repo.selectCompareAsset(out({ thumbUrl: "/thumb", originalUrl: "/orig", originalFailed: true })),
+    { kind: "thumbnail", url: "/thumb", label: "Thumbnail" },
+  );
+  // Thumbnail-only stays thumbnail (no Original projected — nothing fuller exists).
+  assert.deepEqual(
+    repo.selectCompareAsset(out({ thumbUrl: "/thumb" })),
+    { kind: "thumbnail", url: "/thumb", label: "Thumbnail" },
+  );
+  // Unusable states carry no URL so compare entries stay hidden.
+  assert.equal(repo.selectCompareAsset(out({ originalAvailable: true })).url, "");
+  assert.equal(repo.selectCompareAsset(out()).url, "");
+  // Display policies are untouched: feed grid stays lazy (no eager Original),
+  // detail keeps its preview-first display order.
+  assert.deepEqual(
+    repo.selectFeedAsset(out({ thumbUrl: "/thumb", originalUrl: "/orig" })),
+    { kind: "thumbnail", url: "/thumb", label: "Thumbnail" },
+  );
+  assert.deepEqual(
+    repo.selectDetailAsset(out({ thumbUrl: "/thumb", previewUrl: "/prev", originalUrl: "/orig" })),
+    { kind: "data_saver", url: "/prev", label: "Data Saver" },
+  );
+  section("15. selectCompareAsset prefers Original > Data Saver > Thumbnail; display policies unchanged");
+}
+
+// ═══ 16. Every compare descriptor path uses the full-resolution selector ═
+
+{
+  const pickerSrc = readWeb("studio-history-picker.js");
+  const detailSrc = readWeb("studio-history-v2-detail.js");
+  const expSrc = readWeb("studio-history-v2-experiment.js");
+  assert.ok(pickerSrc.includes("selectCompareAsset"), "picker picks full-resolution compare URLs");
+  assert.ok(pickerSrc.includes("selectCompareAsset(record.featuredOutput"), "picker _recordPick uses the compare selector");
+  assert.ok(detailSrc.includes("selectCompareAsset(feat)"), "detail featured Compare uses the compare selector");
+  assert.ok(detailSrc.includes("selectCompareAsset(out)"), "detail output menu uses the compare selector");
+  assert.ok(expSrc.includes("selectCompareAsset(cell)"), "experiment cell compare uses the compare selector");
+  // Display rendering stays on the lazy policies (no eager Original bytes).
+  assert.ok(detailSrc.includes("selectDetailAsset(feat)"), "detail slot still shows the display variant");
+  assert.ok(expSrc.includes("selectExperimentCellAsset(cell)"), "experiment tiles still show the lazy cell asset");
+  section("16. picker/detail/experiment compare entries resolve full-resolution URLs; display stays lazy");
 }
 
 console.log("PASS: phase-i5 image compare unit complete");

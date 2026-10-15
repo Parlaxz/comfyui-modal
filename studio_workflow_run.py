@@ -67,6 +67,508 @@ _MODEL_LOADER_FIELDS = frozenset(
 )
 
 
+# ── Plan-validation escape hatch ─────────────────────────────────────────
+# Temporary triage for validation/dependency false negatives (e.g.
+# frontend-only Set/Get nodes). Fail-closed stays the default; skipping is
+# strictly opt-in via per-request modal_options, the persisted Studio
+# setting, or env. The custom-node runnable gate is skipped alongside plan
+# validation (same opt-out); model reasons always stay fail-closed.
+
+_SKIP_ENV_VALUES = frozenset({"1", "true", "on", "yes"})
+
+# Reason prefixes produced by DependencyResolver.reasons_for for pack
+# dependencies (mirrors the "missing model " filtering precedent in
+# resolve_workflow_run_bundle below).
+_CUSTOM_NODE_REASON_PREFIXES = (
+    "required custom node ",
+    "installed custom node ",
+)
+
+
+def _skip_plan_validation_requested(modal_options: dict[str, Any] | None) -> bool:
+    """True when one request explicitly opts out of plan validation."""
+    try:
+        if bool((modal_options or {}).get("skip_plan_validation") is True):
+            return True
+    except Exception:
+        pass
+    try:
+        if str(os.environ.get("COMFYMODAL_SKIP_PLAN_VALIDATION", "")).strip().lower() in _SKIP_ENV_VALUES:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _skip_gate_active(
+    modal_options: dict[str, Any] | None,
+    node_dir: str | os.PathLike,
+) -> bool:
+    """True when the validation/dependency escape hatch is active.
+
+    Per-request opt-out wins; otherwise the persisted Studio setting
+    (``.modal_settings.json`` under *node_dir*) applies. Never raises.
+    """
+    if _skip_plan_validation_requested(modal_options):
+        return True
+    try:
+        settings_path = os.path.join(str(node_dir), ".modal_settings.json")
+        with open(settings_path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict) and saved.get("skip_plan_validation") is True:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def bypass_nodes_by_id(
+    executable_prompt: dict[str, Any],
+    node_ids: list[Any],
+) -> dict[str, Any]:
+    """Bypass listed nodes by wiring their consumers to their linked source.
+
+    Temporary triage for nodes whose backend is broken in the deployed image
+    (e.g. a patcher whose optional accelerator import is dead): each listed
+    node must have exactly one linked input — that source replaces every
+    ``[node_id, slot]`` reference and the node is dropped. Anything else
+    (missing node, unlinked/multi-linked input) fails closed. This mirrors
+    the node's own documented disable path ("bypass or disconnect this
+    node"). Never mutates inputs. Returns ``{"workflow", "bypassed"}`` or
+    ``{"error"}``.
+    """
+    if not isinstance(executable_prompt, dict):
+        return {"error": "executable prompt is not a dict"}
+    targets = [str(nid) for nid in (node_ids or [])]
+    if not targets:
+        return {"workflow": copy.deepcopy(executable_prompt), "bypassed": []}
+    workflow = copy.deepcopy(executable_prompt)
+    replacements: dict[str, tuple[str, int]] = {}
+    for node_id in targets:
+        node = workflow.get(node_id)
+        if not isinstance(node, dict):
+            return {"error": f"bypass target node {node_id} is not present"}
+        sources: list[tuple[str, int]] = []
+        for value in (node.get("inputs") or {}).values():
+            link = _link_value(value)
+            if link is not None:
+                sources.append(link)
+        if not sources:
+            return {"error": f"bypass target node {node_id} has no linked source"}
+        if len(sources) > 1:
+            return {"error": f"bypass target node {node_id} has multiple linked inputs"}
+        replacements[node_id] = sources[0]
+    for key, node in workflow.items():
+        if not isinstance(node, dict) or str(key) in replacements:
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict):
+            node["inputs"] = _rewrite_wire_refs(inputs, replacements)
+    for node_id in replacements:
+        workflow.pop(node_id, None)
+    return {"workflow": workflow, "bypassed": sorted(replacements)}
+
+
+def _bypass_ids_from_options(modal_options: Mapping[str, Any] | None) -> list[str]:
+    """Explicit per-run bypass list (temporary triage). Never raises."""
+    try:
+        raw = (modal_options or {}).get("bypass_node_ids")
+    except Exception:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(nid) for nid in raw]
+
+
+def _strip_custom_node_reasons(reasons: list[Any]) -> tuple[list[str], list[str]]:
+    """Split dependency reasons into (kept, skipped) by pack prefix."""
+    kept: list[str] = []
+    skipped: list[str] = []
+    for reason in reasons or []:
+        text = str(reason)
+        if text.startswith(_CUSTOM_NODE_REASON_PREFIXES):
+            skipped.append(text)
+        else:
+            kept.append(text)
+    return kept, skipped
+
+
+_VIRTUAL_WIRE_CLASSES = frozenset({"SetNode", "GetNode"})
+
+# Frontend-only broadcast controllers replicated at run time (subset).
+_UE_CONTROLLER_TYPES = frozenset({"Anything Everywhere"})
+
+
+def _ue_props(ui_node: Any) -> dict[str, Any]:
+    """Return a UI node's ``ue_properties`` dict (or {}). Never raises."""
+    try:
+        properties = ui_node.get("properties") if isinstance(ui_node, dict) else None
+        ue_properties = properties.get("ue_properties") if isinstance(properties, dict) else None
+        return dict(ue_properties) if isinstance(ue_properties, dict) else {}
+    except Exception:
+        return {}
+
+
+def _ui_node_is_live(ui_node: Any) -> bool:
+    """Mirror the frontend liveness check (muted/bypassed nodes are off)."""
+    if not isinstance(ui_node, dict):
+        return False
+    mode = ui_node.get("mode", 0)
+    if mode == 0:
+        return True
+    if mode in (2, 4):
+        return False
+    return True
+
+
+def _ue_slot_label(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    label = entry.get("label") or entry.get("name") or ""
+    return str(label)
+
+
+def _ue_name_requirement(rule: Any, source_name: str):
+    """Name-matching requirement for duplicated broadcast types (rule 0-3)."""
+    try:
+        rule = int(rule or 0)
+    except (TypeError, ValueError):
+        return None
+    if rule == 0:
+        return lambda target_name, _target_title="": str(target_name) == source_name
+    if rule == 1:
+        def _start(target_name, _target_title=""):
+            chars = min(len(source_name), len(str(target_name)))
+            return str(target_name)[:chars] == source_name[:chars]
+        return _start
+    if rule == 2:
+        def _end(target_name, _target_title=""):
+            chars = min(len(source_name), len(str(target_name)))
+            t = str(target_name)
+            return t[len(t) - chars:] == source_name[len(source_name) - chars:]
+        return _end
+    if rule == 3:
+        return lambda _target_name, target_title="": str(target_title) == source_name
+    return None
+
+
+def apply_anything_everywhere_broadcast(
+    executable_prompt: dict[str, Any],
+    graph_json: Any = None,
+) -> dict[str, Any]:
+    """Broadcast Anything Everywhere links to unconnected matching inputs.
+
+    Mirrors the canvas Queue path (``cg-use-everywhere`` ``convert_to_links``):
+    each linked input of a live ``Anything Everywhere`` node feeds every
+    unconnected, connectable input of the same slot type. Without this, Studio
+    replays prompts with nulls where the canvas transparently wires
+    MODEL/CLIP/VAE/LATENT (the ``clip input is invalid: None`` failure).
+
+    Conservative by construction: only exact-type matches from unscoped
+    controllers are filled, ambiguous (tied-priority) targets are left alone
+    exactly like the frontend leaves them, and existing links are never
+    clobbered. Returns ``{"workflow", "broadcast"}``; never fails closed —
+    unfillable inputs keep their stored values. Never mutates inputs.
+    """
+    if not isinstance(executable_prompt, dict):
+        return {"error": "executable prompt is not a dict"}
+    workflow = copy.deepcopy(executable_prompt)
+    if not any(
+        isinstance(node, dict) and str(node.get("class_type", "")) in _UE_CONTROLLER_TYPES
+        for node in workflow.values()
+    ):
+        return {"workflow": workflow, "broadcast": 0}
+    if not isinstance(graph_json, dict) or not isinstance(graph_json.get("nodes"), list):
+        return {"workflow": workflow, "broadcast": 0}
+
+    ui_nodes = [
+        entry for entry in (graph_json.get("nodes") or []) if isinstance(entry, dict)
+    ]
+    ui_by_id = {
+        str(entry.get("id")): entry for entry in ui_nodes if entry.get("id") is not None
+    }
+    links_by_id: dict[Any, list[Any]] = {}
+    try:
+        for link in (graph_json.get("links") or []):
+            if isinstance(link, (list, tuple)) and len(link) >= 5:
+                links_by_id[link[0]] = list(link)
+    except Exception:
+        links_by_id = {}
+
+    def _link_origin(link_id: Any) -> tuple[str, int] | None:
+        try:
+            link = links_by_id.get(link_id)
+        except Exception:
+            return None
+        if not isinstance(link, list) or len(link) < 5:
+            return None
+        return _link_value([link[1], link[2]])
+
+    # ── Sources: linked inputs of live, unscoped broadcast controllers ──
+    # (controller_id, input_name, slot_type, origin, priority, requirement)
+    sources: list[tuple[str, str, str, tuple[str, int], int, Any]] = []
+    for entry in ui_nodes:
+        if str(entry.get("type", "")) not in _UE_CONTROLLER_TYPES:
+            continue
+        if not _ui_node_is_live(entry):
+            continue
+        props = _ue_props(entry)
+        if props.get("seed_inputs"):
+            continue
+        if (
+            props.get("group_restricted") not in (None, 0)
+            or props.get("color_restricted") not in (None, 0)
+            or props.get("title_regex") or props.get("input_regex") or props.get("group_regex")
+            or props.get("send_to_any") or props.get("string_to_combo")
+        ):
+            continue
+        linked = [
+            slot for slot in (entry.get("inputs") or [])
+            if isinstance(slot, dict) and slot.get("link") is not None
+        ]
+        if not linked:
+            continue
+        type_counts: dict[str, int] = {}
+        for slot in linked:
+            slot_type = str(slot.get("type") or "")
+            if slot_type:
+                type_counts[slot_type] = type_counts.get(slot_type, 0) + 1
+        duplicated = {t for t, c in type_counts.items() if c > 1}
+        priority = 10
+        if duplicated:
+            priority += 20
+        for slot in linked:
+            slot_type = str(slot.get("type") or "")
+            if not slot_type:
+                continue
+            origin = _link_origin(slot.get("link"))
+            if origin is None:
+                continue
+            try:
+                upstream = ui_by_id.get(str(origin[0]))
+            except Exception:
+                upstream = None
+            if not _ui_node_is_live(upstream):
+                continue
+            requirement = None
+            if slot_type in duplicated or props.get("apply_to_unrepeated"):
+                requirement = _ue_name_requirement(
+                    props.get("repeated_type_rule", 0),
+                    _ue_slot_label(slot),
+                )
+                if requirement is None:
+                    continue
+            sources.append((
+                str(entry.get("id")), _ue_slot_label(slot) or str(slot.get("name") or ""),
+                slot_type, origin, priority, requirement,
+            ))
+    if not sources:
+        return {"workflow": workflow, "broadcast": 0}
+
+    filled = 0
+    for entry in ui_nodes:
+        node_id = str(entry.get("id")) if entry.get("id") is not None else ""
+        if not node_id or str(entry.get("type", "")) in _UE_CONTROLLER_TYPES:
+            continue
+        if not _ui_node_is_live(entry):
+            continue
+        properties = entry.get("properties") if isinstance(entry.get("properties"), dict) else {}
+        if not isinstance(properties, dict):
+            properties = {}
+        if properties.get("rejects_ue_links"):
+            continue
+        if properties.get("ue_convert"):
+            continue
+        unconnectable = _ue_props(entry).get("input_ue_unconnectable") or {}
+        if not isinstance(unconnectable, dict):
+            unconnectable = {}
+        api_node = workflow.get(node_id)
+        if not isinstance(api_node, dict):
+            continue
+        api_inputs = api_node.get("inputs")
+        if not isinstance(api_inputs, dict):
+            continue
+        for slot in (entry.get("inputs") or []):
+            if not isinstance(slot, dict):
+                continue
+            if slot.get("link") is not None:
+                continue
+            if "widget" in slot:
+                continue
+            input_name = str(slot.get("name") or "")
+            if not input_name or unconnectable.get(input_name):
+                continue
+            input_type = str(slot.get("type") or "")
+            if not input_type:
+                continue
+            # Fill absent/null slots only; existing links (or any stored
+            # scalar) are authoritative and never clobbered.
+            if api_inputs.get(input_name, None) is not None:
+                continue
+            candidates = [
+                source for source in sources
+                if source[2] == input_type
+                and str(source[3][0]) != node_id
+                and (source[5] is None or source[5](input_name, str(entry.get("title") or "")))
+            ]
+            if not candidates:
+                continue
+            candidates.sort(key=lambda s: -s[4])
+            if len(candidates) > 1 and candidates[0][4] == candidates[1][4]:
+                continue
+            origin = candidates[0][3]
+            api_inputs[input_name] = [origin[0], origin[1]]
+            filled += 1
+    return {"workflow": workflow, "broadcast": filled}
+
+
+def _wire_name_of_ui_node(ui_node: Any) -> str | None:
+    """Return a Set/Get UI node's pipe name, or None when unusable."""
+    if not isinstance(ui_node, dict):
+        return None
+    widgets = ui_node.get("widgets_values")
+    if isinstance(widgets, list) and widgets:
+        name = widgets[0]
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
+
+
+def _link_value(value: Any) -> tuple[str, int] | None:
+    """Return (node_id, slot) for a ``[node_id, slot]`` link value, else None."""
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        node_id, slot = value[0], value[1]
+        if isinstance(node_id, (str, int)) and isinstance(slot, (int, float)):
+            return (str(node_id), int(slot))
+    return None
+
+
+def _rewrite_wire_refs(value: Any, replacements: dict[str, tuple[str, int]]) -> Any:
+    """Recursively replace link origins listed in *replacements*."""
+    link = _link_value(value)
+    if link is not None:
+        if link[0] in replacements:
+            src_id, src_slot = replacements[link[0]]
+            return [src_id, src_slot]
+        return value
+    if isinstance(value, dict):
+        return {k: _rewrite_wire_refs(v, replacements) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_rewrite_wire_refs(v, replacements) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_rewrite_wire_refs(v, replacements) for v in value)
+    return value
+
+
+def expand_frontend_set_get_nodes(
+    executable_prompt: dict[str, Any],
+    graph_json: Any = None,
+) -> dict[str, Any]:
+    """Replace frontend-only Set/Get wireless links with direct links.
+
+    Mirrors the canvas ``Convert All Set/Get to Links`` operation that the
+    normal Queue path applies via ``graphToPrompt``: every ``GetNode``
+    consumer is rewired to the matching ``SetNode``'s linked source and the
+    virtual nodes are removed. No backend (host or remote) implements these
+    classes, so an unexpanded prompt can never validate or execute.
+
+    Pairing names live only in the UI graph (``widgets_values[0]``); the API
+    prompt carries no name. Returns ``{"workflow", "expanded"}`` on success
+    or ``{"error"}`` (fail-closed: ambiguous, unnamed, sourceless, or
+    graph-less virtual nodes are never guessed). Never mutates inputs.
+    """
+    if not isinstance(executable_prompt, dict):
+        return {"error": "executable prompt is not a dict"}
+    workflow = copy.deepcopy(executable_prompt)
+    virtual_ids = {
+        str(node_id)
+        for node_id, node in workflow.items()
+        if isinstance(node, dict) and str(node.get("class_type", "")) in _VIRTUAL_WIRE_CLASSES
+    }
+    if not virtual_ids:
+        return {"workflow": workflow, "expanded": 0}
+
+    ui_by_id: dict[str, Any] = {}
+    try:
+        ui_nodes = graph_json.get("nodes") if isinstance(graph_json, dict) else None
+        if isinstance(ui_nodes, list):
+            for entry in ui_nodes:
+                if isinstance(entry, dict) and entry.get("id") is not None:
+                    ui_by_id[str(entry.get("id"))] = entry
+    except Exception:
+        ui_by_id = {}
+    names: dict[str, str] = {}
+    for node_id in virtual_ids:
+        name = _wire_name_of_ui_node(ui_by_id.get(node_id))
+        if name is None:
+            return {
+                "error": (
+                    f"frontend-only node {node_id} cannot be expanded without "
+                    "its UI graph pipe name"
+                )
+            }
+        names[node_id] = name
+
+    sets: dict[str, tuple[str, tuple[str, int] | None]] = {}
+    gets: dict[str, str] = {}
+    for node_id in virtual_ids:
+        node = workflow.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("class_type", "")) == "SetNode":
+            sources = [
+                _link_value(v)
+                for v in (node.get("inputs") or {}).values()
+                if _link_value(v) is not None
+            ]
+            if len(sources) > 1:
+                return {"error": f"SetNode {node_id} has multiple linked inputs"}
+            sets[node_id] = (names[node_id], sources[0] if sources else None)
+        else:
+            gets[node_id] = names[node_id]
+
+    sets_by_name: dict[str, list[str]] = {}
+    for node_id, (name, _source) in sets.items():
+        sets_by_name.setdefault(name, []).append(node_id)
+    replacements: dict[str, tuple[str, int]] = {}
+    for node_id, name in gets.items():
+        candidates = sets_by_name.get(name) or []
+        if not candidates:
+            return {"error": f"GetNode {node_id} ({name!r}) has no matching SetNode"}
+        if len(candidates) > 1:
+            return {
+                "error": (
+                    f"GetNode {node_id} ({name!r}) matches multiple SetNodes: "
+                    + ", ".join(sorted(candidates))
+                )
+            }
+        source = sets[candidates[0]][1]
+        if source is None:
+            return {
+                "error": (
+                    f"GetNode {node_id} ({name!r}) matches SetNode "
+                    f"{candidates[0]} with no linked source"
+                )
+            }
+        replacements[node_id] = source
+    for node_id, (_name, source) in sets.items():
+        # A SetNode output passes its source through; rewire direct
+        # consumers of the Set the same way. Sourceless Sets with no Gets
+        # are simply dropped below.
+        if source is not None and node_id not in replacements:
+            replacements[node_id] = source
+
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict) or str(node_id) in virtual_ids:
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict):
+            node["inputs"] = _rewrite_wire_refs(inputs, replacements)
+    for node_id in virtual_ids:
+        workflow.pop(str(node_id), None)
+    return {"workflow": workflow, "expanded": len(virtual_ids)}
+
+
 def _normalize_model_name(value: Any) -> Any:
     """Flatten a model-library path to the name exposed by the model volume."""
     if not isinstance(value, str):
@@ -176,6 +678,7 @@ def resolve_workflow_run_bundle(
     *,
     remote_model_readiness: bool = False,
     reference_request: dict[str, Any] | None = None,
+    skip_custom_node_gate: bool = False,
 ) -> dict[str, Any]:
     """Resolve and gate a workflow run: workflow + version + mapping.
 
@@ -195,6 +698,11 @@ def resolve_workflow_run_bundle(
       target, the bundle still resolves so the request can proceed to its
       executing target (which is gated runnable on its own). Anything else
       stays rejected.
+    * ``skip_custom_node_gate`` (temporary escape hatch): custom-node
+      dependency reasons are tolerated instead of blocking; the skipped
+      reasons are recorded on ``state["skipped_reasons"]`` with
+      ``state["custom_node_gate_skipped"] = True``. Model reasons always
+      stay fail-closed.
 
     There is no preset: control defaults are read from the version's own
     ``executable_prompt`` (see ``default_controls_from_version``).
@@ -225,20 +733,60 @@ def resolve_workflow_run_bundle(
         }
 
     state = service.derive_version_state(version_id).to_dict()
-    if remote_model_readiness and not state.get("runnable"):
+    if remote_model_readiness:
         # Golden resolves models in the deployed Modal volume. Host-local model
         # absence must not block a remote workflow before dispatch; all other
-        # workflow/dependency/mapping reasons remain fail-closed.
+        # workflow/dependency/mapping reasons remain fail-closed. But a KNOWN
+        # remote absence must block: otherwise a workspace switch to a volume
+        # missing models still reports "Ready to run" and fails opaquely later.
+        # Unknown remote inventory (None / malformed) fails open like before.
         reasons = [
             reason for reason in (state.get("reasons") or [])
             if not str(reason).startswith("missing model ")
         ]
+        try:
+            from dependency_resolver import DependencyResolver as _RemoteGateResolver
+            import remote_inventory as _remote_inventory_mod
+
+            _snapshot = _remote_inventory_mod.current()
+            _remote_missing: list[str] = []
+            if isinstance(_snapshot, dict):
+                try:
+                    _gate_resolver = _RemoteGateResolver(
+                        str(node_dir), os.path.dirname(os.path.dirname(str(node_dir)))
+                    )
+                    _remote_missing = _gate_resolver.remote_missing_reasons(
+                        version, _snapshot
+                    )
+                except Exception:
+                    _remote_missing = []
+            reasons = list(reasons) + list(_remote_missing or [])
+        except Exception:
+            pass
         state = {
             **state,
             "reasons": reasons,
             "runnable": not reasons,
             "status": "ready" if not reasons else "incomplete",
         }
+    if skip_custom_node_gate and not state.get("runnable"):
+        # Temporary escape hatch: tolerate pack-dependency reasons (same
+        # opt-out as plan-validation skipping). Model/mapping reasons stay
+        # fail-closed; skipped reasons are recorded, never dropped silently.
+        kept, skipped = _strip_custom_node_reasons(state.get("reasons") or [])
+        state = {
+            **state,
+            "reasons": kept,
+            "skipped_reasons": skipped,
+            "custom_node_gate_skipped": True,
+            "runnable": not kept,
+            "status": "ready" if not kept else "incomplete",
+        }
+        if skipped:
+            _log.warning(
+                "Studio custom-node gate SKIPPED for version %s: %s",
+                version_id, "; ".join(skipped),
+            )
     if not state.get("runnable"):
         if (
             isinstance(reference_request, dict)
@@ -542,6 +1090,29 @@ def _is_image_control(role: str, entry: dict[str, Any]) -> bool:
     return isinstance(entry, dict) and entry.get("control_kind") == "image"
 
 
+_MODEL_FILE_ROLES = frozenset({
+    "model_unet", "model", "unet", "clip", "vae",
+    "model_clip", "model_vae",
+})
+
+
+def _is_model_file_control(role: str, entry: dict[str, Any]) -> bool:
+    """True for model-loader file inputs.
+
+    Model loader entries carry a stale captured ``enum_options`` snapshot
+    (local files at capture time), so membership must not gate a swap to
+    another installed library model — the same staleness rationale as
+    :func:`_is_image_control`. Required/non-empty checks still apply.
+    """
+    if role in _MODEL_FILE_ROLES:
+        return True
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("control_kind") in ("file", "model"):
+        return True
+    return str(entry.get("input_name") or "") in _MODEL_LOADER_FIELDS
+
+
 def validate_workflow_controls(
     controls: dict[str, Any],
     control_schema: dict[str, Any],
@@ -569,7 +1140,11 @@ def validate_workflow_controls(
             continue
 
         enum_options = entry.get("enum_options") or []
-        if enum_options and not _is_image_control(schema_key or key, entry):
+        if (
+            enum_options
+            and not _is_image_control(schema_key or key, entry)
+            and not _is_model_file_control(schema_key or key, entry)
+        ):
             if value not in enum_options:
                 errors.append({
                     "field": key,
@@ -1443,6 +2018,20 @@ def build_workflow_execution_plan(
             return None, prepared["error"]
         workflow = prepared["workflow"]
         text_generate_meta = prepared.get("studio_meta") or {}
+        # Expand frontend-only Set/Get wireless links into direct links
+        # (same as the canvas Queue path). No backend implements these
+        # classes, so an unexpanded prompt can never validate or execute;
+        # unexpandable graphs fail here with a clear reason instead of a
+        # cryptic missing-node error (locally or remotely).
+        _expanded = expand_frontend_set_get_nodes(workflow, graph_json)
+        if "error" in _expanded:
+            return None, _expanded["error"]
+        workflow = _expanded["workflow"]
+        if _expanded.get("expanded"):
+            _log.info(
+                "Studio expanded %d frontend Set/Get node(s)",
+                _expanded["expanded"],
+            )
         # Phase 3: optional explicit conditioning insertion for generic
         # Inpaint. Runs on the already-copied prepared workflow, so the stored
         # version is untouched; downstream validation/hashing then cover the
@@ -1466,6 +2055,33 @@ def build_workflow_execution_plan(
         _repair_missing_clip_inputs(workflow)
         _repair_missing_vae_inputs(workflow)
         _normalize_model_loader_names(workflow)
+        # Explicit per-run bypass list (temporary triage for nodes whose
+        # backend is broken in the image). Runs before hashing so the plan
+        # hash covers the dispatched graph; fail-closed on misuse.
+        _bypassed_ids: list[str] = []
+        _bypass_ids = _bypass_ids_from_options(modal_options)
+        if _bypass_ids:
+            _bypassed = bypass_nodes_by_id(workflow, _bypass_ids)
+            if "error" in _bypassed:
+                return None, _bypassed["error"]
+            workflow = _bypassed["workflow"]
+            _bypassed_ids = list(_bypassed["bypassed"])
+            _log.warning(
+                "Studio bypassed node(s) per request: %s",
+                _bypassed_ids,
+            )
+        # Broadcast Anything Everywhere links (same as the canvas Queue
+        # path). Fills unconnected matching inputs from the controller's
+        # linked sources; never clobbers stored values.
+        _broadcast = apply_anything_everywhere_broadcast(workflow, graph_json)
+        if "error" in _broadcast:
+            return None, _broadcast["error"]
+        workflow = _broadcast["workflow"]
+        if _broadcast.get("broadcast"):
+            _log.info(
+                "Studio broadcast %d Anything Everywhere link(s)",
+                _broadcast["broadcast"],
+            )
 
         # ── Prompt bundle (custom, mirrors _default_build_execution_plan) ──
         # The modern role for the positive prompt is ``positive_prompt``; map
@@ -1527,6 +2143,8 @@ def build_workflow_execution_plan(
                 studio_meta["role_bindings"] = _role_bindings
             if dropdown_repairs:
                 studio_meta["repaired_empty_dropdowns"] = dropdown_repairs
+            if _bypassed_ids:
+                studio_meta["bypassed_node_ids"] = list(_bypassed_ids)
         except Exception:
             pass
 
@@ -1556,6 +2174,12 @@ def build_workflow_execution_plan(
         )
 
         production_options = normalize_production_options(effective_modal_options)
+        # Temporary escape hatch: skip host plan validation when opted out.
+        # Default stays fail-closed.
+        _skip_plan_validation = _skip_plan_validation_requested(effective_modal_options)
+        if _skip_plan_validation:
+            _log.warning("Studio plan validation SKIPPED via skip_plan_validation opt-out")
+            studio_meta["plan_validation_skipped"] = True
         if production_options.get("enabled"):
             from canonical_execution import build_execution_plan as canonical_build_plan
 
@@ -1574,7 +2198,7 @@ def build_workflow_execution_plan(
                 # E7: freeze the plan-carried validation proof so the saved
                 # snapshot stays replay-capable for Generate Original (E3B2
                 # fail-closed replay validation requires a non-empty proof).
-                collect_validation_proof=True,
+                collect_validation_proof=not _skip_plan_validation,
             )
             # Rebuild overriding prompt_bundle (intentional — the modern
             # bundle) and overlaying the modern studio metadata onto the
@@ -4388,7 +5012,11 @@ async def handle_workflow_run_async(
         if _refs_error:
             return {"status": "error", "message": _refs_error}
         bundle = resolve_workflow_run_bundle(
-            workflow_id, version_id, node_dir, reference_request=_refs,
+            workflow_id,
+            version_id,
+            node_dir,
+            reference_request=_refs,
+            skip_custom_node_gate=_skip_gate_active(modal_options, node_dir),
         )
         if bundle.get("status") != "ok":
             return bundle

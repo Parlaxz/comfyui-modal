@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import hashlib
 import inspect
 import importlib.util
 import json
@@ -95,6 +96,251 @@ GOLDEN_SOURCE_EXPERIMENT_ENV = "COMFYMODAL_GOLDEN_SOURCE_EXPERIMENT"
 FULL_RUN_METHOD = "run_plan_stream"
 PROTECTED_GOLDEN_APP = "stable-modal-comfy-v2-golden-p1"
 _MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+# ── Canonical Ideogram workflow selection + exact placement ───────────────
+# Single canonical block for the isolated Ideogram4 H100 experiment. The
+# profile (config/v2/profiles/ideogram4_h100_20261015.toml) carries the
+# request-scoped workflow flags; this block is the only place that interprets
+# them. Revert = delete the profile + the three COMFYMODAL_V2_WORKFLOW_*
+# registry flags + this block and its call sites.
+IDEOGRAM4_H100_PROFILE = "ideogram4_h100_20261015"
+IDEOGRAM4_H100_APP = "ideogram4-h100-profile-20261015"
+IDEOGRAM4_WORKFLOW_ID = "wf_81513286bb304e9f"
+IDEOGRAM4_WORKFLOW_VERSION_ID = "wv_f3baf54d8f784b64"
+IDEOGRAM4_WORKFLOW_NAME = "Ideogram 4 Comfy UI Default"
+# Stored graph "Default" preset steps (.studio_workflows.json, node 98
+# "Default" preset, internal 98:147/149/151). The graph is never rewritten:
+# steps default to this unless the caller passes an explicit override.
+IDEOGRAM4_GRAPH_DEFAULT_STEPS = 20
+# Hard invariant for real dispatch on this profile (dry-run may show either).
+IDEOGRAM4_REQUIRED_STEPS = 16
+IDEOGRAM4_EXPECTED_GPU = "h100!"
+IDEOGRAM4_WORKFLOW_ID_FLAG = "COMFYMODAL_V2_WORKFLOW_ID"
+IDEOGRAM4_WORKFLOW_VERSION_FLAG = "COMFYMODAL_V2_WORKFLOW_VERSION_ID"
+IDEOGRAM4_WORKFLOW_STEPS_FLAG = "COMFYMODAL_V2_WORKFLOW_STEPS"
+# Pinned stored-graph invariants (recorded, never modified by v2ctl):
+# sampler euler, scheduler Ideogram4Scheduler, CFG 7 + CFGOverride 3 @
+# 70-100%, DualModelGuider, 1024x1024, seed 71584314815009, models
+# ideogram4_int8_convrot + ideogram4_unconditional_int8_convrot.
+IDEOGRAM4_GRAPH_INVARIANTS = {
+    "sampler": "euler",
+    "scheduler": "Ideogram4Scheduler",
+    "cfg": 7,
+    "cfg_override": 3,
+    "cfg_override_range": "70-100%",
+    "guider": "DualModelGuider",
+    "width": 1024,
+    "height": 1024,
+    "seed": 71584314815009,
+    "unet": "ideogram4_int8_convrot.safetensors",
+    "unconditional_unet": "ideogram4_unconditional_int8_convrot.safetensors",
+}
+# Request-scoped carriers projected into the backend child environment when a
+# workflow selection is active. The three selection flags already flow via
+# the resolved profile; these derived values bind the exact resolved request.
+IDEOGRAM4_BACKEND_ENV_NAMES = (
+    "COMFYMODAL_V2_WORKFLOW_EFFECTIVE_STEPS",
+    "COMFYMODAL_V2_WORKFLOW_HASH",
+    "COMFYMODAL_V2_WORKFLOW_PROMPT_SHA256",
+    "COMFYMODAL_V2_WORKFLOW_COMPILED_HASH",
+)
+
+
+def _ideogram4_flag_value(config: config_mod.ResolvedConfig, name: str) -> str:
+    flag = config.flag(name)
+    return str(getattr(flag, "value", "") or "").strip() if flag is not None else ""
+
+
+def _ideogram4_stored_graph(repo_root: Path, workflow_id: str, workflow_version_id: str) -> dict:
+    """Load the stored Studio graph entry and prove its id/version binding.
+
+    Local-only: reads the repo-static ``.studio_workflows.json`` (utf-8),
+    never Studio runtime infra. Fail closed when the entry or version is
+    absent so a renamed/missing workflow can never silently substitute.
+    """
+    path = Path(repo_root) / ".studio_workflows.json"
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GateError(f"cannot prove workflow selection: {path} is unreadable ({exc})")
+    entries = stored if isinstance(stored, list) else []
+    entry = next(
+        (item for item in entries
+         if isinstance(item, dict) and str(item.get("workflow_id") or "") == workflow_id),
+        None,
+    )
+    if entry is None:
+        raise GateError(
+            f"workflow {workflow_id!r} is not in {path}; "
+            "refusing to fall back to another workflow"
+        )
+    latest = str(entry.get("latest_version_id") or "")
+    if latest != workflow_version_id:
+        raise GateError(
+            f"workflow {workflow_id!r} stored version {latest!r} != "
+            f"requested {workflow_version_id!r}; refusing to fall back"
+        )
+    graph = entry.get("static_graph")
+    if not isinstance(graph, dict) or not graph.get("nodes"):
+        raise GateError(f"workflow {workflow_id!r} stored graph is missing/empty")
+    prompt_text = ""
+    for node in graph.get("nodes", []):
+        if not isinstance(node, dict) or str(node.get("id")) != "98":
+            continue
+        named = node.get("widgets_values_named")
+        if isinstance(named, dict) and str(named.get("text") or "").strip():
+            prompt_text = str(named.get("text"))
+            break
+        values = node.get("widgets_values")
+        if isinstance(values, list) and values and str(values[0] or "").strip():
+            prompt_text = str(values[0])
+            break
+    if not prompt_text.strip():
+        raise GateError(f"workflow {workflow_id!r} stored prompt text is missing")
+    return {"entry": entry, "static_graph": graph, "prompt_text": prompt_text}
+
+
+def _resolve_workflow_selection(
+    repo_root: Path, config: config_mod.ResolvedConfig,
+) -> dict:
+    """Resolve the canonical workflow selection for this invocation.
+
+    Inactive (``{"active": False}``) unless the isolated Ideogram profile is
+    selected or a workflow flag is explicitly set: every other profile keeps
+    byte-identical behavior. When active, id/version mismatches and missing
+    stored-graph proof raise :class:`GateError` — never a silent fallback.
+    """
+    profile = str(getattr(config, "profile_name", "") or "")
+    workflow_id = _ideogram4_flag_value(config, IDEOGRAM4_WORKFLOW_ID_FLAG)
+    workflow_version_id = _ideogram4_flag_value(config, IDEOGRAM4_WORKFLOW_VERSION_FLAG)
+    steps_raw = _ideogram4_flag_value(config, IDEOGRAM4_WORKFLOW_STEPS_FLAG)
+    is_profile = profile == IDEOGRAM4_H100_PROFILE
+    # The steps flag default "0" means "graph default" (unset): only a
+    # positive value counts as an explicit workflow input.
+    steps_unset = (not steps_raw) or steps_raw == "0"
+    if not is_profile and not workflow_id and not workflow_version_id and steps_unset:
+        return {"active": False}
+    if workflow_id != IDEOGRAM4_WORKFLOW_ID:
+        raise GateError(
+            f"workflow selection {workflow_id!r} != canonical {IDEOGRAM4_WORKFLOW_ID!r}; "
+            "refusing to fall back to another workflow"
+        )
+    if workflow_version_id != IDEOGRAM4_WORKFLOW_VERSION_ID:
+        raise GateError(
+            f"workflow selection {workflow_version_id!r} != canonical "
+            f"{IDEOGRAM4_WORKFLOW_VERSION_ID!r}; refusing to fall back"
+        )
+    if is_profile:
+        # Exact placement: this profile exists for one GPU with no pool.
+        gpu = str(getattr(config.resources, "gpu", "") or "")
+        alt = str(getattr(config.resources, "gpu_alt", "") or "").strip()
+        fallbacks = list(getattr(config.resources, "gpu_fallbacks", ()) or ())
+        if gpu != IDEOGRAM4_EXPECTED_GPU or alt or fallbacks:
+            raise GateError(
+                f"ideogram profile placement must be exactly gpu={IDEOGRAM4_EXPECTED_GPU!r} "
+                f"with no alt/fallback pool; got gpu={gpu!r} alt={alt!r} fallbacks={fallbacks!r}"
+            )
+        cloud = _ideogram4_flag_value(config, "COMFYMODAL_V2_CLOUD")
+        region = _ideogram4_flag_value(config, "COMFYMODAL_V2_REGION")
+        if cloud:
+            raise GateError(
+                "ideogram profile must not pin COMFYMODAL_V2_CLOUD "
+                f"(cloud pinning unsupported); got cloud={cloud!r}"
+            )
+        if region != "us":
+            raise GateError(
+                "ideogram profile requires COMFYMODAL_V2_REGION='us'; "
+                f"got region={region!r}"
+            )
+    try:
+        requested = int(steps_raw) if steps_raw else 0
+    except ValueError:
+        raise GateError(f"{IDEOGRAM4_WORKFLOW_STEPS_FLAG}={steps_raw!r} is not an integer")
+    if requested < 0:
+        raise GateError(f"{IDEOGRAM4_WORKFLOW_STEPS_FLAG} must be >= 0 (0 = graph default)")
+    effective = requested if requested > 0 else IDEOGRAM4_GRAPH_DEFAULT_STEPS
+    source = "explicit" if requested > 0 else "graph_default"
+    stored = _ideogram4_stored_graph(repo_root, workflow_id, workflow_version_id)
+    workflow_hash = hashlib.sha256(
+        fp_mod.FingerprintEngine.canonical_json(stored["static_graph"]).encode("utf-8")
+    ).hexdigest()
+    prompt_sha256 = hashlib.sha256(stored["prompt_text"].encode("utf-8")).hexdigest()
+    compiled_workflow_hash = hashlib.sha256(
+        fp_mod.FingerprintEngine.canonical_json({
+            "workflow_id": workflow_id,
+            "workflow_version_id": workflow_version_id,
+            "workflow_hash": workflow_hash,
+            "prompt_sha256": prompt_sha256,
+            "steps_effective": effective,
+            "steps_source": source,
+        }).encode("utf-8")
+    ).hexdigest()
+    return {
+        "active": True,
+        "profile": profile,
+        "workflow_id": workflow_id,
+        "workflow_version_id": workflow_version_id,
+        "workflow_name": IDEOGRAM4_WORKFLOW_NAME,
+        "workflow_hash": workflow_hash,
+        "prompt_sha256": prompt_sha256,
+        "compiled_workflow_hash": compiled_workflow_hash,
+        "steps": {
+            "graph_default": IDEOGRAM4_GRAPH_DEFAULT_STEPS,
+            "requested": requested,
+            "effective": effective,
+            "source": source,
+        },
+        "placement": {
+            "app": str(getattr(config.target, "app", "") or ""),
+            "class": str(getattr(config.target, "class_name", "") or ""),
+            "method": str(getattr(config.target, "method", "") or ""),
+            "gpu": str(getattr(config.resources, "gpu", "") or ""),
+            "gpu_alt": str(getattr(config.resources, "gpu_alt", "") or ""),
+            "gpu_fallbacks": [
+                str(item) for item in (getattr(config.resources, "gpu_fallbacks", ()) or ())
+            ],
+            "cloud": _ideogram4_flag_value(config, "COMFYMODAL_V2_CLOUD"),
+            "region": _ideogram4_flag_value(config, "COMFYMODAL_V2_REGION"),
+        },
+        "invariants": dict(IDEOGRAM4_GRAPH_INVARIANTS),
+    }
+
+
+def _validate_workflow_selection(selection: dict) -> None:
+    """Fail closed on any workflow-selection proof gap (hashes, ids, steps)."""
+    failures = val_mod.ideogram4_workflow_failures(
+        selection,
+        expected_workflow_id=IDEOGRAM4_WORKFLOW_ID,
+        expected_workflow_version_id=IDEOGRAM4_WORKFLOW_VERSION_ID,
+    )
+    if failures:
+        raise GateError("workflow selection invalid:\n  " + "\n  ".join(failures))
+
+
+def _require_ideogram4_dispatch_steps(selection: dict, *, command: str) -> None:
+    """Enforce the 16-step hard invariant for real dispatch on this profile."""
+    if str(selection.get("profile") or "") != IDEOGRAM4_H100_PROFILE:
+        return
+    effective = int(selection.get("steps", {}).get("effective", 0))
+    if effective != IDEOGRAM4_REQUIRED_STEPS:
+        raise GateError(
+            f"{command} refuses ideogram profile dispatch with effective steps "
+            f"{effective} (hard invariant is {IDEOGRAM4_REQUIRED_STEPS}; pass "
+            f"--steps {IDEOGRAM4_REQUIRED_STEPS} explicitly)"
+        )
+
+
+def _workflow_backend_env(selection: dict) -> dict[str, str]:
+    """Derived request binding for the backend child environment (active only)."""
+    if not isinstance(selection, dict) or not selection.get("active"):
+        return {}
+    steps = selection.get("steps", {}) if isinstance(selection.get("steps"), dict) else {}
+    return {
+        "COMFYMODAL_V2_WORKFLOW_EFFECTIVE_STEPS": str(steps.get("effective", "")),
+        "COMFYMODAL_V2_WORKFLOW_HASH": str(selection.get("workflow_hash") or ""),
+        "COMFYMODAL_V2_WORKFLOW_PROMPT_SHA256": str(selection.get("prompt_sha256") or ""),
+        "COMFYMODAL_V2_WORKFLOW_COMPILED_HASH": str(selection.get("compiled_workflow_hash") or ""),
+    }
 
 
 def is_golden_profile_name(profile: object) -> bool:
@@ -334,7 +580,7 @@ def _identity_env(config: config_mod.ResolvedConfig) -> dict[str, str]:
     sections, never by ``--set``/``--inherit``.  v2ctl itself sets them on
     the child environment of deploy-capable commands.
     """
-    return {
+    env = {
         "COMFYMODAL_V2_APP_NAME": config.target.app,
         "COMFYMODAL_V2_CLASS_NAME": config.target.class_name,
         "COMFYMODAL_V2_GPU": config.resources.gpu,
@@ -343,6 +589,16 @@ def _identity_env(config: config_mod.ResolvedConfig) -> dict[str, str]:
         "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST": str(config.resources.memory_mb),
         "COMFYMODAL_V2_BASELINE_CPU_REQUEST": str(config.resources.cpu),
     }
+    # Dual GPU orders: order A = [GPU] + fallbacks (ModalRuntimeSpec default),
+    # order B = [GPU_ALT] + fallbacks (alt class).  Absent/empty means the
+    # deploy binds a single function, exactly as before.
+    fallbacks = list(getattr(config.resources, "gpu_fallbacks", ()) or ())
+    if fallbacks:
+        env["COMFYMODAL_V2_GPU_FALLBACKS"] = ",".join(str(item) for item in fallbacks)
+    alt = str(getattr(config.resources, "gpu_alt", "") or "").strip()
+    if alt:
+        env["COMFYMODAL_V2_GPU_ALT"] = alt
+    return env
 
 
 def _identity_env_for_command(command: str, config: config_mod.ResolvedConfig) -> dict[str, str]:
@@ -371,9 +627,13 @@ def compute_deploy_id(config: config_mod.ResolvedConfig) -> str:
     """
     resources: dict[str, object] = {}
     resolved = getattr(config, "resources", None)
-    for field in ("gpu", "cpu", "memory_mb", "timeout_s"):
+    for field in ("gpu", "gpu_alt", "gpu_fallbacks", "cpu", "memory_mb", "timeout_s"):
         value = getattr(resolved, field, None)
         if value is not None:
+            if field == "gpu_fallbacks" and not value:
+                continue
+            if field == "gpu_alt" and not str(value or "").strip():
+                continue
             resources[field] = value
     deploy_flags = getattr(config, "deploy_flags", None)
     resolved_config: dict[str, object] = {}
@@ -447,9 +707,29 @@ def _build_components_for_args(repo_root: Path, args):
         repo_root,
         args.profile,
         cli_options=_cli_target_options(args),
-        sets=getattr(args, "set", []),
+        sets=list(getattr(args, "set", [])) + _workflow_sets_from_args(args),
         inherits=getattr(args, "inherit", []),
     )
+
+
+def _workflow_sets_from_args(args) -> list[str]:
+    """Desugar canonical workflow globals into the explicit --set channel.
+
+    ``--workflow-id``/``--workflow-version-id``/``--steps`` carry
+    ``source=set`` provenance and flow through registered-flag validation, so
+    no dotted ``cli_options`` (and no ``config.py`` change) is required.
+    """
+    sets: list[str] = []
+    workflow_id = getattr(args, "workflow_id", None)
+    if workflow_id:
+        sets.append(f"{IDEOGRAM4_WORKFLOW_ID_FLAG}={workflow_id}")
+    workflow_version_id = getattr(args, "workflow_version_id", None)
+    if workflow_version_id:
+        sets.append(f"{IDEOGRAM4_WORKFLOW_VERSION_FLAG}={workflow_version_id}")
+    steps = getattr(args, "steps", None)
+    if steps is not None:
+        sets.append(f"{IDEOGRAM4_WORKFLOW_STEPS_FLAG}={steps}")
+    return sets
 
 
 def _normalize_app_name(value: object) -> str:
@@ -1665,6 +1945,7 @@ def _receipt_effective_env(
     if isinstance(resources, dict):
         for env_name, resource_name in (
             ("COMFYMODAL_V2_GPU", "gpu"),
+            ("COMFYMODAL_V2_GPU_ALT", "gpu_alt"),
             ("COMFYMODAL_V2_CPU_REQUEST", "cpu"),
             ("COMFYMODAL_V2_MEMORY_MB", "memory_mb"),
             ("COMFYMODAL_V2_BASELINE_CPU_REQUEST", "cpu"),
@@ -1672,6 +1953,11 @@ def _receipt_effective_env(
         ):
             if resource_name in resources:
                 bound[env_name] = str(resources[resource_name])
+        fallbacks = resources.get("gpu_fallbacks", [])
+        if fallbacks:
+            bound["COMFYMODAL_V2_GPU_FALLBACKS"] = ",".join(
+                str(item) for item in fallbacks
+            )
     if receipt.profile_config_fingerprint:
         bound["COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"] = receipt.profile_config_fingerprint
     return bound
@@ -1935,7 +2221,8 @@ def _write_golden_deployment_receipt(
         name: str(env[name])
         for name in (
             "COMFYMODAL_V2_APP_NAME", "COMFYMODAL_V2_CLASS_NAME",
-            "COMFYMODAL_V2_GPU", "COMFYMODAL_V2_MEMORY_MB",
+            "COMFYMODAL_V2_GPU", "COMFYMODAL_V2_GPU_ALT",
+            "COMFYMODAL_V2_GPU_FALLBACKS", "COMFYMODAL_V2_MEMORY_MB",
             "COMFYMODAL_V2_CPU_REQUEST", "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST",
             "COMFYMODAL_V2_BASELINE_CPU_REQUEST", "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS",
         )
@@ -1983,6 +2270,11 @@ def _write_golden_deployment_receipt(
             "modal_environment": deploy_identity.environment,
             "resources": {
                 "gpu": str(config.resources.gpu),
+                "gpu_alt": str(getattr(config.resources, "gpu_alt", "") or ""),
+                "gpu_fallbacks": [
+                    str(item)
+                    for item in (getattr(config.resources, "gpu_fallbacks", ()) or ())
+                ],
                 "cpu": int(config.resources.cpu),
                 "memory_mb": int(config.resources.memory_mb),
             },
@@ -1998,6 +2290,11 @@ def _write_golden_deployment_receipt(
             },
             "resources": {
                 "gpu": str(config.resources.gpu),
+                "gpu_alt": str(getattr(config.resources, "gpu_alt", "") or ""),
+                "gpu_fallbacks": [
+                    str(item)
+                    for item in (getattr(config.resources, "gpu_fallbacks", ()) or ())
+                ],
                 "cpu": int(config.resources.cpu),
                 "memory_mb": int(config.resources.memory_mb),
             },
@@ -2178,7 +2475,8 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
                        env: dict[str, str],
                        result: backend_mod.BackendResult,
                        provenance: prov_mod.Provenance | None,
-                       deployment_receipt: receipt_mod.DeploymentReceipt | None = None) -> Path:
+                       deployment_receipt: receipt_mod.DeploymentReceipt | None = None,
+                       workflow_selection: dict | None = None) -> Path:
     d = _run_manifest_dir(repo_root)
     d.mkdir(parents=True, exist_ok=True)
     run_fp = val_mod._bound_run_fingerprint(fingerprints, deployment_receipt)
@@ -2246,6 +2544,12 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
             "gap_seconds": config.workload.gap_seconds,
             "nonce": config.workload.nonce,
         },
+        # Canonical workflow selection binding ({"active": False} when no
+        # workflow is selected): ids, hashes, steps provenance, placement.
+        "workflow_selection": (
+            dict(workflow_selection)
+            if isinstance(workflow_selection, dict) else {"active": False}
+        ),
         "effective_environment": _redact_env(env),
         "backend": {
             "command": result.command,
@@ -3198,7 +3502,40 @@ def _require_no_deploy_in_flight(repo_root: Path) -> None:
 
 
 def _dry_run_report(config: config_mod.ResolvedConfig, fingerprints: fp_mod.FingerprintEngine,
-                    env: dict[str, str], command: str) -> None:
+                    env: dict[str, str], command: str,
+                    selection: dict | None = None, as_json: bool = False) -> None:
+    workflow = selection if isinstance(selection, dict) and selection.get("active") else None
+    if as_json:
+        out = {
+            "profile": config.profile_name,
+            "owner": config.owner,
+            "target": {
+                "app": config.target.app,
+                "class": config.target.class_name,
+                "method": config.target.method,
+            },
+            "resources": {
+                "gpu": config.resources.gpu,
+                "gpu_alt": str(getattr(config.resources, "gpu_alt", "") or ""),
+                "gpu_fallbacks": [
+                    str(item) for item in (getattr(config.resources, "gpu_fallbacks", ()) or ())
+                ],
+                "cpu": config.resources.cpu,
+                "memory_mb": config.resources.memory_mb,
+            },
+            "placement": {
+                "cloud": _ideogram4_flag_value(config, "COMFYMODAL_V2_CLOUD"),
+                "region": _ideogram4_flag_value(config, "COMFYMODAL_V2_REGION"),
+            },
+            "deploy_fingerprint": fingerprints.deploy_fingerprint(),
+            "run_fingerprint": fingerprints.run_fingerprint(),
+            "profile_config_fingerprint": fingerprints.profile_config_fingerprint(),
+            "selector": _backend_selector(config) or "(none)",
+            "command": command,
+            "workflow_selection": workflow or {"active": False},
+        }
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
     print("[v2ctl.dry-run] no invocation performed; effective configuration:")
     print(f"profile={config.profile_name} owner={config.owner}")
     print(
@@ -3209,6 +3546,27 @@ def _dry_run_report(config: config_mod.ResolvedConfig, fingerprints: fp_mod.Fing
     print(f"run_fingerprint={fingerprints.run_fingerprint()}")
     print(f"selector={_backend_selector(config) or '(none)'}")
     print(f"command={command}")
+    if workflow is not None:
+        steps = workflow.get("steps", {})
+        placement = workflow.get("placement", {})
+        print(
+            f"workflow_id={workflow.get('workflow_id')} "
+            f"workflow_version_id={workflow.get('workflow_version_id')} "
+            f"workflow_hash={workflow.get('workflow_hash')}"
+        )
+        print(
+            f"prompt_sha256={workflow.get('prompt_sha256')} "
+            f"compiled_workflow_hash={workflow.get('compiled_workflow_hash')}"
+        )
+        print(
+            f"steps graph_default={steps.get('graph_default')} "
+            f"requested={steps.get('requested')} effective={steps.get('effective')} "
+            f"source={steps.get('source')}"
+        )
+        print(
+            f"placement app={placement.get('app')} gpu={placement.get('gpu')} "
+            f"cloud={placement.get('cloud')} region={placement.get('region')}"
+        )
     print("[v2ctl.dry-run] child environment (redacted):")
     redacted = env_mod.EnvironmentBuilder().display(env)
     for k in sorted(redacted):
@@ -3814,8 +4172,12 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
         _print_destination_preflight(workspace_binding, deploying=True)
         invocation_id = _new_invocation_id()
         spec = backend_registry.canonical()
+        workflow_selection = _resolve_workflow_selection(repo_root, config)
+        if workflow_selection.get("active"):
+            _validate_workflow_selection(workflow_selection)
         env = env_builder.build(config, host_env=os.environ,
                                 backend_extra={**_identity_env_for_command("deploy-run", config),
+                                               **_workflow_backend_env(workflow_selection),
                                                **_canonical_metadata_env(config, fingerprints, invocation_id)})
         # Forward the canonical selector as the BAT's first positional arg
         # (see cmd_deploy).
@@ -3824,7 +4186,8 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
         command = backend_mod.BackendRunner.build_command_line(
             spec, extra_args)
         if args.dry_run:
-            _dry_run_report(config, fingerprints, env, command)
+            _dry_run_report(config, fingerprints, env, command,
+                            selection=workflow_selection, as_json=bool(getattr(args, "json", False)))
             return 0
         enforce_runtime_overrides(config,
                                   ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state"),
@@ -3944,6 +4307,14 @@ def cmd_run(args, repo_root: Path) -> int:
         # ── Full-run guard: run must generate (run_plan_stream), never the
         # snapshot-restore-only PROBE. ──
         _require_full_run_mode(config, command="v2ctl run")
+        # ── Canonical workflow selection: resolve + fail closed before any
+        # dispatch. Real dispatch on the isolated Ideogram profile additionally
+        # enforces the 16-step hard invariant (dry-run may show either). ──
+        workflow_selection = _resolve_workflow_selection(repo_root, config)
+        if workflow_selection.get("active"):
+            _validate_workflow_selection(workflow_selection)
+            if not getattr(args, "dry_run", False):
+                _require_ideogram4_dispatch_steps(workflow_selection, command="v2ctl run")
         # No source-probe precondition here. Which deployment served a request is
         # decided by comparing the expected deploy_id with the one the executing
         # interpreter reports (see StructuralValidator). Requiring a separate
@@ -3967,6 +4338,7 @@ def cmd_run(args, repo_root: Path) -> int:
                                 backend_extra={"V2_BENCHMARK_RUNS": str(run_count),
                                                **_identity_env_for_command("run", config),
                                                **selector_env,
+                                               **_workflow_backend_env(workflow_selection),
                                                **_canonical_metadata_env(config, fingerprints, invocation_id)})
         if workspace_binding is not None:
             _apply_workspace_binding_to_env(env, workspace_binding)
@@ -3990,7 +4362,8 @@ def cmd_run(args, repo_root: Path) -> int:
         # of falling into the snapshot_restore_only probe branch.
         command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
         if args.dry_run:
-            _dry_run_report(config, fingerprints, env, command)
+            _dry_run_report(config, fingerprints, env, command,
+                            selection=workflow_selection, as_json=bool(getattr(args, "json", False)))
             return 0
         print(f"[v2ctl.run] profile={config.profile_name} "
               f"deploy_fingerprint={current} run_fingerprint="
@@ -4052,6 +4425,7 @@ def cmd_run(args, repo_root: Path) -> int:
         run_manifest = write_run_manifest(
             repo_root, config, fingerprints, env, result, provenance,
             deployment_receipt=bound_receipt,
+            workflow_selection=workflow_selection,
         )
         if result.artifacts.run_artifact is not None:
             pass
@@ -4763,6 +5137,10 @@ def _cli_target_options(args) -> dict[str, str]:
         opts["target.app"] = str(args.app).strip().lower()
     if getattr(args, "gpu", None):
         opts["resources.gpu"] = args.gpu
+    if getattr(args, "gpu_alt", None):
+        opts["resources.gpu_alt"] = args.gpu_alt
+    if getattr(args, "gpu_fallbacks", None):
+        opts["resources.gpu_fallbacks"] = args.gpu_fallbacks
     if getattr(args, "memory_mb", None):
         opts["resources.memory_mb"] = str(args.memory_mb)
     if getattr(args, "cpu", None):
@@ -4795,6 +5173,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicit Modal environment (default: registry/default environment)",
     )
     parser.add_argument("--gpu", default=None, help="override resource GPU")
+    parser.add_argument("--gpu-alt", default=None, help="override alt-order GPU (order B primary)")
+    parser.add_argument(
+        "--gpu-fallbacks", default=None,
+        help="override shared GPU fallbacks (comma-separated, up to 3)",
+    )
+    parser.add_argument(
+        "--workflow-id", default=None,
+        help="canonical Studio workflow id (desugars to --set COMFYMODAL_V2_WORKFLOW_ID=...)",
+    )
+    parser.add_argument(
+        "--workflow-version-id", default=None,
+        help="canonical Studio workflow version id (desugars to --set COMFYMODAL_V2_WORKFLOW_VERSION_ID=...)",
+    )
+    parser.add_argument(
+        "--steps", type=int, default=None,
+        help="explicit sampler step override for the selected workflow "
+        "(desugars to --set COMFYMODAL_V2_WORKFLOW_STEPS=...; 0/absent = stored graph default)",
+    )
     parser.add_argument("--memory-mb", type=int, default=None, help="override resource memory")
     parser.add_argument("--cpu", type=int, default=None, help="override resource CPU")
     parser.add_argument("--run-count", type=int, default=None, help="override run count")

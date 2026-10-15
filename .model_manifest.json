@@ -26,6 +26,32 @@
       "url": "https://civitai.red/api/download/models/2985440?fileId=2865386"
     },
     {
+      "added_at": 1792018580.4575958,
+      "filename": "ideogram__qwen3vl_8b_fp8_scaled.safetensors",
+      "folder": "clip",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1792018580.4575958,
+      "url": "https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/text_encoders/qwen3vl_8b_fp8_scaled.safetensors"
+    },
+    {
+      "added_at": 1792032635.6443923,
+      "filename": "qwen3vl_8b_fp8_scaled.safetensors",
+      "folder": "clip",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1792032635.6443923,
+      "url": "https://huggingface.co/Comfy-Org/Qwen3-VL/resolve/main/text_encoders/qwen3vl_8b_fp8_scaled.safetensors"
+    },
+    {
       "added_at": 1791696881.5110219,
       "filename": "qwen3vl_8b_int8_convrot.safetensors",
       "folder": "clip",
@@ -49,6 +75,32 @@
       "source_kind": "huggingface",
       "updated_at": 1781240874.4127293,
       "url": "https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1/resolve/main/Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors?download=true"
+    },
+    {
+      "added_at": 1792041913.9133387,
+      "filename": "Ideogram4-fast_bf16.safetensors",
+      "folder": "diffusion_models",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1792041913.9133387,
+      "url": "https://huggingface.co/Hippotes/Ideogram4-Fal-ComfyUI/resolve/main/Ideogram4-fast_bf16.safetensors?download=true"
+    },
+    {
+      "added_at": 1792041668.6051614,
+      "filename": "Ideogram4-fast_int8-convrot-simple.safetensors",
+      "folder": "diffusion_models",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1792041668.6051614,
+      "url": "https://huggingface.co/Hippotes/Ideogram4-Fal-ComfyUI/resolve/main/Ideogram4-fast_int8-convrot-simple.safetensors?download=true"
     },
     {
       "added_at": 1781243238.184184,
@@ -171,6 +223,19 @@
       "url": "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/text_encoders/mistral_3_small_flux2_bf16.safetensors"
     },
     {
+      "added_at": 1792016054.308372,
+      "filename": "qwen3vl_4b_fp8_scaled.safetensors",
+      "folder": "text_encoders",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1792016054.308372,
+      "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors"
+    },
+    {
       "added_at": 1781243369.9857993,
       "filename": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
       "folder": "text_encoders",
@@ -207,6 +272,58 @@
       "url": "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors"
     },
     {
+      "added_at": 1792017248.9156106,
+      "filename": "ideogram4_fp8_scaled.safetensors",
+      "folder": "unet",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1792017248.9156106,
+      "url": "https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/diffusion_models/ideogram4_int8_convrot.safetensors"
+    },
+    {
+      "added_at": 1792032451.2354536,
+      "filename": "ideogram4_int8_convrot.safetensors",
+      "folder": "unet",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1792032451.2354536,
+      "url": "https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/diffusion_models/ideogram4_int8_convrot.safetensors"
+    },
+    {
+      "added_at": 1792018500.6340725,
+      "filename": "ideogram4_unconditional_fp8_scaled.safetensors",
+      "folder": "unet",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1792018500.6340725,
+      "url": "https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/diffusion_models/ideogram4_unconditional_fp8_scaled.safetensors"
+    },
+    {
+      "added_at": 1792032483.8191373,
+      "filename": "ideogram4_unconditional_int8_convrot.safetensors",
+      "folder": "unet",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1792032483.8191373,
+      "url": "https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/diffusion_models/ideogram4_unconditional_int8_convrot.safetensors"
+    },
+    {
       "added_at": 1789498070.469003,
       "filename": "krea2_turbo_bf16.safetensors",
       "folder": "unet",
@@ -231,6 +348,19 @@
       "source_kind": "huggingface",
       "updated_at": 1791441027.8889015,
       "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors"
+    },
+    {
+      "added_at": 1792046109.9600601,
+      "filename": "krea2_turbo_int8_convrot.safetensors",
+      "folder": "unet",
+      "notes": "",
+      "remove_on_swap": false,
+      "requires_civitai_token": false,
+      "requires_hf_token": true,
+      "sha256": null,
+      "source_kind": "huggingface",
+      "updated_at": 1792046109.9600601,
+      "url": "https://huggingface.co/Comfy-Org/Krea-2/resolve/main/diffusion_models/krea2_turbo_int8_convrot.safetensors?download=true"
     },
     {
       "added_at": 1791696725.0178478,
@@ -262,12 +392,13 @@
       "filename": "flux2-vae.safetensors",
       "folder": "vae",
       "notes": "",
+      "remove_on_swap": false,
       "requires_civitai_token": false,
-      "requires_hf_token": false,
+      "requires_hf_token": true,
       "sha256": null,
       "source_kind": "huggingface",
-      "updated_at": 1781243369.9858015,
-      "url": "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors"
+      "updated_at": 1792017199.7787433,
+      "url": "https://huggingface.co/Comfy-Org/Ideogram-4/resolve/main/vae/flux2-vae.safetensors"
     },
     {
       "added_at": 1781241029.9302888,

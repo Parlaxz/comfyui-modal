@@ -28,6 +28,8 @@ _BASE_DEFAULTS: dict[str, Any] = {
     },
     "resources": {
         "gpu": "rtx-pro-6000",
+        "gpu_alt": "",
+        "gpu_fallbacks": [],
         "cpu": 12,
         "memory_mb": 8192,
         "min_containers": 0,

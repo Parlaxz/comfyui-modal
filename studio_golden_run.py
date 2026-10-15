@@ -312,6 +312,25 @@ def _clear_modal_client_cache() -> None:
     _MODAL_CLIENT_CACHE.clear()
 
 
+def _default_handle_cache_key(
+    profile: GoldenProfile,
+    workspace: Mapping[str, Any] | None,
+) -> tuple:
+    workspace = workspace or {}
+    token_id = str(workspace.get("token_id") or "")
+    token_secret = str(workspace.get("token_secret") or "")
+    environment = str(workspace.get("environment") or "") or None
+    if not token_id or not token_secret:
+        raise GoldenRunError("Golden execution requires an active Modal workspace")
+    return (
+        token_id,
+        token_secret,
+        profile.target["app"],
+        profile.target["class"],
+        environment or "",
+    )
+
+
 def _default_handle_factory(
     profile: GoldenProfile,
     workspace: Mapping[str, Any] | None,
@@ -327,16 +346,21 @@ def _default_handle_factory(
     if not token_id or not token_secret:
         raise GoldenRunError("Golden execution requires an active Modal workspace")
     environment = str(workspace.get("environment") or "") or None
-    cache_key = (
-        token_id,
-        token_secret,
-        profile.target["app"],
-        profile.target["class"],
-        environment or "",
-    )
+    cache_key = _default_handle_cache_key(profile, workspace)
     cached = _MODAL_CLIENT_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    try:
+        import asyncio as _asyncio
+
+        _asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise GoldenRunError(
+            "Golden handle factory called from async context: "
+            "await _adefault_handle_factory instead of the blocking factory"
+        )
     client = modal.Client.from_credentials(token_id, token_secret)
     cls = modal.Cls.from_name(
         profile.target["app"],
@@ -347,6 +371,91 @@ def _default_handle_factory(
     handle = cls()
     _MODAL_CLIENT_CACHE[cache_key] = handle
     return handle
+
+
+async def _adefault_handle_factory(
+    profile: GoldenProfile,
+    workspace: Mapping[str, Any] | None,
+) -> Any:
+    """Async handle factory for async callers; uses Modal's async client."""
+    try:
+        import modal
+    except Exception as exc:  # pragma: no cover - exercised only in live lane
+        raise GoldenRunError("Modal SDK is unavailable") from exc
+    workspace = workspace or {}
+    token_id = str(workspace.get("token_id") or "")
+    token_secret = str(workspace.get("token_secret") or "")
+    if not token_id or not token_secret:
+        raise GoldenRunError("Golden execution requires an active Modal workspace")
+    environment = str(workspace.get("environment") or "") or None
+    cache_key = _default_handle_cache_key(profile, workspace)
+    cached = _MODAL_CLIENT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    client = await modal.Client.from_credentials.aio(token_id, token_secret)
+    cls = modal.Cls.from_name(
+        profile.target["app"],
+        profile.target["class"],
+        client=client,
+        environment_name=environment,
+    )
+    handle = cls()
+    _MODAL_CLIENT_CACHE[cache_key] = handle
+    return handle
+
+
+async def _resolve_handle_async(handle_factory, profile, workspace):
+    """Resolve a Modal handle, awaiting async factories when needed."""
+    import inspect as _inspect
+
+    if handle_factory is not None:
+        handle = handle_factory(profile, workspace)
+        if _inspect.isawaitable(handle):
+            handle = await handle
+        return handle
+    return await _adefault_handle_factory(profile, workspace)
+
+
+# Golden dual-GPU-order selection (run-time, never deploy-baked).  One
+# `modal deploy` binds TWO classes in the same app: the profile's own class
+# serves order A ([gpu] + fallbacks) and GOLDEN_ALT_CLASS_NAME serves the
+# swapped order B ([gpu_alt] + fallbacks).  Selecting B only swaps which
+# already-deployed function the handle lookup targets, so it applies to the
+# very next run with no redeploy.  The active order is server-owned state
+# (settings), never a browser per-request override.
+GPU_ORDER_A = "A"
+GPU_ORDER_B = "B"
+
+
+def effective_profile_for_gpu_order(
+    profile: GoldenProfile, gpu_order: Any
+) -> GoldenProfile:
+    """Return the handle-resolution profile for the requested GPU order.
+
+    Order A returns *profile* unchanged.  Order B returns a copy whose
+    target class is the deployed alt function.  Raises GoldenRunError for
+    anything else, including B when the profile configures no alt primary.
+    """
+    order = str(gpu_order or GPU_ORDER_A).strip().upper()
+    if order in ("", GPU_ORDER_A):
+        return profile
+    if order != GPU_ORDER_B:
+        raise GoldenRunError(
+            "gpu_order must be %r or %r" % (GPU_ORDER_A, GPU_ORDER_B)
+        )
+    alt_primary = str((profile.resources or {}).get("gpu_alt") or "").strip()
+    if not alt_primary:
+        raise GoldenRunError(
+            "Golden profile %r has no alt GPU order; configure one and deploy "
+            "before selecting order B" % (profile.name,)
+        )
+    import dataclasses
+
+    from gpu_catalog import GOLDEN_ALT_CLASS_NAME
+
+    return dataclasses.replace(
+        profile, target={**profile.target, "class": GOLDEN_ALT_CLASS_NAME}
+    )
 
 
 def _sniff_image_extension(raw: bytes | None) -> str | None:
@@ -528,6 +637,85 @@ def _golden_stage_timings(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {"_run_type": "golden", "stages": stages}
 
 
+_GOLDEN_NODE_SPAN_TYPES = frozenset({"gantt_span", "node_progress"})
+_GOLDEN_NODE_SPAN_COMPLETED_PHASES = frozenset({"completed", "complete", "done", "ok", "success"})
+_GOLDEN_NODE_SPAN_MAX_ROWS = 64
+
+
+def _golden_span_number(value: Any) -> float | None:
+    """Best-effort non-negative finite number, else None (never raises)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")) or number < 0:
+        return None
+    return number
+
+
+def _golden_span_interval_ms(event: Mapping[str, Any]) -> float | None:
+    """Duration from a closable monotonic (else wall) interval, else None."""
+    start = _golden_span_number(event.get("entry_monotonic_ns"))
+    end = _golden_span_number(event.get("end_monotonic_ns"))
+    if start is not None and end is not None and end >= start:
+        return (end - start) / 1_000_000
+    start = _golden_span_number(event.get("entry_wall_ns"))
+    end = _golden_span_number(event.get("end_wall_ns"))
+    if start is not None and end is not None and end >= start:
+        return (end - start) / 1_000_000
+    return None
+
+
+def _golden_node_spans(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect completed per-node span rows from Golden stream events.
+
+    Same duck-typed shapes the live progress rows consume
+    (``gantt_span`` / ``node_progress`` with name/label/node/stage identity
+    and an explicit or interval-closable duration), plus completed
+    ``golden_stage`` events.  Only spans with a real measured duration are
+    kept — started-but-never-closed spans have no truthful duration at
+    completion and are dropped, never estimated.  Bounded; ``[]`` when the
+    stream carried nothing usable, so History keeps showing
+    "Diagnostics pending" rather than fabricated rows.
+    """
+    rows: list[dict[str, Any]] = []
+    for event in events or []:
+        if not isinstance(event, Mapping):
+            continue
+        event_type = str(event.get("type") or "").strip().lower()
+        if event_type in _GOLDEN_NODE_SPAN_TYPES:
+            raw_label: Any = None
+            for key in ("name", "label", "node", "stage"):
+                candidate = event.get(key)
+                if candidate is not None and str(candidate).strip() != "":
+                    raw_label = candidate
+                    break
+        elif event_type == "golden_stage" and str(
+            event.get("phase") or ""
+        ).strip().lower() in _GOLDEN_NODE_SPAN_COMPLETED_PHASES:
+            raw_label = event.get("stage")
+        else:
+            continue
+        label = str(raw_label or "").strip()[:120]
+        if not label:
+            continue
+        duration = _golden_span_number(
+            event.get("durationMs", event.get("duration_ms"))
+        )
+        if duration is None:
+            duration = _golden_span_interval_ms(event)
+        if duration is None or duration <= 0:
+            continue
+        rows.append({"label": label, "durationMs": round(duration, 3)})
+        if len(rows) >= _GOLDEN_NODE_SPAN_MAX_ROWS:
+            break
+    return rows
+
+
 def _canonical_golden_fast_path(workflow: Mapping[str, Any]) -> bool:
     """Return true only for the proven canonical Golden graph family."""
     try:
@@ -568,6 +756,9 @@ def _golden_history_meta(
             "generic" if actual_method == "run_plan_stream" else "canonical"
         ),
         "golden_app": profile.target["app"],
+        # The serving function: order A uses the profile class, order B the
+        # deployed alt class.  Recorded so History shows which GPU order ran.
+        "golden_class": str(profile.target.get("class", "")),
         "prompt": str(controls_map.get("prompt") or ""),
         "negative_prompt": str(controls_map.get("negative_prompt") or ""),
         "studio_workflow_id": str(controls_map.get("_workflow_id") or ""),
@@ -736,6 +927,35 @@ def _prepare_variant_prompt(
         raise GoldenRunError(str(prepared["error"]))
     applied = prepared
     _normalize_model_loader_names(applied["workflow"])
+    # Anything Everywhere broadcast (same as the canvas Queue path and the
+    # generic plan seam): fill unconnected matching inputs from the
+    # controller's linked sources. Runs before hashing so the submitted
+    # hash covers the dispatched graph.
+    from studio_workflow_run import (
+        apply_anything_everywhere_broadcast as _apply_ue_broadcast,
+    )
+    _broadcast = _apply_ue_broadcast(
+        applied["workflow"], (bundle.get("version") or {}).get("graph_json")
+    )
+    if "error" in _broadcast:
+        raise GoldenRunError(str(_broadcast["error"]))
+    applied["workflow"] = _broadcast["workflow"]
+    # Explicit per-run bypass list (temporary triage for nodes whose
+    # backend is broken in the image). Same contract as the generic plan
+    # seam; runs before hashing so the submitted hash covers the
+    # dispatched graph. Fail-closed on misuse.
+    from studio_workflow_run import (
+        bypass_nodes_by_id as _bypass_nodes_by_id,
+        _bypass_ids_from_options as _bypass_ids_from_options,
+    )
+    _bypass_ids = _bypass_ids_from_options(effective_options)
+    _bypassed_ids: list[str] = []
+    if _bypass_ids:
+        _bypassed = _bypass_nodes_by_id(applied["workflow"], _bypass_ids)
+        if "error" in _bypassed:
+            raise GoldenRunError(str(_bypassed["error"]))
+        applied["workflow"] = _bypassed["workflow"]
+        _bypassed_ids = list(_bypassed["bypassed"])
     # Same empty-dropdown repair as the generic plan seam: the fast path
     # submits applied["workflow"] directly, so an unconfigured PixaromaDropdown
     # would otherwise feed "" into ImageScaleToTotalPixels.megapixels and crash
@@ -753,6 +973,8 @@ def _prepare_variant_prompt(
     # registry is unavailable.
     _hydrate_missing_required_widget_defaults(applied["workflow"])
     studio_meta = copy.deepcopy(applied.get("studio_meta") or {})
+    if _bypassed_ids:
+        studio_meta["bypassed_node_ids"] = list(_bypassed_ids)
     # The dedicated Golden adapter has no ExecutionPlan to compute this for
     # it; hash the exact graph that will be submitted, after bypass.
     studio_meta["workflow_hash"] = prompt_sha256(applied["workflow"])
@@ -778,10 +1000,15 @@ async def run_golden_workflow(
     studio_method: Mapping[str, Any] | None = None,
     studio_style: Mapping[str, Any] | None = None,
     studio_references: Mapping[str, Any] | None = None,
+    gpu_order: str = GPU_ORDER_A,
 ) -> dict[str, Any]:
     """Resolve controls, submit the selected Golden method, and retain events."""
     request_id = validate_request_id(request_id)
     profile = resolve_golden_profile(profile_name)
+    try:
+        profile = effective_profile_for_gpu_order(profile, gpu_order)
+    except GoldenRunError as exc:
+        return {"status": "error", "message": str(exc)}
 
     # Reuse the established Studio workflow seam read-only.  In particular,
     # this preserves version/preset ownership and verbatim control mapping.
@@ -994,6 +1221,7 @@ async def run_golden_workflow(
             "studio": True,
             "profile": profile.name,
             "method": profile.target["method"],
+            "class": profile.target["class"],
             "request_id": request_id,
         },
     }
@@ -1038,11 +1266,7 @@ async def run_golden_workflow(
             workflow_version_id=str(version_id or ""),
             workflow_hash=str(((bundle or {}).get("version") or {}).get("graph_hash") or ""),
         )
-        handle = (
-            handle_factory(profile, workspace)
-            if handle_factory is not None
-            else _default_handle_factory(profile, workspace)
-        )
+        handle = await _resolve_handle_async(handle_factory, profile, workspace)
         if use_generic_executor:
             plan, plan_error = build_workflow_execution_plan(
                 bundle,
@@ -1195,10 +1419,18 @@ async def run_golden_workflow(
                     "runId": request_id,
                     "profile": profile.name,
                 }
+        _terminal_timings = _golden_stage_timings(stage_events)
+        # Node-span rows are the breakdown Diagnostics renders (Restoring,
+        # loader spans, "CLIPTextEncode (node 98:24)", ...).  Closed stages
+        # alone collapse node detail, and an empty stream must stay an empty
+        # dict so History keeps showing "Diagnostics pending" honestly.
+        _terminal_spans = _golden_node_spans(stage_events)
+        if _terminal_spans:
+            _terminal_timings["nodeSpans"] = _terminal_spans
         _complete_golden_history(
             history_run_id,
             materialized,
-            timings=_golden_stage_timings(stage_events),
+            timings=_terminal_timings,
         )
         # The Studio result contract is flat: the Playground reads
         # ``payload.output_paths`` directly.  Merge the materialized result to
@@ -1341,6 +1573,7 @@ async def run_golden_workflow_batch_stream(
     modal_options: Mapping[str, Any] | None = None,
     event_store: GoldenStageEventStore = EVENT_STORE,
     handle_factory: Callable[[GoldenProfile, Mapping[str, Any] | None], Any] | None = None,
+    gpu_order: str = GPU_ORDER_A,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream a batch's per-variant completions as they land, in order.
 
@@ -1359,6 +1592,15 @@ async def run_golden_workflow_batch_stream(
     """
     batch_id = validate_request_id(request_id)
     profile = resolve_golden_profile(profile_name)
+    try:
+        profile = effective_profile_for_gpu_order(profile, gpu_order)
+    except GoldenRunError as exc:
+        yield {
+            "status": "error",
+            "message": str(exc),
+            "request_id": batch_id,
+        }
+        return
     if not isinstance(variants, list) or not variants:
         yield {
             "status": "error",
@@ -1533,11 +1775,7 @@ async def run_golden_workflow_batch_stream(
             for job in runnable
         ]
         try:
-            handle = (
-                handle_factory(profile, workspace)
-                if handle_factory is not None
-                else _default_handle_factory(profile, workspace)
-            )
+            handle = await _resolve_handle_async(handle_factory, profile, workspace)
             remote_method = getattr(handle, STUDIO_BATCH_METHOD)
             remote_gen = getattr(remote_method, "remote_gen", None)
             if remote_gen is None or not callable(getattr(remote_gen, "aio", None)):
@@ -1661,6 +1899,7 @@ async def run_golden_workflow_batch(
     modal_options: Mapping[str, Any] | None = None,
     event_store: GoldenStageEventStore = EVENT_STORE,
     handle_factory: Callable[[GoldenProfile, Mapping[str, Any] | None], Any] | None = None,
+    gpu_order: str = GPU_ORDER_A,
 ) -> dict[str, Any]:
     """Buffered collection of run_golden_workflow_batch_stream.
 
@@ -1671,6 +1910,10 @@ async def run_golden_workflow_batch(
     """
     batch_id = validate_request_id(request_id)
     profile = resolve_golden_profile(profile_name)
+    try:
+        profile = effective_profile_for_gpu_order(profile, gpu_order)
+    except GoldenRunError as exc:
+        return {"status": "error", "message": str(exc), "request_id": batch_id}
     collected: list[dict[str, Any]] = []
     fallback_error: dict[str, Any] | None = None
     async for event in run_golden_workflow_batch_stream(
@@ -1685,6 +1928,7 @@ async def run_golden_workflow_batch(
         modal_options=modal_options,
         event_store=event_store,
         handle_factory=handle_factory,
+        gpu_order=gpu_order,
     ):
         if (
             isinstance(event, Mapping)

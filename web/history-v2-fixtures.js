@@ -12,7 +12,7 @@
 // padded with null to exactly 4 slots (null = empty block).
 
 import { normalizeFeedItem } from "./history-v2-repository.js";
-import { publishStudioSync } from "./studio-sync.js";
+import { publishStudioSync, notifyRecentRunsDeleted } from "./studio-sync.js";
 
 // ── Fixed clock ──────────────────────────────────────────────────────────
 
@@ -613,6 +613,7 @@ export function createFixtureRepository() {
     if (index === -1) return Promise.resolve({ accepted: false, ok: false, message: "Generation not found: " + id });
     generations.splice(index, 1);
     publishStudioSync("history");
+    notifyRecentRunsDeleted([id]);
     return Promise.resolve({ accepted: true, ok: true, deleted: id, generation_ids: [id], experiment_ids: [] });
   }
 
@@ -621,6 +622,7 @@ export function createFixtureRepository() {
     if (index === -1) return Promise.resolve({ accepted: false, message: "Experiment not found: " + id });
     experiments.splice(index, 1);
     publishStudioSync("history");
+    notifyRecentRunsDeleted([id]);
     return Promise.resolve({ accepted: true, generation_ids: [], experiment_ids: [id] });
   }
 
@@ -644,6 +646,7 @@ export function createFixtureRepository() {
     }
     if (generationIds.length - missingGenerationIds.length + experimentIds.length - missingExperimentIds.length > 0) {
       publishStudioSync("history");
+      notifyRecentRunsDeleted([].concat(generationIds, experimentIds));
     }
     return Promise.resolve({
       accepted: true,

@@ -39,4 +39,12 @@ comfyui-modal-agent*/
 comfyui-modal-worktree*/
 comfyui-modal-wt*/
 comfyui-modal-dc*/
+artifacts/
+unetClipExperimentsSeptember/
+golden_history/
+.repowise/
+*.bundle
+*.rar
+comfymodal-data/
+my-repo.bundle
 

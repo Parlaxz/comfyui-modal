@@ -36,6 +36,21 @@ GPU_CANONICAL_MAP: dict[str, str] = {
 # Deduped preserving order.  Empty/absent fallbacks = no fallback.
 DEFAULT_GPU_FALLBACKS: tuple[str, ...] = ()
 
+# ── Golden dual-GPU-order deployment ────────────────────────────────────
+# One `modal deploy` binds TWO classes in the same app so runs can swap GPU
+# priority without a redeploy.  The primary class keeps the historical name;
+# the alt class serves the swapped order.  Both orders share the tail
+# fallbacks: order A = [GPU] + fallbacks, order B = [GPU_ALT] + fallbacks.
+# GPU_ALT absent/empty (or equal to the primary) means a single-function
+# deploy, exactly as before.
+GOLDEN_ALT_CLASS_NAME = "ModalRuntimeEntrypointV2Alt"
+
+# Maximum stored tail entries in the shared fallback pool.  Each deployed
+# order is [primary] + pool-minus-primary capped at MAX_GPU_ORDER total,
+# so every function tries its primary plus up to 3 fallbacks.
+MAX_GPU_FALLBACKS = 4
+MAX_GPU_ORDER = 4
+
 
 def _normalize_gpu_name(raw: str) -> str:
     """Normalize a GPU name to lower-case with hyphens, then look up canonical."""
@@ -121,6 +136,61 @@ def parse_gpu_request() -> tuple[str, ...]:
     # Build ordered list: primary first, then fallbacks, dedupe preserving order
     ordered = [primary] + fallback_list
     return tuple(_dedupe_preserve_order(ordered))
+
+
+def _parse_fallback_list(raw: str | None) -> list[str]:
+    """Parse a comma-separated fallback env value into canonical names."""
+    if raw is None or not raw.strip():
+        return []
+    return [
+        _normalize_gpu_name(fb.strip())
+        for fb in raw.split(",")
+        if fb.strip()
+    ]
+
+
+def parse_gpu_alt_request() -> tuple[str, ...]:
+    """Parse the swapped GPU order (order B) from environment variables.
+
+    Order B = ``COMFYMODAL_V2_GPU_ALT`` primary + the shared
+    ``COMFYMODAL_V2_GPU_FALLBACKS`` tail, deduped preserving order.
+    Returns an empty tuple when no alt primary is configured (or when it
+    duplicates the order-A primary): the deploy then binds a single
+    function, exactly as before.
+    """
+    alt_raw = os.environ.get("COMFYMODAL_V2_GPU_ALT", "").strip()
+    if not alt_raw:
+        return ()
+    fallbacks_raw = os.environ.get("COMFYMODAL_V2_GPU_FALLBACKS")
+    if fallbacks_raw is None:
+        fallback_list = list(DEFAULT_GPU_FALLBACKS)
+    else:
+        fallback_list = _parse_fallback_list(fallbacks_raw)
+    ordered = build_gpu_order(alt_raw, fallback_list)
+    primary_order = parse_gpu_request()
+    if tuple(ordered) == tuple(primary_order):
+        return ()
+    return tuple(ordered)
+
+
+def build_gpu_order(primary_raw: str, fallbacks_raw: list[str]) -> tuple[str, ...]:
+    """Build one canonical GPU order: [primary] + pool-minus-primary.
+
+    Shared by catalog projection and deploy-side parsing so both derive
+    identical orders from the same stored values.  Capped at
+    ``MAX_GPU_ORDER`` total (primary + up to 3 fallbacks).
+    """
+    primary = _normalize_gpu_name(primary_raw.strip()) if primary_raw.strip() else V2_DEFAULT_GPU
+    tail = [
+        _normalize_gpu_name(str(item).strip())
+        for item in (fallbacks_raw or [])
+        if str(item).strip()
+    ]
+    return tuple(
+        _dedupe_preserve_order([primary] + [name for name in tail if name != primary])[
+            :MAX_GPU_ORDER
+        ]
+    )
 
 GPU_CATALOG = [
     {"value": "rtx-pro-6000", "label": "RTX PRO 6000", "modal_gpu": "rtx-pro-6000", "class_name": "ComfyAPI_RTX_PRO_6000", "profile": "high_mem"},

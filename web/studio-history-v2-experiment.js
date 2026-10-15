@@ -21,6 +21,7 @@ import {
   deriveRetryActionLabel,
   generateOriginalEligibility,
   isTerminalAttemptStatus,
+  selectCompareAsset,
   selectDetailAsset,
   selectFeedAsset,
 } from "./history-v2-repository.js";
@@ -529,8 +530,9 @@ export async function renderExperimentDetail(experimentId, repo, callbacks) {
     const menu = el("div", { class: "comfymodal-studio-history-v2-menu" });
     menu.appendChild(buildCellOriginalAction(cell, currentRecord, "menu"));
     // While a compare session is active, an eligible cell image fills slot
-    // B (further picks truthfully replace B).
-    const menuAsset = selectExperimentCellAsset(cell);
+    // B (further picks truthfully replace B). The descriptor carries the
+    // full-resolution compare URL; the grid tile keeps its lazy thumb.
+    const menuAsset = selectCompareAsset(cell);
     if (menuAsset.url && currentRecord) {
       const compareItem = buildAddToCompareItem({
         descriptor: {
@@ -1187,9 +1189,9 @@ export async function renderExperimentDetail(experimentId, repo, callbacks) {
     const genBtn = buildCellOriginalAction(cell, rec, "pane");
 
     // Lightweight A/B compare entry (I5): client-only transient session
-    // over the cell's EXISTING projected image. No scheduler mutation, no
+    // over the cell's full-resolution compare image. No scheduler mutation, no
     // Experiment authority change, no Experiment-specific compare store.
-    const cellDisplayed = selectDetailAsset(cell);
+    const cellDisplayed = selectCompareAsset(cell);
     let cellCompareBtn = null;
     if (cellDisplayed.url) {
       const cellDesc = {

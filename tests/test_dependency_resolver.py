@@ -1783,6 +1783,38 @@ class DependencyResolverTestCase(unittest.TestCase):
             self.assertEqual(remote["models"][0]["state"], "installed", junk)
             self.assertNotIn("remote_model", remote["models"][0], junk)
 
+    def test_remote_missing_reasons_fail_open_when_unknown(self):
+        version = self._version_with_model("absent_everywhere.safetensors")
+        self.assertEqual(self.resolver.remote_missing_reasons(version, None), [])
+        self.assertEqual(self.resolver.remote_missing_reasons(version, "garbage"), [])
+        self.assertEqual(self.resolver.remote_missing_reasons(version, 42), [])
+
+    def test_remote_missing_reasons_blocks_known_absence(self):
+        # Local disk has the model but the workspace volume does not: the
+        # remote gate must warn instead of reporting "Ready to run".
+        self._seed_model()
+        version = self._version_with_model()
+        missing = self.resolver.remote_missing_reasons(
+            version, self._remote(models=[self._remote_model("something_else.safetensors")])
+        )
+        self.assertEqual(len(missing), 1)
+        self.assertIn("remote model 'krea_model.safetensors'", missing[0])
+        self.assertIn("workspace volume", missing[0])
+
+    def test_remote_missing_reasons_empty_when_present(self):
+        self._seed_model()
+        version = self._version_with_model()
+        missing = self.resolver.remote_missing_reasons(
+            version, self._remote(models=[self._remote_model("krea_model.safetensors")])
+        )
+        self.assertEqual(missing, [])
+
+    def test_remote_missing_reasons_empty_volume_blocks(self):
+        version = self._version_with_model("absent_everywhere.safetensors")
+        missing = self.resolver.remote_missing_reasons(version, self._remote(models=[]))
+        self.assertEqual(len(missing), 1)
+        self.assertIn("remote model 'absent_everywhere.safetensors'", missing[0])
+
     # ── nonessential (no live reference) dependencies ────────────────────
 
     def _version_with_bypassed_lora(self) -> dict:

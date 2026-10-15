@@ -133,7 +133,15 @@ memory_mb = 24576
             "class": "ModalRuntimeEntrypointV2",
             "method": "run_golden_parallel_stream",
         },
-        "resources": {"gpu": "H100", "cpu": 12, "memory_mb": 24576},
+        "resources": {
+            "gpu": "H100",
+            "gpu_alt": "",
+            "gpu_fallbacks": [],
+            "cpu": 12,
+            "memory_mb": 24576,
+        },
+        "gpu_order_a": ["h100"],
+        "gpu_order_b": [],
         "region": "",
         "deployed": False,
     }
@@ -1103,3 +1111,71 @@ def test_golden_rejects_method_combination(monkeypatch, tmp_path) -> None:
     assert result["status"] == "error"
     assert "cannot be combined" in result["message"]
     assert store.active_count == 0
+
+
+def _g_dual_profile():
+    profile = _g_profile()
+    import dataclasses
+
+    return dataclasses.replace(
+        profile,
+        resources={
+            "gpu": "h100!",
+            "gpu_alt": "rtx-pro-6000",
+            "gpu_fallbacks": ["rtx-pro-6000", "h100!", "h200", "a100-80gb"],
+            "cpu": 12,
+            "memory_mb": 24576,
+        },
+    )
+
+
+def test_gpu_order_a_returns_profile_unchanged() -> None:
+    from gpu_catalog import GOLDEN_ALT_CLASS_NAME
+
+    profile = _g_dual_profile()
+    effective = studio_golden_run.effective_profile_for_gpu_order(profile, "A")
+    assert effective is profile
+    assert effective.target["class"] == "ModalRuntimeEntrypointV2"
+    assert GOLDEN_ALT_CLASS_NAME == "ModalRuntimeEntrypointV2Alt"
+
+
+def test_gpu_order_b_swaps_to_alt_function() -> None:
+    from gpu_catalog import GOLDEN_ALT_CLASS_NAME
+
+    profile = _g_dual_profile()
+    effective = studio_golden_run.effective_profile_for_gpu_order(profile, "B")
+    assert effective is not profile
+    assert effective.target["class"] == GOLDEN_ALT_CLASS_NAME
+    assert effective.target["app"] == profile.target["app"]
+    assert effective.target["method"] == profile.target["method"]
+    assert effective.name == profile.name
+
+
+def test_gpu_order_b_without_alt_refuses() -> None:
+    with pytest.raises(GoldenRunError, match="no alt GPU order"):
+        studio_golden_run.effective_profile_for_gpu_order(_g_profile(), "B")
+
+
+def test_gpu_order_rejects_unknown_order() -> None:
+    with pytest.raises(GoldenRunError, match="gpu_order must be"):
+        studio_golden_run.effective_profile_for_gpu_order(_g_dual_profile(), "C")
+
+
+def test_gpu_orders_derive_exact_dual_lists() -> None:
+    order_a, order_b = profile_catalog.gpu_orders_for({
+        "gpu": "h100!",
+        "gpu_alt": "rtx-pro-6000",
+        "gpu_fallbacks": ["rtx-pro-6000", "h100!", "h200", "a100-80gb"],
+    })
+    assert order_a == ["h100!", "rtx-pro-6000", "h200", "a100-80gb"]
+    assert order_b == ["rtx-pro-6000", "h100!", "h200", "a100-80gb"]
+
+
+def test_gpu_orders_without_alt_is_single() -> None:
+    order_a, order_b = profile_catalog.gpu_orders_for({
+        "gpu": "rtx-pro-6000",
+        "gpu_alt": "",
+        "gpu_fallbacks": [],
+    })
+    assert order_a == ["rtx-pro-6000"]
+    assert order_b == []

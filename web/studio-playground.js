@@ -22,16 +22,25 @@ import {
   getGoldenRunProgress,
   stopExperiment,
   listModels,
+  refreshRemoteInventory,
   triggerDeploy,
+  getDeployStatus,
+  pollDeployToTerminal,
   listGoldenProfiles,
   triggerGoldenProfileDeploy,
   getGoldenProfileDeployStatus,
+  listWorkspacesRegistry,
+  summarizeWorkspaces,
+  requestWorkspaceSwap,
+  getWorkspaceSwapStatus,
+  buildSwapConfirmPayload,
+  swapPhaseMessage,
 } from "./studio-backend-api.js";
 import { loadModalOptions } from "./studio-output-preferences.js";
 import { createLayoutEditor, buildIdeogramCaption } from "./studio-layout-editor.js";
 import { goldenProgressResponseAction, progressSpanView } from "./studio-golden-progress.js";
 
-import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines, resolveSelectionResultKey, buildViewerRecordFromRun, resolveViewerInput, generationIdForLegacyRunId } from "./studio-run-normalizer.js";
+import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines, resolveSelectionResultKey, buildViewerRecordFromRun, resolveViewerInput, generationIdForLegacyRunId, extractSpanSnapshot, saveSpanSnapshot, loadSpanSnapshot } from "./studio-run-normalizer.js";
 import {
   saveSelection,
   loadSelection,
@@ -82,6 +91,7 @@ import {
 } from "./studio-guidance.js";
 import { createHistoryRepository } from "./history-v2-repository.js";
 import { requestHistoryRecordFocus } from "./studio-history-v2.js";
+import { subscribeRecentRunsDeleted } from "./studio-sync.js";
 
 const PLAYGROUND_PREVIEW_KEY = "comfymodal.studio.playground-preview.v1";
 const PLAYGROUND_VIEW_KEY = "comfymodal.studio.playground-view.v1";
@@ -872,6 +882,56 @@ export function clearRecentRunsCache() {
   _recentRunsCache = [];
   _recentRunsCacheKey = "";
 }
+
+// Immediate cross-page eviction: a History delete publishes the deleted
+// generation/experiment ids; the carousel drops them from its cache
+// synchronously so navigating back never shows a stale thumbnail waiting
+// for the next server refresh. Matches on every identity the strip carries
+// (durable id, run id, experiment id, bridged generation id).
+export function removeRecentRunsById(ids) {
+  if (!Array.isArray(_recentRunsCache) || _recentRunsCache.length === 0) return 0;
+  const wanted = {};
+  (Array.isArray(ids) ? ids : [ids]).forEach(function (raw) {
+    if (raw == null || raw === "") return;
+    wanted[String(raw)] = true;
+  });
+  const keys = Object.keys(wanted);
+  if (keys.length === 0) return 0;
+  const before = _recentRunsCache.length;
+  _recentRunsCache = _recentRunsCache.filter(function (item) {
+    if (!item) return false;
+    const candidates = [item.id, item.runId, item.experimentId, item.generationId];
+    for (let i = 0; i < candidates.length; i++) {
+      const value = candidates[i];
+      if (value != null && value !== "" && wanted[String(value)]) return false;
+    }
+    return true;
+  });
+  const removed = before - _recentRunsCache.length;
+  if (removed > 0) {
+    // The History detail overlay is body-level: the Playground stays mounted
+    // underneath, so its visible strip would otherwise keep the deleted
+    // thumbnail until the next mount. Rerender in place when the filmstrip
+    // is live; never navigate away from another page to do it.
+    try {
+      const live = typeof document !== "undefined"
+        ? document.querySelector('[data-testid="filmstrip"]')
+        : null;
+      const ref = _latestPlaygroundTrio;
+      if (live && live.isConnected && ref && ref.context
+        && typeof ref.context.setPage === "function") {
+        ref.context.setPage("playground");
+      }
+    } catch (_e) { /* cache eviction already applied; rerender is best-effort */ }
+  }
+  return removed;
+}
+
+try {
+  subscribeRecentRunsDeleted(function (deletedIds) {
+    removeRecentRunsById(deletedIds);
+  });
+} catch (_e) { /* subscription is best-effort; cache eviction stays available */ }
 
 // ΓöÇΓöÇ Same-run history timings fallback (Shelf single-run slice) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
@@ -1808,7 +1868,21 @@ function workflowGatingInfo(store, wf, state) {
   // profile executes in the deployed container, so host-local dependency
   // reasons must not be shown as a reason that remote execution is blocked.
   const { runnable, reasons } = _workflowRunnableForExecution(state, store, wf);
-  if (runnable) return { text: "Ready to run", color: "var(--color-success)" };
+  if (runnable) {
+    // Honest bypass label: the skip only filters custom-node reasons, so a
+    // runnable verdict over raw custom-node reasons means the gate was
+    // skipped for this run.
+    try {
+      const rawState = (((store.runContext || {}).version || {}).state || {});
+      const rawReasons = Array.isArray(rawState.reasons) ? rawState.reasons : [];
+      if (typeof wf.loadSkipPlanValidation === "function" && wf.loadSkipPlanValidation()
+        && typeof wf.isCustomNodeReason === "function"
+        && rawReasons.some((r) => wf.isCustomNodeReason(r))) {
+        return { text: "Ready to run (safety gate skipped)", color: "var(--color-success)" };
+      }
+    } catch (_e) {}
+    return { text: "Ready to run", color: "var(--color-success)" };
+  }
   return { text: reasons.length ? reasons.join("; ") : "Not runnable", color: "#d9a441" };
 }
 
@@ -1869,8 +1943,9 @@ var _WORKSPACE_CARRY_ROLES = ["prompt", "seed", "width", "height"];
 // sampler are workflow-specific — each workflow keeps its own — in either
 // spelling (see the explicit graph-era list in _applyWorkspaceCarry).
 // The same family starts collapsed in the Advanced shelf section on fresh
-// layouts (see _shelfLayoutFor).
-var _DEFAULT_ADVANCED_ROLES = ["steps", "step_count", "cfg", "cfg_scale", "scheduler"];
+// layouts (see _shelfLayoutFor). The UNET checkpoint family rides along:
+// swappable, but out of the way until opened.
+var _DEFAULT_ADVANCED_ROLES = ["steps", "step_count", "cfg", "cfg_scale", "scheduler", "model_unet", "model", "unet"];
 // Carry targets include graph-era spellings: the loop below commits only
 // roles present in the NEW schema, resolving each through _carryValue so
 // `steps` seeds `step_count` and vice versa.
@@ -2186,7 +2261,262 @@ function _renderGoldenDeployNotice(container, context) {
   }).catch(() => {});
 }
 
-function _workflowGatingLineEl(state, wf, context) {
+// In-flight manifest install triggered from the run-gating warning line.
+// Keyed by workflow+version so a selection change never paints another
+// version's progress; re-renders (_syncWorkflowGating fires on every
+// seed/prompt edit) repaint the disabled progress button instead of
+// dropping it. Explicit click only — nothing here installs on its own.
+var _gatingManifestInstall = { key: "", busy: false, pct: 0, message: "" };
+var _GATING_INSTALL_POLL_MS = 1500;
+var _GATING_INSTALL_DEADLINE_MS = 30 * 60 * 1000;
+
+function _gatingVersionKey(store) {
+  return String((store && store.workflowId) || "") + "::" + String((store && store.workflowVersionId) || "");
+}
+
+/**
+ * Remote-missing models behind the current gating warning that the master
+ * manifest can install ({filename, folder, manifest_key,
+ * manifest_installable} entries only). Reads the structured run-context
+ * field via the workflow-run module when available, else parses the
+ * reason strings (which never claim installability). Pure read; never
+ * installs. Best-effort: any failure yields [] and the line stays text.
+ */
+function _gatingInstallableModels(store, wf) {
+  try {
+    var models = null;
+    if (wf && typeof wf.remoteMissingModels === "function") {
+      models = wf.remoteMissingModels(store);
+    } else if (wf && typeof wf.remoteMissingReasons === "function") {
+      models = [];
+      var reasons = wf.remoteMissingReasons(store) || [];
+      for (var i = 0; i < reasons.length; i++) {
+        var m = String(reasons[i] || "").match(
+          /^remote model '([^']+)' not in workspace volume \(([^)]+)\)$/
+        );
+        if (m && m[1]) models.push({ filename: m[1], folder: m[2] || "unknown", manifest_key: "", manifest_installable: false });
+      }
+    } else {
+      return [];
+    }
+    return (Array.isArray(models) ? models : []).filter(function (e) {
+      return e && e.manifest_installable === true && String(e.manifest_key || "").length > 0;
+    });
+  } catch (_e) {
+    return [];
+  }
+}
+
+/**
+ * True when any of the just-installed filenames still reads as
+ * remote-missing in the store's run-context. Same evidence sources as
+ * _gatingInstallableModels (structured field first, reason-string parse
+ * fallback. Cannot-tell yields false so the refresh loop never spins
+ * forever on an unreadable store.
+ */
+function _gatingStillMissing(store, wf, filenames) {
+  try {
+    var want = {};
+    (filenames || []).forEach(function (f) { want[String(f).toLowerCase()] = true; });
+    var models = null;
+    if (wf && typeof wf.remoteMissingModels === "function") {
+      models = wf.remoteMissingModels(store) || [];
+    } else if (wf && typeof wf.remoteMissingReasons === "function") {
+      models = [];
+      var reasons = wf.remoteMissingReasons(store) || [];
+      for (var i = 0; i < reasons.length; i++) {
+        var m = String(reasons[i] || "").match(
+          /^remote model '([^']+)' not in workspace volume \(([^)]+)\)$/
+        );
+        if (m && m[1]) models.push({ filename: m[1] });
+      }
+    } else {
+      return false;
+    }
+    for (var j = 0; j < models.length; j++) {
+      if (want[String((models[j] && models[j].filename) || "").toLowerCase()]) return true;
+    }
+    return false;
+  } catch (_e) {
+    return false;
+  }
+}
+
+function _gatingInstallProgressPct(data) {
+  var direct = Number(data && data.download_pct_current);
+  if (Number.isFinite(direct)) return Math.max(0, Math.min(100, direct));
+  var completed = Number(data && data.download_completed) || 0;
+  var total = Number(data && data.download_total) || 0;
+  return total ? Math.max(0, Math.min(100, (completed / total) * 100)) : 0;
+}
+
+async function _gatingInstallFromManifest(state, context, actions, entries, btn) {
+  var store = state && state.playground && state.playground._workflowRun;
+  var wf = state && state.playground && state.playground._workflowRunModule;
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  var key = _gatingVersionKey(store);
+  if (!entries.length || _gatingManifestInstall.busy) return;
+  _gatingManifestInstall = { key: key, busy: true, pct: 0, message: "Starting install…" };
+  _syncWorkflowGating(state, context, actions);
+  try {
+    var reg = await listWorkspacesRegistry(apiBase);
+    var summary = summarizeWorkspaces(reg);
+    var activeId = summary && summary.activeId;
+    if (!activeId) throw new Error("No active workspace.");
+    var keys = entries.map(function (e) { return e.manifest_key; });
+    var started = await requestWorkspaceSwap(apiBase, buildSwapConfirmPayload(activeId, keys));
+    if (!started) throw new Error("Manifest install failed: no response.");
+    if (started.status === "busy" || started.status === "confirm_required") {
+      throw new Error(started.message || "Deploy or prompt execution is active - try again later.");
+    }
+    if (started.status === "error") throw new Error(started.message || "Manifest install failed.");
+    if (started.status === "repair_required") throw new Error(started.message || "Manifest repair required.");
+    if (!(started.status === "started" && started.swap_id)) {
+      throw new Error(started.message || "Unexpected manifest install response.");
+    }
+    var swapId = started.swap_id;
+    var deadline = Date.now() + _GATING_INSTALL_DEADLINE_MS;
+    for (;;) {
+      await new Promise(function (r) { setTimeout(r, _GATING_INSTALL_POLL_MS); });
+      // Selection changed mid-install: stop repainting a stale line. The
+      // swap job itself keeps running server-side; returning to the
+      // workflow re-reads truth via run-context.
+      var cur = state && state.playground && state.playground._workflowRun;
+      if (!cur || _gatingVersionKey(cur) !== _gatingManifestInstall.key) {
+        _gatingManifestInstall = { key: "", busy: false, pct: 0, message: "" };
+        return;
+      }
+      var st = null;
+      try { st = await getWorkspaceSwapStatus(apiBase, swapId); } catch (_e) { st = null; }
+      if (!st || st.status === "not_found") throw new Error("Manifest install status unavailable.");
+      if (st.status === "running" || st.status === "pending") {
+        _gatingManifestInstall.pct = _gatingInstallProgressPct(st);
+        _gatingManifestInstall.message = swapPhaseMessage(st) || st.download_message || "Installing…";
+        _syncWorkflowGating(state, context, actions);
+        if (Date.now() > deadline) {
+          throw new Error("Still installing — check Backend → Install from Manifest for progress.");
+        }
+        continue;
+      }
+      if (st.status === "ok") break;
+      if (st.status === "repair_required") throw new Error(st.message || "Manifest repair required.");
+      if (st.status === "error") {
+        var phase = String(st.phase || "");
+        var postDownload = phase === "syncing_custom_nodes" || phase === "deploying" || phase === "removing_models";
+        var dlFailed = Array.isArray(st.failures) && st.failures.length > 0;
+        if (postDownload && !dlFailed) break; // model landed; sync/deploy warned
+        throw new Error(st.message || st.error || st.download_message || "Manifest install failed.");
+      }
+      throw new Error(st.message || st.error || "Manifest install failed.");
+    }
+    // The volume snapshot behind run-context is cached: force a fresh read
+    // (max_age=0 bypasses the TTL) before re-reading run-context truth,
+    // otherwise the just-installed models still read as missing and the
+    // warning never clears. Retry bounded: the volume listing can lag the
+    // download completion by seconds.
+    var wanted = entries.map(function (e) { return e.filename; });
+    _gatingManifestInstall = { key: key, busy: true, pct: 100, message: "Refreshing workspace state…" };
+    _syncWorkflowGating(state, context, actions);
+    var cleared = false;
+    for (var attempt = 0; attempt < 5; attempt++) {
+      try { await refreshRemoteInventory(apiBase, 0); } catch (_e) { /* refresh is best-effort */ }
+      try {
+        if (wf && typeof wf.loadRunContext === "function" && store.workflowId && store.workflowVersionId) {
+          await wf.loadRunContext(apiBase, store, store.workflowId, store.workflowVersionId);
+        }
+      } catch (_e2) { /* reload is best-effort */ }
+      // Selection changed: stop touching a stale line (same rule as polling).
+      var cur2 = state && state.playground && state.playground._workflowRun;
+      if (!cur2 || _gatingVersionKey(cur2) !== _gatingManifestInstall.key) {
+        _gatingManifestInstall = { key: "", busy: false, pct: 0, message: "" };
+        return;
+      }
+      if (!_gatingStillMissing(cur2, wf, wanted)) { cleared = true; break; }
+      await new Promise(function (r) { setTimeout(r, 4000); });
+    }
+    _gatingManifestInstall = { key: "", busy: false, pct: 0, message: "" };
+    _syncWorkflowGating(state, context, actions);
+    if (!cleared) {
+      // Installed per the swap job, but the volume still doesn't list the
+      // files: say so on the line instead of leaving a stale warning with
+      // no explanation.
+      try {
+        var line2 = document.querySelector('[data-testid="workflow-run-gating"]');
+        if (line2) {
+          line2.appendChild(document.createTextNode(" "));
+          line2.appendChild(el("span", {
+            "data-testid": "workflow-run-gating-install-error",
+            text: "Installed, but the volume doesn't list the files yet — they will clear on the next refresh.",
+            style: "color:#f5a623;",
+          }));
+        }
+      } catch (_e3) {}
+    }
+  } catch (err) {
+    var msg = (err && err.message) || "Manifest install failed.";
+    _gatingManifestInstall = { key: "", busy: false, pct: 0, message: "" };
+    _syncWorkflowGating(state, context, actions);
+    // Surface the failure on the line itself: a silent re-enable reads as
+    // the button doing nothing.
+    try {
+      var line = document.querySelector('[data-testid="workflow-run-gating"]');
+      if (line) {
+        line.appendChild(document.createTextNode(" "));
+        line.appendChild(el("span", {
+          "data-testid": "workflow-run-gating-install-error",
+          text: msg,
+          style: "color:#f87171;",
+        }));
+      }
+    } catch (_e2) {}
+  }
+}
+
+/**
+ * Append the manifest install affordance to a gating warning line.
+ * No-op unless remote-missing models carry manifest installability; the
+ * warning text itself is untouched. An in-flight install repaints as a
+ * disabled progress button so _syncWorkflowGating rebuilds never drop it.
+ */
+function _appendGatingInstallButton(line, state, wf, context, actions) {
+  var store = state && state.playground && state.playground._workflowRun;
+  if (!store || !line) return;
+  var install = _gatingManifestInstall;
+  var curKey = _gatingVersionKey(store);
+  if (install.busy && install.key === curKey) {
+    line.appendChild(document.createTextNode(" "));
+    line.appendChild(el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": "workflow-run-gating-install",
+      text: "Installing… " + Math.round(Number(install.pct) || 0) + "%",
+      title: install.message || "Installing missing models from the manifest",
+      disabled: true,
+      style: "font-size:10px;padding:2px 8px;width:auto;",
+    }));
+    return;
+  }
+  var entries = _gatingInstallableModels(store, wf);
+  if (!entries.length) return;
+  line.appendChild(document.createTextNode(" "));
+  var label = entries.length === 1
+    ? "Install from Manifest"
+    : "Install " + entries.length + " from Manifest";
+  var btn = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn",
+    "data-testid": "workflow-run-gating-install",
+    text: label,
+    title: "Install missing model" + (entries.length === 1 ? "" : "s") + " from the manifest: " + entries.map(function (e) { return e.filename; }).join(", "),
+    style: "font-size:10px;padding:2px 8px;width:auto;",
+  });
+  btn.addEventListener("click", function () {
+    _gatingInstallFromManifest(state, context, actions, entries, btn);
+  });
+  line.appendChild(btn);
+}
+
+function _workflowGatingLineEl(state, wf, context, actions) {
   const store = state && state.playground && state.playground._workflowRun;
   const info = workflowGatingInfo(store, wf, state);
   const line = el("div", {
@@ -2196,6 +2526,7 @@ function _workflowGatingLineEl(state, wf, context) {
   });
   if (info.color) line.style.color = info.color;
   line.textContent = info.text;
+  _appendGatingInstallButton(line, state, wf, context, actions);
   if (store && !store.workflowId) {
     // Empty-state link to the Workflows page (legacy layout untouched).
     line.appendChild(document.createTextNode(" "));
@@ -2243,7 +2574,7 @@ function _populateWorkflowSelectorInner(container, state, context, actions) {
     "data-testid": "workflow-type",
     text: "Type: " + _workflowTypeLabel(state),
   }));
-  container.appendChild(_workflowGatingLineEl(state, wf, context));
+  container.appendChild(_workflowGatingLineEl(state, wf, context, actions));
 
   if (store && store.handoff) {
     container.appendChild(el("div", {
@@ -2299,8 +2630,71 @@ function _syncWorkflowGating(state, context, actions) {
     const info = workflowGatingInfo(store, wf, state);
     line.style.color = info.color ? info.color : "";
     line.textContent = info.text;
+    // Rebuilds wipe children: re-append the manifest install affordance so
+    // per-keystroke syncs never drop a needed (or in-flight) install.
+    _appendGatingInstallButton(line, state, wf, context, actions);
   }
   _syncRunButtonGating(state, context, actions);
+  // The bundle behind a "Ready to run" line may predate remote truth (first
+  // load before the inventory snapshot lands, or a Modal workspace switch
+  // behind an already-loaded bundle). One bounded catch-up per version; the
+  // workspace-changed listener below covers later switches explicitly.
+  _maybeRefreshRemoteReadiness(state, context, actions);
+}
+
+// Reload the live selection's run-context bundle in place. The Modal volume
+// behind remote readiness can change under the Playground (workspace switch)
+// while the store still holds the previous workspace's bundle, so the gating
+// line keeps reporting the old truth. Returns true when the store now holds
+// fresh truth for the still-current selection. Never throws.
+async function _reloadPlaygroundRunContext(state, context) {
+  const pg = state && state.playground;
+  const store = pg && pg._workflowRun;
+  const wf = pg && pg._workflowRunModule;
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  if (!store || !wf || typeof wf.loadRunContext !== "function") return false;
+  if (!store.workflowId || !store.workflowVersionId || !store.runContext) return false;
+  const key = _gatingVersionKey(store);
+  try {
+    const res = await wf.loadRunContext(apiBase, store, store.workflowId, store.workflowVersionId);
+    if (!res || !res.ok) return false;
+    // A newer selection replaced the store mid-flight: leave it alone; its
+    // own load path owns the truth now.
+    if (_gatingVersionKey(store) !== key) return false;
+    return true;
+  } catch (_e) { return false; }
+}
+
+// One-shot catch-up per workflow version: a bundle served before the first
+// remote inventory snapshot lands reports remote_inventory_available:false,
+// which fails open to "Ready to run" and nothing ever re-reads it. When a
+// remote target is selected and the gate otherwise claims runnable, spend one
+// explicit refresh + reload so the warning appears without a manual reselect.
+// At most one attempt per version key; unknown inventory afterwards keeps
+// the previous fail-open behavior. Never throws.
+async function _maybeRefreshRemoteReadiness(state, context, actions) {
+  try {
+    const pg = state && state.playground;
+    const store = pg && pg._workflowRun;
+    const wf = pg && pg._workflowRunModule;
+    if (!store || !wf || !store.runContext) return;
+    if (!_remoteGoldenSelected()) return;
+    if (store.runContext.remote_inventory_available === true) return;
+    if (!store.workflowId || !store.workflowVersionId) return;
+    var decision = null;
+    try { decision = _workflowRunnableForExecution(state, store, wf); } catch (_e) { decision = null; }
+    // Only spend the extra round trips when the line currently claims ready:
+    // a blocked gate already warns, and its next selection change carries
+    // fresh truth anyway. The key is set only on a real attempt.
+    if (!decision || decision.runnable !== true) return;
+    const key = _gatingVersionKey(store);
+    if (pg._remoteReadinessCatchupKey === key) return;
+    pg._remoteReadinessCatchupKey = key;
+    const apiBase = (context && context.apiBase) || "/comfymodal";
+    try { await refreshRemoteInventory(apiBase); } catch (_e) {}
+    const reloaded = await _reloadPlaygroundRunContext(state, context);
+    if (reloaded) _rerenderWorkflowSection(state, context, actions);
+  } catch (_e) { /* readiness catch-up is best-effort */ }
 }
 
 function renderWorkflowSelector(state, context, actions) {
@@ -2357,6 +2751,21 @@ async function initWorkflowRun(state, context, actions) {
       pg._workflowRunModule = wf;
       const apiBase = (context && context.apiBase) || "/comfymodal";
       _preloadStudioModalOptions(apiBase);
+      // A Modal workspace switch (Backend → Workspaces → Set Active) replaces
+      // the remote volume behind the bundle the Playground already holds: the
+      // gating line would keep reporting the previous workspace's truth.
+      // Re-read run-context for the live selection so the warning reflects
+      // the NEW workspace. Attached once; the reload itself is a no-op
+      // without a live selection.
+      if (!pg._workspaceChangedAttached && typeof window !== "undefined"
+        && typeof window.addEventListener === "function") {
+        pg._workspaceChangedAttached = true;
+        window.addEventListener("workspace-changed", () => {
+          _reloadPlaygroundRunContext(state, context).then((reloaded) => {
+            if (reloaded) _rerenderWorkflowSection(state, context, actions);
+          }).catch(() => {});
+        });
+      }
 
       // Paint the selector from the store immediately. The library request is
       // intentionally started before handoff/restore, but it must not delay
@@ -2594,12 +3003,26 @@ function _remoteGoldenSelected() {
 function _workflowRunnableForExecution(state, store, wf) {
   const modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
   const gated = _resolveWorkflowRunnable(store, wf, modelRecords);
+  const remoteSelected = _remoteGoldenSelected();
+  let execution = gated;
   if (typeof wf.resolveExecutionRunnable === "function") {
-    return wf.resolveExecutionRunnable(gated, _remoteGoldenSelected());
+    execution = wf.resolveExecutionRunnable(gated, remoteSelected);
+  } else if (gated.runnable || !remoteSelected) {
+    execution = gated;
+  } else {
+    // Compatibility with an older dynamically-loaded workflow module.
+    execution = { runnable: true, reasons: [] };
   }
-  // Compatibility with an older dynamically-loaded workflow module.
-  if (gated.runnable || !_remoteGoldenSelected()) return gated;
-  return { runnable: true, reasons: [] };
+  // A KNOWN remote absence re-blocks: a workspace switch to a volume missing
+  // models must surface instead of "Ready to run". Unknown inventory fails
+  // open (previous behavior). The backend bundle gate applies the same rule.
+  try {
+    if (remoteSelected && execution && execution.runnable === true
+      && typeof wf.resolveRemoteExecutionRunnable === "function") {
+      return wf.resolveRemoteExecutionRunnable(store, execution, true);
+    }
+  } catch (_e) {}
+  return execution;
 }
 function _applyModernRunButtonState(state, context, actions, btn, reason) {
   // Phase 1 shell gate: Post runs the local engine and later-phase
@@ -2885,8 +3308,8 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
     var _gz = _studioGuidanceForRun(state, store);
     if (_gz) payload.guidance = _gz;
   } catch (_eG) {}
-  // Phase 5: prompt-style composition. The user's prompt stays first and
-  // verbatim; the selected style fragment appends deterministically (see
+  // Phase 5: prompt-style composition. Style leads under a "Style:" label
+  // and the user prompt follows verbatim under "Subject:" (see
   // composeStylePrompt). studio_style carries user_prompt + style identity
   // so History retains all three: user prompt, style, final prompt.
   try {
@@ -3330,6 +3753,60 @@ function _disposeScopedTracker(state) {
 // Lazily created once per page; beginRun() on every Run click allocates a
 // fresh canonical runId. The canonical store drives runState via a pure
 // projection; legacy lifecycle fields are outputs, never independent inputs.
+// Refresh-durable Diagnostics (see studio-run-normalizer.js span snapshots):
+// freeze the terminal per-node breakdown under every run identity so the
+// viewer renders it after a refresh, when runState.goldenProgress is gone
+// and the durable record carries no timing.
+function _spanStorage() {
+  try {
+    if (typeof localStorage !== "undefined" && localStorage) return localStorage;
+  } catch (e) { /* privacy mode: no persistence */ }
+  return null;
+}
+
+function _persistTerminalSpans(legacy, apiBase) {
+  if (!legacy || !legacy.goldenProgress) return false;
+  var store = _spanStorage();
+  if (!store) return false;
+  var snapshot;
+  try {
+    snapshot = extractSpanSnapshot(legacy.goldenProgress, legacy.elapsedMs);
+  } catch (e) { return false; }
+  if (!snapshot) return false;
+  var wrote = false;
+  try {
+    wrote = saveSpanSnapshot(store, [
+      legacy.runId, legacy.experimentId, legacy.runHistoryId, legacy.id,
+      legacy.historyGenerationId, legacy.history_generation_id,
+    ], snapshot);
+  } catch (e) { wrote = false; }
+  // History bridge: the detail surface only knows the durable generation
+  // id, which the terminal projection never carries. Derive it the same
+  // way the preview's record resolution does (history entry run_id
+  // deterministically maps to the generation id) and file the snapshot
+  // under it too — fire-and-forget, never blocking the terminal path.
+  // Once per run identity: terminal updates can re-fire while polls drain.
+  try {
+    var base = apiBase || "/comfymodal";
+    var key = legacy.runId || legacy.experimentId;
+    _persistTerminalSpans._bridged = _persistTerminalSpans._bridged || {};
+    if (key && !_persistTerminalSpans._bridged[key]) {
+      _persistTerminalSpans._bridged[key] = true;
+      _fetchSameRunHistoryEntry(base, key).then(function (entry) {
+        if (!entry) return null;
+        return generationIdForLegacyRunId(entry.run_id, entry.kind);
+      }).then(function (genId) {
+        if (!genId) return;
+        try {
+          var s = _spanStorage();
+          if (s) saveSpanSnapshot(s, [genId], snapshot);
+        } catch (e) { /* best-effort */ }
+      }).catch(function () { /* best-effort */ });
+    }
+  } catch (e) { /* best-effort */ }
+  return wrote;
+}
+
 function _getRunController(state, actions) {
   if (!state.playground) return null;
   if (actions) state.playground._runActions = actions;
@@ -3366,6 +3843,15 @@ function _getRunController(state, actions) {
       : (golden && golden.statusMessage != null ? golden.statusMessage : null);
     if (modalPhase != null) legacy.modalPhase = modalPhase;
     if (modalMessage != null) legacy.modalMessage = modalMessage;
+    // Refresh-durable Diagnostics: freeze the terminal span breakdown to
+    // localStorage (keyed by every run identity) the moment the run lands
+    // terminal. The durable History record carries no timing, so without
+    // this a refresh wipes the only copy of the breakdown and Diagnostics
+    // falls back to "pending" for every completed run. Idempotent — the
+    // same terminal re-fires the same payload.
+    if (legacy.status && LEGACY_TERMINAL_STATUSES.indexOf(legacy.status) !== -1) {
+      _persistTerminalSpans(legacy, (typeof context !== "undefined" && context && context.apiBase) || "/comfymodal");
+    }
     var prev = state.playground.runState;
     var prevStatus = prev && prev.status;
     if (prev && prevStatus === legacy.status) {
@@ -3763,8 +4249,29 @@ function renderRunButton(state, context, actions) {
         let response = null;
         try { response = await triggerDeploy(apiBase); } catch { response = null; }
         if (response && (response.status === "started" || response.status === "already_deploying")) {
-          redeployBtn.textContent = response.status === "already_deploying" ? "Redeploy in progress" : "Redeploy started";
-          redeployBtn.title = "Wait for deployment to finish, then run again";
+          redeployBtn.textContent = response.status === "already_deploying" ? "Redeploy in progress…" : "Redeploy started…";
+          redeployBtn.title = "Polling deployment status…";
+          // Shared bounded poll (studio-backend-api.js): same terminal
+          // vocabulary as every other redeploy button.
+          const terminal = await pollDeployToTerminal(async function () {
+            let data = null;
+            try { data = await getDeployStatus(apiBase); } catch { data = null; }
+            if (!data || typeof data !== "object") return null;
+            return { state: data.state, message: data.message };
+          });
+          if (terminal.outcome === "usable") {
+            redeployBtn.textContent = "Redeploy finished — run again";
+            redeployBtn.title = "Deployment finished, click Run to try again";
+          } else if (terminal.outcome === "timeout") {
+            redeployBtn.disabled = false;
+            redeployBtn.textContent = "Redeploy Modal app";
+            redeployBtn.title = "Redeploy timed out — try again";
+          } else {
+            const failed = terminal.status || {};
+            redeployBtn.disabled = false;
+            redeployBtn.textContent = "Redeploy Modal app";
+            redeployBtn.title = (failed && failed.message) || "Redeploy failed — try again";
+          }
           return;
         }
         redeployBtn.disabled = false;
@@ -8048,15 +8555,15 @@ function _styleSetForId(id) {
   }
   return null;
 }
-// Deterministic composition: user prompt stays first and verbatim; the
-// style fragment appends after a separator. Empty user prompt + style
-// submits the fragment alone (still an honest, visible prompt).
+// Deterministic composition: style leads with an explicit label, subject
+// follows verbatim. Empty user prompt + style submits the style block alone
+// (still an honest, visible prompt).
 function composeStylePrompt(userPrompt, fragment) {
   var user = String(userPrompt == null ? "" : userPrompt).trim();
   var frag = String(fragment == null ? "" : fragment).trim();
   if (!frag) return String(userPrompt == null ? "" : userPrompt);
-  if (!user) return frag;
-  return user + ", " + frag;
+  if (!user) return "Style: " + frag;
+  return "Style: " + frag + "\n\nSubject: " + user;
 }
 // Explicit style request for the current run, or null for a plain prompt.
 // Generate → Text only; the selected style must still exist in the catalog.
@@ -8102,31 +8609,38 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
       saveStyleSelection({ selectedId: "" });
       sel0.selectedId = "";
     }
-    var box = el("div", {
-      class: "comfymodal-studio-style-browser",
+    var box = el("details", {
+      class: "comfymodal-studio-style-browser comfymodal-studio-dependency-accordion",
       "data-testid": "style-browser",
       style: "margin:8px 0;",
     });
-    var head = el("div", {
-      style: "display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;",
+    var head = el("summary", {
+      class: "comfymodal-studio-accordion-summary",
+      "data-testid": "style-browser-toggle",
+      style: "gap:8px;flex-wrap:wrap;",
     });
     head.appendChild(el("span", {
+      class: "comfymodal-studio-accordion-label",
       text: "Prompt Style",
-      style: "font-size:12px;color:#aaa;",
     }));
     var selName = el("span", {
       "data-testid": "style-selected-name",
-      style: "font-size:12px;color:var(--color-text, #ddd);",
+      style: "font-size:12px;font-weight:400;color:var(--color-text, #ddd);",
     });
     head.appendChild(selName);
+    box.appendChild(head);
+    var body = el("div", {
+      style: "display:flex;flex-direction:column;gap:6px;",
+    });
+    box.appendChild(body);
     var noneBtn = el("button", {
       type: "button", class: "comfymodal-secondary-btn",
       text: "None",
       "data-testid": "style-none",
       title: "Clear the selected style (plain prompt)",
+      style: "align-self:flex-start;",
     });
-    head.appendChild(noneBtn);
-    box.appendChild(head);
+    body.appendChild(noneBtn);
     // Set tabs above search: search/category/favorites/None/details/
     // effective-preview all operate within the active tab. Favorites and
     // the selection persist across tabs (global store key).
@@ -8159,7 +8673,7 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
       });
       tabs.appendChild(tab);
     });
-    box.appendChild(tabs);
+    body.appendChild(tabs);
     function paintTabStates() {
       tabBtns.forEach(function (entry) {
         var on = !!activeSet && entry.set.id === activeSet.id;
@@ -8198,24 +8712,24 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
     rebuildCategories();
     tools.appendChild(search);
     tools.appendChild(catSel);
-    box.appendChild(tools);
+    body.appendChild(tools);
     var grid = el("div", {
       "data-testid": "style-grid",
       style: "display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px;",
     });
-    box.appendChild(grid);
+    body.appendChild(grid);
     var details = el("p", {
       "data-testid": "style-details",
       class: "comfymodal-studio-control-note",
       style: "font-size:11px;color:#888;margin:6px 0 0;",
     });
-    box.appendChild(details);
+    body.appendChild(details);
     var effLine = el("p", {
       "data-testid": "style-effective-prompt",
       class: "comfymodal-studio-control-note",
-      style: "font-size:11px;color:#888;margin:4px 0 0;overflow-wrap:anywhere;",
+      style: "font-size:11px;color:#888;margin:4px 0 0;overflow-wrap:anywhere;white-space:pre-wrap;",
     });
-    box.appendChild(effLine);
+    body.appendChild(effLine);
     // Attribution + source links for remote-preview sets. Curated presets
     // need none (bundled text under MIT); the Style Library is remote-only
     // with an unverified license, so the post/gallery/Drive links stay
@@ -8225,7 +8739,7 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
       class: "comfymodal-studio-control-note",
       style: "font-size:11px;color:#888;margin:4px 0 0;",
     });
-    box.appendChild(sourceNote);
+    body.appendChild(sourceNote);
     function paintSourceNote() {
       while (sourceNote.firstChild) sourceNote.removeChild(sourceNote.firstChild);
       if (!activeSet || activeSet.id !== "reddit-style-library") {
@@ -8261,7 +8775,7 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
         : "Pick a style card to append its fragment to your prompt at run time.";
       var composed = st ? composeStylePrompt(currentPromptText(), st.prompt_fragment) : "";
       effLine.textContent = st
-        ? (composed ? ("Effective prompt: " + composed) : "")
+        ? (composed ? ("Effective prompt:\n" + composed) : "")
         : "";
       Array.prototype.forEach.call(grid.querySelectorAll('[data-testid^="style-card-"]'), function (card) {
         var on = !!st && card.getAttribute("data-style-id") === st.id;
@@ -8403,7 +8917,7 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
           var st = sel.selectedId ? _styleById(sel.selectedId) : null;
           var composedLive = st ? composeStylePrompt(t.value, st.prompt_fragment) : "";
           effLine.textContent = st
-            ? (composedLive ? ("Effective prompt: " + composedLive) : "")
+            ? (composedLive ? ("Effective prompt:\n" + composedLive) : "")
             : "";
         } catch (_e) {}
       });
@@ -11428,6 +11942,36 @@ export async function openRunImagePreview(state, context, run, outputUrl) {
     }
 
     var _viewer = resolveViewerInput(_record, outputUrl);
+    // Live span breakdown for Diagnostics: the durable record carries no
+    // goldenProgress, but the in-memory run state does (same source as the
+    // progress-node-rows behind the overlay). Attach it so the viewer
+    // timing renders the breakdown instead of "Diagnostics pending".
+    try {
+      var _liveGolden = state.playground && state.playground.runState && state.playground.runState.goldenProgress;
+      if (_liveGolden && typeof _liveGolden === "object" && !_viewer.goldenProgress) {
+        _viewer.goldenProgress = _liveGolden;
+      }
+    } catch (_e) { /* spans stay absent; placeholder remains truthful */ }
+    // Refresh-durable fallback: a terminal snapshot persisted to
+    // localStorage under a run identity (survives the refresh that wipes
+    // runState.goldenProgress). Only when the record itself has no timing —
+    // durable data always wins over this browser-local copy.
+    if (!_viewer.goldenProgress) {
+      try {
+        var _store = _spanStorage();
+        var _timingEmpty = !_viewer.timing || Object.keys(_viewer.timing).length === 0;
+        if (_store && _timingEmpty) {
+          var _persisted = loadSpanSnapshot(_store, [
+            _runId,
+            _record && _record.id, _record && _record.runId, _record && _record.run_id,
+            _record && _record.experimentId, _record && _record.experiment_id,
+            _record && _record.generationId, _record && _record.historyGenerationId,
+            _run && _run.experimentId, _run && _run.generationId,
+          ]);
+          if (_persisted) _viewer.goldenProgress = _persisted;
+        }
+      } catch (_e) { /* placeholder remains truthful */ }
+    }
     // Native File actions need a V2 repository: local-only run records
     // carry no asset identity (buttons stay hidden), and bridge-mode
     // repos have no open/reveal routes (same reason).
@@ -12360,63 +12904,7 @@ function renderToolSubmenu(state, context, actions) {
     body.appendChild(btn);
   });
 
-  if (mode === "generate" && sub === "text") {
-    // Background fill: paints the canvas background a user-picked color.
-    var pg = state.playground || {};
-    var current = pg.canvasBg || "";
-    var fillBtn = el("button", {
-      type: "button",
-      class: "comfymodal-secondary-btn comfymodal-studio-bgfill-btn" + (current ? " is-on" : ""),
-      "data-testid": "bg-fill-btn",
-      title: "Fill the canvas background with a solid color",
-    });
-    fillBtn.appendChild(el("span", { "aria-hidden": "true", text: "🪣 " }));
-    fillBtn.appendChild(el("span", { text: "Bg Fill" }));
-    var picker = document.createElement("input");
-    picker.type = "color";
-    picker.value = current || "#18181b";
-    picker.setAttribute("data-testid", "bg-fill-picker");
-    picker.setAttribute("aria-label", "Background fill color");
-    picker.title = "Pick a background color";
-    picker.addEventListener("input", function () {
-      var canvas = document.querySelector('[data-testid="canvas-area"]');
-      if (canvas) {
-        canvas.style.background = picker.value;
-        canvas.style.backgroundImage = "none";
-      }
-    });
-    picker.addEventListener("change", function () {
-      if (actions && actions.setCanvasBg) actions.setCanvasBg(picker.value);
-    });
-    fillBtn.addEventListener("click", function () { picker.click(); });
-    body.appendChild(fillBtn);
-    body.appendChild(picker);
-    if (current) {
-      var swatch = el("span", {
-        class: "comfymodal-studio-bgfill-swatch",
-        "data-testid": "bg-fill-swatch",
-        title: current,
-      });
-      swatch.style.background = current;
-      body.appendChild(swatch);
-      var clear = el("button", {
-        type: "button",
-        class: "comfymodal-secondary-btn",
-        "data-testid": "bg-fill-clear",
-        text: "Clear",
-        title: "Remove the background fill",
-      });
-      clear.addEventListener("click", function () {
-        if (actions && actions.setCanvasBg) actions.setCanvasBg("");
-      });
-      body.appendChild(clear);
-    } else {
-      body.appendChild(el("span", {
-        class: "comfymodal-studio-tool-submenu-note",
-        text: "Optional — fills the empty canvas background.",
-      }));
-    }
-  } else if (spec.id === "post") {
+  if (spec.id === "post") {
     body.appendChild(el("span", {
       class: "comfymodal-studio-tool-submenu-note",
       "data-testid": "submenu-post-note",
@@ -12433,13 +12921,163 @@ function renderToolSubmenu(state, context, actions) {
   return row;
 }
 
-// Mapped roles that are deliberately NOT rendered as Shelf fields. These are
-// model-loader inputs: the files are chosen in the Model Library and already
-// flow through the version's executable prompt, so an editable field here only
-// invited a second, conflicting place to change the model stack.
-var _SHELF_HIDDEN_ROLES = ["model_unet", "clip", "vae", "model", "model_clip", "model_vae"];
+// Mapped roles that are deliberately NOT rendered as Shelf fields. CLIP/VAE
+// files are chosen in the Model Library and already flow through the
+// version's executable prompt, so an editable field here only invited a
+// second, conflicting place to change them. The UNET checkpoint stays
+// swappable from the shelf Advanced section (see _shelfUnetOptions) — only
+// the clip/vae family stays hidden here.
+var _SHELF_HIDDEN_ROLES = ["clip", "vae", "model_clip", "model_vae"];
 var _SHELF_SAVE_DELAY_MS = 300;
 var _shelfPointerDrag = null;
+
+// UNET checkpoint swapping (Advanced shelf section): the version's saved
+// checkpoint stays the default, and the model library supplies the swap
+// targets. "model"/"unet" are legacy spellings of the same "model_unet"
+// role — every _shelfUnet* helper below treats the three as one family.
+var _SHELF_UNET_ROLES = ["model_unet", "model", "unet"];
+var _SHELF_UNET_MODEL_TYPES = ["unet", "diffusion_models", "checkpoint"];
+var _SHELF_UNET_FOLDERS = ["unet", "diffusion_models", "checkpoints"];
+
+function _shelfIsUnetRole(role) {
+  return _SHELF_UNET_ROLES.indexOf(String(role == null ? "" : role)) !== -1;
+}
+
+function _shelfBasename(name) {
+  var parts = String(name == null ? "" : name).split(/[\\/]/);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
+// Saved-with UNET filename for a shelf role: graph executable value first
+// (via defaultValuesFromContext), then the mapping entry default. Falls
+// back across the unet family spellings; returns "" when the version
+// declares no default. Never invents a value.
+function _shelfUnetDefault(state, role) {
+  try {
+    var ready = _shelfReady(state);
+    if (!ready) return "";
+    var defaults = {};
+    try {
+      defaults = (ready.wf.defaultValuesFromContext
+        && ready.wf.defaultValuesFromContext(ready.store)) || {};
+    } catch (_e) { defaults = {}; }
+    if (defaults[role] !== undefined && defaults[role] !== null
+      && String(defaults[role]) !== "") {
+      return String(defaults[role]);
+    }
+    for (var i = 0; i < _SHELF_UNET_ROLES.length; i++) {
+      var hit = defaults[_SHELF_UNET_ROLES[i]];
+      if (hit !== undefined && hit !== null && String(hit) !== "") return String(hit);
+    }
+  } catch (_e) { /* best-effort */ }
+  return "";
+}
+
+// Model-library UNET records (installed first). Returns
+// [{ filename, installed }]; labels are applied by _shelfUnetOptions.
+function _shelfUnetLibrary(state) {
+  var installed = [];
+  var missing = [];
+  try {
+    var records = (state && state.playground && state.playground._workflowModelLibrary) || [];
+    records.forEach(function (rec) {
+      if (!rec || typeof rec !== "object") return;
+      var mt = String(rec.model_type == null ? "" : rec.model_type).toLowerCase();
+      var folder = String(rec.folder == null ? "" : rec.folder).toLowerCase();
+      if (_SHELF_UNET_MODEL_TYPES.indexOf(mt) === -1
+        && _SHELF_UNET_FOLDERS.indexOf(folder) === -1) return;
+      var name = rec.filename == null ? "" : String(rec.filename);
+      if (!name) return;
+      if (rec.installed === true || rec.state === "installed") installed.push(name);
+      else missing.push(name);
+    });
+  } catch (_e) { /* best-effort */ }
+  var ordered = installed.concat(missing);
+  return ordered.map(function (name, idx) {
+    return { filename: name, installed: idx < installed.length };
+  });
+}
+
+// Dropdown union: saved default first (labeled " (default)"), then library
+// UNET records (not-installed ones marked), then the live value so the
+// select never blanks on a value outside both. Deduped by basename; option
+// values stay raw filenames while visible labels carry the suffixes. When
+// the library is empty/unloaded the saved default is still offered alone.
+function _shelfUnetOptions(state, role) {
+  var seen = {};
+  var options = [];
+  function push(value, label) {
+    var raw = value == null ? "" : String(value);
+    if (!raw) return;
+    var key = _shelfBasename(raw) || raw;
+    if (Object.prototype.hasOwnProperty.call(seen, key)) return;
+    seen[key] = true;
+    options.push({ value: raw, label: label == null ? raw : String(label) });
+  }
+  var def = _shelfUnetDefault(state, role);
+  if (def) push(def, def + " (default)");
+  _shelfUnetLibrary(state).forEach(function (hit) {
+    push(hit.filename, hit.installed ? hit.filename : hit.filename + " (not installed)");
+  });
+  try {
+    var ready = _shelfReady(state);
+    var current = ready && ready.store.controlValues
+      ? ready.store.controlValues[role] : "";
+    if (current !== undefined && current !== null && String(current) !== "") {
+      push(String(current), String(current));
+    }
+  } catch (_e) { /* best-effort */ }
+  return options;
+}
+
+// Extend the live run-context enum_options for a UNET shelf role so the
+// shelf dropdown and validateMappedValues agree. Patches only the in-memory
+// bundle (rebuilt on every version load) — never the stored mapping.
+// Returns the union's raw filenames.
+function _shelfEnsureUnetEnumOptions(state, role) {
+  var union = _shelfUnetOptions(state, role).map(function (o) { return o.value; });
+  try {
+    var ready = _shelfReady(state);
+    if (!ready) return union;
+    var schema = {};
+    try { schema = ready.wf.getControlSchema(ready.store) || {}; } catch (_e) { schema = {}; }
+    var entry = schema && schema[role];
+    if (entry && typeof entry === "object") {
+      var existing = Array.isArray(entry.enum_options) ? entry.enum_options.slice() : [];
+      var have = {};
+      existing.forEach(function (o) { have[String(o)] = true; });
+      union.forEach(function (f) {
+        if (!Object.prototype.hasOwnProperty.call(have, String(f))) {
+          existing.push(f);
+          have[String(f)] = true;
+        }
+      });
+      entry.enum_options = existing;
+    }
+    var mappingEntries = ready.store.runContext && ready.store.runContext.mapping
+      && ready.store.runContext.mapping.entries;
+    if (Array.isArray(mappingEntries)) {
+      mappingEntries.forEach(function (e) {
+        if (!e || typeof e !== "object" || _shelfRoleOf(e) !== role) return;
+        var cur = Array.isArray(e.enum_options) ? e.enum_options.slice() : [];
+        var seen = {};
+        cur.forEach(function (o) {
+          var v = (o && typeof o === "object")
+            ? (o.value != null ? o.value : o.filename) : o;
+          seen[String(v)] = true;
+        });
+        union.forEach(function (f) {
+          if (!Object.prototype.hasOwnProperty.call(seen, String(f))) {
+            cur.push(f);
+            seen[String(f)] = true;
+          }
+        });
+        e.enum_options = cur;
+      });
+    }
+  } catch (_e) { /* best-effort */ }
+  return union;
+}
 
 function _shelfClearDropIndicators() {
   Array.prototype.forEach.call(document.querySelectorAll(
@@ -12555,9 +13193,11 @@ function _shelfEntries(state) {
     if (!e || typeof e !== "object") return false;
     var role = e.semantic_role || e.input_name || "";
     if (!role || role === "output") return false;
-    // Model-loader roles are not editable knobs: the model/CLIP/VAE files are
-    // chosen in the Model Library and already flow through the version's
-    // executable prompt. Rendering them here just invited conflicting edits.
+    // CLIP/VAE loader roles are not editable knobs: the files are chosen in
+    // the Model Library and already flow through the version's executable
+    // prompt. Rendering them here just invited conflicting edits. The UNET
+    // checkpoint family (model_unet/model/unet) is intentionally visible:
+    // it renders as the swappable Model card in Advanced.
     if (_SHELF_HIDDEN_ROLES.indexOf(role) !== -1) return false;
     return true;
   }) : [];
@@ -13488,6 +14128,14 @@ function _applyShelfSavedValues(state) {
     }
   });
   if (!applied) return;
+  // UNET checkpoint restores save raw filenames that can postdate the
+  // bundle's enum snapshot: ensure the union first so re-validation does
+  // not flag the user's own saved choice as "must be one of".
+  try {
+    Object.keys(schema).forEach(function (role) {
+      if (_shelfIsUnetRole(role)) _shelfEnsureUnetEnumOptions(state, role);
+    });
+  } catch (_e) { /* best-effort */ }
   var validation = ready.wf.validateMappedValues(ready.store.controlValues || {}, schema);
   ready.store.setControlValues(validation.values);
 }
@@ -13525,6 +14173,21 @@ function _applyShelfBaseValues(state, payload) {
 function commitShelfValue(state, context, actions, role, rawValue) {
   var ready = _shelfReady(state);
   if (!ready) return;
+  if (_shelfIsUnetRole(role)) {
+    // The saved bundle snapshot can predate the library (stale
+    // enum_options): ensure the default+library union first so the validated
+    // set and the dropdown agree, then admit the committed choice itself.
+    try {
+      var _union = _shelfEnsureUnetEnumOptions(state, role);
+      var _schema = ready.wf.getControlSchema(ready.store) || {};
+      var _entry = _schema && _schema[role];
+      if (_entry && typeof _entry === "object"
+        && rawValue !== undefined && rawValue !== null && String(rawValue) !== "") {
+        if (!Array.isArray(_entry.enum_options)) _entry.enum_options = [];
+        if (_union.indexOf(String(rawValue)) === -1) _entry.enum_options.push(String(rawValue));
+      }
+    } catch (_e) { /* best-effort */ }
+  }
   ready.store.setControlValue(role, rawValue);
   var schema = ready.wf.getControlSchema(ready.store);
   var validation = ready.wf.validateMappedValues(ready.store.controlValues || {}, schema);
@@ -13649,7 +14312,7 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
   }
   head.appendChild(el("span", {
     class: "comfymodal-studio-shelf-card-label",
-    text: _shelfDisplayName(role, entry),
+    text: _shelfIsUnetRole(role) ? "Model" : _shelfDisplayName(role, entry),
   }));
   if (!fixed) {
   }
@@ -13675,7 +14338,22 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
     // Ownership token for slow async completions (file upload): the commit
     // below is dropped when the selection changed mid-upload.
     var _renderIdentity = _selectionIdentity(_shelfStore(state));
-    body.appendChild(_shelfRenderInput(role, entry, value, function (next) {
+    var _effEntry = entry;
+    var _unetOpts = null;
+    var _unetDef = "";
+    if (_shelfIsUnetRole(role)) {
+      // Checkpoint swap: dropdown over the saved default + library UNETs.
+      // enum_options here are {value,label} display objects (raw filename
+      // values, " (default)"-suffixed labels); validation runs against the
+      // raw-string union ensured on the live schema (see
+      // _shelfEnsureUnetEnumOptions + commitShelfValue). The copy keeps the
+      // stored mapping entry untouched.
+      _shelfEnsureUnetEnumOptions(state, role);
+      _unetOpts = _shelfUnetOptions(state, role);
+      _unetDef = _shelfUnetDefault(state, role);
+      _effEntry = Object.assign({}, entry, { control_kind: "file", enum_options: _unetOpts });
+    }
+    body.appendChild(_shelfRenderInput(role, _effEntry, value, function (next) {
       // A slow file upload may finish after the user switched workflows —
       // never commit it into the newly selected workflow.
       if ((role === "source_image" || role === "mask")
@@ -13710,6 +14388,12 @@ function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) 
         _refreshShelfSection(state, context, actions);
       }
     }, extra));
+    if (_shelfIsUnetRole(role) && _unetOpts && _unetOpts.length) {
+      body.appendChild(el("p", {
+        class: "comfymodal-studio-control-note",
+        text: _unetDef ? "Saved default: " + _unetDef : "No saved default in this version.",
+      }));
+    }
   }
   card.appendChild(body);
   return card;

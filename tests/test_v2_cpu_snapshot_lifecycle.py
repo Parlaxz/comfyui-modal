@@ -3260,47 +3260,50 @@ class CpuSnapshotRequestTimeActivationTests(unittest.TestCase):
         self.assertIs(served_unet, unet)
         self.assertIs(served_clip, clip)
 
-    # ── Test 3: identity mismatch still fails closed for production ───
+    # ── Test 3: identity mismatch falls back (all profiles) ───
 
-    def test_production_cold_run_identity_mismatch_fails_closed(self):
-        """A request for a DIFFERENT model must not be served from the
-        retained snapshot — production raises identity mismatch and the
-        snapshot stays inactive."""
+    def test_production_cold_run_identity_mismatch_falls_back(self):
+        """A request for a DIFFERENT model is served by the normal loader:
+        no raise, bridge cleared, snapshot stays inactive, executor runs."""
         self.entrypoint._cpu_snapshot_models = _make_retained_snapshot()
         self.entrypoint._cpu_snapshot_models_active = False
+        executor_called: list[bool] = []
 
         async def _stub_execute(*_a, **_kw):
+            executor_called.append(True)
             return {"images": [], "videos": [], "outputs": {}}
 
         self.entrypoint._execute_v2_prompt_executor = _stub_execute  # type: ignore[assignment]
         plan = _cold_run_plan(unet_name="different.safetensors")
         context = ExecutionContext(request_id="cold-run-mismatch")
         with patch(self._RETARGET_PATCH, return_value=(True, "ok")):
-            with self.assertRaises(RuntimeError) as ctx:
-                asyncio.run(self.entrypoint._run_in_process(plan, context))
-        self.assertIn("identity mismatch", str(ctx.exception).lower())
+            result = asyncio.run(self.entrypoint._run_in_process(plan, context))
+        self.assertEqual(executor_called, [True])
         self.assertFalse(self.entrypoint._cpu_snapshot_models_active)
         self.assertIsNone(self.entrypoint._preload_bridge._preparation)
+        self.assertIsInstance(result, dict)
 
-    # ── Test 4: retarget failure fails closed for production ──────────
+    # ── Test 4: retarget failure falls back (all profiles) ──────────
 
-    def test_production_cold_run_retarget_failure_fails_closed(self):
-        """When request-time retargeting fails, the production path raises
-        instead of publishing an un-retargeted CPU patcher."""
+    def test_production_cold_run_retarget_failure_falls_back(self):
+        """When request-time retargeting fails, the request still falls back
+        to the normal loader instead of publishing an un-retargeted patcher."""
         self.entrypoint._cpu_snapshot_models = _make_retained_snapshot()
         self.entrypoint._cpu_snapshot_models_active = False
+        executor_called: list[bool] = []
 
         async def _stub_execute(*_a, **_kw):
+            executor_called.append(True)
             return {"images": [], "videos": [], "outputs": {}}
 
         self.entrypoint._execute_v2_prompt_executor = _stub_execute  # type: ignore[assignment]
         plan = _cold_run_plan()
         context = ExecutionContext(request_id="cold-run-retarget-fail")
         with patch(self._RETARGET_PATCH, return_value=(False, "no_device_policy")):
-            with self.assertRaises(RuntimeError) as ctx:
-                asyncio.run(self.entrypoint._run_in_process(plan, context))
-        self.assertIn("retarget failed", str(ctx.exception).lower())
+            result = asyncio.run(self.entrypoint._run_in_process(plan, context))
+        self.assertEqual(executor_called, [True])
         self.assertFalse(self.entrypoint._cpu_snapshot_models_active)
+        self.assertIsInstance(result, dict)
 
     # ── Test 5: non-production mismatch falls back, does not raise ─────
 
