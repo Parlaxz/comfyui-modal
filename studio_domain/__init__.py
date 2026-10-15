@@ -1,14 +1,16 @@
 """Studio Workflow platform foundation.
 
-Workflow → immutable Workflow Version → exactly one Mapping.
+Workflow → immutable Workflow Version → exactly one Mapping, plus
+version-scoped Workflow Presets (image-free studio_state v1 snapshots).
 
 * ``models`` — dataclass entities and derived states.
+* ``preset_state`` — closed studio_state v1 normalization/validation.
 * ``store`` — atomic JSON persistence (versions are write-once immutable;
-  exactly one mapping per version).
+  exactly one mapping per version; presets cascade with their workflow).
 * ``graph`` — pure graph introspection (hashing, node-def metadata, mapping
   candidates).
 * ``services`` — ``WorkflowDomainService`` with all domain rules (mapping
-  revisions, incomplete states, model compatibility).
+  revisions, incomplete states, model compatibility, presets).
 """
 
 from .models import (
@@ -27,8 +29,10 @@ from .models import (
     MappingAlreadyExistsError,
     MappingEntry,
     MappingNotFoundError,
+    PresetNotFoundError,
     VersionState,
     Workflow,
+    WorkflowPreset,
     WorkflowDomainError,
     WorkflowNotFoundError,
     WorkflowNotRunnableError,
@@ -36,9 +40,18 @@ from .models import (
     WorkflowVersion,
     WorkflowVersionNotFoundError,
     make_mapping_id,
+    make_preset_id,
     make_version_id,
     make_workflow_id,
     now_iso,
+)
+from .preset_state import (
+    STUDIO_STATE_SCHEMA_VERSION,
+    STUDIO_STATE_SECTIONS,
+    compute_mapping_fingerprint,
+    normalize_preset_metadata,
+    normalize_studio_state,
+    validate_studio_state,
 )
 from .store import WorkflowDomainStore
 from .graph import (
@@ -62,9 +75,16 @@ from .services import WorkflowDomainService
 __all__ = [
     "Workflow",
     "WorkflowVersion",
+    "WorkflowPreset",
     "Mapping",
     "MappingEntry",
     "VersionState",
+    "STUDIO_STATE_SCHEMA_VERSION",
+    "STUDIO_STATE_SECTIONS",
+    "normalize_studio_state",
+    "validate_studio_state",
+    "normalize_preset_metadata",
+    "compute_mapping_fingerprint",
     "WorkflowDomainStore",
     "WorkflowDomainService",
     "CANONICAL_SEMANTIC_ROLES",
@@ -81,6 +101,7 @@ __all__ = [
     "WorkflowNotFoundError",
     "WorkflowVersionNotFoundError",
     "MappingNotFoundError",
+    "PresetNotFoundError",
     "MappingAlreadyExistsError",
     "WorkflowDomainValidationError",
     "ImmutableVersionError",
@@ -89,6 +110,7 @@ __all__ = [
     "INPUT_BINDING_KINDS",
     "make_workflow_id",
     "make_version_id",
+    "make_preset_id",
     "make_mapping_id",
     "now_iso",
     "derive_mapping_candidates",

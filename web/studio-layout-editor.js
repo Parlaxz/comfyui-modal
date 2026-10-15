@@ -1901,5 +1901,88 @@ export function createLayoutEditor(container, opts) {
       bgImg = null;
       wrap.remove();
     },
+    clearBackground() {
+      // Phase 12 preset image-clear: drop the local upload background pixels
+      // (file-upload only; see header). Tool/draft text state is untouched.
+      if (bgUrl) {
+        try { URL.revokeObjectURL(bgUrl); } catch (e) { /* noop */ }
+        bgUrl = "";
+      }
+      bgImg = null;
+      touch();
+    },
   };
+}
+
+// ── Studio V3 preset hooks (Phase 12, frontend lane) ─────────────────────
+// Narrow snapshot/apply/reset only. Snapshot returns the owner-native draft
+// (getDraft already detaches); allowlist projection lives in
+// web/studio-presets.js capturePresetState. Apply reuses the existing
+// setDraft (which normalizes); reset reuses setDraft + clearBackground.
+// Background pixels are never snapshotted and never restored.
+
+/** Owner-native layout snapshot for preset capture (detached draft). */
+export function snapshotLayoutForPreset(editor) {
+  try {
+    if (editor && typeof editor.getDraft === "function") return editor.getDraft();
+  } catch (_e) { /* fall through */ }
+  return null;
+}
+
+/**
+ * Apply a preset layout section via the existing setDraft path. Accepts the
+ * flat contract section (and the historical nested draft — both project to
+ * flat). Palette strings split back into native lists.
+ * @param {*} editor layout editor instance
+ * @param {object} section preset layout section (or null for neutral reset)
+ */
+export function applyLayoutFromPreset(editor, section) {
+  if (!editor || typeof editor.setDraft !== "function") return false;
+  const s = section && typeof section === "object" ? section : null;
+  const modes = (s && s.modes && typeof s.modes === "object") ? s.modes : {};
+  const dims = (s && s.dims && typeof s.dims === "object") ? s.dims : {};
+  const splitPalette = (value) => {
+    if (Array.isArray(value)) return value.slice();
+    if (typeof value === "string" && value) {
+      return value.split(",").map((part) => part.trim()).filter(Boolean);
+    }
+    return [];
+  };
+  const pick = (flat, nested, legacy) => {
+    if (s && s[flat] !== undefined) return s[flat];
+    if (nested && modes[nested] !== undefined) return modes[nested];
+    if (legacy && s && s[legacy] !== undefined) return s[legacy];
+    return undefined;
+  };
+  const rawBoxes = s && Array.isArray(s.boxes) ? s.boxes : [];
+  try {
+    editor.setDraft({
+      high_level_description: s ? String(pick("high_level_description", null, "descriptor") || "") : "",
+      background: s ? String(pick("background") || "") : "",
+      style_mode: String(pick("style_mode") || "none"),
+      aesthetics: String(pick("aesthetics") || ""),
+      lighting: String(pick("lighting") || ""),
+      photo: String(pick("photo") || ""),
+      medium: String(pick("medium") || ""),
+      art_style: String(pick("art_style") || ""),
+      color_palette: splitPalette(s ? (s.color_palette !== undefined ? s.color_palette : s.palette) : []),
+      width: (s && (s.width !== undefined ? s.width : dims.width)) || 1024,
+      height: (s && (s.height !== undefined ? s.height : dims.height)) || 1024,
+      boxes: rawBoxes.map((b) => Object.assign({}, b, {
+        color_palette: splitPalette(b && b.color_palette),
+      })),
+    });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+/** Reset the editor to neutral preset state (empty draft, no background). */
+export function resetLayoutForPreset(editor) {
+  if (!editor) return false;
+  try {
+    if (typeof editor.clearBackground === "function") editor.clearBackground();
+  } catch (_e) { /* background clear is best-effort */ }
+  return applyLayoutFromPreset(editor, null);
 }

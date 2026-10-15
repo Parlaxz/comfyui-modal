@@ -64,6 +64,7 @@ export function openSketch(opts) {
   let engine = o.engine || null;
   let layerStore = o.layerStore || null;
   const onCommitted = typeof o.onCommitted === "function" ? o.onCommitted : null;
+  const onSettingsChange = typeof o.onSettingsChange === "function" ? o.onSettingsChange : null;
   let settings = {};
   let destroyed = false;
 
@@ -160,6 +161,11 @@ export function openSketch(opts) {
       if (patch && typeof patch === "object") {
         settings = Object.assign({}, settings, patch);
       }
+      // Phase 12: notify the Studio shell that tool config changed (the shell
+      // marks its active preset dirty; this module never touches presets).
+      try {
+        if (typeof onSettingsChange === "function") onSettingsChange(Object.assign({}, settings));
+      } catch (_e) { /* edit notification is best-effort */ }
       return Object.assign({}, settings);
     },
 
@@ -206,4 +212,116 @@ function _coerceDims(width, height) {
     width: Number.isFinite(w) && w > 0 ? w : SKETCH_DEFAULT_SIZE,
     height: Number.isFinite(h) && h > 0 ? h : SKETCH_DEFAULT_SIZE,
   };
+}
+
+// ── Studio V3 preset hooks (Phase 12, frontend lane) ─────────────────────
+// Narrow snapshot/apply/reset only, over tool settings (session.
+// getToolSettings/setToolSettings). Strokes/overlays are pixels and are never
+// snapshotted; the base image URL is never read. Apply reuses the existing
+// setToolSettings + reset (overlay clear); base-image clearing stays with
+// the playground image-clear step via clearSketchBaseForPreset.
+
+const _SKETCH_PRESET_TOOLS = ["brush", "pencil", "eraser", "line", "rectangle", "circle", "fill", "eyedropper"];
+
+function _presetNum(value, fallback, min, max) {
+  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+  if (typeof n !== "number" || !Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function _presetStr(value, max) {
+  if (value == null) return "";
+  return String(value).slice(0, max);
+}
+
+/**
+ * Owner-native sketch snapshot for preset capture: tool settings + canvas
+ * dims only. Never pixels, never the base image.
+ *
+ * The tool panels drive the ENGINE directly (setTool/setSize/setColor/...)
+ * and the session only learns settings through setToolSettings, so the live
+ * engine state (engine.getState(), when the caller has it) is the true source
+ * and wins over stale session settings for the tool keys it carries. Dims
+ * still come from the session (the engine mirrors them; the session owns the
+ * generate-size contract).
+ */
+export function snapshotSketchSettingsForPreset(session, engineState) {
+  let settings = {};
+  try {
+    if (session && typeof session.getToolSettings === "function") {
+      settings = session.getToolSettings() || {};
+    }
+  } catch (_e) {
+    settings = {};
+  }
+  try {
+    const live = engineState && typeof engineState === "object" ? engineState : null;
+    if (live) {
+      for (const key of ["tool", "brushSize", "opacity", "hardness", "color", "bgColor"]) {
+        if (live[key] !== undefined && live[key] !== null) settings[key] = live[key];
+      }
+    }
+  } catch (_eLive) { /* session settings stand alone */ }
+  let width = SKETCH_DEFAULT_SIZE;
+  let height = SKETCH_DEFAULT_SIZE;
+  try {
+    if (session) {
+      if (Number.isFinite(Number(session.width))) width = Number(session.width);
+      if (Number.isFinite(Number(session.height))) height = Number(session.height);
+    }
+  } catch (_e2) { /* dims fall back to defaults */ }
+  return {
+    tool: settings.tool,
+    brushSize: settings.brushSize,
+    opacity: settings.opacity,
+    hardness: settings.hardness,
+    color: settings.color,
+    bgColor: settings.bgColor,
+    width,
+    height,
+  };
+}
+
+/**
+ * Apply a preset sketch section via the existing setToolSettings, then reset
+ * overlay layers (strokes must never survive a preset load). Returns false
+ * when there is no live session (caller falls back to pending defaults).
+ */
+export function applySketchSettingsFromPreset(session, section) {
+  if (!session || typeof session.setToolSettings !== "function") return false;
+  const s = section && typeof section === "object" ? section : null;
+  const tool = s && _SKETCH_PRESET_TOOLS.indexOf(s.tool) !== -1 ? s.tool : "brush";
+  try {
+    session.setToolSettings({
+      tool,
+      brushSize: _presetNum(s && s.brushSize, 8, 0.5, 512),
+      opacity: _presetNum(s && s.opacity, 1, 0, 1),
+      hardness: _presetNum(s && s.hardness, 0.8, 0, 1),
+      color: _presetStr(s && s.color, 32),
+      bgColor: _presetStr(s && s.bgColor, 32),
+    });
+  } catch (_e) {
+    return false;
+  }
+  try {
+    if (typeof session.reset === "function") session.reset();
+  } catch (_e2) { /* overlay clear is best-effort */ }
+  return true;
+}
+
+/** Reset sketch tool settings to neutral + clear overlays. */
+export function resetSketchForPreset(session) {
+  return applySketchSettingsFromPreset(session, null);
+}
+
+/**
+ * Playground image-clear step: drop the locked base image (edit sessions)
+ * so no pixels survive a preset load. Best-effort; never throws.
+ */
+export function clearSketchBaseForPreset(session) {
+  if (!session || typeof session.setBaseImage !== "function") return;
+  try {
+    const p = session.setBaseImage(null);
+    if (p && typeof p.catch === "function") p.catch(function () {});
+  } catch (_e) { /* base clear is best-effort */ }
 }

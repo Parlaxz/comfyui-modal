@@ -946,7 +946,10 @@ export function mountPostprocessWorkspace(host, opts) {
       if (itemKeyOf(S.items[ei]) === key) { loadItem(ei); return S.items[ei]; }
     }
     var item = { id: uid(), name: name || "image", url: url || "", file: file || null, img: PP_STORE.imgs[key] || null, recipe: defaultRecipe(), lut: null };
-    if (PP_STORE.recipes[key]) item.recipe = Object.assign(defaultRecipe(), clone(PP_STORE.recipes[key]));
+    // Phase 12 preset lane: an explicit preset Load replaces scope state, so
+    // the active (image-free) preset recipe wins over older per-item drafts.
+    if (_presetPendingRecipe) item.recipe = Object.assign(defaultRecipe(), clone(_presetPendingRecipe));
+    else if (PP_STORE.recipes[key]) item.recipe = Object.assign(defaultRecipe(), clone(PP_STORE.recipes[key]));
     else {
       var saved = storeGet(LS_RECIPE, null);
       if (saved && url && saved.url === url && saved.recipe) item.recipe = Object.assign(defaultRecipe(), saved.recipe);
@@ -1743,6 +1746,11 @@ export function mountPostprocessWorkspace(host, opts) {
     PP_STORE.recipes[itemKeyOf(item)] = clone(item.recipe);
     storeSet(LS_RECIPE, { url: item.url, name: item.name, recipe: item.recipe });
     window.__ppRecipe = { url: item.url, name: item.name, recipe: clone(item.recipe) };
+    // Phase 12: notify the Studio shell that recipe config changed (the shell
+    // marks its active preset dirty; this module never touches presets).
+    try {
+      if (opts && typeof opts.onRecipeChange === "function") opts.onRecipeChange(clone(item.recipe));
+    } catch (_e) { /* edit notification is best-effort */ }
   }
   function saveRecipe() { saveDraft(); say("Recipe saved locally — reopen this image to resume."); }
 
@@ -1846,4 +1854,100 @@ export function mountPostprocessWorkspace(host, opts) {
     stage: stage,
     workspace: ws,
   };
+}
+
+// ── Studio V3 preset hooks (Phase 12, frontend lane) ─────────────────────
+// Narrow snapshot/apply/reset only. The post recipe allowlist is numeric/
+// choice fields only (curves/mixer/grading/spots/crop geometry are excluded
+// by the closed allowlist — never captured, never restored).
+//
+// Apply reuses the existing recipe lane: the allowlisted recipe is seeded as
+// the pending default that addItem merges over defaultRecipe(), and stale
+// undo/redo stacks are dropped (a preset Load replaces state; stale undo
+// would resurrect pre-preset config). Source pixels/buffers are never
+// touched here — the playground image-clear step owns them.
+
+var _presetPendingRecipe = null;
+
+// Frozen post recipe fields, mirroring the backend contract
+// (spot lists and LUT contents are not allowlisted server-side).
+var PRESET_POST_RECIPE_KEYS = [
+  "curves",
+  "mixer",
+  "grading",
+  "crop",
+  "format",
+  "quality",
+  "embedMetadata",
+  "embed_metadata",
+];
+
+function _presetRecipeScalar(value) {
+  if (value == null) return { keep: true, value: null };
+  if (typeof value === "string") {
+    if (/^(data:|blob:|https?:)/i.test(value.trim())) return { keep: false };
+    return { keep: true, value: value };
+  }
+  if (typeof value === "boolean") return { keep: true, value: value };
+  if (typeof value === "number" && isFinite(value)) return { keep: true, value: value };
+  return { keep: false };
+}
+
+/** Allowlisted projection of a recipe (pure; unknown/image keys dropped). */
+export function snapshotPostRecipeForPreset(recipe) {
+  var src = recipe && typeof recipe === "object" ? recipe : defaultRecipe();
+  var out = {};
+  for (var i = 0; i < PRESET_POST_RECIPE_KEYS.length; i++) {
+    var key = PRESET_POST_RECIPE_KEYS[i];
+    if (!Object.prototype.hasOwnProperty.call(src, key)) continue;
+    var projected = _presetRecipeScalar(src[key]);
+    if (projected.keep) out[key] = projected.value;
+  }
+  return out;
+}
+
+/** Allowlisted merge of a preset patch over a base recipe (pure). */
+export function mergePostRecipeForPreset(current, patch) {
+  var base = current && typeof current === "object" ? clone(current) : defaultRecipe();
+  var src = patch && typeof patch === "object"
+    ? (patch.recipe && typeof patch.recipe === "object" ? patch.recipe : patch)
+    : {};
+  var projected = snapshotPostRecipeForPreset(src);
+  var keys = Object.keys(projected);
+  for (var i = 0; i < keys.length; i++) {
+    base[keys[i]] = projected[keys[i]];
+  }
+  return base;
+}
+
+/** Neutral (default) allowlisted recipe for omitted-section reset. */
+export function neutralPostRecipeForPreset() {
+  return snapshotPostRecipeForPreset(defaultRecipe());
+}
+
+/**
+ * Apply a preset post section: seed the pending recipe consumed by addItem
+ * and drop stale undo/redo stacks. patch null/undefined resets to neutral
+ * (omitted sections reset, never inherit). Never touches source pixels.
+ * @returns {object} the seeded allowlisted recipe (detached)
+ */
+export function applyPostRecipeForPreset(patch) {
+  var next = (patch == null)
+    ? neutralPostRecipeForPreset()
+    : snapshotPostRecipeForPreset(
+        patch.recipe && typeof patch.recipe === "object" ? patch.recipe : patch
+      );
+  _presetPendingRecipe = clone(next);
+  try {
+    if (typeof window !== "undefined" && window.__ppStore) {
+      window.__ppStore.undo = {};
+      window.__ppStore.redo = {};
+    }
+  } catch (_e) { /* undo clear is best-effort */ }
+  return clone(next);
+}
+
+/** Drop the pending preset recipe (no override; stored drafts apply again). */
+export function clearPostPresetPending() {
+  _presetPendingRecipe = null;
 }

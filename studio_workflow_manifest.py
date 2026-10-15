@@ -248,54 +248,101 @@ def _collect_issues(manifest) -> list:
                 if not isinstance(item, dict):
                     _append_issue(issues, "%s entries must be dicts" % name)
 
+    # Workflow presets: v1 record contract (version-scoped, image-free
+    # studio_state).  The pre-v1 control/value fields (is_default,
+    # favorite, values, exposed_controls, dropped_controls, model_choices,
+    # lora_values, recommended_values) are obsolete and rejected as unknown
+    # preset fields below.  Deep studio_state shaping is owned by the
+    # domain/portability layers; here the record is checked structurally
+    # (required keys, closed fields, version linkage) so the codec stays
+    # pure-stdlib.
+    PRESET_REQUIRED = ("preset_id", "workflow_version_id", "name", "studio_state")
+    PRESET_FIELDS = (
+        "preset_id", "workflow_version_id", "name", "description", "tags",
+        "studio_state", "mapping_fingerprint", "created_at", "updated_at",
+    )
+    PRESET_ID_RE = re.compile(r"wp_[0-9a-f]{16}")
+
     presets = manifest.get("presets")
     if isinstance(presets, list):
         seen_ids = {}
-        default_count = 0
         for idx, p in enumerate(presets):
             if not isinstance(p, dict):
                 continue
             pid = p.get("preset_id")
-            if not isinstance(pid, str) or not pid:
-                _append_issue(issues, "preset at index %d: preset_id must be a non-empty string" % idx)
+            if (not isinstance(pid, str) or not pid
+                    or PRESET_ID_RE.fullmatch(pid) is None):
+                _append_issue(
+                    issues,
+                    "preset at index %d: preset_id must look like "
+                    "'wp_<16 hex>'" % idx,
+                )
                 pid = None
             if pid is not None:
                 if pid in seen_ids:
                     _append_issue(issues, "duplicate preset id: %s" % pid)
                 seen_ids[pid] = True
             label = pid if pid is not None else ("index %d" % idx)
+            for key in p:
+                if key not in PRESET_FIELDS:
+                    _append_issue(
+                        issues,
+                        "preset %s: unknown preset field %r" % (label, key),
+                    )
             pwvid = p.get("workflow_version_id")
             if not isinstance(pwvid, str) or not pwvid:
                 _append_issue(issues, "preset %s: workflow_version_id must be a non-empty string" % label)
             nm = p.get("name")
-            if not isinstance(nm, str) or not nm:
+            if not isinstance(nm, str) or not nm.strip():
                 _append_issue(issues, "preset %s: name must be a non-empty string" % label)
-            for fld in ("is_default", "favorite"):
-                val = p.get(fld)
-                if val is not None and not isinstance(val, bool):
-                    _append_issue(issues, "preset %s: %s must be a bool" % (label, fld))
-            if p.get("is_default") is True:
-                default_count += 1
-            for fld in ("exposed_controls", "dropped_controls", "tags"):
-                val = p.get(fld)
-                if val is None:
-                    continue
-                if not isinstance(val, list):
-                    _append_issue(issues, "preset %s: %s must be a list" % (label, fld))
+            elif len(nm.strip()) > 200:
+                _append_issue(issues, "preset %s: name exceeds 200 characters" % label)
+            desc = p.get("description")
+            if desc is not None:
+                if not isinstance(desc, str):
+                    _append_issue(issues, "preset %s: description must be a string" % label)
+                elif len(desc) > 2000:
+                    _append_issue(issues, "preset %s: description exceeds 2000 characters" % label)
+            tags = p.get("tags")
+            if tags is not None:
+                if not isinstance(tags, list) or len(tags) > 20:
+                    _append_issue(issues, "preset %s: tags must be a list of at most 20 strings" % label)
                 else:
-                    for item in val:
-                        if not isinstance(item, str):
-                            _append_issue(issues, "preset %s: %s items must be strings" % (label, fld))
-            for fld in ("values", "model_choices", "lora_values", "recommended_values"):
-                val = p.get(fld)
-                if val is not None and not isinstance(val, dict):
-                    _append_issue(issues, "preset %s: %s must be a dict" % (label, fld))
-            for fld in ("description", "created_at", "updated_at"):
+                    for item in tags:
+                        if not isinstance(item, str) or not item.strip() or len(item.strip()) > 80:
+                            _append_issue(
+                                issues,
+                                "preset %s: tags items must be non-empty strings "
+                                "of at most 80 characters" % label,
+                            )
+                            break
+            state = p.get("studio_state")
+            if not isinstance(state, dict):
+                _append_issue(issues, "preset %s: studio_state must be an object" % label)
+            else:
+                if state.get("schema_version") != 1:
+                    _append_issue(
+                        issues,
+                        "preset %s: studio_state.schema_version must be 1" % label,
+                    )
+                for section in (
+                    "core", "styles", "layout", "methods",
+                    "references", "guidance", "sketch", "post", "output",
+                ):
+                    section_value = state.get(section)
+                    if section_value is not None and not isinstance(section_value, dict):
+                        _append_issue(
+                            issues,
+                            "preset %s: studio_state.%s must be an object"
+                            % (label, section),
+                        )
+            for fld in ("mapping_fingerprint", "created_at", "updated_at"):
                 val = p.get(fld)
                 if val is not None and not isinstance(val, str):
                     _append_issue(issues, "preset %s: %s must be a string" % (label, fld))
-        if default_count > 1:
-            _append_issue(issues, "multiple default presets")
+            for fld in PRESET_REQUIRED:
+                if fld not in p:
+                    _append_issue(issues, "preset %s: missing required field %r" % (label, fld))
 
     if isinstance(vs, dict) and isinstance(presets, list):
         vs_vid = vs.get("workflow_version_id")

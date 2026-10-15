@@ -319,12 +319,13 @@ class DependencyResolverTestCase(unittest.TestCase):
         self.assertEqual(state.status, "ready")
         self.assertTrue(state.runnable)
 
-        # A runnable version needs no preset record at all: control defaults
-        # are read from the version's own captured graph.
-        self.assertFalse(hasattr(self.service, "create_preset"),
-                         "presets are removed from the domain service")
-        self.assertFalse(hasattr(self.service.store, "insert_preset"),
-                         "the preset store is gone")
+        # A runnable version needs no preset record: control defaults are
+        # read from the version's own captured graph (Phase 12 keeps
+        # presets version-scoped and opt-in, so readiness creates none).
+        self.assertEqual(self.service.list_presets(version_id), [])
+        self.assertEqual(
+            self.service.store.list_presets_for_version(version_id), []
+        )
 
     # ── 16. old version compatibility stays frozen ───────────────────────
 

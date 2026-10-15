@@ -371,3 +371,83 @@ export async function loadModalOptions(apiBase) {
     buildModalOptions(source),
   );
 }
+
+// ── Studio V3 preset hooks (Phase 12, frontend lane) ─────────────────────
+// Narrow snapshot/override only. Preset output settings are a Playground-
+// scoped override: they NEVER POST global settings and never write
+// localStorage. The override rides the single run payload via
+// resolveEffectiveOutputOptions (web/studio-workflow-run.js).
+
+var PRESET_OUTPUT_FORMATS = ["original", "png", "jpeg", "webp"];
+
+function _presetOutputUnsafe(value) {
+  return /^(data:|blob:|https?:|wss?:)/i.test(String(value).trim());
+}
+
+function _presetOutputStr(value, max) {
+  if (value == null) return "";
+  var s = String(value);
+  if (_presetOutputUnsafe(s)) return "";
+  return s.slice(0, max);
+}
+
+/**
+ * Owner-native output snapshot for preset capture (format/quality/save +
+ * preview options only). Reads the existing getOutputPreferences lane.
+ */
+export function snapshotOutputForPreset() {
+  var prefs = null;
+  try {
+    prefs = getOutputPreferences();
+  } catch (_e) {
+    return null;
+  }
+  if (!prefs || typeof prefs !== "object") return null;
+  return {
+    format: prefs.output_format,
+    quality: prefs.quality,
+    auto_save_local: !!prefs.auto_save_local,
+    save_folder: prefs.save_folder,
+    save_metadata_sidecar: prefs.save_metadata_sidecar !== false,
+    preview_default: prefs.preview_default,
+    preview_quality: prefs.preview_quality,
+  };
+}
+
+/**
+ * Build the Playground-scoped output override from a preset output section.
+ * Flat contract shape (mirrors the backend output section): output_format,
+ * quality, auto_save_local, save_folder, save_metadata_sidecar, preview_*
+ * scalars. webp_lossless_compression is backend-bool while the lane stores a
+ * name, so it is never carried. Pure: no persistence, no network. Returns
+ * null when the section is absent (no override; global options apply).
+ */
+export function buildPresetOutputOverride(section) {
+  var s = section && typeof section === "object" ? section : null;
+  if (!s) return null;
+  var override = {};
+  if (typeof s.output_format === "string" && s.output_format
+    && PRESET_OUTPUT_FORMATS.indexOf(s.output_format) !== -1) {
+    override.output_format = s.output_format;
+  }
+  if (typeof s.quality === "number" && isFinite(s.quality)) {
+    override.quality = Math.max(1, Math.min(100, Math.floor(s.quality)));
+  }
+  if (typeof s.auto_save_local === "boolean") override.auto_save_local = s.auto_save_local;
+  var folder = _presetOutputStr(s.save_folder, 500);
+  if (folder) override.save_folder = folder;
+  if (typeof s.save_metadata_sidecar === "boolean") {
+    override.save_metadata_sidecar = s.save_metadata_sidecar;
+  }
+  ["preview_default", "preview_codec", "preview_quality"].forEach(function (key) {
+    var value = s[key];
+    if (typeof value === "string" && value && !_presetOutputUnsafe(value)) {
+      override[key] = value.slice(0, 40);
+    } else if (typeof value === "number" && isFinite(value)) {
+      override[key] = value;
+    } else if (typeof value === "boolean") {
+      override[key] = value;
+    }
+  });
+  return Object.keys(override).length ? override : null;
+}

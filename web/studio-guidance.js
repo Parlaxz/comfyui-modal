@@ -727,3 +727,107 @@ export function summarizeGuidanceProvenance(provenance) {
   push("Refusal detail", p.refusal_detail);
   return rows.length > 0 ? rows : null;
 }
+
+// ── Studio V3 preset hooks (Phase 12, frontend lane) ─────────────────────
+// Narrow snapshot/apply/reset only, over plain guidance-input shapes (the
+// resolveGuidanceState input the playground already builds). This module has
+// no imports and no fetch by construction, so these hooks CANNOT call
+// mapping-save/confirm APIs and NEVER substitute mappings: missing/stale
+// mappings hydrate to blocked/manual state via planPresetHydration (web/
+// studio-presets.js). Guide images are never snapshotted and never restored.
+
+/**
+ * Owner-native guidance snapshot for preset capture. Reads only confirmed-
+ * mapping config (mode/mechanism/identity/revision/controller/nodes/
+ * conditioning); the guide image is deliberately never read.
+ * Shape mirrors the backend guidance section: controller is an object,
+ * mapping_revision is an opaque string, model_sha256 is 64-hex-or-empty
+ * (enforced downstream by projection).
+ * @param {object} input resolveGuidanceState-style input
+ * @returns {object|null} owner-native snapshot (allowlist-projected downstream)
+ */
+export function snapshotGuidanceForPreset(input) {
+  const src = input && typeof input === "object" ? input : {};
+  if (src.engaged !== true) return { engaged: false };
+  const mapping = src.mapping && typeof src.mapping === "object" ? src.mapping : null;
+  const record = mapping && mapping.record && typeof mapping.record === "object"
+    ? mapping.record
+    : null;
+  const controller = record && record.controller && typeof record.controller === "object"
+    ? record.controller
+    : {};
+  const nodes = record && record.nodes && typeof record.nodes === "object" ? record.nodes : {};
+  const conditioning = record && record.conditioning && typeof record.conditioning === "object"
+    ? record.conditioning
+    : src.conditioning && typeof src.conditioning === "object"
+      ? src.conditioning
+      : {};
+  const sha = _str(
+    (src.identity && src.identity.sha) || (record && record.model_sha256)
+  ).trim().toLowerCase();
+  const revision = record && record.revision != null
+    ? record.revision
+    : (record && record.mapping_revision != null ? record.mapping_revision : "");
+  return {
+    engaged: true,
+    mode: normalizeGuidanceMode(src.mode),
+    mechanism: _str(src.mechanism || (record && record.mechanism)).trim(),
+    model_sha256: /^[0-9a-f]{64}$/.test(sha) ? sha : "",
+    mapping_revision: revision == null ? "" : String(revision),
+    controller: {
+      checkpoint: _str(controller.checkpoint).trim(),
+      folder: _str(controller.folder || controller.checkpointFolder).trim(),
+      checkpoint_sha256: _str(controller.checkpoint_sha256 || controller.checkpointSha256).trim().toLowerCase(),
+    },
+    nodes: {
+      loader: _str(nodes.loader).trim(),
+      apply: _str(nodes.apply).trim(),
+      preprocessor: _str(nodes.preprocessor).trim(),
+    },
+    conditioning: {
+      strength: conditioning.strength,
+      start: conditioning.start,
+      end: conditioning.end,
+    },
+  };
+}
+
+/**
+ * Apply a preset guidance section onto a guidance-input draft. Returns a new
+ * input object; never writes mappings, never confirms anything. Missing or
+ * stale mappings are left for planPresetHydration to block (manual state).
+ * @param {object} current current guidance input (or null)
+ * @param {object} section preset guidance section (or null for neutral)
+ * @returns {object} next guidance input
+ */
+export function applyGuidanceFromPreset(current, section) {
+  const base = current && typeof current === "object" ? Object.assign({}, current) : {};
+  const s = section && typeof section === "object" ? section : null;
+  if (!s || s.engaged !== true) {
+    base.engaged = false;
+    return base;
+  }
+  base.engaged = true;
+  if (s.mode) base.mode = s.mode;
+  // Identity/mapping re-resolve live at load time from the stored sha; the
+  // confirmed record itself is never carried (no substitution, no confirm).
+  base.presetModelSha256 = String(s.model_sha256 || "");
+  base.presetMappingRevision = s.mapping_revision != null ? String(s.mapping_revision) : "";
+  if (s.conditioning && typeof s.conditioning === "object") {
+    base.conditioning = {
+      strength: s.conditioning.strength,
+      start: s.conditioning.start,
+      end: s.conditioning.end,
+    };
+  }
+  return base;
+}
+
+/** Neutral (disengaged) guidance input for omitted-section reset. */
+export function resetGuidanceForPreset(current) {
+  const base = current && typeof current === "object" ? Object.assign({}, current) : {};
+  base.engaged = false;
+  delete base.presetModelSha256;
+  delete base.presetMappingRevision;
+  return base;
+}

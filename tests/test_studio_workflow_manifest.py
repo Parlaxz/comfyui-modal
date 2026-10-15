@@ -93,20 +93,32 @@ def make_sections():
     }
     presets = [
         {
-            "preset_id": "wpres_0011223344556677",
+            "preset_id": "wp_0011223344556677",
             "workflow_version_id": version_id,
-            "workflow_id": workflow_id,
             "name": "Default Quality",
             "description": "Quality preset",
-            "values": {"positive_prompt": "a cat", "seed": 7, "steps": 25},
-            "model_choices": {"model": "sdxl_base.safetensors"},
-            "lora_values": {"lora1": 0.7},
-            "exposed_controls": ["positive_prompt", "seed", "steps"],
-            "recommended_values": {"steps": 25},
-            "favorite": True,
             "tags": ["quality", "default"],
-            "dropped_controls": ["negative_prompt"],
-            "is_default": True,
+            "studio_state": {
+                "schema_version": 1,
+                "core": {
+                    "positive_prompt": "a cat",
+                    "negative_prompt": "",
+                    "controls": {"seed": 7, "steps": 25},
+                    "activeMode": "t2i",
+                    "activeSubtool": "",
+                    "skipTextGenerate": False,
+                },
+                "styles": {"setId": "set-a", "selectedId": "sel-1"},
+                "layout": {"width": 512, "height": 512},
+                "methods": {"inpaintMethod": None, "inpaintOverride": None,
+                            "expandMethod": "", "expandOverride": None},
+                "references": {"method": "", "override": None, "cards": []},
+                "guidance": {"engaged": False},
+                "sketch": {"tool": "brush"},
+                "post": {"recipe": {"format": "png", "quality": 95}},
+                "output": {"output_format": "png"},
+            },
+            "mapping_fingerprint": "f" * 64,
             "created_at": "2026-08-14T00:00:00+00:00",
             "updated_at": "2026-08-14T00:00:00+00:00",
         }
@@ -224,7 +236,8 @@ def test_full_manifest():
     assert man["workflow"]["source"]["author"] == "fixture"
     parsed = m.parse_manifest(m.canonical_json(man))
     assert parsed == m.canonicalize(man)
-    assert parsed["presets"][0]["is_default"] is True
+    assert parsed["presets"][0]["name"] == "Default Quality"
+    assert parsed["presets"][0]["studio_state"]["schema_version"] == 1
     assert parsed["models"][0]["sha256"] == "a" * 64
     assert parsed["models"][0]["size"] == 6876255102
     assert parsed["custom_nodes"][0]["classes"] == ["FooNode", "BarNode"]
@@ -308,16 +321,16 @@ def test_multiple_presets():
     man["presets"].extend(
         [
             {
-                "preset_id": "wpres_9900000000000001",
+                "preset_id": "wp_9900000000000001",
                 "workflow_version_id": vid,
                 "name": "Fast",
-                "values": {"steps": 12},
+                "studio_state": {"schema_version": 1},
             },
             {
-                "preset_id": "wpres_9900000000000002",
+                "preset_id": "wp_9900000000000002",
                 "workflow_version_id": vid,
                 "name": "Cinematic",
-                "values": {"cfg": 5.0},
+                "studio_state": {"schema_version": 1},
             },
         ]
     )
@@ -325,40 +338,36 @@ def test_multiple_presets():
     parsed = m.parse_manifest(m.canonical_json(man))
     assert len(parsed["presets"]) == 3
     assert [p["preset_id"] for p in parsed["presets"]] == [
-        "wpres_0011223344556677",
-        "wpres_9900000000000001",
-        "wpres_9900000000000002",
+        "wp_0011223344556677",
+        "wp_9900000000000001",
+        "wp_9900000000000002",
     ]
 
 
-def test_default_preset():
-    man = make_manifest()  # exactly one is_default True -> valid
+def test_obsolete_preset_fields_rejected():
+    man = make_manifest()  # v1 record -> valid
     m.validate_manifest(man)
-    bad = make_manifest()
-    vid = bad["version"]["workflow_version_id"]
-    bad["presets"].append(
-        {
-            "preset_id": "wpres_9900000000000003",
-            "workflow_version_id": vid,
-            "name": "Also Default",
-            "is_default": True,
-        }
-    )
-    expect_error(m.validate_manifest, bad)
+    for obsolete in ("is_default", "favorite", "values", "exposed_controls",
+                     "dropped_controls", "model_choices", "lora_values",
+                     "recommended_values", "workflow_id"):
+        bad = make_manifest()
+        bad["presets"][0][obsolete] = True
+        expect_error(m.validate_manifest, bad)
 
 
 def test_incomplete_preset_preserved():
     man = make_manifest()
     vid = man["version"]["workflow_version_id"]
     man["presets"] = [
-        {"preset_id": "wpres_bare1234567890", "workflow_version_id": vid, "name": "Bare Preset"}
+        {"preset_id": "wp_ba9e000000000001", "workflow_version_id": vid,
+         "name": "Bare Preset", "studio_state": {"schema_version": 1}}
     ]
     m.validate_manifest(man)
     parsed = m.parse_manifest(m.canonical_json(man))
-    assert set(parsed["presets"][0].keys()) == {"preset_id", "workflow_version_id", "name"}
-    assert "is_default" not in parsed["presets"][0]
-    assert "values" not in parsed["presets"][0]
+    assert set(parsed["presets"][0].keys()) == {
+        "preset_id", "workflow_version_id", "name", "studio_state"}
     assert "description" not in parsed["presets"][0]
+    assert "tags" not in parsed["presets"][0]
 
 
 def test_model_references():
@@ -450,7 +459,6 @@ def test_duplicate_preset_id_rejected():
     man = make_manifest()
     dup = dict(man["presets"][0])
     dup["name"] = "Second preset"
-    dup["is_default"] = False
     man["presets"].append(dup)
     expect_error(m.validate_manifest, man)
 

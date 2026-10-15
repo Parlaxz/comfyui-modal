@@ -1260,3 +1260,186 @@ export function clearReferenceCards(workflowId, versionId) {
     // Ignore
   }
 }
+
+// ── Studio V3 active preset (Phase 12) ────────────────────────────────────
+//
+// activePresetId is the Phase 12 Studio preset selection and lives SEPARATE
+// from the legacy presetId (saveSelection/loadSelection draft/result keys
+// "presetId::featureId"). The legacy keys are untouched; preset identity is
+// {presetId, workflowVersionId, updatedAt} so a reload can verify the draft
+// revision before restoring it.
+
+const ACTIVE_PRESET_KEY = "comfymodal.studio.playground.active-preset.v1";
+
+/**
+ * Persist the active Phase 12 preset selection.
+ * @param {{presetId?: string, workflowVersionId?: string, updatedAt?: string}} sel
+ */
+export function saveActivePreset(sel) {
+  if (!sel || typeof sel !== "object") return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(ACTIVE_PRESET_KEY, JSON.stringify({
+      presetId: typeof sel.presetId === "string" ? sel.presetId : "",
+      workflowVersionId: typeof sel.workflowVersionId === "string" ? sel.workflowVersionId : "",
+      updatedAt: typeof sel.updatedAt === "string" ? sel.updatedAt : "",
+    }));
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
+ * Load the active Phase 12 preset selection.
+ * @returns {{presetId: string, workflowVersionId: string, updatedAt: string}|null}
+ */
+export function loadActivePreset() {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    const raw = localStorage.getItem(ACTIVE_PRESET_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.presetId !== "string" || !parsed.presetId) return null;
+    return {
+      presetId: parsed.presetId,
+      workflowVersionId: typeof parsed.workflowVersionId === "string" ? parsed.workflowVersionId : "",
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "",
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Clear the active Phase 12 preset selection (legacy keys untouched).
+ */
+export function clearActivePreset() {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.removeItem(ACTIVE_PRESET_KEY);
+  } catch (e) {
+    // Ignore
+  }
+}
+
+// ── Phase 12 image-free working draft ─────────────────────────────────────
+//
+// Working draft keyed by exact version + preset id + updated_at. Reload
+// restores ONLY the matching-revision draft; any revision drift degrades to
+// null so a stale draft can never resurrect under a newer record. Explicit
+// Load replaces the scope draft (overwrite, never merge). The draft itself
+// must be image-free (v1 studio_state shape); saves carrying image-bearing
+// fields are refused (fail closed, never silently stripped).
+
+const PRESET_DRAFT_KEY = "comfymodal.studio.preset-draft.v1";
+
+function _presetDraftMapKey(workflowVersionId, presetId) {
+  return String(workflowVersionId || "") + "::" + String(presetId || "");
+}
+
+function _readPresetDraftStore() {
+  try {
+    if (typeof localStorage === "undefined") return {};
+    const raw = localStorage.getItem(PRESET_DRAFT_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function _hasImageBearingField(value, depth) {
+  if (depth > 6) return false;
+  if (typeof value === "string") {
+    const v = value.trim();
+    return /^(data:image\/|blob:|https?:\/\/|wss?:\/\/)/i.test(v);
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => _hasImageBearingField(item, depth + 1));
+  }
+  if (value && typeof value === "object") {
+    return Object.keys(value).some((key) => {
+      const norm = String(key).toLowerCase().replace(/[_\-\s]/g, "");
+      if (/(image|mask|thumbnail|base64|pixels|bitmap|guideimage|history|compare)/.test(norm)) return true;
+      if (/url$/.test(norm)) return true;
+      return _hasImageBearingField(value[key], depth + 1);
+    });
+  }
+  return false;
+}
+
+/**
+ * Save the image-free working draft for an exact version+preset revision.
+ * Explicit Load replaces the scope draft. Returns false (and stores nothing)
+ * when the draft carries image-bearing fields.
+ * @param {string} workflowVersionId
+ * @param {string} presetId
+ * @param {string} updatedAt exact record revision the draft belongs to
+ * @param {object} draft image-free draft object
+ * @returns {boolean} true when stored
+ */
+export function savePresetWorkingDraft(workflowVersionId, presetId, updatedAt, draft) {
+  if (!workflowVersionId || !presetId) return false;
+  if (!draft || typeof draft !== "object") return false;
+  if (_hasImageBearingField(draft, 0)) return false;
+  try {
+    if (typeof localStorage === "undefined") return false;
+    const store = _readPresetDraftStore();
+    let snapshot = null;
+    try {
+      snapshot = JSON.parse(JSON.stringify(draft));
+    } catch (e) {
+      return false;
+    }
+    store[_presetDraftMapKey(workflowVersionId, presetId)] = {
+      updatedAt: typeof updatedAt === "string" ? updatedAt : "",
+      draft: snapshot,
+    };
+    localStorage.setItem(PRESET_DRAFT_KEY, JSON.stringify(store));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Load the working draft ONLY when the stored revision matches exactly.
+ * Any drift (including empty updatedAt on either side) yields null.
+ * @param {string} workflowVersionId
+ * @param {string} presetId
+ * @param {string} updatedAt current record revision
+ * @returns {object|null} detached draft copy or null
+ */
+export function loadPresetWorkingDraft(workflowVersionId, presetId, updatedAt) {
+  if (!workflowVersionId || !presetId) return null;
+  try {
+    const store = _readPresetDraftStore();
+    const entry = store[_presetDraftMapKey(workflowVersionId, presetId)];
+    if (!entry || typeof entry !== "object") return null;
+    if (typeof entry.updatedAt !== "string" || !entry.updatedAt) return null;
+    if (entry.updatedAt !== String(updatedAt || "")) return null;
+    if (!entry.draft || typeof entry.draft !== "object") return null;
+    return JSON.parse(JSON.stringify(entry.draft));
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Remove the working draft for a version+preset scope.
+ * @param {string} workflowVersionId
+ * @param {string} presetId
+ */
+export function clearPresetWorkingDraft(workflowVersionId, presetId) {
+  if (!workflowVersionId || !presetId) return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    const store = _readPresetDraftStore();
+    delete store[_presetDraftMapKey(workflowVersionId, presetId)];
+    localStorage.setItem(PRESET_DRAFT_KEY, JSON.stringify(store));
+  } catch (e) {
+    // Ignore
+  }
+}
