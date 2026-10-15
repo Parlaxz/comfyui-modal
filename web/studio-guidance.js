@@ -510,8 +510,11 @@ export function resolveGuidanceState(input) {
       runGateReason: "Guidance unavailable for this model — identity not verified",
       snapshot: { engaged: true, ready: false, reason: "identity_unresolvable" },
       headline: "Guidance unavailable for this model",
+      // GUI-01: headline + one detail. The exact identity lives in the
+      // separate identity field (behind a <details> on the shelf); the
+      // detail keeps only the actionable cause.
       detail:
-        "Loaded '" + filename + "', Identity: Not verified. No verified guidance " +
+        "Loaded '" + filename + "'. No verified guidance " +
         "mapping was found. Studio will not guess from the filename.",
       actions: [
         { id: "choose_mapping", label: "Choose mapping" },
@@ -535,10 +538,11 @@ export function resolveGuidanceState(input) {
       runGateReason: "Guidance unavailable for this model — no confirmed mapping",
       snapshot: { engaged: true, ready: false, reason: "no_confirmed_mapping" },
       headline: "Guidance unavailable for this model",
+      // GUI-01: headline + one detail (identity hash stays in the identity
+      // field, not duplicated here).
       detail:
-        "Loaded '" + (formatted.filename || "this model") + "', Identity: " +
-        (formatted.shortHash ? "sha256:" + formatted.shortHash : "Not verified") +
-        ". No verified guidance mapping was found. Studio will not guess from the filename.",
+        "No verified guidance mapping was found for this model identity. " +
+        "Studio will not guess from the filename.",
       actions: [
         { id: "choose_mapping", label: "Choose mapping" },
         { id: "cancel", label: "Cancel" },
@@ -610,36 +614,50 @@ export function resolveGuidanceState(input) {
   if (anchors && anchors.ok !== true) {
     const reason = _str(anchors.reason) || "incompatible_workflow";
     const candidates = Array.isArray(anchors.candidates) ? anchors.candidates : [];
-    if (reason === "multiple_samplers" && candidates.length > 0 && !anchorPick) {
+    // Confirm-path guard (P1): a selected anchorPick is validated against
+    // the presented candidates BEFORE any confirmation is offered. A pick
+    // that names a live candidate resolves the ambiguity — execution falls
+    // through to the guide-image/ready checks below instead of confirming
+    // an incompatible state. Unknown/stale picks stay incompatible.
+    const pickHit = anchorPick && candidates.some(function (c) {
+      return c && _str(c.node_id) === anchorPick;
+    });
+    if (pickHit) {
+      // Resolved: the validated pick answers the ambiguity — fall through
+      // to the guide-image/ready checks below (never confirm incompatible).
+    } else {
+      if (reason === "multiple_samplers" && candidates.length > 0 && !anchorPick) {
+        return {
+          state: "incompatible_workflow",
+          ready: false,
+          runGateReason: "Guidance anchor is ambiguous — confirm which sampler to guide",
+          snapshot: { engaged: true, ready: false, reason },
+          headline: "More than one generation sampler is present",
+          detail: _str(anchors.detail) || "Confirm which one to guide.",
+          actions: [
+            { id: "confirm_anchor", label: "Confirm anchor" },
+            { id: "cancel", label: "Cancel" },
+          ],
+          identity: formatted,
+          candidates,
+        };
+      }
       return {
         state: "incompatible_workflow",
         ready: false,
-        runGateReason: "Guidance anchor is ambiguous — confirm which sampler to guide",
+        runGateReason: "Guidance anchor not found: " + reason,
         snapshot: { engaged: true, ready: false, reason },
-        headline: "More than one generation sampler is present",
-        detail: _str(anchors.detail) || "Confirm which one to guide.",
+        headline: "Required guidance anchor not found",
+        // GUI-01: headline + one detail (was two sentences).
+        detail: (_str(anchors.detail) || "The workflow cannot take guidance structurally."),
         actions: [
-          { id: "confirm_anchor", label: "Confirm anchor" },
+          { id: "choose_workflow", label: "Choose another workflow" },
           { id: "cancel", label: "Cancel" },
         ],
         identity: formatted,
         candidates,
       };
     }
-    return {
-      state: "incompatible_workflow",
-      ready: false,
-      runGateReason: "Guidance anchor not found: " + reason,
-      snapshot: { engaged: true, ready: false, reason },
-      headline: "Required guidance anchor not found",
-      detail: (_str(anchors.detail) || "The workflow cannot take guidance structurally.") + " No fallback method was selected.",
-      actions: [
-        { id: "choose_workflow", label: "Choose another workflow" },
-        { id: "cancel", label: "Cancel" },
-      ],
-      identity: formatted,
-      candidates,
-    };
   }
 
   if (!guideImage) {
@@ -649,7 +667,9 @@ export function resolveGuidanceState(input) {
       runGateReason: "Guidance is confirmed but needs a guide image",
       snapshot: { engaged: true, ready: false, reason: "guide_image_missing" },
       headline: "Guidance ready",
-      detail: "Mapping confirmed for this model identity. Select a guide image to run with guidance.",
+      // GUI-01: headline + one detail (the mapping-confirmed state is
+      // already carried by headline + state).
+      detail: "Select a guide image to run with guidance.",
       actions: [
         { id: "change", label: "Change" },
         { id: "reconfirm", label: "Reconfirm" },
@@ -664,8 +684,9 @@ export function resolveGuidanceState(input) {
     runGateReason: null,
     snapshot: { engaged: true, ready: true },
     headline: "Guidance ready",
+    // GUI-01: headline + one detail (the sha stays in the identity field).
     detail:
-      "Guidance will condition this run (" + mode + ", sha256:" + (formatted.shortHash || "?") + ").",
+      "Guidance will condition this run (" + mode + ").",
     actions: [
       { id: "change", label: "Change" },
       { id: "reconfirm", label: "Reconfirm" },
@@ -726,4 +747,108 @@ export function summarizeGuidanceProvenance(provenance) {
   push("Refusal reason", p.refusal_reason);
   push("Refusal detail", p.refusal_detail);
   return rows.length > 0 ? rows : null;
+}
+
+// ── Studio V3 preset hooks (Phase 12, frontend lane) ─────────────────────
+// Narrow snapshot/apply/reset only, over plain guidance-input shapes (the
+// resolveGuidanceState input the playground already builds). This module has
+// no imports and no fetch by construction, so these hooks CANNOT call
+// mapping-save/confirm APIs and NEVER substitute mappings: missing/stale
+// mappings hydrate to blocked/manual state via planPresetHydration (web/
+// studio-presets.js). Guide images are never snapshotted and never restored.
+
+/**
+ * Owner-native guidance snapshot for preset capture. Reads only confirmed-
+ * mapping config (mode/mechanism/identity/revision/controller/nodes/
+ * conditioning); the guide image is deliberately never read.
+ * Shape mirrors the backend guidance section: controller is an object,
+ * mapping_revision is an opaque string, model_sha256 is 64-hex-or-empty
+ * (enforced downstream by projection).
+ * @param {object} input resolveGuidanceState-style input
+ * @returns {object|null} owner-native snapshot (allowlist-projected downstream)
+ */
+export function snapshotGuidanceForPreset(input) {
+  const src = input && typeof input === "object" ? input : {};
+  if (src.engaged !== true) return { engaged: false };
+  const mapping = src.mapping && typeof src.mapping === "object" ? src.mapping : null;
+  const record = mapping && mapping.record && typeof mapping.record === "object"
+    ? mapping.record
+    : null;
+  const controller = record && record.controller && typeof record.controller === "object"
+    ? record.controller
+    : {};
+  const nodes = record && record.nodes && typeof record.nodes === "object" ? record.nodes : {};
+  const conditioning = record && record.conditioning && typeof record.conditioning === "object"
+    ? record.conditioning
+    : src.conditioning && typeof src.conditioning === "object"
+      ? src.conditioning
+      : {};
+  const sha = _str(
+    (src.identity && src.identity.sha) || (record && record.model_sha256)
+  ).trim().toLowerCase();
+  const revision = record && record.revision != null
+    ? record.revision
+    : (record && record.mapping_revision != null ? record.mapping_revision : "");
+  return {
+    engaged: true,
+    mode: normalizeGuidanceMode(src.mode),
+    mechanism: _str(src.mechanism || (record && record.mechanism)).trim(),
+    model_sha256: /^[0-9a-f]{64}$/.test(sha) ? sha : "",
+    mapping_revision: revision == null ? "" : String(revision),
+    controller: {
+      checkpoint: _str(controller.checkpoint).trim(),
+      folder: _str(controller.folder || controller.checkpointFolder).trim(),
+      checkpoint_sha256: _str(controller.checkpoint_sha256 || controller.checkpointSha256).trim().toLowerCase(),
+    },
+    nodes: {
+      loader: _str(nodes.loader).trim(),
+      apply: _str(nodes.apply).trim(),
+      preprocessor: _str(nodes.preprocessor).trim(),
+    },
+    conditioning: {
+      strength: conditioning.strength,
+      start: conditioning.start,
+      end: conditioning.end,
+    },
+  };
+}
+
+/**
+ * Apply a preset guidance section onto a guidance-input draft. Returns a new
+ * input object; never writes mappings, never confirms anything. Missing or
+ * stale mappings are left for planPresetHydration to block (manual state).
+ * @param {object} current current guidance input (or null)
+ * @param {object} section preset guidance section (or null for neutral)
+ * @returns {object} next guidance input
+ */
+export function applyGuidanceFromPreset(current, section) {
+  const base = current && typeof current === "object" ? Object.assign({}, current) : {};
+  const s = section && typeof section === "object" ? section : null;
+  if (!s || s.engaged !== true) {
+    base.engaged = false;
+    return base;
+  }
+  base.engaged = true;
+  if (s.mode) base.mode = s.mode;
+  // Identity/mapping re-resolve live at load time from the stored sha; the
+  // confirmed record itself is never carried (no substitution, no confirm).
+  base.presetModelSha256 = String(s.model_sha256 || "");
+  base.presetMappingRevision = s.mapping_revision != null ? String(s.mapping_revision) : "";
+  if (s.conditioning && typeof s.conditioning === "object") {
+    base.conditioning = {
+      strength: s.conditioning.strength,
+      start: s.conditioning.start,
+      end: s.conditioning.end,
+    };
+  }
+  return base;
+}
+
+/** Neutral (disengaged) guidance input for omitted-section reset. */
+export function resetGuidanceForPreset(current) {
+  const base = current && typeof current === "object" ? Object.assign({}, current) : {};
+  base.engaged = false;
+  delete base.presetModelSha256;
+  delete base.presetMappingRevision;
+  return base;
 }

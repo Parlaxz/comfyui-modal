@@ -309,6 +309,38 @@
       return s;
     }
 
+    // SKT-01: collapsed-by-default group. The toggle carries the section
+    // name; the body (with all testids + engine wiring intact) starts
+    // hidden. Disabled controls are never hidden — they stay visible but
+    // disabled inside their group so the sidebar layout stays stable.
+    // FOLLOW-UP (playground lane): the shelf footer owns the single visible
+    // Undo affordance (this module's backup undo row stays hidden per P1-5);
+    // SKT-01's "keep undo visible" is satisfied there, not here.
+    function collapsedGroup(title, testid) {
+      var s = el("div", "sketch-panels-section comfymodal-studio-control-group");
+      var toggle = doc.createElement("button");
+      toggle.type = "button";
+      toggle.className = "sketch-panels-advanced-toggle";
+      toggle.setAttribute("data-testid", testid);
+      toggle.setAttribute("aria-expanded", "false");
+      var bodyId = testid + "-body";
+      toggle.setAttribute("aria-controls", bodyId);
+      toggle.innerHTML = '<span class="arrow">\u25b6</span><span>' + title + "</span>";
+      var body = el("div", "sketch-panels-advanced-body");
+      body.id = bodyId;
+      body.setAttribute("hidden", "");
+      toggle.addEventListener("click", function () {
+        var open = toggle.getAttribute("aria-expanded") === "true";
+        toggle.setAttribute("aria-expanded", open ? "false" : "true");
+        if (open) body.setAttribute("hidden", "");
+        else body.removeAttribute("hidden");
+      });
+      s.appendChild(toggle);
+      s.appendChild(body);
+      root.appendChild(s);
+      return body;
+    }
+
     function paintToolButtons() {
       for (var i = 0; i < TOOL_DEFS.length; i++) {
         (function (def) {
@@ -615,7 +647,11 @@
     }
 
     // ---- build: tool bar (compact 4-col grid, 2 rows in the narrow rail) ----
-
+    // SKT-01 remediation (Pass-C): TOOLS stays EXPANDED — tool switching is
+    // the PRIMARY path (1 click, 0 to reveal). Collapsing it regressed the
+    // common draw path to 2 clicks (expand, then switch), so the collapsed
+    // default is reverted here. CANVAS below stays collapsed: Fit/zoom is a
+    // SECONDARY path (1 extra click tradeoff, documented there).
     var toolSec = section("TOOLS");
     var toolGrid = el("div", "sketch-panels-tools");
     toolGrid.setAttribute("role", "toolbar");
@@ -873,8 +909,11 @@
     colSec.appendChild(advBody);
 
     // ---- build: canvas controls (zoom mini-row + backup history; Clear/Save owned by shell) ----
-
-    var cvSec = section("CANVAS");
+    // SKT-01: CANVAS stays collapsed by default; brush + color + (footer)
+    // undo stay visible. Fit/zoom is a SECONDARY path, so its 1-extra-click
+    // (expand, then Fit/zoom) tradeoff is accepted and documented here —
+    // unlike TOOLS, which is PRIMARY and must stay 1-click.
+    var cvBody = collapsedGroup("CANVAS", "sketch-canvas-toggle");
     var zoomRow = el("div", "sketch-panels-zoomrow");
     function miniBtn(text, title, testid, onClick) {
       var b = el("button", "sketch-panels-mini comfymodal-secondary-btn", text);
@@ -892,7 +931,7 @@
      miniBtn("", "Zoom in (+)", "sketch-zoom-in", doZoomIn).innerHTML = icon("zoomIn");
      miniBtn("", "Fit to view (0)", "sketch-zoom-fit", doZoomFit).innerHTML = icon("fit");
      miniBtn("100%", "Zoom 100% (1)", "sketch-zoom-100", doZoom100);
-    cvSec.appendChild(zoomRow);
+    cvBody.appendChild(zoomRow);
 
     var histRow = el("div", "sketch-panels-histrow");
     undoBtn = el("button", "sketch-panels-btn comfymodal-secondary-btn"); undoBtn.innerHTML = icon("undo", "Undo");
@@ -907,9 +946,9 @@
     redoBtn.addEventListener("click", doRedo);
     histRow.appendChild(undoBtn);
     histRow.appendChild(redoBtn);
-    cvSec.appendChild(histRow);
+    cvBody.appendChild(histRow);
     var histHint = el("div", "sketch-panels-help", "");
-    cvSec.appendChild(histHint);
+    cvBody.appendChild(histHint);
     // P1-5: ONE persistent action affordance lives in the shelf footer
     // (other lane). This backup row + helper stay in the DOM with testids
     // and engine wiring intact, but hidden so they never render a second

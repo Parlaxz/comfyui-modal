@@ -7725,6 +7725,18 @@ button.comfymodal-studio-feature-chip {
   margin-top: 6px;
 }
 
+/* ── Phase 13: shared shelf section title ─────────────────────── */
+/* One headed-shelf-section pattern (STY-02): shelf sections share one h4 +
+   class instead of span/h4/none drift. Margins mirror the legacy section
+   rhythm; pages own higher-level headings. */
+.cm-shelf-section-title {
+  margin: 0 0 6px;
+  padding: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #ccc;
+}
+
 /* ── Phase I5 — Image compare/viewer region ────────────────────────────── */
 /* Lightweight client-only A/B comparison (transient session tray + modal   */
 /* view). Uses existing Studio tokens only; no second design system.        */
@@ -7755,6 +7767,34 @@ button.comfymodal-studio-feature-chip {
   letter-spacing: 0.04em;
 }
 .cm-compare-tray-slot {
+  white-space: nowrap;
+}
+/* CMP-01: tray slots are gallery-link buttons; the unbuttoned reset keeps
+   the slot-label read while exposing the gallery affordance. */
+/* CMP-01 discoverability (Pass-C): the gallery affordance is visible WITHOUT
+   hover — a tiny dotted underline plus a 9px link cue — so keyboard/touch
+   users can tell the slots open the gallery. Kept tiny on purpose. */
+button.cm-compare-tray-slot {
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+button.cm-compare-tray-slot::after {
+  content: " \\2197";
+  font-size: 9px;
+  color: #888;
+}
+button.cm-compare-tray-slot:hover {
+  color: #fff;
+  text-decoration: underline;
+}
+button.cm-compare-tray-slot:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 1px;
+}
+/* CMP-01: inline reason under the disabled Compare button. */
+.cm-compare-tray-reason {
+  font-size: 11px;
+  color: #888;
   white-space: nowrap;
 }
 .cm-compare-tray-btn {

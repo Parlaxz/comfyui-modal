@@ -493,7 +493,7 @@ test.describe("I5 lightweight A/B image compare", () => {
 
       await expect(page.locator('[data-testid="cm-compare-overlay"]')).toBeVisible();
       await expect(page.locator('[data-testid="cm-compare-unavailable-b"]')).toHaveText(
-        "Image unavailable"
+        "No image available"
       );
       // A/B labels remain visible; the overlay stays interactive.
       await expect(page.locator('[data-testid="cm-compare-label-a"]')).toBeVisible();

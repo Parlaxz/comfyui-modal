@@ -11,7 +11,7 @@
 // fixture/bridge implementation can be swapped later without touching this
 // module.
 
-import { el, renderEmptyState } from "./studio-ui.js";
+import { el, missingImageCopy, renderEmptyState, STATUS_LABELS } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
 import { createHistoryRepository, selectFeedAsset } from "./history-v2-repository.js";
 import { subscribeStudioSync } from "./studio-sync.js";
@@ -88,18 +88,11 @@ function _readStoredColumns() {
   }
 }
 
-const STATUS_LABELS = {
-  completed: "Completed",
-  completed_with_failures: "Completed with failures",
-  failed: "Failed",
-  canceled: "Canceled",
-  interrupted: "Interrupted",
-  running: "Running",
-};
-
-// Shared chip tones (I3 taxonomy): STATUS → data-tone.  Legacy status-*
-// classes stay verbatim; the tone recolors nothing that the legacy rules
-// already decide — meaning never changes.
+// HST-02: STATUS_LABELS is shared from studio-ui.js (single import across
+// feed/detail/experiment). STATUS_TONES stays LOCAL per file on purpose:
+// tone vocabularies differ per surface (this feed adds a queued tone;
+// experiment maps cell states), so sharing tones would force false
+// uniformity — labels are the contract, tones are presentation.
 const STATUS_TONES = {
   completed: "ok",
   completed_with_failures: "warn",
@@ -107,6 +100,7 @@ const STATUS_TONES = {
   canceled: "neutral",
   interrupted: "warn",
   running: "running",
+  queued: "running",
 };
 
 const SORT_OPTIONS = [
@@ -188,11 +182,20 @@ function _assetBadge(asset) {
 }
 
 function _assetPlaceholder(asset, className) {
+  // HST-01: single missing-image copy. The repository still labels kind-none
+  // assets "No image" (pinned unit contract in history-v2-repository.js,
+  // owned by another lane), so the legacy label is normalized here at render.
+  // The failed-image path below reuses the broken asset (label "Data Saver" /
+  // "Thumbnail") — those name the asset VARIANT, not the state, so they also
+  // resolve to the missing copy: placeholder text is never a variant label.
+  const rawLabel = asset && asset.label ? asset.label : "";
+  const label = (!rawLabel || rawLabel === "No image" || rawLabel === "Data Saver" || rawLabel === "Thumbnail")
+    ? missingImageCopy() : rawLabel;
   return el("div", {
     class: (className || "comfymodal-studio-history-v2-noimage")
       + " comfymodal-studio-history-v2-asset-placeholder",
     "data-asset-kind": asset && asset.kind ? asset.kind : "none",
-  }, [el("span", { text: asset && asset.label ? asset.label : "No image" })]);
+  }, [el("span", { text: label })]);
 }
 
 // Build a card thumbnail container without ever selecting an Original URL.
@@ -570,7 +573,7 @@ export function renderHistoryV2(state, context) {
     });
     workflowSelect.value = wfValue;
     while (presetSelect.firstChild) presetSelect.removeChild(presetSelect.firstChild);
-    presetSelect.appendChild(el("option", { value: "", text: "All presets" }));
+    presetSelect.appendChild(el("option", { value: "", text: "All saved workflows" }));
     (facets.presets || []).forEach(function (p) {
       presetSelect.appendChild(el("option", { value: p, text: p }));
     });
@@ -697,15 +700,25 @@ export function renderHistoryV2(state, context) {
   }
 
   function errorStateEl() {
-    return el("div", { class: "comfymodal-studio-history-v2-state" }, [
-      el("p", { class: "comfymodal-studio-history-v2-state-error", text: error || "Could not load history" }),
-      el("button", {
+    // HST-01: error state routes through the shared renderEmptyState (same
+    // pattern as the filter-empty state above) with a Retry action. The
+    // legacy state-error class is kept on the title node so existing
+    // error-copy selectors keep matching.
+    const node = renderEmptyState({
+      title: error || "Could not load history",
+      action: el("button", {
         class: "comfymodal-secondary-btn",
         type: "button",
         text: "Retry",
         onclick: function () { fetchFeed(true); },
       }),
-    ]);
+      testid: "history-v2-error",
+    });
+    try {
+      const titleEl = node.querySelector(".cm-empty-state-title");
+      if (titleEl) titleEl.classList.add("comfymodal-studio-history-v2-state-error");
+    } catch (_e) { /* class pin is best-effort */ }
+    return node;
   }
 
   function renderLoadMore() {
@@ -1259,7 +1272,10 @@ export function renderHistoryV2(state, context) {
     });
     presetSelect = el("select", {
       class: "comfymodal-studio-history-v2-select",
-      "aria-label": "Filter by preset",
+      // PRS-01: user-facing copy says "saved workflow" (matches the
+      // playground picker); internal identifiers (filters.preset,
+      // facets.presets, rec.preset) stay untouched.
+      "aria-label": "Filter by saved workflow",
       onchange: function (e) {
         viewState.filters.preset = e.currentTarget.value;
         onViewChange();
@@ -1288,7 +1304,7 @@ export function renderHistoryV2(state, context) {
 
     row3.appendChild(el("span", { class: "comfymodal-studio-history-v2-toolbar-label", text: "Workflow" }));
     row3.appendChild(workflowSelect);
-    row3.appendChild(el("span", { class: "comfymodal-studio-history-v2-toolbar-label", text: "Preset" }));
+    row3.appendChild(el("span", { class: "comfymodal-studio-history-v2-toolbar-label", text: "Saved workflow" }));
     row3.appendChild(presetSelect);
     row3.appendChild(el("span", { class: "comfymodal-studio-history-v2-toolbar-label", text: "From" }));
     row3.appendChild(dateFromInput);

@@ -588,7 +588,7 @@ var CSS = [
   ".pp-stage canvas{max-width:100%;max-height:100%;cursor:crosshair}",
   ".pp-film{flex:none}",
   ".pp-status{flex:none}",
-  ".pp-compare{position:absolute;top:8px;right:8px;display:flex;gap:6px;align-items:center;background:rgba(10,10,12,.75);padding:4px 8px;border-radius:6px}",
+  ".pp-compare{flex:none;display:flex;gap:6px;align-items:center;padding:2px 0;color:#8b8b94;font-size:11px}",
   ".pp-divider{position:absolute;top:0;bottom:0;width:2px;background:#d9a441;cursor:ew-resize}",
   ".pp-divider::after{content:'◂ ▸';position:absolute;top:8px;left:-16px;font-size:10px;background:#d9a441;color:#111;border-radius:4px;padding:1px 4px}",
   ".pp-group{border-bottom:1px solid var(--color-border,#2b2d35);padding:2px 0}",
@@ -873,7 +873,7 @@ export function mountPostprocessWorkspace(host, opts) {
   var cropBtn = btn("⛶ Crop", "pp-crop", "Crop tool (C)", function () { setTool(S.tool === "crop" ? null : "crop"); });
   var healBtn = btn("◍ Heal", "pp-heal", "Spot heal (J)", function () { setTool(S.tool === "heal" ? null : "heal"); });
   var wbBtn = btn("WB", "pp-wb", "White-balance picker (W)", function () { setTool(S.tool === "wb" ? null : "wb"); });
-  btn("Save", "pp-save", "Store recipe locally", saveRecipe);
+  btn("Save", "pp-save", "Save settings locally", saveRecipe);
   btn("Export", "pp-export", "Render full-res and download", doExport);
   ws.appendChild(toolbar);
 
@@ -888,15 +888,18 @@ export function mountPostprocessWorkspace(host, opts) {
   var view = document.createElement("canvas");
   view.setAttribute("data-testid", "pp-view");
   stage.appendChild(view);
+  // Pass-C remediation: the compare status/shortcut text lives in the
+  // utility row (normal flow below), never as an absolute pill over the
+  // image. Only the divider stays on-image (see refreshCompare).
   var cmpBar = el("div", { class: "pp-compare" });
   var cmpLabel = el("span", { class: "pp-note", text: "compare off (\\ toggles)" });
   cmpBar.appendChild(cmpLabel);
-  stage.appendChild(cmpBar);
   var divider = el("div", { class: "pp-divider", "data-testid": "pp-compare-divider", style: "display:none;left:50%" });
   stage.appendChild(divider);
 
   var film = el("div", { class: "pp-film", "data-testid": "pp-filmstrip" });
   ws.appendChild(film);
+  ws.appendChild(cmpBar);
   var status = el("div", { class: "pp-status", "data-testid": "pp-status" });
   ws.appendChild(status);
   function say(t) { status.textContent = t || ""; }
@@ -946,7 +949,10 @@ export function mountPostprocessWorkspace(host, opts) {
       if (itemKeyOf(S.items[ei]) === key) { loadItem(ei); return S.items[ei]; }
     }
     var item = { id: uid(), name: name || "image", url: url || "", file: file || null, img: PP_STORE.imgs[key] || null, recipe: defaultRecipe(), lut: null };
-    if (PP_STORE.recipes[key]) item.recipe = Object.assign(defaultRecipe(), clone(PP_STORE.recipes[key]));
+    // Phase 12 preset lane: an explicit preset Load replaces scope state, so
+    // the active (image-free) preset recipe wins over older per-item drafts.
+    if (_presetPendingRecipe) item.recipe = Object.assign(defaultRecipe(), clone(_presetPendingRecipe));
+    else if (PP_STORE.recipes[key]) item.recipe = Object.assign(defaultRecipe(), clone(PP_STORE.recipes[key]));
     else {
       var saved = storeGet(LS_RECIPE, null);
       if (saved && url && saved.url === url && saved.recipe) item.recipe = Object.assign(defaultRecipe(), saved.recipe);
@@ -1427,26 +1433,44 @@ export function mountPostprocessWorkspace(host, opts) {
     sliderRow(parent, "Balance", -100, 100, 1, function () { return r.grading.balance; }, function (v) { r.grading.balance = v; }).setAttribute("data-key", "grading");
   }
 
-  // ── Looks (presets + LUT) ──
+  // ── Looks (saved looks + LUT) ──
+  // POST-01: one staged empty state (image → look → LUT) shared by the
+  // no-image, no-LUT, and boot empties below — fixing one stage never
+  // reveals a differently-worded dead end for the same "no image" condition.
+  // Looks and LUTs read as OPTIONAL refinements (upload is the only
+  // required step). The single "Post" heading owns this surface (the engine
+  // stage was re-homed into center by the playground shell; this module
+  // never adds a second heading). DEFERRED beyond bounded scope: collapsing
+  // the deeper panel > postHost > workspace > tabs > sections nesting — the
+  // outer panel/postHost layers are owned by studio-playground.js, which
+  // this lane must not touch, so nesting can only be documented here.
+  function postStagedEmpty(stage) {
+    if (stage === "lut") {
+      return "No LUTs yet — import .cube files (optional Post step 3 of image → look → LUT).";
+    }
+    return "No image yet — upload an image to begin (looks and LUTs are optional next steps).";
+  }
   function renderLooks() {
     looks.innerHTML = "";
-    looks.appendChild(el("div", { class: "pp-note", text: "Looks", style: "font-weight:700;font-size:13px" }));
+    looks.appendChild(el("div", { class: "pp-note", text: "Post", style: "font-weight:700;font-size:13px" }));
     if (!cur() || !recipe()) {
-      looks.appendChild(el("p", { class: "pp-note", text: "Presets and LUTs appear once an image is loaded." }));
+      looks.appendChild(el("p", { class: "pp-note", text: postStagedEmpty("image") }));
       return;
     }
     var user = storeGet(LS_PRESETS, []);
-    // Section hooks for the native tab bar (presentation only): presets and
+    // Section hooks for the native tab bar (presentation only): looks and
     // the LUT library are distinct tab sections in Adjust/Color views.
     var looksSec = el("div", { "data-pp-section": "looks" });
     looks.appendChild(looksSec);
-    looksSec.appendChild(el("div", { class: "pp-note", text: "Presets", style: "font-weight:600;margin-top:6px" }));
+    // PRS-02: Post-side saved styles are "Looks" (matches looksSec), never
+    // "Presets" — that word belongs to the removed workflow presets.
+    looksSec.appendChild(el("div", { class: "pp-note", text: "Looks", style: "font-weight:600;margin-top:6px" }));
     BUILTIN_PRESETS.concat(user).forEach(function (p) {
       var b = el("button", { type: "button", class: "pp-btn", text: p.name, style: "display:block;width:100%;margin:2px 0;text-align:left" });
       b.addEventListener("click", function () {
         var keep = recipe(); var incoming = clone(p.recipe);
-        incoming.crop = keep.crop; incoming.spots = keep.spots; // presets carry look, not geometry
-        commit("preset " + p.name);
+        incoming.crop = keep.crop; incoming.spots = keep.spots; // looks carry look, not geometry
+        commit("look " + p.name);
         cur().recipe = incoming;
         buildInspector(); scheduleRender(); saveDraft();
       });
@@ -1454,13 +1478,13 @@ export function mountPostprocessWorkspace(host, opts) {
     });
     var saveRow = el("div", { style: "display:flex;gap:4px;margin:6px 0" });
     var nameIn = document.createElement("input");
-    nameIn.placeholder = "Preset name"; nameIn.style.flex = "1";
+    nameIn.placeholder = "Look name"; nameIn.style.flex = "1";
     nameIn.className = "pp-btn"; nameIn.style.cursor = "text";
     var saveB = el("button", { type: "button", class: "pp-btn", text: "Save" });
     saveB.addEventListener("click", function () {
       var nm = (nameIn.value || "").trim() || ("Look " + (user.length + 1));
       user.push({ name: nm, recipe: snapshot() });
-      storeSet(LS_PRESETS, user); renderLooks(); say("Preset saved: " + nm);
+      storeSet(LS_PRESETS, user); renderLooks(); say("Look saved: " + nm);
     });
     saveRow.appendChild(nameIn); saveRow.appendChild(saveB);
     looksSec.appendChild(saveRow);
@@ -1527,7 +1551,7 @@ export function mountPostprocessWorkspace(host, opts) {
         row.appendChild(b); row.appendChild(fav);
         lutList.appendChild(row);
       });
-      if (!S.luts.length) lutList.appendChild(el("p", { class: "pp-note", text: "No LUTs yet — import .cube files." }));
+      if (!S.luts.length) lutList.appendChild(el("p", { class: "pp-note", text: postStagedEmpty("lut") }));
     }
     search.addEventListener("input", paintLuts);
     paintLuts();
@@ -1743,8 +1767,13 @@ export function mountPostprocessWorkspace(host, opts) {
     PP_STORE.recipes[itemKeyOf(item)] = clone(item.recipe);
     storeSet(LS_RECIPE, { url: item.url, name: item.name, recipe: item.recipe });
     window.__ppRecipe = { url: item.url, name: item.name, recipe: clone(item.recipe) };
+    // Phase 12: notify the Studio shell that recipe config changed (the shell
+    // marks its active preset dirty; this module never touches presets).
+    try {
+      if (opts && typeof opts.onRecipeChange === "function") opts.onRecipeChange(clone(item.recipe));
+    } catch (_e) { /* edit notification is best-effort */ }
   }
-  function saveRecipe() { saveDraft(); say("Recipe saved locally — reopen this image to resume."); }
+  function saveRecipe() { saveDraft(); say("Settings saved locally — reopen this image to resume."); }
 
   function renderFullRes(item, done) {
     try {
@@ -1827,7 +1856,8 @@ export function mountPostprocessWorkspace(host, opts) {
   if (sourceUrl) addItem("Studio output", sourceUrl, null);
   if (!S.items.length) {
     insp.innerHTML = "";
-    insp.appendChild(el("p", { class: "pp-note", text: "No Studio output on the canvas yet. Upload an image, or run a generation and return here." }));
+    // POST-01: boot empty shares the staged Post copy (same stage 1).
+    insp.appendChild(el("p", { class: "pp-note", text: postStagedEmpty("image") }));
     var up0 = el("button", { type: "button", class: "pp-btn", "data-testid": "pp-upload-empty", text: "Upload image" });
     up0.addEventListener("click", function () {
       var fi = document.createElement("input");
@@ -1846,4 +1876,100 @@ export function mountPostprocessWorkspace(host, opts) {
     stage: stage,
     workspace: ws,
   };
+}
+
+// ── Studio V3 preset hooks (Phase 12, frontend lane) ─────────────────────
+// Narrow snapshot/apply/reset only. The post recipe allowlist is numeric/
+// choice fields only (curves/mixer/grading/spots/crop geometry are excluded
+// by the closed allowlist — never captured, never restored).
+//
+// Apply reuses the existing recipe lane: the allowlisted recipe is seeded as
+// the pending default that addItem merges over defaultRecipe(), and stale
+// undo/redo stacks are dropped (a preset Load replaces state; stale undo
+// would resurrect pre-preset config). Source pixels/buffers are never
+// touched here — the playground image-clear step owns them.
+
+var _presetPendingRecipe = null;
+
+// Frozen post recipe fields, mirroring the backend contract
+// (spot lists and LUT contents are not allowlisted server-side).
+var PRESET_POST_RECIPE_KEYS = [
+  "curves",
+  "mixer",
+  "grading",
+  "crop",
+  "format",
+  "quality",
+  "embedMetadata",
+  "embed_metadata",
+];
+
+function _presetRecipeScalar(value) {
+  if (value == null) return { keep: true, value: null };
+  if (typeof value === "string") {
+    if (/^(data:|blob:|https?:)/i.test(value.trim())) return { keep: false };
+    return { keep: true, value: value };
+  }
+  if (typeof value === "boolean") return { keep: true, value: value };
+  if (typeof value === "number" && isFinite(value)) return { keep: true, value: value };
+  return { keep: false };
+}
+
+/** Allowlisted projection of a recipe (pure; unknown/image keys dropped). */
+export function snapshotPostRecipeForPreset(recipe) {
+  var src = recipe && typeof recipe === "object" ? recipe : defaultRecipe();
+  var out = {};
+  for (var i = 0; i < PRESET_POST_RECIPE_KEYS.length; i++) {
+    var key = PRESET_POST_RECIPE_KEYS[i];
+    if (!Object.prototype.hasOwnProperty.call(src, key)) continue;
+    var projected = _presetRecipeScalar(src[key]);
+    if (projected.keep) out[key] = projected.value;
+  }
+  return out;
+}
+
+/** Allowlisted merge of a preset patch over a base recipe (pure). */
+export function mergePostRecipeForPreset(current, patch) {
+  var base = current && typeof current === "object" ? clone(current) : defaultRecipe();
+  var src = patch && typeof patch === "object"
+    ? (patch.recipe && typeof patch.recipe === "object" ? patch.recipe : patch)
+    : {};
+  var projected = snapshotPostRecipeForPreset(src);
+  var keys = Object.keys(projected);
+  for (var i = 0; i < keys.length; i++) {
+    base[keys[i]] = projected[keys[i]];
+  }
+  return base;
+}
+
+/** Neutral (default) allowlisted recipe for omitted-section reset. */
+export function neutralPostRecipeForPreset() {
+  return snapshotPostRecipeForPreset(defaultRecipe());
+}
+
+/**
+ * Apply a preset post section: seed the pending recipe consumed by addItem
+ * and drop stale undo/redo stacks. patch null/undefined resets to neutral
+ * (omitted sections reset, never inherit). Never touches source pixels.
+ * @returns {object} the seeded allowlisted recipe (detached)
+ */
+export function applyPostRecipeForPreset(patch) {
+  var next = (patch == null)
+    ? neutralPostRecipeForPreset()
+    : snapshotPostRecipeForPreset(
+        patch.recipe && typeof patch.recipe === "object" ? patch.recipe : patch
+      );
+  _presetPendingRecipe = clone(next);
+  try {
+    if (typeof window !== "undefined" && window.__ppStore) {
+      window.__ppStore.undo = {};
+      window.__ppStore.redo = {};
+    }
+  } catch (_e) { /* undo clear is best-effort */ }
+  return clone(next);
+}
+
+/** Drop the pending preset recipe (no override; stored drafts apply again). */
+export function clearPostPresetPending() {
+  _presetPendingRecipe = null;
 }

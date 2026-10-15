@@ -1374,3 +1374,151 @@ export async function getGoldenRunProgress(apiBase, requestId, cursor) {
   const suffix = cursor != null ? `?cursor=${encodeURIComponent(cursor)}` : "";
   return apiFetch(apiBase, `/studio/run-progress/${encodeURIComponent(requestId)}${suffix}`);
 }
+
+// ── Studio V3 Presets API (Phase 12, frontend lane) ───────────────────────
+// Server contract (backend lane builds it in parallel; these helpers code to
+// the contract): REST under /comfymodal/studio/workflows —
+//   GET|POST /versions/{vid}/presets
+//   GET|PATCH|DELETE /presets/{pid}
+//   POST /presets/{pid}/duplicate
+//   POST /presets/{pid}/copy-to-version
+// Record: {preset_id, workflow_version_id, name, description, tags,
+//   studio_state v1, mapping_fingerprint, created_at, updated_at}.
+// apiBase already carries the /comfymodal prefix at every call site, so paths
+// below are /studio/workflows/... like the neighboring workflow helpers.
+
+/** Pure: endpoint path for version-scoped preset collection (unit-testable). */
+export function versionPresetsEndpointPath(versionId) {
+  return `/studio/workflows/versions/${encodeURIComponent(versionId)}/presets`;
+}
+
+/** Pure: endpoint path for one preset record (unit-testable). */
+export function presetEndpointPath(presetId) {
+  return `/studio/workflows/presets/${encodeURIComponent(presetId)}`;
+}
+
+/** Pure: endpoint path for preset duplication (unit-testable). */
+export function presetDuplicateEndpointPath(presetId) {
+  return `/studio/workflows/presets/${encodeURIComponent(presetId)}/duplicate`;
+}
+
+/** Pure: endpoint path for copy-forward to another version (unit-testable). */
+export function presetCopyToVersionEndpointPath(presetId) {
+  return `/studio/workflows/presets/${encodeURIComponent(presetId)}/copy-to-version`;
+}
+
+/**
+ * List presets for one immutable workflow version.
+ * @param {string} apiBase
+ * @param {string} versionId
+ */
+export async function listVersionPresets(apiBase, versionId) {
+  if (!versionId) return null;
+  return apiFetch(apiBase, versionPresetsEndpointPath(versionId));
+}
+
+/**
+ * Create a preset under one immutable workflow version.
+ * Body: {name (required), description?, tags?, studio_state v1}.
+ * Images are never part of the payload — callers surface the note
+ * "Images are not saved with presets."
+ * @param {string} apiBase
+ * @param {string} versionId
+ * @param {object} payload
+ */
+export async function createVersionPreset(apiBase, versionId, payload) {
+  if (!versionId) return null;
+  return apiFetch(apiBase, versionPresetsEndpointPath(versionId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+/**
+ * Fetch one preset record by id.
+ * @param {string} apiBase
+ * @param {string} presetId
+ */
+export async function getPreset(apiBase, presetId) {
+  if (!presetId) return null;
+  return apiFetch(apiBase, presetEndpointPath(presetId));
+}
+
+/**
+ * Whole-state replace of a preset record (PATCH).
+ * Body may carry {name?, description?, tags?, studio_state?}.
+ * @param {string} apiBase
+ * @param {string} presetId
+ * @param {object} payload
+ */
+export async function updatePreset(apiBase, presetId, payload) {
+  if (!presetId) return null;
+  return apiFetch(apiBase, presetEndpointPath(presetId), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+/**
+ * Delete a preset record.
+ * @param {string} apiBase
+ * @param {string} presetId
+ */
+export async function deletePreset(apiBase, presetId) {
+  if (!presetId) return null;
+  return apiFetch(apiBase, presetEndpointPath(presetId), { method: "DELETE" });
+}
+
+/**
+ * Duplicate a preset within its version. Optional {name} renames the copy.
+ * @param {string} apiBase
+ * @param {string} presetId
+ * @param {object} payload
+ */
+export async function duplicatePreset(apiBase, presetId, payload) {
+  if (!presetId) return null;
+  return apiFetch(apiBase, presetDuplicateEndpointPath(presetId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+/**
+ * Copy-forward a preset to another workflow version. Body:
+ * {workflow_version_id (required)}.
+ * @param {string} apiBase
+ * @param {string} presetId
+ * @param {object} payload
+ */
+export async function copyPresetToVersion(apiBase, presetId, payload) {
+  if (!presetId) return null;
+  return apiFetch(apiBase, presetCopyToVersionEndpointPath(presetId), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+/**
+ * Pure: normalize a preset-list envelope into records. Unknown/malformed
+ * payloads degrade to [] — never throws.
+ */
+export function normalizePresetList(data) {
+  if (!data || typeof data !== "object") return [];
+  const list = Array.isArray(data.presets) ? data.presets : [];
+  return list.filter((p) => p && typeof p === "object");
+}
+
+/**
+ * Pure: normalize one preset record envelope ({status, preset} or the
+ * record itself) into the record or null.
+ */
+export function normalizePresetRecord(data) {
+  if (!data || typeof data !== "object") return null;
+  const rec = data.preset && typeof data.preset === "object" ? data.preset : data;
+  if (!rec || typeof rec !== "object" || !rec.preset_id) return null;
+  return rec;
+}

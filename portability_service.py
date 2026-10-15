@@ -80,10 +80,18 @@ from studio_domain.graph import extract_dependency_metadata, extract_executable_
 from studio_domain.models import (
     Mapping,
     Workflow,
+    WorkflowDomainValidationError,
+    WorkflowPreset,
     WorkflowVersion,
     make_mapping_id,
+    make_preset_id,
     make_version_id,
     make_workflow_id,
+)
+from studio_domain.preset_state import (
+    compute_mapping_fingerprint,
+    normalize_preset_metadata,
+    normalize_studio_state,
 )
 from studio_domain.services import WorkflowDomainService
 from studio_workflow_manifest import (
@@ -666,10 +674,18 @@ class PortabilityService:
         if warnings:
             metadata["export_warnings"] = warnings
 
+        # Version-scoped presets travel with the version (v1 records,
+        # verbatim).  The graph/API objects above are untouched by this.
+        preset_records = [
+            copy.deepcopy(p)
+            for p in self.store.list_presets_for_version(version_id)
+        ]
+
         manifest = build_manifest(
             workflow=manifest_workflow,
             version=manifest_version_section,
             mapping=manifest_mapping,
+            presets=preset_records,
             models=model_records,
             custom_nodes=custom_records,
             assets=asset_records,
@@ -831,6 +847,7 @@ class PortabilityService:
                 "workflow": True,
                 "version": True,
                 "mapping": True,
+                "preset_count": len(manifest.get("presets") or []),
                             },
             "dependency_summary": _dependency_summary(
                 analysis["model_rows"], analysis["custom_node_rows"]
@@ -967,10 +984,74 @@ class PortabilityService:
             }
         )
 
+        # Presets: validate ALL before any write (fail-closed, zero partial
+        # state).  New ids are minted, the version is remapped to the new
+        # local version, and the fingerprint is recomputed against the
+        # imported mapping.  The version graph JSON/hash above is untouched.
+        mapping_record = mapping.to_dict()
+        imported_presets: list[WorkflowPreset] = []
+        raw_presets = manifest.get("presets") or []
+        if not isinstance(raw_presets, list):
+            raise ImportBlockedError("manifest presets must be a list")
+        for idx, raw in enumerate(raw_presets):
+            label = (
+                str(raw.get("preset_id"))
+                if isinstance(raw, dict) and raw.get("preset_id")
+                else ("index %d" % idx)
+            )
+            if not isinstance(raw, dict):
+                raise ImportBlockedError(
+                    "invalid preset %s" % label, issues=["preset must be an object"]
+                )
+            try:
+                clean_name, clean_description, clean_tags = normalize_preset_metadata(
+                    raw.get("name"), raw.get("description"), raw.get("tags")
+                )
+                normalized_state = normalize_studio_state(raw.get("studio_state"))
+            except WorkflowDomainValidationError as exc:
+                raise ImportBlockedError(
+                    "invalid preset %s" % label, issues=[str(exc)]
+                ) from None
+            # Controls must bind roles the imported mapping actually maps;
+            # anything else is a stale binding carried from the origin.
+            mapped_roles = {
+                str(e.get("semantic_role", ""))
+                for e in entries_list
+                if isinstance(e, dict) and e.get("semantic_role")
+            }
+            stale = [
+                key
+                for key in (normalized_state.get("core") or {}).get("controls") or {}
+                if key not in mapped_roles
+            ]
+            if stale:
+                raise ImportBlockedError(
+                    "invalid preset %s" % label,
+                    issues=[
+                        "preset controls %s are not mapped roles "
+                        "on the imported version (stale binding)"
+                        % ", ".join(sorted(repr(s) for s in stale))
+                    ],
+                )
+            imported_presets.append(
+                WorkflowPreset(
+                    preset_id=make_preset_id(),
+                    workflow_version_id=new_version_id,
+                    name=clean_name,
+                    description=clean_description,
+                    tags=clean_tags,
+                    studio_state=normalized_state,
+                    mapping_fingerprint=compute_mapping_fingerprint(mapping_record),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
         return {
             "workflow": workflow,
             "version": version,
             "mapping": mapping,
+            "presets": imported_presets,
             "proposed_name": proposed_name,
         }
 
@@ -987,6 +1068,7 @@ class PortabilityService:
             records["workflow"],
             records["version"],
             records["mapping"],
+            records["presets"],
         )
         provenance = created["version"]["dependency_metadata"].get(
             "import_provenance"
@@ -996,6 +1078,8 @@ class PortabilityService:
             "workflow_id": created["workflow"]["workflow_id"],
             "workflow_version_id": created["version"]["workflow_version_id"],
             "mapping_id": created["mapping"]["mapping_id"],
+            "preset_ids": [p["preset_id"] for p in created["presets"]],
+            "preset_count": len(created["presets"]),
             "workflow_name": created["workflow"]["name"],
             "provenance": provenance,
             "dependency_summary": _dependency_summary(

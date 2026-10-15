@@ -2728,18 +2728,9 @@ async def _execute_job(item: tuple, item_id: int):
         )
         if _skip_plan_validation:
             print("[comfyui-modal] plan validation SKIPPED via skip_plan_validation opt-out")
-        # ── Ideogram Studio-workflow injection (isolated profile only) ──
-        # Revert: delete ideogram_studio_injection.py + this block. Inactive
-        # requests return the input workflow untouched (zero behavior change);
-        # active requests either swap in the validated Studio graph
-        # (Ideogram 4 Comfy UI Default, steps=16) or raise GateError here —
-        # fail closed before plan build, never a silent fallback.
-        from ideogram_studio_injection import (
-            maybe_inject_ideogram_studio_workflow as _maybe_inject_studio,
-        )
-        execution_workflow, _studio_selection = _maybe_inject_studio(
-            execution_workflow, modal_options=_mo, trace=_v2_trace,
-        )
+        # NOTE: Ideogram Studio-workflow injection lives in
+        # canonical_execution.build_execution_plan (the single choke point all
+        # entry paths share). Do NOT re-add a call here (double injection).
         _v2_plan = build_execution_plan(
             execution_workflow,
             prompt_id=prompt_id,

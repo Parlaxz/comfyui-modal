@@ -39,19 +39,27 @@ from .models import (
     Mapping,
     MappingAlreadyExistsError,
     MappingEntry,
+    PresetNotFoundError,
     VersionState,
     Workflow,
     WorkflowNotFoundError,
     WorkflowNotRunnableError,
     WorkflowDomainValidationError,
+    WorkflowPreset,
     WorkflowVersion,
     WorkflowVersionNotFoundError,
     build_studio_references_companion,
     make_mapping_id,
+    make_preset_id,
     make_version_id,
     make_workflow_id,
     normalize_reference_bindings,
     now_iso,
+)
+from .preset_state import (
+    compute_mapping_fingerprint,
+    normalize_preset_metadata,
+    normalize_studio_state,
 )
 from .store import WorkflowDomainStore
 
@@ -1587,3 +1595,204 @@ class WorkflowDomainService:
         enriched["mapping_id"] = mapping.get("mapping_id") if mapping else None
         enriched["mapping"] = self._enrich_mapping(mapping) if mapping else None
         return enriched
+
+    # ── Workflow Presets (version-scoped, Phase 12) ──────────────────────
+
+    def _require_preset_version(self, workflow_version_id: str) -> dict[str, Any]:
+        version = self.store.get_version(workflow_version_id)
+        if version is None:
+            raise WorkflowVersionNotFoundError(
+                f"workflow version {workflow_version_id!r} not found"
+            )
+        return version
+
+    def _preset_mapping_roles(self, workflow_version_id: str) -> dict[str, dict]:
+        """Mapped semantic roles for one version (canonical spellings)."""
+        mapping = self.store.get_mapping_for_version(workflow_version_id)
+        if mapping is None:
+            raise WorkflowDomainValidationError(
+                f"workflow version {workflow_version_id!r} has no mapping; "
+                "attach a mapping before creating presets"
+            )
+        roles: dict[str, dict] = {}
+        for raw in mapping.get("entries") or []:
+            if isinstance(raw, dict) and raw.get("semantic_role"):
+                roles[str(raw["semantic_role"])] = raw
+        return roles
+
+    def _validate_preset_controls(
+        self,
+        studio_state: dict[str, Any],
+        roles: dict[str, dict],
+        *,
+        target_version_id: str,
+    ) -> None:
+        """Fail closed when a preset control is not bound on the version."""
+        canonical_roles = {_ROLE_ALIASES.get(r, r) for r in roles}
+        for key in (studio_state.get("core") or {}).get("controls") or {}:
+            if _ROLE_ALIASES.get(key, key) not in canonical_roles:
+                raise WorkflowDomainValidationError(
+                    f"studio_state.core.controls[{key!r}] is not a mapped role "
+                    f"on workflow version {target_version_id!r} (stale binding)"
+                )
+
+    def _build_preset_record(
+        self,
+        *,
+        preset_id: str,
+        workflow_version_id: str,
+        name: Any,
+        description: Any,
+        tags: Any,
+        studio_state: Any,
+        created_at: str,
+        updated_at: str,
+    ) -> WorkflowPreset:
+        """Validate everything BEFORE any write; returns an unsaved record."""
+        self._require_preset_version(workflow_version_id)
+        clean_name, clean_description, clean_tags = normalize_preset_metadata(
+            name, description, tags
+        )
+        normalized_state = normalize_studio_state(studio_state)
+        mapping = self.store.get_mapping_for_version(workflow_version_id)
+        roles = self._preset_mapping_roles(workflow_version_id)
+        self._validate_preset_controls(
+            normalized_state, roles, target_version_id=workflow_version_id
+        )
+        return WorkflowPreset(
+            preset_id=preset_id,
+            workflow_version_id=workflow_version_id,
+            name=clean_name,
+            description=clean_description,
+            tags=clean_tags,
+            studio_state=normalized_state,
+            mapping_fingerprint=compute_mapping_fingerprint(mapping),
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
+    def list_presets(self, workflow_version_id: str) -> list[dict[str, Any]]:
+        self._require_preset_version(workflow_version_id)
+        presets = self.store.list_presets_for_version(workflow_version_id)
+        presets.sort(key=lambda p: (str(p.get("created_at", "")),
+                                    str(p.get("preset_id", ""))))
+        return presets
+
+    def get_preset(self, preset_id: str) -> dict[str, Any]:
+        preset = self.store.get_preset(preset_id)
+        if preset is None:
+            raise PresetNotFoundError(f"preset {preset_id!r} not found")
+        return preset
+
+    def create_preset(
+        self,
+        workflow_version_id: str,
+        *,
+        name: Any,
+        description: Any = "",
+        tags: Any = None,
+        studio_state: Any,
+    ) -> dict[str, Any]:
+        now = now_iso()
+        record = self._build_preset_record(
+            preset_id=make_preset_id(),
+            workflow_version_id=workflow_version_id,
+            name=name,
+            description="" if description is None else description,
+            tags=[] if tags is None else tags,
+            studio_state=studio_state,
+            created_at=now,
+            updated_at=now,
+        )
+        return self.store.insert_preset(record)
+
+    def update_preset(self, preset_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Whole-state replace (no merge): ``studio_state`` is replaced in
+        full and revalidated; version binding is immutable here."""
+        stored = self.store.get_preset(preset_id)
+        if stored is None:
+            raise PresetNotFoundError(f"preset {preset_id!r} not found")
+        if not isinstance(body, dict):
+            raise WorkflowDomainValidationError("preset update must be an object")
+        if ("workflow_version_id" in body
+                and body["workflow_version_id"] != stored.get("workflow_version_id")):
+            raise WorkflowDomainValidationError(
+                "preset workflow_version_id is immutable; "
+                "use copy-to-version to move a preset forward"
+            )
+        if "preset_id" in body and body["preset_id"] != preset_id:
+            raise WorkflowDomainValidationError("preset preset_id is immutable")
+        if "mapping_fingerprint" in body:
+            raise WorkflowDomainValidationError(
+                "preset mapping_fingerprint is server-computed and not editable"
+            )
+        name = body.get("name", stored.get("name", ""))
+        description = body.get("description", stored.get("description", ""))
+        tags = body.get("tags", stored.get("tags", []))
+        if "studio_state" in body:
+            studio_state = body["studio_state"]
+        else:
+            # No merge with history: callers resubmit the full state they
+            # intend to keep; without one there is nothing to update.
+            studio_state = stored.get("studio_state")
+        record = self._build_preset_record(
+            preset_id=preset_id,
+            workflow_version_id=str(stored.get("workflow_version_id", "")),
+            name=name,
+            description="" if description is None else description,
+            tags=[] if tags is None else tags,
+            studio_state=copy.deepcopy(studio_state),
+            created_at=str(stored.get("created_at", "")),
+            updated_at=now_iso(),
+        )
+        return self.store.update_preset(record)
+
+    def delete_preset(self, preset_id: str) -> None:
+        if not self.store.delete_preset(preset_id):
+            raise PresetNotFoundError(f"preset {preset_id!r} not found")
+
+    def duplicate_preset(
+        self, preset_id: str, *, name: Any = None
+    ) -> dict[str, Any]:
+        """Duplicate on the SAME version: new id and timestamps, same state."""
+        stored = self.store.get_preset(preset_id)
+        if stored is None:
+            raise PresetNotFoundError(f"preset {preset_id!r} not found")
+        now = now_iso()
+        record = self._build_preset_record(
+            preset_id=make_preset_id(),
+            workflow_version_id=str(stored.get("workflow_version_id", "")),
+            name=stored.get("name", "") if name is None else name,
+            description=stored.get("description", ""),
+            tags=list(stored.get("tags", [])),
+            studio_state=copy.deepcopy(stored.get("studio_state")),
+            created_at=now,
+            updated_at=now,
+        )
+        return self.store.insert_preset(record)
+
+    def copy_preset_to_version(
+        self, preset_id: str, target_version_id: str
+    ) -> dict[str, Any]:
+        """Copy forward onto another version with target revalidation.
+
+        The carried ``studio_state`` is revalidated against the TARGET
+        version's mapping; controls bound to roles the target does not map
+        fail closed as stale bindings and nothing is written.
+        """
+        stored = self.store.get_preset(preset_id)
+        if stored is None:
+            raise PresetNotFoundError(f"preset {preset_id!r} not found")
+        self._require_preset_version(target_version_id)
+        now = now_iso()
+        record = self._build_preset_record(
+            preset_id=make_preset_id(),
+            workflow_version_id=target_version_id,
+            name=stored.get("name", ""),
+            description=stored.get("description", ""),
+            tags=list(stored.get("tags", [])),
+            studio_state=copy.deepcopy(stored.get("studio_state")),
+            created_at=now,
+            updated_at=now,
+        )
+        return self.store.insert_preset(record)

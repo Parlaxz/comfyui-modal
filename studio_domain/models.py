@@ -16,6 +16,7 @@ persisted on the immutable version record.
 
 from __future__ import annotations
 
+import copy
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -99,6 +100,10 @@ class MappingNotFoundError(WorkflowDomainError):
     pass
 
 
+class PresetNotFoundError(WorkflowDomainError):
+    pass
+
+
 class MappingAlreadyExistsError(WorkflowDomainError):
     """A Workflow Version already has its (immutable) Mapping."""
 
@@ -136,6 +141,10 @@ def make_version_id() -> str:
 
 def make_mapping_id() -> str:
     return f"wm_{uuid.uuid4().hex[:16]}"
+
+
+def make_preset_id() -> str:
+    return f"wp_{uuid.uuid4().hex[:16]}"
 
 
 def _sanitize_str(value: Any, max_len: int = 2000, default: str = "") -> str:
@@ -551,3 +560,59 @@ class VersionState:
             "reasons": list(self.reasons),
             "runnable": self.runnable,
         }
+
+
+# ── Workflow presets (Phase 12) ────────────────────────────────────────────
+
+
+@dataclass
+class WorkflowPreset:
+    """Version-scoped, image-free UI intent snapshot for one WorkflowVersion.
+
+    Bound to exactly one ``workflow_version_id`` (no ``workflow_id`` field —
+    the version already owns that edge) and carrying a closed
+    ``studio_state`` v1 dict.  There is no default-preset concept: presets
+    are peers and only move forward via explicit copy-to-version.
+    ``mapping_fingerprint`` is server-computed at write time.
+    """
+
+    preset_id: str
+    workflow_version_id: str
+    name: str = ""
+    description: str = ""
+    tags: list[str] = field(default_factory=list)
+    studio_state: dict[str, Any] = field(default_factory=dict)
+    mapping_fingerprint: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "preset_id": self.preset_id,
+            "workflow_version_id": self.workflow_version_id,
+            "name": self.name,
+            "description": self.description,
+            "tags": list(self.tags),
+            "studio_state": copy.deepcopy(self.studio_state),
+            "mapping_fingerprint": self.mapping_fingerprint,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WorkflowPreset":
+        tags = data.get("tags")
+        state = data.get("studio_state")
+        return cls(
+            preset_id=str(data.get("preset_id", "")),
+            workflow_version_id=str(data.get("workflow_version_id", "")),
+            name=str(data.get("name", "")),
+            description=str(data.get("description", "")),
+            tags=[t for t in tags if isinstance(t, str)]
+            if isinstance(tags, list) else [],
+            studio_state=copy.deepcopy(state)
+            if isinstance(state, dict) else {},
+            mapping_fingerprint=str(data.get("mapping_fingerprint", "")),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+        )

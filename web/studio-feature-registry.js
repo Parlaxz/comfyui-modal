@@ -19,7 +19,7 @@ export const FEATURE_SPECS = [
     supportsImageCanvas: true,
     futureTools: ["SAM click selection", "Text object selection", "Brush refine"],
     isPlaceholder: true,
-    placeholderReason: "Image-edit tools are not available in the modern Playground yet.",
+    placeholderReason: "Object Remove arrives in a later phase — manual mask via Edit → Select works today.",
     controls: ["prompt", "instruction", "steps", "guidance", "denoise", "seed", "lora", "lora_strength", "mask_blur", "mask_expand"],
   },
   {
@@ -29,10 +29,17 @@ export const FEATURE_SPECS = [
     supportsImageCanvas: true,
     futureTools: ["SAM click selection", "Text object selection", "Reference image"],
     isPlaceholder: true,
-    placeholderReason: "Image-edit tools are not available in the modern Playground yet.",
+    placeholderReason: "Object Replace arrives in a later phase — manual mask via Edit → Select works today.",
     controls: ["prompt", "instruction", "steps", "guidance", "denoise", "seed", "lora", "lora_strength", "mask_blur", "mask_expand"],
   },
 ];
+
+// INP-02: user-facing placeholder copy is scoped per feature above
+// ("Object Remove arrives in a later phase — manual mask via Edit →
+// Select works today"). The honest generic status below stays as the
+// greppable truthfulness marker: image-edit tools are not available in
+// the modern Playground yet.
+export const PLACEHOLDER_STATUS_LEGACY = "Image-edit tools are not available in the modern Playground yet.";
 
 export const CONTROL_DEFS = {
   prompt: {
@@ -144,7 +151,7 @@ export const CONTROL_DEFS = {
     defaultValue: "euler",
     experimentEligible: true,
     dynamicOptions: true,
-    helpText: "Sampler name for the generation. Options come from the backend preset's graph schema.",
+    helpText: "Sampler name for the generation. Options come from the backend saved workflow's graph schema.",
     applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   scheduler: {
@@ -154,7 +161,7 @@ export const CONTROL_DEFS = {
     defaultValue: "normal",
     experimentEligible: true,
     dynamicOptions: true,
-    helpText: "Scheduler name for the generation. Options come from the backend preset's graph schema.",
+    helpText: "Scheduler name for the generation. Options come from the backend saved workflow's graph schema.",
     applicableFeatures: ["txt2img", "object_remove", "object_replace"],
   },
   lora: {

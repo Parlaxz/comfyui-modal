@@ -1290,3 +1290,134 @@ export function referenceBlockMessage(engagement) {
       + "Run from Studio References, or clear the reference method/cards and run again.";
   }
 }
+
+// ── Studio V3 preset overrides (Phase 12, frontend lane) ─────────────────
+// Pure, DOM-free helpers so exact-version preset overrides and Playground-
+// scoped output options reach the Run path. No storage, no fetch.
+
+/**
+ * Apply a preset's core overrides onto the store's control values.
+ * Exact-version only: the preset record's workflow_version_id must equal the
+ * store's live workflowVersionId, otherwise {ok:false} and the store is
+ * untouched (never cross-version apply). Only schema-known roles survive
+ * (validated, never coerced); image-control roles are never set from a
+ * preset (presets carry no images by contract).
+ *
+ * @param {object} store workflow-run store
+ * @param {object} presetState v1 studio_state (or null for neutral reset)
+ * @param {object} opts {expectedVersionId?: string}
+ * @returns {{ok: boolean, error?: string, applied?: object}}
+ */
+export function applyPresetCoreOverrides(store, presetState, opts) {
+  if (!store || typeof store !== "object") return { ok: false, error: "no store" };
+  const o = opts && typeof opts === "object" ? opts : {};
+  const liveVersion = store.workflowVersionId != null ? String(store.workflowVersionId) : "";
+  if (o.expectedVersionId != null && String(o.expectedVersionId) !== liveVersion) {
+    return { ok: false, error: "preset version mismatch" };
+  }
+  const schema = getControlSchema(store);
+  const core = presetState && typeof presetState === "object" ? presetState.core : null;
+  const next = Object.assign({}, store.controlValues || {});
+  const applied = {};
+  if (core && typeof core === "object") {
+    // The visible prompt is mapping-independent core state (not a mapped
+    // control): on a stale-mapping version the prompt role is absent from the
+    // control schema while scalar roles like seed survive, so gating the
+    // prompt on schema membership would leave a stale prompt behind. Always
+    // write it — including "" (a preset replace clears the editor; empty must
+    // never inherit). The shelf prompt card reads mapping entries rather than
+    // the schema, so it shows whatever alias is written here.
+    if (typeof core.positive_prompt === "string") {
+      const hasSchemaPrompt = !!(schema.positive_prompt || schema.prompt);
+      const hasStorePrompt = Object.prototype.hasOwnProperty.call(next, "positive_prompt")
+        || Object.prototype.hasOwnProperty.call(next, "prompt");
+      // Clearing an absent prompt is a no-op — never invent the key (an
+      // unknown empty role would newly fail validation on prompt-less
+      // versions). A present value always writes (mapping-independent core).
+      if (core.positive_prompt !== "" || hasSchemaPrompt || hasStorePrompt) {
+        const role = schema.positive_prompt ? "positive_prompt" : schema.prompt ? "prompt"
+          : Object.prototype.hasOwnProperty.call(next, "positive_prompt") ? "positive_prompt"
+          : "prompt";
+        if (!isImageControlRole(role, schema[role])) {
+          next[role] = core.positive_prompt;
+          applied[role] = core.positive_prompt;
+        }
+      }
+    }
+    if (typeof core.negative_prompt === "string") {
+      if (schema.negative_prompt) {
+        next.negative_prompt = core.negative_prompt;
+        applied.negative_prompt = core.negative_prompt;
+      } else if (core.negative_prompt === "") {
+        // Clearing must also reach a store holding the role under no schema.
+        delete next.negative_prompt;
+      }
+    }
+    const overrides = core.controls && typeof core.controls === "object" ? core.controls : {};
+    for (const role of Object.keys(overrides)) {
+      if (!Object.prototype.hasOwnProperty.call(schema, role)) continue;
+      if (isImageControlRole(role, schema[role])) continue;
+      next[role] = overrides[role];
+      applied[role] = overrides[role];
+    }
+  }
+  const { values } = validateMappedValues(next, schema);
+  store.controlValues = values;
+  // Intentionally applied prompt aliases survive validation even when the
+  // schema lost the role (stale mapping): the editor reads them back, and the
+  // run-payload builder re-validates, so nothing schema-unknown is ever sent.
+  for (const role of ["prompt", "positive_prompt"]) {
+    if (
+      Object.prototype.hasOwnProperty.call(applied, role)
+      && typeof store.controlValues[role] !== "string"
+    ) {
+      store.controlValues = { ...store.controlValues, [role]: applied[role] };
+    }
+  }
+  return { ok: true, applied };
+}
+
+/**
+ * Resolve the effective output options for a Run: global base options with
+ * the preset's Playground-scoped output override applied. The preset section
+ * is the FLAT contract shape (output_format, quality, auto_save_local,
+ * save_folder, save_metadata_sidecar, preview_* scalars). The override never
+ * persists globally (no POST, no localStorage write here) — it rides the
+ * single run payload only. Unknown override keys are dropped.
+ *
+ * @param {object} baseOptions global modal options (from the preload cache)
+ * @param {object} presetOutput preset output section or null
+ * @returns {object} merged options (fresh object; inputs untouched)
+ */
+export function resolveEffectiveOutputOptions(baseOptions, presetOutput) {
+  const base = baseOptions && typeof baseOptions === "object" ? baseOptions : {};
+  const merged = Object.assign({}, base);
+  const over = presetOutput && typeof presetOutput === "object" ? presetOutput : null;
+  if (!over) return merged;
+  if (typeof over.output_format === "string" && over.output_format) {
+    merged.output_format = over.output_format;
+  }
+  if (typeof over.quality === "number" && Number.isFinite(over.quality)) {
+    merged.quality = Math.max(1, Math.min(100, Math.floor(over.quality)));
+  }
+  if (typeof over.auto_save_local === "boolean") merged.auto_save_local = over.auto_save_local;
+  if (typeof over.save_folder === "string" && over.save_folder) {
+    merged.save_folder = over.save_folder;
+  }
+  if (typeof over.save_metadata_sidecar === "boolean") {
+    merged.save_metadata_sidecar = over.save_metadata_sidecar;
+  }
+  if (over.preview_default === "on" || over.preview_default === "off") {
+    merged.preview_default = over.preview_default;
+    merged.data_saver_default = over.preview_default;
+  }
+  if (typeof over.preview_codec === "string" && over.preview_codec) {
+    merged.preview_codec = over.preview_codec;
+  }
+  if (typeof over.preview_quality === "number" && Number.isFinite(over.preview_quality)) {
+    const q = Math.max(1, Math.min(100, Math.floor(over.preview_quality)));
+    merged.preview_quality = q;
+    merged.data_saver_quality = q;
+  }
+  return merged;
+}

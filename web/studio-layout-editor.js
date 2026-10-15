@@ -406,7 +406,10 @@ function injectStyle() {
     ".stlay-lsw{width:16px;height:16px;border-radius:3px;border:1px solid #666;flex:0 0 auto;}",
     ".stlay-lnum{font:bold 11px monospace;color:#888;flex:0 0 auto;width:20px;}",
     ".stlay-ltext{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}",
-    ".stlay-ltext.empty{color:#777;font-style:italic;}",
+    // LAY-01: unplaced rows carry an explicit badge, never italic
+    // pseudo-labels (the old .stlay-ltext.empty rule is gone).
+    ".stlay-unplaced{flex:0 0 auto;font:600 10px sans-serif;color:#0d0d0d;background:#d9a441;border-radius:3px;padding:1px 6px;white-space:nowrap;}",
+    ".stlay-labwrap{display:flex;flex-direction:column;gap:2px;flex:1 1 90px;min-width:0;}",
     ".stlay-lbtn{background:none;border:none;color:#999;cursor:pointer;font:13px sans-serif;line-height:1;padding:2px 5px;border-radius:3px;flex:0 0 auto;}",
     ".stlay-lbtn:hover{color:#fff;background:#444;}",
     ".stlay-lbtn:disabled{opacity:0.3;cursor:default;}",
@@ -529,15 +532,30 @@ export function createLayoutEditor(container, opts) {
   scene.appendChild(bgArea);
 
   const styleRow = el("div", "stlay-bar");
-  const aesInput = el("input", "stlay-field"); aesInput.placeholder = "aesthetics";
-  const lightInput = el("input", "stlay-field"); lightInput.placeholder = "lighting";
-  const photoInput = el("input", "stlay-field"); photoInput.placeholder = "photo";
-  const mediumInput = el("input", "stlay-field"); mediumInput.placeholder = "medium";
-  const artInput = el("input", "stlay-field"); artInput.placeholder = "Art style";
-  for (const inp of [aesInput, lightInput, photoInput, mediumInput, artInput]) {
-    inp.style.flex = "1 1 90px";
-    styleRow.appendChild(inp);
+  // LAY-02: real <label> per style input (placeholders vanish on type and
+  // were the only labels). Labels persist; placeholders stay as examples.
+  function styleField(id, labelText, example) {
+    const wrap = document.createElement("div");
+    wrap.className = "stlay-labwrap";
+    const lab = document.createElement("label");
+    lab.className = "stlay-lbl";
+    lab.htmlFor = id;
+    lab.textContent = labelText;
+    const inp = el("input", "stlay-field");
+    inp.id = id;
+    inp.placeholder = example;
+    inp.style.width = "100%";
+    inp.style.boxSizing = "border-box";
+    wrap.appendChild(lab);
+    wrap.appendChild(inp);
+    styleRow.appendChild(wrap);
+    return inp;
   }
+  const aesInput = styleField("stlay-aesthetics", "Aesthetics", "e.g. clean");
+  const lightInput = styleField("stlay-lighting", "Lighting", "e.g. soft");
+  const photoInput = styleField("stlay-photo", "Photo", "e.g. 35mm");
+  const mediumInput = styleField("stlay-medium", "Medium", "e.g. digital");
+  const artInput = styleField("stlay-art-style", "Art style", "e.g. watercolor");
   scene.appendChild(styleRow);
 
   const stylePalBar = el("div", "stlay-bar");
@@ -545,7 +563,9 @@ export function createLayoutEditor(container, opts) {
   scene.appendChild(stylePalBar);
   // Oracle P0-1: style detail controls must not look usable when they cannot
   // contribute (mode none omits the whole style block from the caption).
-  const styleHint = el("div", "stlay-lbl", "Choose Photo or Art to include style settings.");
+  // LAY-02: the helper stays visible as the inactive-state explanation;
+  // inputs are never disabled (values are kept either way).
+  const styleHint = el("div", "stlay-lbl", "Style settings apply when Photo or Art is chosen — values are kept either way.");
   scene.appendChild(styleHint);
 
   // ---- background image (local file only) ----
@@ -770,16 +790,14 @@ export function createLayoutEditor(container, opts) {
       ctx.fillStyle = "#1a1a1a";
       ctx.fillRect(0, 0, cw, ch);
     }
-    // Oracle P1-3: an empty canvas invites the first action in-canvas instead
-    // of leaving instructions to the side panel.
+    // Oracle P1-3 + LAY-01: the gesture hintBar below the canvas owns the
+    // drawing hint; the in-canvas invite is a single line so the empty
+    // canvas never triple-explains drawing.
     if (!draft.boxes.length) {
       ctx.fillStyle = "rgba(200,200,200,0.75)";
       ctx.font = "13px sans-serif";
       ctx.textAlign = "center";
-      ctx.fillText("Drag on the canvas to draw a region", cw / 2, ch / 2 - 10);
-      ctx.font = "11px sans-serif";
-      ctx.fillStyle = "rgba(160,160,160,0.75)";
-      ctx.fillText("New regions start as objects — switch to Text in the side panel", cw / 2, ch / 2 + 12);
+      ctx.fillText("Drag on the canvas to draw a region", cw / 2, ch / 2);
       ctx.textAlign = "start";
     }
     // Boxes in array order (later = front).
@@ -1361,8 +1379,19 @@ export function createLayoutEditor(container, opts) {
   // open state is preserved explicitly instead of snapping shut on every edit.
   let geoOpen = false;
   function rowLabel(b) {
-    return (b.desc || (b.type === "text" ? b.text : "") || ("(" + b.type + ")")) +
-      (b.nobbox ? " · unpositioned" : "");
+    // LAY-01: plain label only — unplaced state is an explicit badge on the
+    // row, never an italic pseudo-label or a "· unpositioned" suffix.
+    return (b.desc || (b.type === "text" ? b.text : "") || ("(" + b.type + ")"));
+  }
+  function isRowUnplaced(b) {
+    // LAY-01 remediation (Pass-C): nobbox/validated geometry ONLY. The old
+    // label-prefix inference (label.startsWith("(")) misbadged newly drawn
+    // positioned regions, which carry a "(type)" fallback label until the
+    // user names them but have real geometry (nobbox:false — see endDrag).
+    return !!b.nobbox;
+  }
+  function unplacedBadge() {
+    return el("span", "stlay-unplaced", "Unplaced");
   }
   function renderPanel() {
     if (destroyed) return;
@@ -1376,11 +1405,12 @@ export function createLayoutEditor(container, opts) {
       chip.style.background = boxColor(b);
       const num = el("span", "stlay-lnum", String(i + 1).padStart(2, "0"));
       const label = rowLabel(b);
-      const txt = el("span", "stlay-ltext" + (label.startsWith("(") ? " empty" : ""), label);
+      const txt = el("span", "stlay-ltext", label);
       txt.title = label;
       r.appendChild(chip);
       r.appendChild(num);
       r.appendChild(txt);
+      if (isRowUnplaced(b)) r.appendChild(unplacedBadge());
       const lockBtn = el("button", "stlay-lbtn" + (b.locked ? " on" : ""), b.locked ? "🔒" : "🔓");
       lockBtn.title = b.locked ? "Unlock" : "Lock";
       lockBtn.addEventListener("click", (e) => {
@@ -1454,7 +1484,9 @@ export function createLayoutEditor(container, opts) {
       listBox.appendChild(r);
     }
     if (!draft.boxes.length) {
-      listBox.appendChild(el("div", "stlay-lbl", "No regions — drag on the canvas to draw one."));
+      // LAY-01: plain list empty state — drawing is explained once by the
+      // canvas hint bar, not repeated here.
+      listBox.appendChild(el("div", "stlay-lbl", "No regions yet."));
     }
     // Inspector heading prefers the human-readable label, numeric id second.
     const _headBox = activeIdx >= 0 ? draft.boxes[activeIdx] : null;
@@ -1629,19 +1661,16 @@ export function createLayoutEditor(container, opts) {
     aesInput.value = draft.aesthetics || "";
     lightInput.value = draft.lighting || "";
     photoInput.value = draft.photo || "";
-    photoInput.style.display = draft.style_mode === "photo" ? "" : "none";
+    // Mode-specific fields hide by wrapper (LAY-02 labels wrap the inputs).
+    photoInput.parentNode.style.display = draft.style_mode === "photo" ? "" : "none";
     mediumInput.value = draft.medium || "";
-    mediumInput.style.display = draft.style_mode === "none" ? "none" : "";
+    mediumInput.parentNode.style.display = draft.style_mode === "none" ? "none" : "";
     artInput.value = draft.art_style || "";
-    artInput.style.display = draft.style_mode === "art_style" ? "" : "none";
-    // Oracle P0-1: style block is omitted unless a style mode is chosen, so
-    // the detail controls go honestly inactive instead of silently dead.
-    const styleActive = draft.style_mode === "photo" || draft.style_mode === "art_style";
-    for (const inp of [aesInput, lightInput, photoInput, mediumInput, artInput]) inp.disabled = !styleActive;
-    styleRow.style.opacity = styleActive ? "" : "0.45";
-    stylePalBar.style.opacity = styleActive ? "" : "0.45";
-    for (const b of stylePalBar.querySelectorAll("button")) b.disabled = !styleActive;
-    styleHint.style.display = styleActive ? "none" : "";
+    artInput.parentNode.style.display = draft.style_mode === "art_style" ? "" : "none";
+    // Oracle P0-1 + LAY-02: the style block is omitted unless a style mode
+    // is chosen, but the detail controls stay enabled with the helper above
+    // so the affordance never vanishes mid-typing.
+    for (const inp of [aesInput, lightInput, photoInput, mediumInput, artInput]) inp.disabled = false;
     brightRange.value = String(draft.bgBrightness);
     brightLbl.textContent = String(draft.bgBrightness) + "%";
     syncing = false;
@@ -1689,7 +1718,11 @@ export function createLayoutEditor(container, opts) {
           const label = rowLabel(ab);
           t.textContent = label;
           t.title = label;
-          t.classList.toggle("empty", label.startsWith("("));
+          // LAY-01: light touch keeps the badge in sync without rebuilding.
+          const hasBadge = !!row.querySelector(".stlay-unplaced");
+          const wantBadge = isRowUnplaced(ab);
+          if (wantBadge && !hasBadge) row.insertBefore(unplacedBadge(), t.nextSibling);
+          else if (!wantBadge && hasBadge) row.removeChild(row.querySelector(".stlay-unplaced"));
         }
         const chip = row.querySelector(".stlay-lsw");
         if (chip) chip.style.background = boxColor(ab);
@@ -1901,5 +1934,88 @@ export function createLayoutEditor(container, opts) {
       bgImg = null;
       wrap.remove();
     },
+    clearBackground() {
+      // Phase 12 preset image-clear: drop the local upload background pixels
+      // (file-upload only; see header). Tool/draft text state is untouched.
+      if (bgUrl) {
+        try { URL.revokeObjectURL(bgUrl); } catch (e) { /* noop */ }
+        bgUrl = "";
+      }
+      bgImg = null;
+      touch();
+    },
   };
+}
+
+// ── Studio V3 preset hooks (Phase 12, frontend lane) ─────────────────────
+// Narrow snapshot/apply/reset only. Snapshot returns the owner-native draft
+// (getDraft already detaches); allowlist projection lives in
+// web/studio-presets.js capturePresetState. Apply reuses the existing
+// setDraft (which normalizes); reset reuses setDraft + clearBackground.
+// Background pixels are never snapshotted and never restored.
+
+/** Owner-native layout snapshot for preset capture (detached draft). */
+export function snapshotLayoutForPreset(editor) {
+  try {
+    if (editor && typeof editor.getDraft === "function") return editor.getDraft();
+  } catch (_e) { /* fall through */ }
+  return null;
+}
+
+/**
+ * Apply a preset layout section via the existing setDraft path. Accepts the
+ * flat contract section (and the historical nested draft — both project to
+ * flat). Palette strings split back into native lists.
+ * @param {*} editor layout editor instance
+ * @param {object} section preset layout section (or null for neutral reset)
+ */
+export function applyLayoutFromPreset(editor, section) {
+  if (!editor || typeof editor.setDraft !== "function") return false;
+  const s = section && typeof section === "object" ? section : null;
+  const modes = (s && s.modes && typeof s.modes === "object") ? s.modes : {};
+  const dims = (s && s.dims && typeof s.dims === "object") ? s.dims : {};
+  const splitPalette = (value) => {
+    if (Array.isArray(value)) return value.slice();
+    if (typeof value === "string" && value) {
+      return value.split(",").map((part) => part.trim()).filter(Boolean);
+    }
+    return [];
+  };
+  const pick = (flat, nested, legacy) => {
+    if (s && s[flat] !== undefined) return s[flat];
+    if (nested && modes[nested] !== undefined) return modes[nested];
+    if (legacy && s && s[legacy] !== undefined) return s[legacy];
+    return undefined;
+  };
+  const rawBoxes = s && Array.isArray(s.boxes) ? s.boxes : [];
+  try {
+    editor.setDraft({
+      high_level_description: s ? String(pick("high_level_description", null, "descriptor") || "") : "",
+      background: s ? String(pick("background") || "") : "",
+      style_mode: String(pick("style_mode") || "none"),
+      aesthetics: String(pick("aesthetics") || ""),
+      lighting: String(pick("lighting") || ""),
+      photo: String(pick("photo") || ""),
+      medium: String(pick("medium") || ""),
+      art_style: String(pick("art_style") || ""),
+      color_palette: splitPalette(s ? (s.color_palette !== undefined ? s.color_palette : s.palette) : []),
+      width: (s && (s.width !== undefined ? s.width : dims.width)) || 1024,
+      height: (s && (s.height !== undefined ? s.height : dims.height)) || 1024,
+      boxes: rawBoxes.map((b) => Object.assign({}, b, {
+        color_palette: splitPalette(b && b.color_palette),
+      })),
+    });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+/** Reset the editor to neutral preset state (empty draft, no background). */
+export function resetLayoutForPreset(editor) {
+  if (!editor) return false;
+  try {
+    if (typeof editor.clearBackground === "function") editor.clearBackground();
+  } catch (_e) { /* background clear is best-effort */ }
+  return applyLayoutFromPreset(editor, null);
 }

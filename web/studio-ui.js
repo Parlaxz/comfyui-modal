@@ -1391,7 +1391,8 @@ export function buildViewerBody(opts = {}) {
   if (opts.imageUrl) {
     stage.appendChild(createZoomableImageEl(opts.imageUrl, "Generated image", {}).container);
   } else {
-    stage.appendChild(el("div", { class: "comfymodal-studio-preview-overlay-noimage", text: "No image available" }));
+    // HST-01: single shared missing-image copy.
+    stage.appendChild(el("div", { class: "comfymodal-studio-preview-overlay-noimage", text: missingImageCopy() }));
   }
   // Record-derived stage badges (fixed semantics, not a caller opt).
   (opts.stageBadges || []).forEach(function (child) { if (child) stage.appendChild(child); });
@@ -2250,7 +2251,8 @@ export function createImagePreviewOverlay(opts) {
   } else {
     var noImg = document.createElement("div");
     noImg.className = "comfymodal-studio-preview-overlay-noimage";
-    noImg.textContent = "No image available";
+    // HST-01: single shared missing-image copy.
+    noImg.textContent = missingImageCopy();
     stage.appendChild(noImg);
   }
 
@@ -2467,4 +2469,49 @@ export function renderEmptyState(options = {}) {
     root.appendChild(actionWrap);
   }
   return root;
+}
+
+// ── Phase 13 shared shelf/history helpers ─────────────────────────────────
+//
+// ShelfSectionTitle: one headed-shelf-section pattern (h4 + shared class) so
+// Guidance / References / Styles-style shelf sections share document
+// hierarchy instead of span/h4/none drift (audit STY-02). The page owner
+// still owns higher-level headings; this is the per-section title only.
+// NOTE (playground FOLLOW-UP): shelf sections owned by studio-playground.js
+// (Guidance card, References box, Styles browser) should adopt
+// ShelfSectionTitle when that lane touches them — this lane does not edit
+// playground files.
+//
+// missingImageCopy: single canonical phrasing for a missing/unavailable
+// image ("No image available"), replacing the four-way drift ("No image" /
+// "No image available" / "Image unavailable") (audit HST-01).
+//
+// STATUS_LABELS: single shared run-status label map for the History
+// feed/detail/experiment surfaces (audit HST-02). Per-file STATUS_TONES
+// stay local (experiment adds a queued tone).
+
+export const STATUS_LABELS = {
+  completed: "Completed",
+  completed_with_failures: "Completed with failures",
+  failed: "Failed",
+  canceled: "Canceled",
+  interrupted: "Interrupted",
+  running: "Running",
+  queued: "Queued",
+};
+
+export function missingImageCopy() {
+  return "No image available";
+}
+
+export function ShelfSectionTitle(title, opts) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const node = el("h4", {
+    class: "cm-shelf-section-title",
+    text: typeof title === "string" ? title : "",
+  });
+  if (typeof o.testid === "string" && o.testid !== "") {
+    node.setAttribute("data-testid", o.testid);
+  }
+  return node;
 }

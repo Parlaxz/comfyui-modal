@@ -35,8 +35,27 @@ import {
   getWorkspaceSwapStatus,
   buildSwapConfirmPayload,
   swapPhaseMessage,
+  listVersionPresets,
+  createVersionPreset,
+  getPreset,
+  updatePreset,
+  deletePreset,
+  duplicatePreset,
+  copyPresetToVersion,
+  normalizePresetList,
+  normalizePresetRecord,
 } from "./studio-backend-api.js";
-import { loadModalOptions } from "./studio-output-preferences.js";
+import {
+  capturePresetState,
+  validatePresetState,
+  planPresetHydration,
+  buildPresetSavePayload,
+  resolvePresetPrompt,
+  PRESET_INPAINT_METHODS,
+  PRESET_EXPAND_METHODS,
+} from "./studio-presets.js";
+import { snapshotSketchSettingsForPreset } from "./studio-sketch-shell.js";
+import { loadModalOptions, snapshotOutputForPreset } from "./studio-output-preferences.js";
 import { createLayoutEditor, buildIdeogramCaption } from "./studio-layout-editor.js";
 import { goldenProgressResponseAction, progressSpanView } from "./studio-golden-progress.js";
 
@@ -65,12 +84,21 @@ import {
   SHELL_SUBTOOLS,
   SHELL_PLACEHOLDERS,
   shellGateReason,
+  LATER_PHASE_SUFFIX,
 } from "./studio-playground-state.js";
 import {
   createPlaygroundRunController,
   projectRunToLegacy,
   LEGACY_TERMINAL_STATUSES,
 } from "./studio-playground-run.js";
+import {
+  saveActivePreset,
+  loadActivePreset,
+  clearActivePreset,
+  savePresetWorkingDraft,
+  loadPresetWorkingDraft,
+  clearPresetWorkingDraft,
+} from "./studio-playground-state.js";
 import { updateRunAnnotation, saveRunOutput, getMethodCompat, getGuidanceMapping, saveGuidanceMapping } from "./studio-backend-api.js";
 import {
   GUIDANCE_MODES,
@@ -88,6 +116,9 @@ import {
   buildMappingRecord,
   resolveGuidanceState,
   buildSnapshotGuidance,
+  snapshotGuidanceForPreset,
+  applyGuidanceFromPreset,
+  resetGuidanceForPreset,
 } from "./studio-guidance.js";
 import { createHistoryRepository } from "./history-v2-repository.js";
 import { requestHistoryRecordFocus } from "./studio-history-v2.js";
@@ -294,8 +325,8 @@ export async function loadExperimentIntoPlayground(state, context, experimentId)
   context.setPage("history");
   return { ok: true };
 }
-import { el, buildViewerShell, resolveViewerShellArgs, viewerFirst, renderEmptyState } from "./studio-ui.js";
-import { openComparePair } from "./studio-image-compare.js";
+import { el, buildViewerShell, resolveViewerShellArgs, viewerFirst, renderEmptyState, ShelfSectionTitle, missingImageCopy } from "./studio-ui.js";
+import { openComparePair, clearCompareSession } from "./studio-image-compare.js";
 import { openHistoryPicker } from "./studio-history-picker.js";
 import { mountPostprocessWorkspace } from "./studio-postprocess.js";
 import { renderLoadingState } from "./studio-loading.js";
@@ -1098,6 +1129,13 @@ export function renderPlayground(state, context) {
   container.appendChild(resizeHandle);
   container.appendChild(rightWorkspace);
 
+  // SEL-01 (HARD CANVAS RULE): relocate the Select/Inpaint conventional
+  // controls from the center tool-editor box into the shelf host. Covers
+  // both Select-on-I2I and legacy Inpaint: both render through the same
+  // _renderPaintEditor path (:6012/:6017).
+  try { _rehomePaintControlsToShelf(leftPanel, rightWorkspace, state); } catch (_eRehomePg) {}
+  try { _rehomeExpandControlsToShelf(leftPanel, rightWorkspace, state); } catch (_eRehomeEx) {}
+
   // One-shot image handoff (History/viewer actions). Consumed here — the
   // page root that runs on every Playground show — not in a sub-section
   // build that cached-page navigation can skip. current/post set the
@@ -1285,6 +1323,8 @@ function renderControlPanel(state, context) {
         // same shell path as the top submenu buttons (single truth, and the
         // Crop/Heal tool disarms through the existing toggle-off).
         onRequestSubtool: function (sub) { _selectPostCategory(state, context, sub); },
+        // Phase 12: recipe edits mark the active preset dirty (never autosave).
+        onRecipeChange: function () { try { _markPresetDirty(state); } catch (_e) {} },
       });
       panel.appendChild(postHost);
       _focusPostCategory(_shellSub, postHost);
@@ -1297,21 +1337,15 @@ function renderControlPanel(state, context) {
     }
   } else {
     if (_isPostView && _shellSub === "upscale") {
-      panel.appendChild(el("p", {
-        class: "comfymodal-studio-control-note",
-        "data-testid": "post-side-note",
-        text: "Upscale arrives in a later phase — execution is disabled. Your Post recipe and image remain preserved.",
-      }));
+      // POST-02/GEN-03: one notice component + one testid for all
+      // placeholder views. PRS-01: user-facing "recipe" renamed to settings.
+      panel.appendChild(_placeholderNotice(_shellSub, "Your Post settings and image remain preserved."));
     }
     panel.appendChild(renderWorkflowSelector(state, context, actions));
 
     if (_isPlaceholderView) {
-      panel.appendChild(el("p", {
-        class: "comfymodal-studio-control-note",
-        "data-testid": "placeholder-side-note",
-        text: (STUDIO_SUBTOOL_LABELS[_shellSub] || _shellSub)
-          + " arrives in a later phase — workflow execution is disabled for this view. Your workflow, values, and current image are preserved.",
-      }));
+      // POST-02/GEN-03: same shared placeholder notice as the canvas view.
+      panel.appendChild(_placeholderNotice(_shellSub));
     } else if (_isModernRunSelected(state)) {
       panel.appendChild(renderShelfSection(state, context, actions));
     }
@@ -2585,13 +2619,21 @@ function _populateWorkflowSelectorInner(container, state, context, actions) {
     }));
   }
   if (store && store.handoffError) {
-container.appendChild(el("div", {
+    container.appendChild(el("div", {
       "data-testid": "workflow-handoff-error",
       class: "comfymodal-studio-empty-state",
       text: store.handoffError,
       style: "font-size:var(--font-size-xs);color:#f87171;margin-top:4px;",
     }));
   }
+  // Phase 12: compact Studio preset picker/menu (preset selector, Save with
+  // the images-not-saved note, Update-when-selected, Rename/Duplicate/Delete/
+  // copy-forward overflow, dirty indicator). Best-effort; never breaks the
+  // selector when the preset lane is unavailable.
+  try {
+    var _presetHost = _presetPickerEl(state, context, actions);
+    if (_presetHost) container.appendChild(_presetHost);
+  } catch (_ePreset) { /* preset picker is additive only */ }
 }
 
 function _rerenderWorkflowSection(state, context, actions, opts) {
@@ -2793,6 +2835,9 @@ async function initWorkflowRun(state, context, actions) {
         await _restoreWorkflowSelection(state, context, actions, wf, store, saved);
         // Shelf: a restored selection reloads its durably autosaved values.
         _rerenderWorkflowSection(state, context, actions, { applySaved: true });
+        // Phase 12: restore the active preset only when its exact
+        // version+revision still matches (stale drafts never resurrect).
+        try { await _restoreActivePresetIfMatching(state, context, actions); } catch (_eP) {}
         return;
       }
 
@@ -3024,6 +3069,33 @@ function _workflowRunnableForExecution(state, store, wf) {
   } catch (_e) {}
   return execution;
 }
+// Queue-enqueue validation (TOP-01): the same gate chain as
+// _applyModernRunButtonState (shell → method → reference → guidance →
+// runnable), as a pure reason-or-null helper so the Queue button cannot
+// bypass validation the Run button enforces. Returns null when enqueueing
+// is allowed.
+function _queueEnqueueGate(state) {
+  try {
+    var g = _shellRunGate(state);
+    if (!g) { try { g = _studioMethodGate(state); } catch (_e) { g = null; } }
+    if (!g) { try { g = _studioReferenceGate(state); } catch (_eRef) { g = null; } }
+    if (!g) { try { g = _studioGuidanceGate(state); } catch (_eG) { g = null; } }
+    if (g) return g;
+    var store = state && state.playground && state.playground._workflowRun;
+    var wf = state && state.playground && state.playground._workflowRunModule;
+    if (!store || !wf) return "Select a workflow to run";
+    if (store.status === "loading" || store.status === "error" || !store.runContext) {
+      try {
+        var info = workflowGatingInfo(store, wf, state);
+        return (info && info.text) || "Workflow is not ready";
+      } catch (_eI) { return "Workflow is not ready"; }
+    }
+    var r = _workflowRunnableForExecution(state, store, wf);
+    if (!r.runnable) return (r.reasons && r.reasons.length) ? r.reasons.join("; ") : "Not runnable";
+  } catch (_eO) { return null; }
+  return null;
+}
+
 function _applyModernRunButtonState(state, context, actions, btn, reason) {
   // Phase 1 shell gate: Post runs the local engine and later-phase
   // placeholders have no execution path — the button stays disabled with
@@ -3044,9 +3116,9 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
   }
   if (_gate && !_gateBusy) {
     if (state && state.playground && state.playground.queueMode) {
-      btn.textContent = "Queue";
+      btn.textContent = _RUN_LABELS.queue;
     } else {
-      btn.textContent = "Run";
+      btn.textContent = _RUN_LABELS.run;
     }
     btn.disabled = true;
     btn.title = _gate;
@@ -3097,7 +3169,7 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
   const g = workflowGatingInfo(store, wf, state);
   if (store.status === "loading" || store.status === "error" || !store.runContext) {
     btn.disabled = true;
-    btn.textContent = "Run";
+    btn.textContent = _RUN_LABELS.run;
     btn.title = g.text;
     // Modern gating owns the primary button: never leave a stale legacy
     // onclick on the visible Run button while a modern selection is active.
@@ -3114,7 +3186,7 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
   const { runnable, reasons } = _workflowRunnableForExecution(state, store, wf);
   if (!runnable) {
     btn.disabled = true;
-    btn.textContent = "Run";
+    btn.textContent = _RUN_LABELS.run;
     btn.title = reasons.length ? reasons.join("; ") : "Not runnable";
     // See above ├óΓé¼ΓÇ¥ no competing legacy onclick while gated in modern mode.
     btn.onclick = null;
@@ -3127,11 +3199,11 @@ function _applyModernRunButtonState(state, context, actions, btn, reason) {
     return;
   }
   btn.disabled = false;
-  btn.textContent = "Run";
+  btn.textContent = _RUN_LABELS.run;
   btn.title = "";
   btn.onclick = function () {
     btn.disabled = true;
-    btn.textContent = "Running\u2026";
+    btn.textContent = _RUN_LABELS.running;
     _modernRunSubmit(state, context, actions, btn);
   };
 }
@@ -3160,6 +3232,22 @@ function _syncRunButtonGating(state, context, actions) {
     if (unselected && !unselected.title) {
       unselected.title = "Select a workflow to run";
     }
+    // TOP-01: the unselected-run title was hover-only — mirror it into the
+    // visible topbar reason line as well (single line, no duplicates).
+    try {
+      var _topbar = unselected && unselected.closest
+        ? unselected.closest(".comfymodal-studio-topbar-actions") : null;
+      var _line = _topbar ? _topbar.querySelector(".comfymodal-studio-topbar-reason") : null;
+      if (_line && !_line.querySelector('[data-testid="topbar-gate-reason"]')
+        && !_line.querySelector('[data-testid="shell-gate-reason"]')
+        && !_line.firstChild) {
+        _line.appendChild(el("p", {
+          "data-testid": "topbar-gate-reason",
+          text: "Select a workflow to run",
+          style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+        }));
+      }
+    } catch (_eMirror) {}
     return;
   }
   const btn = _resolvePrimaryRunButton();
@@ -3186,9 +3274,9 @@ function _resetSubmitBtnIdle(state, btn) {
   if (queueMode && isTopbar) {
     while (btn.firstChild) btn.removeChild(btn.firstChild);
     btn.appendChild(el("span", { class: "run-glyph", "aria-hidden": "true", text: "+" }));
-    btn.appendChild(el("span", { text: "Queue", "data-testid": "run-btn-label" }));
+    btn.appendChild(el("span", { text: _RUN_LABELS.queue, "data-testid": "run-btn-label" }));
   } else {
-    btn.textContent = "Run";
+    btn.textContent = _RUN_LABELS.run;
   }
 }
 
@@ -3279,7 +3367,16 @@ async function _modernRunSubmit(state, context, actions, btn, requestId) {
   // Selection/init normally warmed this promise. Awaiting here is retained as
   // the correctness fallback when a caller reaches Run before preload or
   // after a settings change replaced the cache entry.
-  const modalOptions = await _preloadStudioModalOptions(apiBase);
+  var modalOptions = await _preloadStudioModalOptions(apiBase);
+  // Phase 12: exact-version preset output rides this run only (Playground-
+  // scoped override — never POSTed globally, never persisted). Without an
+  // active preset section the preloaded options pass through untouched.
+  try {
+    var _presetOutputSection = state && state.playground && state.playground._presetOutputSection;
+    if (_presetOutputSection && wf && typeof wf.resolveEffectiveOutputOptions === "function") {
+      modalOptions = wf.resolveEffectiveOutputOptions(modalOptions, _presetOutputSection);
+    }
+  } catch (_ePresetOutput) { /* override is best-effort; base options stand */ }
 
   ctrl.mark("build_start");
   const payload = wf.buildRunPayload(apiBase, store, modalOptions, {
@@ -3579,14 +3676,23 @@ function renderControl(def, state, actions, preset) {
       if (actions.setControl) actions.setControl(def.id, input.value);
     });
   } else if (schemaKind === "image" || schemaKind === "file" || schemaKind === "model") {
-    // Image/file/model controls: render as disabled text input for now
+    // EDIT-02: the preserved value stays visible as read-only text with an
+    // inline (not title-only) reason — hover-only help fails on touch and
+    // keyboard, and the value must be verifiable in place.
     input = el("input", {
       type: "text",
       class: "comfymodal-input comfymodal-studio-text-input",
       value: value != null ? String(value) : "",
       disabled: true,
+      "aria-readonly": "true",
       "data-testid": `input-${def.id}`,
+      title: "Value preserved from the workflow — editing is not available here",
     });
+    group.appendChild(el("span", {
+      class: "comfymodal-studio-control-note",
+      text: "Value preserved from the workflow — editing is not available here.",
+      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);",
+    }));
   }
 
   // ├óΓÇ¥Γé¼├óΓÇ¥Γé¼ Static CONTROL_DEFS type dispatch (fallback) ├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼├óΓÇ¥Γé¼
@@ -3710,7 +3816,7 @@ function renderControl(def, state, actions, preset) {
           recBtn.disabled = true;
           recBtn.title = recStatus.reason;
         } else {
-          recBtn.title = "From selected preset workflow capture";
+          recBtn.title = "From selected workflow capture";
           recBtn.addEventListener("click", function () {
             if (actions && actions.setControl) {
               actions.setControl("steps", recStatus.value);
@@ -5381,6 +5487,7 @@ function _renderLayoutEditor(state, context, actions) {
         onDraftChange: function (next) {
           if (next) draft = next;
           saveLayoutDraft(draft);
+          try { _markPresetDirty(state); } catch (_eDirty) {}
           paintPreview();
         },
       }) || null;
@@ -5691,6 +5798,130 @@ function _renderLegacyLayoutEditor(state, context, actions) {
 
 // -- Canvas ----------------------------------------------------------
 
+// ── Phase 13 audit shared helpers ─────────────────────────────────────
+// Single-sourced run-button labels (TOP-01), single-sourced later-phase
+// placeholder copy (GEN-03/POST-02), and the shelf/canvas empty-state
+// actions (GEN-01/GEN-02). Behavior-preserving: same testids, same
+// PRIMARY-path click counts (controls stay visible, no extra clicks).
+
+// One label map for every Run-button state (TOP-01). Callers must use
+// _paintRunButton + _setRunGate instead of ad-hoc label strings so the
+// "Running…"/"Queued…"/"Batch…" variants cannot drift per file.
+// DEFERRED (not in this lane): sharing this map with the experiment submit
+// surfaces. Those labels live in web/studio-history-v2-experiment.js, owned
+// by another lane — unifying now would cross ownership and risk diverging
+// the experiment contract. Revisit when ownership allows a joint pass.
+var _RUN_LABELS = {
+  run: "Run",
+  queue: "Queue",
+  running: "Running…",
+  queued: "Queued…",
+  batch: "Batch…",
+};
+
+// Paint the primary button label without destroying the glyph+label span
+// structure (textContent assignment would drop the spans).
+function _paintRunButton(btn, text) {
+  if (!btn) return;
+  var label = btn.querySelector ? btn.querySelector('[data-testid="run-btn-label"]') : null;
+  if (label) label.textContent = text;
+  else btn.textContent = text;
+}
+
+// Disabled-with-reason gate painter (TOP-01): the visible topbar-reason
+// line always mirrors the button title, so touch/keyboard users get the
+// block reason without hover. Single <p> child (no layout thrash).
+function _setRunGate(btn, reasonEl, label, gateReason) {
+  _paintRunButton(btn, label);
+  if (btn) {
+    btn.disabled = true;
+    btn.title = gateReason || "";
+    if (btn.classList) btn.classList.add("is-busy");
+  }
+  if (reasonEl) {
+    while (reasonEl.firstChild) reasonEl.removeChild(reasonEl.firstChild);
+    if (gateReason) {
+      reasonEl.appendChild(el("p", {
+        "data-testid": "topbar-gate-reason",
+        text: String(gateReason),
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    }
+  }
+}
+
+// Single later-phase placeholder phrasing (GEN-03): one 1-line notice plus
+// a <details> for the preserved-state reassurance. All placeholder views
+// (shelf note, canvas notice, submenu note, Post upscale note) share it.
+// The sentence composes from the shared LATER_PHASE_SUFFIX (same source as
+// shellGateReason) so gate + notice copy cannot drift.
+function placeholderCopy(subtool, detailOverride) {
+  var label = "Later phase";
+  try {
+    label = (typeof STUDIO_SUBTOOL_LABELS !== "undefined"
+      && STUDIO_SUBTOOL_LABELS[subtool]) || subtool || "Later phase";
+  } catch (_e) { label = subtool || "Later phase"; }
+  var suffix = "arrives in a later phase — execution is disabled.";
+  try { if (typeof LATER_PHASE_SUFFIX === "string" && LATER_PHASE_SUFFIX) suffix = LATER_PHASE_SUFFIX; } catch (_eS) {}
+  return {
+    line: label + " " + suffix,
+    detail: detailOverride || "Your workflow, values, and current image are preserved.",
+  };
+}
+
+// One notice component + one testid for all placeholder views (POST-02).
+function _placeholderNotice(subtool, detailOverride) {
+  var c = placeholderCopy(subtool, detailOverride);
+  var wrap = el("div", {
+    class: "comfymodal-studio-placeholder-notice",
+    "data-testid": "placeholder-notice",
+    style: "text-align:center;padding:24px 20px;",
+  });
+  wrap.appendChild(el("p", {
+    text: c.line,
+    style: "font-weight:var(--font-weight-semibold);margin-bottom:8px;",
+  }));
+  var more = el("details", { style: "font-size:var(--font-size-sm);color:var(--color-text-muted);" });
+  more.appendChild(el("summary", { text: "What is preserved", style: "cursor:pointer;" }));
+  more.appendChild(el("p", { text: c.detail, style: "margin:4px 0 0;" }));
+  wrap.appendChild(more);
+  return wrap;
+}
+
+// Focus the workflow picker select (GEN-01/GEN-02 empty-state actions).
+function _focusWorkflowSelector() {
+  try {
+    var host = document.querySelector('[data-testid="workflow-selector-section"]');
+    if (!host) return false;
+    var sel = host.querySelector("select, input, button");
+    if (sel) {
+      if (sel.scrollIntoView) sel.scrollIntoView({ block: "nearest" });
+      sel.focus();
+      return true;
+    }
+  } catch (_e) {}
+  return false;
+}
+
+// Canvas empty state through the shared primitive (GEN-01): same testid,
+// plus a Select-workflow action so first-run users have a next step.
+function _canvasEmptyState() {
+  var btn = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn",
+    "data-testid": "canvas-empty-select-workflow",
+    text: "Select workflow",
+    title: "Choose the workflow that produces this canvas",
+  });
+  btn.addEventListener("click", function () { _focusWorkflowSelector(); });
+  return renderEmptyState({
+    testid: "canvas-empty",
+    title: "No output yet",
+    detail: "Generated output will appear here.",
+    action: btn,
+  });
+}
+
 function renderCanvas(state, context, actions) {
   const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
   const currentSpec = FEATURE_SPECS.find((f) => f.id === currentFeatureId);
@@ -5711,15 +5942,8 @@ function renderCanvas(state, context, actions) {
   // stays visible and no stale controls appear.
   var _shellSub = activeSubtoolOf(state);
   if (_isPlaceholderSubtool(_shellSub)) {
-    var _shellLabel = STUDIO_SUBTOOL_LABELS[_shellSub] || _shellSub;
-    canvas.appendChild(el("div", {
-      class: "comfymodal-studio-placeholder-notice",
-      "data-testid": "shell-placeholder",
-      style: "text-align:center;padding:24px 20px;",
-    }, [
-      el("p", { text: _shellLabel + " — available in a later phase", style: "font-weight:var(--font-weight-semibold);margin-bottom:8px;" }),
-      el("p", { text: "Execution is disabled for this view. Your workflow, values, and current image are preserved.", style: "font-size:var(--font-size-sm);color:var(--color-text-muted);" }),
-    ]));
+    // POST-02/GEN-03: same shared placeholder notice as the shelf view.
+    canvas.appendChild(_placeholderNotice(_shellSub));
   }
   // Phase 7: Layout is visual prompt authoring on Generate. The editor owns
   // this view (the last output stays available in filmstrip/recent runs).
@@ -5736,29 +5960,56 @@ function renderCanvas(state, context, actions) {
   // Shelf: a Workflow switch marks the previous output stale until a new
   // run completes. The right-side canvas dims and carries an explicit note.
   if (outputUrl && state.playground && state.playground._shelfStaleOutput) {
+    // EDIT-01: stale-output is informational (neutral tone — amber is
+    // reserved for action-required states like the guidance anchor pick),
+    // with an explicit Run action instead of a bare note.
     canvas.classList.add("is-stale");
-    canvas.appendChild(el("p", {
+    var _staleRow = el("div", { style: "display:flex;gap:8px;align-items:center;margin:0 0 6px;flex-wrap:wrap;" });
+    _staleRow.appendChild(el("p", {
       "data-testid": "shelf-stale-note",
       text: "Output from the previous Workflow — run to refresh.",
-      style: "font-size:var(--font-size-xs);color:#d9a441;margin:0 0 6px;",
+      style: "font-size:var(--font-size-xs);color:#888;margin:0;",
     }));
+    var _staleRun = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": "stale-refresh-btn",
+      text: "Run to refresh",
+      title: "Run the current workflow to refresh this output",
+      style: "font-size:var(--font-size-xs);padding:2px 8px;",
+    });
+    // EDIT-01 (honest-when-blocked): when the current config cannot run,
+    // the CTA carries the block reason instead of silently doing nothing
+    // (or silently queueing instead of refreshing).
+    try {
+      var _staleGate = _queueEnqueueGate(state);
+      if (_staleGate) {
+        _staleRun.disabled = true;
+        _staleRun.title = _staleGate;
+      }
+    } catch (_eStaleGate) {}
+    _staleRun.addEventListener("click", function () {
+      try {
+        var _rb = document.querySelector('[data-testid="run-btn"]');
+        if (_rb && !_rb.disabled) _rb.click();
+      } catch (_eStale) {}
+    });
+    _staleRow.appendChild(_staleRun);
+    canvas.appendChild(_staleRow);
   }
   if (currentSpec && currentSpec.isPlaceholder) {
-    // Honest disabled placeholder for image-edit features
-    const placeholderMsg = el("div", { class: "comfymodal-studio-placeholder-notice", style: "text-align:center;padding:40px 20px;" }, [
+    // INP-01: one merged disabled notice for the unavailable feature
+    // (was two stacked blocks reading as two separate problems). Keeps the
+    // pinned mask-controls testid and honest future-work copy.
+    const placeholderMsg = el("div", {
+      class: "comfymodal-studio-placeholder-notice",
+      "data-testid": "mask-controls",
+      style: "text-align:center;padding:40px 20px;opacity:0.75;",
+    }, [
       el("p", { text: `${currentSpec.label} — Not Implemented`, style: "font-weight:var(--font-weight-semibold);margin-bottom:8px;" }),
-      el("p", { text: currentSpec.placeholderReason || "This feature is not available in this release.", style: "font-size:var(--font-size-sm);color:var(--color-text-muted);" }),
+      el("p", { text: currentSpec.placeholderReason || "Mask editing tools (brush, selection) are future work — not implemented in this release.", style: "font-size:var(--font-size-sm);color:var(--color-text-muted);margin:0;" }),
     ]);
     canvas.appendChild(placeholderMsg);
-    // Honest accessible mask-controls section (disabled with explanation)
-    const maskSection = el("div", {
-      "data-testid": "mask-controls",
-      style: "padding:12px;border:1px solid #2a2a2a;border-radius:4px;margin:8px;background:#0a0a0a;opacity:0.6;",
-    }, [
-      el("p", { text: "Mask Controls", style: "font-weight:var(--font-weight-semibold);margin:0 0 4px;color:#888;font-size:var(--font-size-sm);" }),
-      el("p", { text: "Mask editing tools (brush, selection) are not implemented in this release.", style: "font-size:var(--font-size-xs);color:var(--color-text-muted);margin:0;" }),
-    ]);
-    canvas.appendChild(maskSection);
   } else if (outputUrl || _paintBaseUrl) {
     const img = el("img", {
       src: (outputUrl || _paintBaseUrl),
@@ -5770,12 +6021,10 @@ function renderCanvas(state, context, actions) {
         const imgEl = e.currentTarget;
         const parent = imgEl.parentNode;
         imgEl.remove();
+        // GEN-01: same shared empty state as a missing output (with the
+        // Select-workflow action), never a bare broken-image glyph.
         if (parent && !parent.querySelector('[data-testid="canvas-empty"]')) {
-          parent.appendChild(el("p", {
-            "data-testid": "canvas-empty",
-            text: "Generated output will appear here.",
-            style: "color:var(--color-text-muted);",
-          }));
+          parent.appendChild(_canvasEmptyState());
         }
       },
     });
@@ -5819,11 +6068,9 @@ function renderCanvas(state, context, actions) {
       canvas.appendChild(renderLiveReturnControl(state, context));
     }
   } else {
-    canvas.appendChild(el("p", {
-      "data-testid": "canvas-empty",
-      text: "Generated output will appear here.",
-      style: "color:var(--color-text-muted);",
-    }));
+    // GEN-01: canvas-empty via the shared renderEmptyState primitive with a
+    // Select-workflow action (same contract as the History empty state).
+    canvas.appendChild(_canvasEmptyState());
   }
 
   // Placeholder views keep the image but hide the previous workflow tool
@@ -6188,6 +6435,7 @@ function _renderSketchEditor(state, context, actions, canvasEl, where) {
     if (_sketchTornDown) return;
     _sketchTornDown = true;
     try { _cleanupOverlay(); } catch (_e0) {}
+    try { if (box && typeof box._sketchSettingsUnsub === "function") box._sketchSettingsUnsub(); } catch (_eU) {}
     try { if (_sketchObserver && typeof _sketchObserver.disconnect === "function") _sketchObserver.disconnect(); } catch (_e) {}
     _sketchObserver = null;
     try { if (panelsHandle && typeof panelsHandle.destroy === "function") panelsHandle.destroy(); } catch (_e) {}
@@ -6203,7 +6451,7 @@ function _renderSketchEditor(state, context, actions, canvasEl, where) {
     try {
       box._sketchSession = null; box._sketchEngine = null;
       box._sketchPanels = null; box._sketchStore = null;
-      box._sketchSyncOverlay = null;
+      box._sketchSyncOverlay = null; box._sketchSettingsUnsub = null;
     } catch (_e2) {}
   }
   // Actual-unmount teardown: a MutationObserver on box removal (not window
@@ -6327,6 +6575,9 @@ function _renderSketchEditor(state, context, actions, canvasEl, where) {
         layerStore: layerStore,
         width: _blankDims.width,
         height: _blankDims.height,
+        // Phase 12: tool-setting edits mark the active preset dirty (pixels
+        // never do — the commit path below stays dirty-free).
+        onSettingsChange: function () { try { _markPresetDirty(state); } catch (_eS) {} },
         onCommitted: function (filename) {
           try {
             if (_selectionIdentity(_shelfStore(state)) !== pendingIdentity) {
@@ -6350,6 +6601,44 @@ function _renderSketchEditor(state, context, actions, canvasEl, where) {
         box._sketchSession = session; box._sketchEngine = engine;
         box._sketchPanels = panelsHandle; box._sketchStore = layerStore;
       } catch (_e2) {}
+      // Phase 12 presets: panel edits drive the engine directly, bypassing
+      // session.setToolSettings (whose onSettingsChange hook marks the active
+      // preset dirty). Mirror engine tool settings into the session so the
+      // hook fires and the session stays current for preset capture.
+      // setToolSettings never touches the engine, so this cannot loop.
+      try {
+        if (engine && typeof engine.onChange === "function"
+          && session && typeof session.setToolSettings === "function") {
+          var _mirrorSketchSettings = function () {
+            try {
+              var _st = (engine.getState && engine.getState()) || null;
+              if (!_st || typeof _st !== "object") return;
+              session.setToolSettings({
+                tool: _st.tool,
+                brushSize: _st.brushSize,
+                opacity: _st.opacity,
+                hardness: _st.hardness,
+                color: _st.color,
+                bgColor: _st.bgColor,
+              });
+            } catch (_eM) {}
+          };
+          try {
+            if (box._sketchSettingsUnsub && typeof box._sketchSettingsUnsub === "function") {
+              box._sketchSettingsUnsub();
+            }
+          } catch (_eOld) {}
+          box._sketchSettingsUnsub = engine.onChange(_mirrorSketchSettings);
+        }
+      } catch (_eSub) {}
+      // Phase 12: apply preset-pending tool settings to a fresh mount (base
+      // stays blank — presets carry no pixels).
+      try {
+        var _pendingSketch = state && state.playground && state.playground._presetSketchPending;
+        if (_pendingSketch && shellMod && typeof shellMod.applySketchSettingsFromPreset === "function") {
+          shellMod.applySketchSettingsFromPreset(session, _pendingSketch);
+        }
+      } catch (_ePS) {}
       if (loading.parentNode) loading.parentNode.removeChild(loading);
       if (panelsHandle && typeof panelsHandle.syncFromEngine === "function") {
         try { panelsHandle.syncFromEngine(); } catch (_e) {}
@@ -6408,6 +6697,11 @@ function _renderSketchCenterStub(state, canvasEl) {
 }
 
 function _renderToolEditor(state, context, actions, canvasEl) {
+  // Visible-surface gate (P1): the Post surface owns its own engine. A
+  // retained inpaint/outpaint execution type must never mount the legacy
+  // paint/expand editors under the Post stage — gate on the visible mode,
+  // not only on the retained tool.
+  try { if (activeModeOf(state) === "post") return null; } catch (_ePost) {}
   var tool = activeToolOf(state);
   // Phase 6: Generate/Sketch and Edit/Sketch run the same sketch editor on
   // the ordinary I2I engine. Legacy dedicated sketch workflows (tool ===
@@ -6433,6 +6727,50 @@ function _renderToolEditor(state, context, actions, canvasEl) {
   if (_isExpandOnI2I(state)) return _renderOutpaintEditor(state, context, actions);
   if (tool === "outpaint") return _renderOutpaintEditor(state, context, actions);
   return null;
+}
+
+// ── SEL-01: shelf-homed Select/Inpaint controls ─────────────────────
+// The paint editor builds in the center column (the overlay attach needs
+// the canvas element), then this page-level pass relocates ONLY the marked
+// conventional controls into the shelf host. The canvas keeps the image +
+// direct-manipulation overlays (paint + marching-ants, data-paint-overlay).
+// Moving nodes keeps every listener/closure intact: single engine, no
+// duplicate testids, no extra clicks (the host sits below the prompt card).
+function _rehomePaintControlsToShelf(panel, workspace, state) {
+  try {
+    if (!panel || !workspace || !panel.querySelector || !workspace.querySelector) return;
+    var box = workspace.querySelector('[data-testid="inpaint-editor"]');
+    var host = panel.querySelector('[data-testid="inpaint-shelf-controls"]');
+    if (!box || !host) return;
+    // Selection-identity key (P1): a same-type workflow switch must not
+    // preserve a stale host. When the homed identity differs from the live
+    // selection, un-home so the fresh controls relocate (never silently
+    // keep the previous workflow's session).
+    var liveId = "";
+    try { liveId = _selectionIdentity(_shelfStore(state)); } catch (_eI) { liveId = ""; }
+    var homedId = box.getAttribute("data-shelf-home-id") || "";
+    if (box.getAttribute("data-shelf-homed") === "true") {
+      if (!liveId || homedId === liveId) return;
+      box.setAttribute("data-shelf-homed", "false");
+    }
+    var controls = box.querySelectorAll('[data-paint-controls="shelf"]');
+    if (!controls.length) return;
+    Array.prototype.forEach.call(controls, function (n) { host.appendChild(n); });
+    box.setAttribute("data-shelf-homed", "true");
+    if (liveId) box.setAttribute("data-shelf-home-id", liveId);
+    try {
+      if (state && state.playground) state.playground._paintHostIdentity = liveId;
+    } catch (_eP) {}
+    // The center keeps an honest pointer, mirroring the sketch-center-hint
+    // pattern — no empty box, no duplicate controls.
+    if (!box.querySelector('[data-testid="inpaint-center-hint"]')) {
+      box.appendChild(el("p", {
+        "data-testid": "inpaint-center-hint",
+        text: "Select controls are in the left shelf — paint on the canvas above.",
+        style: "font-size:12px;color:#aaa;margin:0;",
+      }));
+    }
+  } catch (_eRehome) {}
 }
 
 function _renderPaintEditor(state, tool, context, actions, canvasEl) {
@@ -6471,8 +6809,10 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     ({ brush: brushBtn, erase: eraseBtn, lasso: lassoBtn, rect: rectBtn, object: objBtn, text: textBtn })[m].classList.add("is-on");
     paint.style.cursor = (m === "object" || m === "text") ? "pointer" : "crosshair";
     var smart = (m === "object" || m === "text");
-    samRow.style.display = smart ? "flex" : "none";
-    samChips.style.display = smart ? "flex" : "none";
+    // SEL-01: the disclosed SAM section auto-opens on smart modes (no extra
+    // click vs the old auto-shown rows); it never auto-closes, so the
+    // disclosure state the user chose is preserved.
+    try { if (smart && typeof samDetails !== "undefined" && samDetails && !samDetails.open) samDetails.open = true; } catch (_eD) {}
     if (!smart) samList.style.display = "none";
   }
   brushBtn.addEventListener("click", function () { setMode("brush"); });
@@ -6519,36 +6859,67 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   ops.appendChild(saveBtn);
   box.appendChild(controls);
   box.appendChild(ops);
-  // Phase 3: explicit Inpaint Method lives with the selection tools, on the
-  // I2I engine only. Legacy dedicated inpaint workflows run natively.
-  if (_isSelectOnI2I(state)) {
-    box.appendChild(_methodSelectRow(state, context, actions, "inpaint", null));
-    _refreshMethodCompat(state, context);
+  // Phase 3: explicit Inpaint Method lives with the selection tools.
+  // SEL-01: the method select + override sit beside Save in the ops row
+  // (max 3 visible rows); the compat note stays as a footnote.
+  // SEL-03: always rendered for mask tools — legacy dedicated inpaint
+  // renders disabled with reason instead of silently vanishing.
+  if (isMask && (_isSelectOnI2I(state) || tool === "inpaint")) {
+    var _methodRow = _methodSelectRow(state, context, actions, "inpaint", null);
+    if (!_isSelectOnI2I(state)) {
+      var _mReason = "Inpaint Method applies to Edit → Select workflows — this workflow runs natively.";
+      [_methodRow.querySelector('[data-testid="inpaint-method"]'),
+        _methodRow.querySelector('[data-testid="inpaint-override-btn"]')].forEach(function (n) {
+          if (n) { n.disabled = true; n.title = _mReason; }
+        });
+      var _mNoteLock = _methodRow.querySelector('[data-testid="inpaint-method-note"]');
+      if (_mNoteLock) { _mNoteLock.textContent = _mReason; _mNoteLock.setAttribute("data-locked", "true"); }
+    } else {
+      _refreshMethodCompat(state, context);
+    }
+    var _mSel = _methodRow.querySelector('[data-testid="inpaint-method"]');
+    var _mOver = _methodRow.querySelector('[data-testid="inpaint-override-btn"]');
+    var _mNt = _methodRow.querySelector('[data-testid="inpaint-method-note"]');
+    if (_mSel) ops.insertBefore(_mSel, saveBtn);
+    if (_mOver) ops.insertBefore(_mOver, saveBtn);
+    if (_mNt) box.appendChild(_mNt);
   }
-  var samRow = el("div", { style: "display:none;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;", "data-testid": tool + "-sam-row" });
+  // SEL-01: SAM row + chips + list collapse into one disclosed section.
+  // SEL-02: shortened hint ("Click image, or type + Find").
+  var samDetails = el("details", { "data-testid": tool + "-sam-details", style: "margin-bottom:8px;" });
+  samDetails.appendChild(el("summary", {
+    text: "Smart select (Object / Detect)",
+    style: "font-size:12px;color:#aaa;cursor:pointer;",
+  }));
+  var samRow = el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;margin:6px 0;align-items:center;", "data-testid": tool + "-sam-row" });
   var samText = el("input", { type: "text", placeholder: "person, hair, red car, shirt", "data-testid": tool + "-sam-text", "aria-label": "Describe what to select", style: "flex:1;min-width:140px;" });
   var samConf = el("input", { type: "number", min: "0.05", max: "0.95", step: "0.05", value: "0.3", "data-testid": tool + "-sam-conf", title: "Confidence", style: "width:64px;" });
   var samFindBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Find", "data-testid": tool + "-sam-find" });
   var samScanBtn = el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Scan photo", title: "List everything detected so you can pick instead of typing", "data-testid": tool + "-sam-scan" });
-  var samHint = el("span", { text: "Object: click the image. Detect: type + Find, Scan, or tap a chip.", style: "font-size:11px;color:#888;", "data-testid": tool + "-sam-hint" });
+  var samHint = el("span", { text: "Click image, or type + Find.", style: "font-size:11px;color:#888;", "data-testid": tool + "-sam-hint" });
   samRow.appendChild(samText);
   samRow.appendChild(samConf);
   samRow.appendChild(samFindBtn);
   samRow.appendChild(samScanBtn);
   samRow.appendChild(samHint);
-  box.appendChild(samRow);
-  var samChips = el("div", { style: "display:none;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;", "data-testid": tool + "-sam-chips" });
+  samDetails.appendChild(samRow);
+  var samChips = el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;", "data-testid": tool + "-sam-chips" });
   ["person", "face", "hair", "shirt", "pants", "shoes", "hat", "bag"].forEach(function (label) {
     var chip = el("button", { type: "button", class: "comfymodal-secondary-btn", text: label, "data-testid": tool + "-sam-chip-" + label, title: "Select " + label });
     chip.addEventListener("click", function () { samText.value = label; samFind(); });
     samChips.appendChild(chip);
   });
-  box.appendChild(samChips);
+  samDetails.appendChild(samChips);
   var samList = el("div", { style: "display:none;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center;", "data-testid": tool + "-sam-list" });
-  box.appendChild(samList);
+  samDetails.appendChild(samList);
+  box.appendChild(samDetails);
   var base = null;
   var paint = document.createElement("canvas");
   paint.setAttribute("data-testid", tool + "-canvas");
+  // SEL-01: the paint/mask canvases are direct-manipulation overlays ONLY
+  // (selection outline/mask/strokes) — no conventional controls may mount
+  // inside the overlay wrapper. Controls live in the shelf host.
+  paint.setAttribute("data-paint-overlay", "direct-manipulation");
   paint.style.position = "absolute";
   paint.style.inset = "0";
   paint.style.width = "100%";
@@ -6561,6 +6932,7 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
   paint.style.opacity = String(maskVisualOpacity);
   var ants = document.createElement("canvas");
   ants.setAttribute("aria-hidden", "true");
+  ants.setAttribute("data-paint-overlay", "direct-manipulation");
   ants.style.position = "absolute";
   ants.style.pointerEvents = "none";
   ants.style.inset = "0";
@@ -6600,6 +6972,18 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     "data-testid": tool + "-mask-preview",
   });
   box.appendChild(preview);
+  // SEL-01 markers: conventional controls relocate to the shelf host via
+  // _rehomePaintControlsToShelf; the fallback base-image wrap (if any)
+  // carries no marker and stays on the canvas with the direct overlays.
+  try {
+    var _markShelf = function (n) { if (n && n.setAttribute) n.setAttribute("data-paint-controls", "shelf"); };
+    _markShelf(box.querySelector('[data-testid="' + tool + '-editor-hint"]'));
+    _markShelf(typeof controls !== "undefined" ? controls : null);
+    _markShelf(typeof ops !== "undefined" ? ops : null);
+    _markShelf(typeof _mNt !== "undefined" ? _mNt : null);
+    _markShelf(typeof samDetails !== "undefined" ? samDetails : null);
+    _markShelf(preview);
+  } catch (_eMark) {}
 
   function fitCanvas() {
     var w = base.naturalWidth || base.clientWidth || 480;
@@ -7340,11 +7724,108 @@ function _renderPaintEditor(state, tool, context, actions, canvasEl) {
     } catch (_e) { preview.textContent = "Save failed — try again."; }
   });
   invalidateOutline();
+  // Direct-compose (P1): when the shelf host is already mounted, compose the
+  // shelf-bound controls into it at build time instead of waiting for the
+  // page-level rehome pass (covers shelf-first mount order; the page-level
+  // pass covers editor-first order).
+  try { _maybeHomePaintControlsNow(box, state); } catch (_eHome) {}
   return box;
 }
 
-function _renderOutpaintEditor(state, context, actions) {
-  var box = el("div", {
+// Direct-compose helper: move shelf-marked paint nodes into the mounted
+// shelf host now (no-op when the host is not mounted yet — the page-level
+// _rehomePaintControlsToShelf pass + the _refreshShelfSection retry cover
+// that order). Moving nodes keeps listeners intact.
+function _maybeHomePaintControlsNow(box, state) {
+  try {
+    if (!box || !box.querySelectorAll) return;
+    var host = document.querySelector('[data-testid="inpaint-shelf-controls"]');
+    if (!host || !host.isConnected) return;
+    var nodes = box.querySelectorAll('[data-paint-controls="shelf"]');
+    if (!nodes.length) return;
+    Array.prototype.forEach.call(nodes, function (n) { host.appendChild(n); });
+    box.setAttribute("data-shelf-homed", "true");
+    try {
+      var liveId = _selectionIdentity(_shelfStore(state));
+      if (liveId) {
+        box.setAttribute("data-shelf-home-id", liveId);
+        if (state && state.playground) state.playground._paintHostIdentity = liveId;
+      }
+    } catch (_eI) {}
+    if (!box.querySelector('[data-testid="inpaint-center-hint"]')) {
+      box.appendChild(el("p", {
+        "data-testid": "inpaint-center-hint",
+        text: "Select controls are in the left shelf — paint on the canvas above.",
+        style: "font-size:12px;color:#aaa;margin:0;",
+      }));
+    }
+  } catch (_e) {}
+}
+
+// ── EXP: shelf-homed Expand/Outpaint controls ─────────────────────────
+// Mirrors the SEL-01 Select pattern: the expansion editor builds in the
+// center column, then ONLY the marked form nodes (dimensions grid, method
+// row, status + resample note) relocate into the shelf host. The canvas
+// keeps the image + direct-manipulation overlays. Moving nodes keeps every
+// listener/closure intact (same Save handler, no extra clicks).
+function _rehomeExpandControlsToShelf(panel, workspace, state) {
+  try {
+    if (!panel || !workspace || !panel.querySelector || !workspace.querySelector) return;
+    var box = workspace.querySelector('[data-testid="outpaint-editor"]');
+    var host = panel.querySelector('[data-testid="expand-shelf-controls"]');
+    if (!box || !host) return;
+    var liveId = "";
+    try { liveId = _selectionIdentity(_shelfStore(state)); } catch (_eI) { liveId = ""; }
+    var homedId = box.getAttribute("data-shelf-home-id") || "";
+    if (box.getAttribute("data-shelf-homed") === "true") {
+      if (!liveId || homedId === liveId) return;
+      box.setAttribute("data-shelf-homed", "false");
+    }
+    var controls = box.querySelectorAll('[data-expand-controls="shelf"]');
+    if (!controls.length) return;
+    Array.prototype.forEach.call(controls, function (n) { host.appendChild(n); });
+    box.setAttribute("data-shelf-homed", "true");
+    if (liveId) box.setAttribute("data-shelf-home-id", liveId);
+    try {
+      if (state && state.playground) state.playground._expandHostIdentity = liveId;
+    } catch (_eP) {}
+    if (!box.querySelector('[data-testid="outpaint-center-hint"]')) {
+      box.appendChild(el("p", {
+        "data-testid": "outpaint-center-hint",
+        text: "Expand controls are in the left shelf — the canvas above shows the image.",
+        style: "font-size:12px;color:#aaa;margin:0;",
+      }));
+    }
+  } catch (_eRehome) {}
+}
+
+function _maybeHomeExpandControlsNow(box, state) {
+  try {
+    if (!box || !box.querySelectorAll) return;
+    var host = document.querySelector('[data-testid="expand-shelf-controls"]');
+    if (!host || !host.isConnected) return;
+    var nodes = box.querySelectorAll('[data-expand-controls="shelf"]');
+    if (!nodes.length) return;
+    Array.prototype.forEach.call(nodes, function (n) { host.appendChild(n); });
+    box.setAttribute("data-shelf-homed", "true");
+    try {
+      var liveId = _selectionIdentity(_shelfStore(state));
+      if (liveId) {
+        box.setAttribute("data-shelf-home-id", liveId);
+        if (state && state.playground) state.playground._expandHostIdentity = liveId;
+      }
+    } catch (_eI) {}
+    if (!box.querySelector('[data-testid="outpaint-center-hint"]')) {
+      box.appendChild(el("p", {
+        "data-testid": "outpaint-center-hint",
+        text: "Expand controls are in the left shelf — the canvas above shows the image.",
+        style: "font-size:12px;color:#aaa;margin:0;",
+      }));
+    }
+  } catch (_e) {}
+}
+
+function _renderOutpaintEditor(state, context, actions) {  var box = el("div", {
     class: "comfymodal-studio-outpaint-editor",
     "data-testid": "outpaint-editor",
     style: "margin-top:10px;padding:10px;border:1px solid #2a2a2a;border-radius:8px;background:#0a0a0a;",
@@ -7379,6 +7860,7 @@ function _renderOutpaintEditor(state, context, actions) {
       try {
         var _pst = _shelfStore(state);
         saveWorkflowMethods(_pst && _pst.workflowId ? String(_pst.workflowId) : "", patch);
+        _markPresetDirty(state);
       } catch (_e2) {}
       try { _syncWorkflowGating(state, context, actions); } catch (_e3) {}
     });
@@ -7390,17 +7872,48 @@ function _renderOutpaintEditor(state, context, actions) {
   box.appendChild(grid);
   // Phase 3: explicit Expand Method on the I2I engine. Legacy dedicated
   // outpaint workflows run natively.
+  var _expandMethodRow = null;
   if (_isExpandOnI2I(state)) {
-    box.appendChild(_methodSelectRow(state, context, actions, "expand", function () {
+    _expandMethodRow = _methodSelectRow(state, context, actions, "expand", function () {
       var hasWH = false;
       try { hasWH = _schemaHasRole(state, "width") && _schemaHasRole(state, "height"); } catch (_e4) { hasWH = false; }
       if (hasWH) return "";
       return "Output will be resampled to fit — map Width/Height in the Wizard for exact sizes.";
-    }));
+    });
+    box.appendChild(_expandMethodRow);
   }
-  var status = el("p", { class: "comfymodal-studio-control-note", text: "Original stays centered; new area is masked.", "data-testid": "outpaint-preview-note" });
+  // EXP-01: one role="status" line under Save (all four outcomes report
+  // here); failures gain a retry CTA instead of a bare sentence.
+  // EXP-02: the gray-pad fill + resample caveat are always visible with a
+  // swatch, not a silent default or a conditional footnote.
+  var status = el("p", { class: "comfymodal-studio-control-note", text: "Original stays centered; new area is masked.", "data-testid": "outpaint-preview-note", role: "status" });
   box.appendChild(status);
-  saveBtn.addEventListener("click", async function () {
+  var sizeNote = el("div", {
+    "data-testid": "outpaint-size-note",
+    class: "comfymodal-studio-control-note",
+    style: "display:flex;gap:6px;align-items:center;font-size:11px;color:#888;margin:0;",
+  });
+  sizeNote.appendChild(el("span", {
+    "aria-hidden": "true",
+    title: "New-area fill: #808080",
+    style: "display:inline-block;width:14px;height:14px;border-radius:3px;background:#808080;border:1px solid #555;flex:none;",
+  }));
+  sizeNote.appendChild(el("span", { text: "New area fills mid-gray (#808080). Map Width/Height in the Wizard for exact sizes." }));
+  box.appendChild(sizeNote);
+  // Viewport purity (EXP): the dimensions/method/Save form belongs in the
+  // shelf — the canvas keeps the image + direct overlays only. Marked nodes
+  // relocate via _rehomeExpandControlsToShelf (page-level + refresh retry);
+  // _maybeHomeExpandControlsNow covers shelf-first mount order.
+  try {
+    var _markExpand = function (n) { if (n && n.setAttribute) n.setAttribute("data-expand-controls", "shelf"); };
+    _markExpand(grid);
+    _markExpand(_expandMethodRow);
+    _markExpand(status);
+    _markExpand(sizeNote);
+  } catch (_eMarkEx) {}
+  try { _maybeHomeExpandControlsNow(box, state); } catch (_eHomeEx) {}
+  saveBtn.addEventListener("click", function () { doSave(); });
+  async function doSave() {
     try {
       var outStore = _shelfStore(state);
       var outIdentity = _selectionIdentity(outStore);
@@ -7450,8 +7963,24 @@ function _renderOutpaintEditor(state, context, actions) {
       }
       _setCanvasImage(state, _lineageDisplayUrl(expName));
       _refreshShelfSection(state, context, actions);
-    } catch (_e) { status.textContent = "Expansion failed — try again."; }
-  });
+    } catch (_e) {
+      // EXP-01: failure copy gains a retry CTA (same save, no re-entry).
+      status.textContent = "Expansion failed — ";
+      var _retry = el("button", {
+        type: "button",
+        class: "comfymodal-secondary-btn",
+        "data-testid": "outpaint-retry",
+        text: "Retry",
+        title: "Retry the expansion save",
+        style: "font-size:11px;padding:1px 8px;",
+      });
+      _retry.addEventListener("click", function () {
+        try { if (_retry.parentNode === status) status.removeChild(_retry); } catch (_eR) {}
+        doSave();
+      });
+      status.appendChild(_retry);
+    }
+  }
   return box;
 }
 
@@ -8194,7 +8723,9 @@ function renderFilmstrip(state, context) {
             if (parent && !parent.querySelector(".comfymodal-studio-carousel-thumb-empty")) {
               parent.insertBefore(el("span", {
                 class: "comfymodal-studio-carousel-thumb comfymodal-studio-carousel-thumb-empty",
-                text: "No image",
+                // HST-01: single canonical missing-image copy (shared with
+                // History/compare via studio-ui.js missingImageCopy).
+                text: missingImageCopy(),
                 "aria-hidden": "true",
               }), parent.firstChild);
             }
@@ -8203,9 +8734,10 @@ function renderFilmstrip(state, context) {
       } else {
         // Same truthful rule as the History cards: an imageless record keeps
         // its place with a placeholder instead of a broken image.
+        // HST-01: canonical copy via missingImageCopy (see above).
         thumb.appendChild(el("span", {
           class: "comfymodal-studio-carousel-thumb comfymodal-studio-carousel-thumb-empty",
-          text: "No image",
+          text: missingImageCopy(),
           "aria-hidden": "true",
         }));
       }
@@ -8494,6 +9026,14 @@ function loadStyleSelection() {
   return out;
 }
 function saveStyleSelection(patch) {
+  // Phase 12: selectedId/setId are preset-covered config (favorites are not)
+  // — note a possible preset edit; the picker syncs it only while a preset
+  // is active. Never autosaves any preset record.
+  try {
+    if (patch && (typeof patch.selectedId === "string" || typeof patch.setId === "string")) {
+      _notePresetEdit();
+    }
+  } catch (_e0) {}
   try {
     var cur = loadStyleSelection();
     if (patch && typeof patch.selectedId === "string") cur.selectedId = patch.selectedId;
@@ -8588,15 +9128,46 @@ function _studioStyleForRun(state, store) {
     };
   } catch (_e) { return null; }
 }
+// STY-01: collapsed stub pointing at Generate → Text (instead of null).
+// An optional note overrides the default line for the missing-context
+// cases (no prompt role / empty catalog / empty set).
+function _styleContextStub(note) {
+  var stub = el("details", {
+    class: "comfymodal-studio-style-browser",
+    "data-testid": "style-browser-stub",
+    style: "margin:8px 0;",
+  });
+  stub.appendChild(el("summary", {
+    text: "Prompt Style (available in Generate → Text)",
+    style: "font-size:12px;color:#aaa;cursor:pointer;",
+  }));
+  stub.appendChild(el("p", {
+    text: note || "Switch to Generate → Text to browse prompt styles.",
+    style: "font-size:11px;color:#888;margin:4px 0 0;",
+  }));
+  return stub;
+}
 function _renderStyleBrowser(state, context, actions, entries, promptRole) {
   try {
     if (!state) return null;
-    if (activeToolOf(state) !== "t2i") return null;
-    if (activeModeOf(state) !== "generate") return null;
-    if (activeSubtoolOf(state) !== "text") return null;
-    if (!promptRole) return null;
+    // STY-01: outside Generate → Text the browser renders a collapsed stub
+    // (discoverable pointer to where it lives) instead of vanishing to null.
+    if (activeToolOf(state) !== "t2i"
+      || activeModeOf(state) !== "generate"
+      || activeSubtoolOf(state) !== "text") {
+      return _styleContextStub();
+    }
+    if (!promptRole) {
+      // STY-01: no prompt role on this workflow — stub explains instead of
+      // vanishing (styles compose onto the prompt, so no prompt means no
+      // styles here).
+      return _styleContextStub("This workflow has no prompt field — styles need a prompt to compose onto.");
+    }
     var sets = _styleSets();
-    if (!sets.length) return null;
+    if (!sets.length) {
+      // STY-01: empty catalog — stub instead of null.
+      return _styleContextStub("No style sets are available in the catalog yet.");
+    }
     var sel0 = loadStyleSelection();
     var activeSet = _styleSetById(sel0.setId) || _styleSetById("curated") || sets[0];
     if (sel0.setId !== activeSet.id) {
@@ -8604,7 +9175,10 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
       sel0.setId = activeSet.id;
     }
     var styles = _styleSetStyles(activeSet);
-    if (!styles.length) return null;
+    if (!styles.length) {
+      // STY-01: set with no styles — stub instead of null.
+      return _styleContextStub("This style set has no styles to browse.");
+    }
     if (sel0.selectedId && !_styleById(sel0.selectedId)) {
       saveStyleSelection({ selectedId: "" });
       sel0.selectedId = "";
@@ -8619,10 +9193,8 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
       "data-testid": "style-browser-toggle",
       style: "gap:8px;flex-wrap:wrap;",
     });
-    head.appendChild(el("span", {
-      class: "comfymodal-studio-accordion-label",
-      text: "Prompt Style",
-    }));
+    // STY-02: one shared ShelfSectionTitle (h4) for shelf sections.
+    head.appendChild(ShelfSectionTitle("Prompt Style"));
     var selName = el("span", {
       "data-testid": "style-selected-name",
       style: "font-size:12px;font-weight:400;color:var(--color-text, #ddd);",
@@ -8723,13 +9295,21 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
       class: "comfymodal-studio-control-note",
       style: "font-size:11px;color:#888;margin:6px 0 0;",
     });
-    body.appendChild(details);
+    box.appendChild(details);
+    // STY-03: the effective-prompt preview lives behind a disclosure so
+    // long composed prompts cannot push the shelf past the fold.
+    var effDetails = el("details", { style: "margin:4px 0 0;" });
+    effDetails.appendChild(el("summary", {
+      text: "Effective prompt",
+      style: "font-size:11px;color:#888;cursor:pointer;",
+    }));
     var effLine = el("p", {
       "data-testid": "style-effective-prompt",
       class: "comfymodal-studio-control-note",
       style: "font-size:11px;color:#888;margin:4px 0 0;overflow-wrap:anywhere;white-space:pre-wrap;",
     });
-    body.appendChild(effLine);
+    effDetails.appendChild(effLine);
+    box.appendChild(effDetails);
     // Attribution + source links for remote-preview sets. Curated presets
     // need none (bundled text under MIT); the Style Library is remote-only
     // with an unverified license, so the post/gallery/Drive links stay
@@ -8860,11 +9440,20 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
         text: s.title,
         style: "font-size:11px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
       }));
-      var fav = el("span", {
+      // Favorite toggle is a real button (keyboard-operable: Tab + Enter/
+      // Space) with pressed state, not a click-only span. The card click
+      // still selects the style; the button stops propagation.
+      var _favOn = false;
+      try { _favOn = loadStyleSelection().favorites.indexOf(s.id) !== -1; } catch (_eF0) { _favOn = false; }
+      var fav = el("button", {
+        type: "button",
+        class: "comfymodal-secondary-btn",
         text: "★",
         "data-testid": "style-fav-" + s.id,
         title: "Toggle favorite",
-        style: "font-size:12px;cursor:pointer;color:#666;flex:none;",
+        "aria-label": "Toggle favorite for " + s.title,
+        "aria-pressed": _favOn ? "true" : "false",
+        style: "font-size:12px;color:" + (_favOn ? "#e8b93e" : "#666") + ";flex:none;padding:0 4px;border:none;background:none;cursor:pointer;",
       });
       row.appendChild(fav);
       card.appendChild(row);
@@ -8872,6 +9461,10 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
         text: s.category || "",
         style: "font-size:10px;color:#888;",
       }));
+      var _paintFav = function (on) {
+        fav.style.color = on ? "#e8b93e" : "#666";
+        fav.setAttribute("aria-pressed", on ? "true" : "false");
+      };
       fav.addEventListener("click", function (ev) {
         ev.stopPropagation();
         ev.preventDefault();
@@ -8881,12 +9474,9 @@ function _renderStyleBrowser(state, context, actions, entries, promptRole) {
           if (i === -1) cur.favorites.push(s.id);
           else cur.favorites.splice(i, 1);
           saveStyleSelection({ favorites: cur.favorites });
-          fav.style.color = i === -1 ? "#e8b93e" : "#666";
+          _paintFav(i === -1);
         } catch (_e) {}
       });
-      try {
-        if (loadStyleSelection().favorites.indexOf(s.id) !== -1) fav.style.color = "#e8b93e";
-      } catch (_e) {}
       card.addEventListener("click", function () {
         try { saveStyleSelection({ selectedId: s.id }); } catch (_e) {}
         paintSelection();
@@ -9044,6 +9634,9 @@ function _paintCompatNote(state) {
   try {
     var note = document.querySelector('[data-testid="inpaint-method-note"]');
     if (!note || !note.isConnected) return;
+    // SEL-03: a locked (disabled-with-reason) method note is never
+    // overwritten by the async compat answer.
+    if (note.getAttribute("data-locked") === "true") return;
     var pg = state && state.playground;
     var store = pg && pg._workflowRun;
     var c = _methodCompatCache;
@@ -9213,6 +9806,7 @@ function _methodSelectRow(state, context, actions, kind, noteText) {
       var patch = {};
       patch[overrideKey] = nextId;
       try { saveWorkflowMethods(rowWfId(), patch); } catch (_e2) {}
+      try { _markPresetDirty(state); } catch (_e2d) {}
       try { overBtn.textContent = _overrideButtonLabel(state, store, nextId); } catch (_e3) {}
       try { _syncWorkflowGating(state, context, actions); } catch (_e4) {}
     }, function () {
@@ -9241,6 +9835,7 @@ function _methodSelectRow(state, context, actions, kind, noteText) {
     var patch = {};
     patch[methodKey] = sel.value;
     try { saveWorkflowMethods(rowWfId(), patch); } catch (_e2) {}
+    try { _markPresetDirty(state); } catch (_e2d) {}
     var isDed = sel.value === "dedicated";
     overBtn.style.display = isDed ? "" : "none";
     paintNote();
@@ -9258,6 +9853,7 @@ function _methodSelectRow(state, context, actions, kind, noteText) {
           var p2 = {};
           p2[overrideKey] = nextId;
           try { saveWorkflowMethods(rowWfId(), p2); } catch (_e5) {}
+          try { _markPresetDirty(state); } catch (_e5d) {}
           try { overBtn.textContent = _overrideButtonLabel(state, store, nextId); } catch (_e6) {}
           try { _syncWorkflowGating(state, context, actions); } catch (_e7) {}
         }, function () {
@@ -9322,10 +9918,15 @@ function _referenceCardsOf(state) {
   return Array.isArray(raw) ? raw.filter(function (c) { return c && typeof c === "object"; }) : [];
 }
 
-function _saveReferenceCardsOf(state, cards) {
+function _saveReferenceCardsOf(state, cards, skipDirty) {
   var store = _shelfStore(state);
   if (!store || !store.workflowId) return;
   try { saveReferenceCards(store.workflowId, store.workflowVersionId || "", cards || []); } catch (_e) {}
+  // Phase 12: card structure/label edits dirty the active preset; image-file
+  // commits (skipDirty) are runtime pixels, never preset config.
+  if (!skipDirty) {
+    try { _markPresetDirty(state); } catch (_e2) {}
+  }
 }
 
 function _referenceMethodStateOf(state) {
@@ -9388,7 +9989,7 @@ function _commitReferenceCardFile(state, context, actions, cardId, file) {
   }
   if (at === -1) return;
   cards[at] = { id: cardId, file: String(file || ""), label: cards[at].label || "" };
-  _saveReferenceCardsOf(state, cards);
+  _saveReferenceCardsOf(state, cards, true);
   _syncWorkflowGating(state, context, actions);
   _refreshShelfSection(state, context, actions);
 }
@@ -9443,10 +10044,11 @@ function _moveReferenceCard(state, context, actions, cardId, delta) {
 async function _materializeUrlToFile(state, url, prefix) {
   var store = _shelfStore(state);
   var identity = _selectionIdentity(store);
+  var _pgen = _presetAsyncToken();
   var hit = null;
   try { hit = await _resolveVerifiedCanvasFile(state, url); } catch (_e) { hit = null; }
   if (hit && hit.filename) {
-    if (_selectionIdentity(_shelfStore(state)) !== identity) return "";
+    if (_presetAsyncStale(_pgen) || _selectionIdentity(_shelfStore(state)) !== identity) return "";
     return String(hit.filename);
   }
   var resp = null;
@@ -9459,7 +10061,7 @@ async function _materializeUrlToFile(state, url, prefix) {
   var blob = await resp.blob();
   var mod = await import("./studio-field-blocks.js");
   var name = await mod.uploadImageBlob(blob, mod.uniqueImageName(prefix || "studio-reference"));
-  if (_selectionIdentity(_shelfStore(state)) !== identity) return "";
+  if (_presetAsyncStale(_pgen) || _selectionIdentity(_shelfStore(state)) !== identity) return "";
   return String(name);
 }
 
@@ -9469,6 +10071,7 @@ async function _linkUrlAsReferenceCard(state, context, actions, cardId, url, pre
   var t = _referenceTrackerSynced(state);
   if (!t) return;
   var identity = _selectionIdentity(store);
+  var _pgenRef = _presetAsyncToken();
   if (!t.guards[cardId]) {
     try { t.guards[cardId] = createUploadGuard(); } catch (_e) {}
   }
@@ -9489,8 +10092,8 @@ async function _linkUrlAsReferenceCard(state, context, actions, cardId, url, pre
   }
   // A workflow/version switch mid-flight orphans this completion: the gate
   // ignores stale-identity tracker entries, so just stop without touching
-  // the new selection's UI.
-  if (_selectionIdentity(_shelfStore(state)) !== identity) return;
+  // the new selection's UI. A preset load likewise orphans it (Phase 12).
+  if (_presetAsyncStale(_pgenRef) || _selectionIdentity(_shelfStore(state)) !== identity) return;
   t.seq[cardId] = Math.max(0, (t.seq[cardId] || 1) - 1);
   if (!t.seq[cardId]) delete t.busy[cardId];
   if (err) {
@@ -9556,6 +10159,9 @@ function _referenceCountText(state) {
     var wf = _shelfModule(state);
     var cap = st && wf && typeof wf.referenceCapacityFor === "function" ? wf.referenceCapacityFor(st) : null;
     if (cap != null) base += " · " + cards.length + " of " + cap + " slots";
+    // REF-01: overcapacity stays addable by design, but the count line now
+    // carries an inline over-limit flag instead of failing silently at run.
+    if (cap != null && cards.length > cap) base += " · over limit";
   } catch (_e) {}
   return base;
 }
@@ -9602,6 +10208,7 @@ function _referenceMethodRow(state, context, actions) {
     try { cur = String(loadWorkflowMethods(rowWfId()).referenceOverride || ""); } catch (_e) {}
     _openMethodOverridePicker(state, context, "references", cur, function (nextId) {
       try { saveWorkflowMethods(rowWfId(), { referenceOverride: nextId }); } catch (_e2) {}
+      try { _markPresetDirty(state); } catch (_e2d) {}
       try { overBtn.textContent = _overrideButtonLabel(state, store, nextId); } catch (_e3) {}
       try { _syncWorkflowGating(state, context, actions); } catch (_e4) {}
       try { _refreshShelfSection(state, context, actions); } catch (_e5) {}
@@ -9626,12 +10233,16 @@ function _referenceMethodRow(state, context, actions) {
       note.textContent = _referenceStatusText(state, st) || "";
       note.style.color = (st && !st.supported && st.reason) ? "#d9a441" : "#888";
     } catch (_e) {}
+    // REF-02: keep the inline gate line live on method changes (same
+    // synchronous repaint as the method note — no shelf rebuild needed).
+    try { _repaintReferenceGateLine(state, row); } catch (_eG) {}
   }
   paintNote();
   sel.addEventListener("change", function () {
     var prev = "";
     try { prev = String(loadWorkflowMethods(rowWfId()).referenceMethod || ""); } catch (_e) {}
     try { saveWorkflowMethods(rowWfId(), { referenceMethod: sel.value }); } catch (_e2) {}
+    try { _markPresetDirty(state); } catch (_e2d) {}
     var isDed = sel.value === "dedicated";
     overBtn.style.display = isDed ? "" : "none";
     paintNote();
@@ -9643,6 +10254,7 @@ function _referenceMethodRow(state, context, actions) {
       if (!cur2) {
         _openMethodOverridePicker(state, context, "references", "", function (nextId) {
           try { saveWorkflowMethods(rowWfId(), { referenceOverride: nextId }); } catch (_e4) {}
+          try { _markPresetDirty(state); } catch (_e4d) {}
           try { overBtn.textContent = _overrideButtonLabel(state, store, nextId); } catch (_e5) {}
           try { _syncWorkflowGating(state, context, actions); } catch (_e6) {}
           try { _refreshShelfSection(state, context, actions); } catch (_e7) {}
@@ -9660,6 +10272,33 @@ function _referenceMethodRow(state, context, actions) {
     try { _syncWorkflowGating(state, context, actions); } catch (_e12) {}
   });
   return row;
+}
+
+// REF-02: synchronous repaint of the inline gate line for the references
+// section containing `anchorRow` (create when gated, remove when clear).
+function _repaintReferenceGateLine(state, anchorRow) {
+  var section = anchorRow && anchorRow.closest
+    ? anchorRow.closest('[data-testid="references-section"]') : null;
+  if (!section) {
+    section = document.querySelector('[data-testid="references-section"]');
+  }
+  if (!section || !section.isConnected) return;
+  var gate = null;
+  try { gate = _studioReferenceGate(state); } catch (_e) { gate = null; }
+  var line = section.querySelector('[data-testid="reference-gate-reason"]');
+  if (!gate) {
+    if (line && line.parentNode) line.parentNode.removeChild(line);
+    return;
+  }
+  if (!line) {
+    line = el("p", {
+      "data-testid": "reference-gate-reason",
+      class: "comfymodal-studio-control-note",
+      style: "font-size:11px;color:#d9a441;margin:6px 0 0;",
+    });
+    section.appendChild(line);
+  }
+  line.textContent = String(gate);
 }
 
 function _renderReferenceCard(state, context, actions, card, index, total) {
@@ -9755,6 +10394,8 @@ function _renderReferenceSection(state, context, actions) {
     "data-testid": "references-section",
     style: "margin:8px 0;",
   });
+  // REF-01/STY-02: shared section title (was heading-less).
+  box.appendChild(ShelfSectionTitle("References"));
   box.appendChild(_referenceMethodRow(state, context, actions));
   var cards = _referenceCardsOf(state);
   var list = el("div", { "data-testid": "reference-cards" });
@@ -9788,6 +10429,20 @@ function _renderReferenceSection(state, context, actions) {
     style: "font-size:11px;color:#888;",
   }));
   box.appendChild(foot);
+  // REF-02: the run-gate reason surfaces inline under the section, live —
+  // not only at submit time. Repainted by paintNote on method changes and
+  // rebuilt on every shelf refresh.
+  try {
+    var _refGate = _studioReferenceGate(state);
+    if (_refGate) {
+      box.appendChild(el("p", {
+        "data-testid": "reference-gate-reason",
+        class: "comfymodal-studio-control-note",
+        text: _refGate,
+        style: "font-size:11px;color:#d9a441;margin:6px 0 0;",
+      }));
+    }
+  } catch (_eGate) {}
   return box;
 }
 
@@ -10040,7 +10695,12 @@ function _syncGuidanceStatus(state) {
     }
     var draft = g.draft || {};
     var guideKey = _guidanceSelectionKey(store) + "::" + normalizeGuidanceMode(g.mode);
-    var guideImage = String(draft.guideImage || g.guideImages[guideKey] || "");
+    // Draft-scope guard (P2): the draft is global, the keyed images are per
+    // selection+mode. A stale global draft.guideImage must never win over
+    // the current key — only honor it when the draft was written for this
+    // key, otherwise fall back to the keyed image (or empty).
+    var _draftScoped = draft && draft.guideKey === guideKey;
+    var guideImage = String((_draftScoped && draft.guideImage) || g.guideImages[guideKey] || "");
     var resolved = resolveGuidanceState({
       engaged: g.engaged,
       mode: g.mode,
@@ -10210,6 +10870,7 @@ function _guidanceDraftOf(state) {
     g.draft = {
       open: false,
       mode: g.mode,
+      guideKey: "",
       mechanism: GUIDANCE_MECHANISMS[0],
       checkpoint: "",
       loader: "",
@@ -10252,7 +10913,7 @@ function _commitGuidanceGuideImage(state, context, actions, name) {
   var guideKey = _guidanceSelectionKey(store) + "::" + normalizeGuidanceMode(g.mode);
   g.guideImages[guideKey] = String(name || "");
   var draft = _guidanceDraftOf(state);
-  if (draft) draft.guideImage = String(name || "");
+  if (draft) { draft.guideImage = String(name || ""); draft.guideKey = guideKey; }
   g.guideError = "";
   g.guideBusy = false;
   _syncGuidanceStatus(state);
@@ -10265,6 +10926,7 @@ async function _linkUrlAsGuidanceGuide(state, context, actions, url, prefix) {
   if (!g || !url) return;
   var store = _shelfStore(state);
   var identity = _selectionIdentity(store);
+  var _pgen = _presetAsyncToken();
   g.guideBusy = true;
   g.guideError = "";
   _refreshShelfSection(state, context, actions);
@@ -10276,7 +10938,7 @@ async function _linkUrlAsGuidanceGuide(state, context, actions, url, prefix) {
   } catch (_e2) {
     err = "Could not use that image — " + ((_e2 && _e2.message) || "linking failed") + ".";
   }
-  if (_selectionIdentity(_shelfStore(state)) !== identity) return;
+  if (_presetAsyncStale(_pgen) || _selectionIdentity(_shelfStore(state)) !== identity) return;
   if (err) {
     g.guideBusy = false;
     g.guideError = err;
@@ -10533,6 +11195,13 @@ function _guidanceAnchorBlock(state, draft) {
       style: "font-size:11px;color:#d9a441;margin:0 0 4px;",
     }));
     var list = el("div", { "data-testid": "guidance-anchor-candidates" });
+    // GUI-02: the 6-cap is disclosed, never silent.
+    if (found.candidates.length > 6) {
+      wrap.appendChild(el("p", {
+        text: "Showing 6 of " + found.candidates.length + " samplers — the rest share the same choice.",
+        style: "font-size:11px;color:#888;margin:0 0 4px;",
+      }));
+    }
     found.candidates.slice(0, 6).forEach(function (c) {
       var label = el("label", { style: "display:flex;gap:6px;align-items:center;font-size:12px;color:#ccc;margin-bottom:4px;" });
       var radio = el("input", { type: "radio", name: "guidance-anchor-pick", value: c.node_id });
@@ -10541,7 +11210,19 @@ function _guidanceAnchorBlock(state, draft) {
         // No silent choice: the pick counts only after the user confirms it.
         radio.checked = false;
       }
-      radio.addEventListener("change", function () { draft.anchorPick = radio.value; });
+      // Validated pick only: a stale value never confirms an incompatible
+      // state (see resolveGuidanceState anchorPick check).
+      radio.addEventListener("change", function () {
+        var _ok = false;
+        try {
+          (found.candidates || []).forEach(function (k) {
+            if (k && String(k.node_id) === String(radio.value)) _ok = true;
+          });
+        } catch (_eV) { _ok = false; }
+        if (!_ok) return;
+        draft.anchorPick = radio.value;
+        try { _markPresetDirty(state); } catch (_e) {}
+      });
       label.appendChild(radio);
       label.appendChild(el("span", { text: "Sampler " + c.node_id + " (" + (c.class_type || "?") + ")" }));
       list.appendChild(label);
@@ -10574,12 +11255,12 @@ function _guidanceManualFlow(state, context, actions, g, draft, identity) {
   box.appendChild(_guidanceSelectRow("Mode", "guidance-draft-mode",
     normalizeGuidanceMode(draft.mode) || "canny",
     GUIDANCE_MODES.map(function (m) { return { value: m, label: m }; }),
-    function (v) { draft.mode = v; _refreshShelfSection(state, context, actions); }));
+    function (v) { draft.mode = v; try { _markPresetDirty(state); } catch (_e) {} _refreshShelfSection(state, context, actions); }));
   // Mechanism from the implemented list only.
   box.appendChild(_guidanceSelectRow("Mechanism", "guidance-draft-mechanism",
     draft.mechanism || GUIDANCE_MECHANISMS[0],
     GUIDANCE_MECHANISMS.map(function (m) { return { value: m, label: m }; }),
-    function (v) { draft.mechanism = v; _refreshShelfSection(state, context, actions); }));
+    function (v) { draft.mechanism = v; try { _markPresetDirty(state); } catch (_e) {} _refreshShelfSection(state, context, actions); }));
   // Installed controller checkpoint (controlnet folder).
   if (!checkpoints.length) {
     box.appendChild(el("p", {
@@ -10650,13 +11331,13 @@ function _guidanceManualFlow(state, context, actions, g, draft, identity) {
   var cond = validateConditioning({ strength: draft.strength, start: draft.start, end: draft.end });
   var base = cond.ok ? cond.conditioning : GUIDANCE_DEFAULT_CONDITIONING;
   box.appendChild(_guidanceNumberRow("Strength", "guidance-draft-strength", base.strength, function (v) {
-    draft.strength = v; _refreshShelfSection(state, context, actions);
+    draft.strength = v; try { _markPresetDirty(state); } catch (_e) {} _refreshShelfSection(state, context, actions);
   }));
   box.appendChild(_guidanceNumberRow("Start", "guidance-draft-start", base.start, function (v) {
-    draft.start = v; _refreshShelfSection(state, context, actions);
+    draft.start = v; try { _markPresetDirty(state); } catch (_e) {} _refreshShelfSection(state, context, actions);
   }));
   box.appendChild(_guidanceNumberRow("End", "guidance-draft-end", base.end, function (v) {
-    draft.end = v; _refreshShelfSection(state, context, actions);
+    draft.end = v; try { _markPresetDirty(state); } catch (_e) {} _refreshShelfSection(state, context, actions);
   }));
   // Review screen: all mapping fields, evidence as display.
   var review = el("div", { "data-testid": "guidance-review", style: "margin:8px 0;font-size:12px;color:#ccc;" });
@@ -10720,10 +11401,8 @@ function _renderGuidanceSection(state, context, actions) {
     "data-testid": "guidance-section",
     style: "margin:8px 0;",
   });
-  box.appendChild(el("h4", {
-    class: "comfymodal-studio-block-heading",
-    text: "Guidance",
-  }));
+  // STY-02: one shared ShelfSectionTitle (h4) for shelf sections.
+  box.appendChild(ShelfSectionTitle("Guidance"));
   // Mode row: Off (disengaged) or one explicit mode. No Auto option.
   var modeRow = el("div", { style: "display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap;" });
   modeRow.appendChild(el("span", { text: "Mode", style: "font-size:12px;color:#aaa;" }));
@@ -10743,7 +11422,14 @@ function _renderGuidanceSection(state, context, actions) {
     g.engaged = sel.value !== "";
     if (g.engaged && isSupportedGuidanceMode(sel.value)) g.mode = normalizeGuidanceMode(sel.value);
     var draft = _guidanceDraftOf(state);
-    if (draft) { draft.open = false; draft.keepExisting = false; draft.mode = g.mode; }
+    // Mode change closes the draft AND clears its per-key selections: a
+    // closed draft must not keep a stale global guideImage/anchorPick that
+    // outranks the newly keyed images on the next open.
+    if (draft) {
+      draft.open = false; draft.keepExisting = false; draft.mode = g.mode;
+      draft.guideImage = ""; draft.anchorPick = "";
+      try { draft.guideKey = _guidanceSelectionKey(_shelfStore(state)) + "::" + normalizeGuidanceMode(g.mode); } catch (_eK) { draft.guideKey = ""; }
+    }
     _refreshGuidanceMapping(state, context, actions);
     _refreshGuidanceObjectInfo(state, context, actions);
     _syncGuidanceStatus(state);
@@ -10778,11 +11464,19 @@ function _renderGuidanceSection(state, context, actions) {
     }));
   }
   if (st.identity && (st.identity.shortHash || st.identity.filename)) {
-    status.appendChild(el("p", {
+    // GUI-01: status caps at headline + one detail line; the model identity
+    // moves behind a disclosure so narrow-shelf wrapping stays bounded.
+    var _idDetails = el("details", { style: "margin:0;" });
+    _idDetails.appendChild(el("summary", {
+      text: "Model",
+      style: "font-size:11px;color:#888;cursor:pointer;",
+    }));
+    _idDetails.appendChild(el("p", {
       text: "Model: " + (st.identity.label || ""),
       "data-testid": "guidance-identity",
-      style: "font-size:11px;color:#888;margin:0;",
+      style: "font-size:11px;color:#888;margin:2px 0 0;",
     }));
+    status.appendChild(_idDetails);
   }
   box.appendChild(status);
   var ops = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;" });
@@ -10812,7 +11506,19 @@ function _renderGuidanceSection(state, context, actions) {
       radio.checked = current === String(c.node_id);
       radio.addEventListener("change", function () {
         var d = _guidanceDraftOf(state);
-        if (d) d.anchorPick = radio.value;
+        // Validate the pick against the presented candidates before
+        // accepting it: a stale radio value must never confirm an
+        // incompatible state (see resolveGuidanceState anchorPick check).
+        var _ok = false;
+        try {
+          (st.candidates || []).forEach(function (c) {
+            if (c && String(c.node_id) === String(radio.value)) _ok = true;
+          });
+        } catch (_eV) { _ok = false; }
+        if (d && _ok) {
+          d.anchorPick = radio.value;
+          try { d.guideKey = _guidanceSelectionKey(_shelfStore(state)) + "::" + normalizeGuidanceMode(g.mode); } catch (_eK) {}
+        }
         _syncGuidanceStatus(state);
         try { _syncWorkflowGating(state, context, actions); } catch (_e3) {}
         _refreshShelfSection(state, context, actions);
@@ -10822,6 +11528,31 @@ function _renderGuidanceSection(state, context, actions) {
       pick.appendChild(label);
     });
     box.appendChild(pick);
+    // GUI-02: persist a selected-anchor summary line so the pick stays
+    // visible after selection (the 6-cap radio list alone leaves the
+    // post-pick state unclear). Honest wording while still incompatible:
+    // "Selected" (pending), never "Guided" — only a resolved state earns
+    // the Guided label (see the resolved-state summary below). Stale picks
+    // show nothing rather than confirming an incompatible state.
+    try {
+      var _pickedAnchor = draft ? String(draft.anchorPick || "") : "";
+      if (_pickedAnchor) {
+        var _pickedHit = null;
+        (st.candidates || []).forEach(function (c) {
+          if (c && String(c.node_id) === _pickedAnchor) _pickedHit = c;
+        });
+        if (_pickedHit) {
+          var _candNote = (st.candidates || []).length > 6 ? " (showing 6 of " + (st.candidates || []).length + ")" : "";
+          box.appendChild(el("p", {
+            "data-testid": "guidance-anchor-summary",
+            text: "Selected sampler: " + _pickedAnchor
+              + (_pickedHit && _pickedHit.class_type ? " (" + _pickedHit.class_type + ")" : "")
+              + " — confirming…" + _candNote,
+            style: "font-size:11px;color:#888;margin:4px 0 0;",
+          }));
+        }
+      }
+    } catch (_eSum) {}
   }
   return box;
 }
@@ -11370,7 +12101,8 @@ function _setActiveSubtool(state, context, actions, mode, subtool) {
 }
 
 function _postSubmenuNote(subtool) {
-  if (subtool === "upscale") return "Upscale arrives in a later phase — execution is disabled.";
+  // GEN-03: the upscale line shares the single placeholderCopy phrasing.
+  if (subtool === "upscale") return placeholderCopy("upscale").line;
   return "Adjust the photo in the sidebar — pick the Studio image in the canvas, or upload your own. Shortcuts: \\ compare · C crop · J heal · W white balance · Ctrl+Z/Y undo/redo.";
 }
 
@@ -11435,6 +12167,24 @@ function _focusPostCategory(subtool, root) {
   } catch (_e) { /* routing is best-effort */ }
 }
 
+// GEN-04: single-sourced breadcrumb text + in-place refresh for
+// navigations that skip the topbar rebuild (in-place Post category
+// switches). Same text as the topbar build path — never drift.
+function _breadcrumbText(state) {
+  try {
+    var mode = activeModeOf(state);
+    var sub = activeSubtoolOf(state);
+    var spec = STUDIO_MODES.find(function (m) { return m.id === mode; }) || STUDIO_MODES[0];
+    return (spec ? spec.label : mode) + " › " + (STUDIO_SUBTOOL_LABELS[sub] || sub);
+  } catch (_e) { return ""; }
+}
+
+function _refreshBreadcrumb(state) {
+  var node = document.querySelector('[data-testid="tool-breadcrumb"]');
+  if (!node || !node.isConnected) return;
+  node.textContent = _breadcrumbText(state);
+}
+
 // Post category switches stay in place: the mounted engine keeps its
 // recipe, canvas, undo/redo, and compare state instead of remounting.
 // Only crossing the Upscale boundary remounts (Upscale is a canvas
@@ -11472,6 +12222,9 @@ function _selectPostCategory(state, context, subtool) {
       if (note) note.textContent = _postSubmenuNote(subtool);
     }
   } catch (_e) {}
+  // GEN-04: in-place Post nav skips the topbar rebuild — refresh the
+  // breadcrumb text in place so it never goes stale.
+  try { _refreshBreadcrumb(state); } catch (_eCrumb) {}
   _focusPostCategory(subtool);
 }
 
@@ -11665,13 +12418,39 @@ function _enqueueCurrentRun(state) {
   if (!pg) return null;
   var store = pg._workflowRun;
   var q = _runQueueOf(state);
+  // Freeze the complete supported request: identity + values + the
+  // companions the submit path derives from live state (subtool, explicit
+  // method prefs, reference cards, style selection, guidance engagement).
+  // Best-effort JSON clones: companions are plain data; a clone failure
+  // degrades to null (never a live reference the user can mutate later).
+  function _freeze(value) {
+    try { return value === undefined ? null : JSON.parse(JSON.stringify(value)); }
+    catch (_e) { return null; }
+  }
+  var _methodPrefs = null;
+  try { _methodPrefs = _freeze(loadWorkflowMethods(store && store.workflowId ? String(store.workflowId) : "")); } catch (_eM) { _methodPrefs = null; }
+  var _refCards = null;
+  try { _refCards = _freeze(typeof _referenceCardsOf === "function" ? _referenceCardsOf(state) : null); } catch (_eR) { _refCards = null; }
+  var _styleSel = null;
+  try { _styleSel = _freeze(typeof loadStyleSelection === "function" ? loadStyleSelection() : null); } catch (_eS) { _styleSel = null; }
+  var _guideState = null;
+  try {
+    var _g = _guidanceOf(state);
+    _guideState = _freeze(_g ? { engaged: !!_g.engaged, mode: _g.mode || "", guideImages: _g.guideImages || {}, anchorPick: (_g.draft && _g.draft.anchorPick) || "" } : null);
+  } catch (_eG) { _guideState = null; }
   var snapshot = {
     id: "q_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7),
     tool: activeToolOf(state),
+    subtool: activeSubtoolOf(state),
+    mode: activeModeOf(state),
     workflowId: (store && store.workflowId) || "",
     workflowVersionId: (store && store.workflowVersionId) || "",
     workflowName: (store && store.workflowName) || "",
     controlValues: Object.assign({}, (store && store.controlValues) || {}, pg.controls || {}),
+    methodPrefs: _methodPrefs,
+    referenceCards: _refCards,
+    styleSelection: _styleSel,
+    guidance: _guideState,
     label: ((store && store.workflowName) || activeToolOf(state)) + " #" + (q.length + 1),
     createdAt: Date.now(),
   };
@@ -11708,13 +12487,48 @@ function _runNextQueued(state, context, actions, btn) {
   if (!q.length || _isRunActive(state)) return;
   var next = q.shift();
   _saveQueue(state);
-  // Background queue execution restores only the queued values onto the
-  // live store, then submits through the same single-run path. It never
-  // overwrites the visible UI: the user may be in Post or a placeholder
-  // while earlier-enqueued runs drain, and a same-type auto-drain must not
-  // jump the view back to Generate/Text. Shell reconciliation stays with
-  // explicit picker/mode actions only.
+  // Queued-identity guard (P1): the snapshot recorded workflow/version, but
+  // the live store may have moved on while the item waited. Restoring only
+  // values against the live store would run the WRONG workflow, so validate
+  // identity first. On mismatch the item is NOT executed: it returns to the
+  // head of the queue with a visible reason (queue viewer + topbar line).
   var store = pg._workflowRun;
+  var liveId = (store && store.workflowId) || "";
+  var liveVer = (store && store.workflowVersionId) || "";
+  if (!next || !next.workflowId
+    || String(next.workflowId) !== String(liveId)
+    || String(next.workflowVersionId || "") !== String(liveVer || "")) {
+    q.unshift(next);
+    _saveQueue(state);
+    pg._queueBlockedReason = "Queued " + (next && next.workflowName ? next.workflowName : "run")
+      + " targets a different workflow/version — select it again to run.";
+    try { _refreshQueueViewer(state, context); } catch (_eV) {}
+    try { if (context && context.setPage) context.setPage("playground"); } catch (_eP) {}
+    return;
+  }
+  // Unsupported-config guard (P1): later-phase placeholders have no
+  // execution path. A queued placeholder must block honestly instead of
+  // degrading into a silent ordinary run on the live workflow.
+  try {
+    var _qGate = (typeof shellGateReason === "function")
+      ? shellGateReason(next.mode || activeModeOf(state), next.subtool || activeSubtoolOf(state))
+      : null;
+    if (_qGate) {
+      q.unshift(next);
+      _saveQueue(state);
+      pg._queueBlockedReason = _qGate;
+      try { _refreshQueueViewer(state, context); } catch (_eV2) {}
+      try { if (context && context.setPage) context.setPage("playground"); } catch (_eP2) {}
+      return;
+    }
+  } catch (_eG) {}
+  pg._queueBlockedReason = "";
+  // Background queue execution restores the frozen values AND the frozen
+  // companions onto the live store, then submits through the same
+  // single-run path. It never overwrites the visible UI: the user may be in
+  // Post or a placeholder while earlier-enqueued runs drain, and a
+  // same-type auto-drain must not jump the view back to Generate/Text.
+  // Shell reconciliation stays with explicit picker/mode actions only.
   if (store && next.controlValues) {
     store.controlValues = Object.assign({}, next.controlValues);
   }
@@ -11723,6 +12537,43 @@ function _runNextQueued(state, context, actions, btn) {
       if (next.controlValues[k] !== undefined) pg.controls[k] = next.controlValues[k];
     });
   }
+  // Restore frozen intent (best-effort, same shapes the submit path reads):
+  // method prefs persist per workflow id; reference cards are re-saved for
+  // the queued identity; style selection + guidance engagement are restored
+  // so the payload companions match what was queued (not the live shelf).
+  try {
+    if (next.methodPrefs && store && store.workflowId
+      && String(store.workflowId) === String(next.workflowId)
+      && typeof saveWorkflowMethods === "function") {
+      saveWorkflowMethods(String(store.workflowId), next.methodPrefs);
+    }
+  } catch (_eM) {}
+  try {
+    if (Array.isArray(next.referenceCards) && store && store.workflowId
+      && typeof saveReferenceCards === "function") {
+      saveReferenceCards(store.workflowId, store.workflowVersionId || "", next.referenceCards);
+    }
+  } catch (_eR) {}
+  try {
+    if (next.styleSelection && typeof saveStyleSelection === "function") {
+      saveStyleSelection(next.styleSelection);
+    }
+  } catch (_eS) {}
+  try {
+    var _g2 = _guidanceOf(state);
+    if (_g2 && next.guidance && typeof next.guidance === "object") {
+      _g2.engaged = !!next.guidance.engaged;
+      if (next.guidance.mode) _g2.mode = next.guidance.mode;
+      if (next.guidance.guideImages && typeof next.guidance.guideImages === "object") {
+        _g2.guideImages = Object.assign({}, next.guidance.guideImages);
+      }
+      var _d2 = _guidanceDraftOf(state);
+      if (_d2) {
+        _d2.anchorPick = String((next.guidance && next.guidance.anchorPick) || "");
+        _d2.guideKey = _guidanceSelectionKey(store) + "::" + normalizeGuidanceMode(_g2.mode);
+      }
+    }
+  } catch (_eG2) {}
   setTimeout(function () {
     var liveBtn = _resolvePrimaryRunButton();
     _modernRunSubmit(state, context, actions, liveBtn || btn);
@@ -12160,6 +13011,15 @@ function _refreshQueueViewer(state, context) {
     class: "comfymodal-studio-queue-manager-subhead",
     text: "Queued",
   }));
+  // Queued-identity / unsupported-config blocks surface visibly at the top
+  // of the viewer (never hover-only) so a refused drain explains itself.
+  if (pg._queueBlockedReason) {
+    list.appendChild(el("p", {
+      class: "comfymodal-studio-tool-submenu-note",
+      "data-testid": "queue-blocked-reason",
+      text: String(pg._queueBlockedReason),
+    }));
+  }
   q.forEach(function (item, idx) {
     list.appendChild(_renderQueuedItem(state, context, item, idx, q.length));
   });
@@ -12449,6 +13309,15 @@ function _renderQueuedItem(state, context, item, idx, total) {
   var spec = STUDIO_TOOLS.find(function (t) { return t.id === item.tool; });
   var meta = el("div", { class: "comfymodal-studio-queued-item-meta" });
   meta.appendChild(el("span", { text: "Tool: " + (spec ? spec.label : (item.tool || "—")) }));
+  // Frozen intent stays visible per item: subtool + companion presence, so
+  // a queued run explains what it will execute (no silent ordinary runs).
+  if (item.subtool) meta.appendChild(el("span", { text: "View: " + String(item.subtool) }));
+  var _companions = [];
+  if (item.methodPrefs) _companions.push("method");
+  if (item.referenceCards && item.referenceCards.length) _companions.push("references");
+  if (item.styleSelection && item.styleSelection.selectedId) _companions.push("style");
+  if (item.guidance && item.guidance.engaged) _companions.push("guidance");
+  if (_companions.length) meta.appendChild(el("span", { text: "With: " + _companions.join(", ") }));
   meta.appendChild(el("span", {
     text: "Workflow: " + (item.workflowName || item.workflowId || "—")
       + (item.workflowVersionId ? " · " + item.workflowVersionId : ""),
@@ -12552,6 +13421,24 @@ function renderWorkspaceTopBar(state, context, actions) {
   });
 
   var leftSpacer = el("div", { class: "comfymodal-studio-topbar-spacer" });
+  // GEN-04: visible tool breadcrumb (mode › subtool) so the current tool is
+  // glanceable without opening the submenu. Text-only, no layout shift.
+  // Responsive note (intentional): the spacer hides below 900px via the
+  // shared topbar media query (topbar-space tradeoff — rail + actions win
+  // on narrow screens). The breadcrumb is progressive enhancement there;
+  // the submenu buttons remain the navigation. KEEP; do not re-show it
+  // narrow without a topbar-wrap redesign (styles lane owns that query).
+  try {
+    var _crumbMode = activeModeOf(state);
+    var _crumbSub = activeSubtoolOf(state);
+    var _crumbSpec = STUDIO_MODES.find(function (m) { return m.id === _crumbMode; }) || STUDIO_MODES[0];
+    leftSpacer.appendChild(el("span", {
+      class: "comfymodal-studio-tool-breadcrumb",
+      "data-testid": "tool-breadcrumb",
+      text: _breadcrumbText(state),
+      style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);",
+    }));
+  } catch (_eCrumb) {}
   bar.appendChild(leftSpacer);
 
   var railWrap = el("div", { class: "comfymodal-studio-topbar-rail" });
@@ -12561,27 +13448,35 @@ function renderWorkspaceTopBar(state, context, actions) {
   var right = el("div", { class: "comfymodal-studio-topbar-actions" });
 
   // Queue toggle (radio with experiment toggle), split with the batch
-  // history dropdown: squared inner corners + 2px gap read as one button.
+  // history dropdown. TOP-02: an explicit divider + distinct labels
+  // ("Queue mode" / "Batch history") so the composite never misreads as
+  // one button.
   var queueSplit = el("div", { class: "comfymodal-studio-queue-split" });
   var queueToggle = el("button", {
     type: "button",
     class: "comfymodal-studio-mode-toggle comfymodal-studio-queue-split-main" + (queueMode ? " is-on active" : ""),
     "data-testid": "queue-toggle",
     title: queueMode ? "Queue mode on — runs are collected first" : "Queue mode off — run immediately",
+    "aria-label": "Queue mode",
   });
   queueToggle.setAttribute("aria-pressed", queueMode ? "true" : "false");
   queueToggle.appendChild(el("span", { class: "toggle-dot", "aria-hidden": "true" }));
-  queueToggle.appendChild(el("span", { text: "Queue" }));
+  queueToggle.appendChild(el("span", { text: "Queue mode" }));
   queueToggle.addEventListener("click", function () {
     if (actions && actions.setQueueMode) actions.setQueueMode(!queueMode);
   });
   queueSplit.appendChild(queueToggle);
+  queueSplit.appendChild(el("span", {
+    class: "comfymodal-studio-queue-split-divider",
+    "aria-hidden": "true",
+    style: "width:1px;align-self:stretch;background:var(--color-border, #333);margin:2px 2px;",
+  }));
   var histArrow = el("button", {
     type: "button",
     class: "comfymodal-studio-mode-toggle comfymodal-studio-queue-split-arrow",
     "data-testid": "queue-history-btn",
-    title: "Queued batch history",
-    "aria-label": "Queued batch history",
+    title: "Batch history",
+    "aria-label": "Batch history",
     "aria-expanded": "false",
     "aria-haspopup": "menu",
   });
@@ -12657,9 +13552,11 @@ function renderWorkspaceTopBar(state, context, actions) {
   queueSplit.appendChild(histMenu);
   right.appendChild(queueSplit);
 
-  // Primary run button: becomes "Queue" in queue mode.
+  // Primary run button: becomes "Queue" in queue mode. Labels come from
+  // the single _RUN_LABELS map (TOP-01); every disabled gate also mirrors
+  // its title into the visible topbar-reason line (no hover-only reasons).
   var runState = pg.runState;
-  var primaryLabel = queueMode ? "Queue" : "Run";
+  var primaryLabel = queueMode ? _RUN_LABELS.queue : _RUN_LABELS.run;
   var primaryBtn = el("button", {
     type: "button",
     class: "comfymodal-studio-run-btn",
@@ -12692,28 +13589,61 @@ function renderWorkspaceTopBar(state, context, actions) {
   } else if (batchApplying) {
     // A container batch is in flight: lock the primary button on batch
     // progress so a second batch or single run cannot overlap it.
+    // TOP-01: the busy title is mirrored into the visible reason line.
     primaryBtn.disabled = true;
     primaryBtn.classList.add("is-busy");
     var _done = pg._batchCompleted || 0;
     var _total = pg._batchTotal || 0;
-    primaryBtn.querySelector('[data-testid="run-btn-label"]').textContent =
-      _total ? ("Batch " + _done + "/" + _total + "…") : "Batch…";
+    _paintRunButton(primaryBtn,
+      _total ? ("Batch " + _done + "/" + _total + "…") : _RUN_LABELS.batch);
     primaryBtn.title = "Batch running";
+    if (reason) {
+      reason.appendChild(el("p", {
+        "data-testid": "topbar-gate-reason",
+        text: "Batch running",
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    }
   } else if (runState && (runState.status === "running" || runState.status === "submitted"
     || runState.status === "waiting" || runState.status === "queued"
     || runState.status === "in_progress")) {
+    // TOP-01: the busy title is mirrored into the visible reason line.
     primaryBtn.disabled = true;
     primaryBtn.classList.add("is-busy");
-    primaryBtn.querySelector('[data-testid="run-btn-label"]').textContent =
-      runState.status === "queued" ? "Queued…" : "Running…";
+    _paintRunButton(primaryBtn,
+      runState.status === "queued" ? _RUN_LABELS.queued : _RUN_LABELS.running);
     primaryBtn.title = "Run in progress";
+    if (reason) {
+      reason.appendChild(el("p", {
+        "data-testid": "topbar-gate-reason",
+        text: "Run in progress",
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    }
   } else if (queueMode) {
-    primaryBtn.disabled = false;
-    primaryBtn.onclick = null;
-    primaryBtn.addEventListener("click", function () {
-      _enqueueCurrentRun(state);
-      if (context && context.setPage) context.setPage("playground");
-    });
+    // TOP-01: the Queue branch runs the SAME validation as the Run path
+    // (shell → method → reference → guidance → runnable). Queueing a
+    // blocked config would only fail at drain time — block honestly here
+    // with the same visible reason instead.
+    var _queueGate = _queueEnqueueGate(state);
+    if (_queueGate) {
+      primaryBtn.disabled = true;
+      primaryBtn.title = _queueGate;
+      if (reason) {
+        reason.appendChild(el("p", {
+          "data-testid": "topbar-gate-reason",
+          text: _queueGate,
+          style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+        }));
+      }
+    } else {
+      primaryBtn.disabled = false;
+      primaryBtn.onclick = null;
+      primaryBtn.addEventListener("click", function () {
+        _enqueueCurrentRun(state);
+        if (context && context.setPage) context.setPage("playground");
+      });
+    }
   } else if (_isModernRunSelected(state)) {
     primaryBtn.disabled = true;
     var _savedOnclick = primaryBtn.onclick;
@@ -12731,7 +13661,7 @@ function renderWorkspaceTopBar(state, context, actions) {
       primaryBtn.onclick = function () {
         primaryBtn.disabled = true;
         var lbl = primaryBtn.querySelector('[data-testid="run-btn-label"]');
-        if (lbl) lbl.textContent = "Running…";
+        if (lbl) lbl.textContent = _RUN_LABELS.running;
         _modernRunSubmit(state, context, actions, primaryBtn);
         if (primaryBtn.disabled === false && typeof _gatedOnclick === "function") _gatedOnclick();
         void _savedOnclick;
@@ -12740,8 +13670,17 @@ function renderWorkspaceTopBar(state, context, actions) {
       primaryBtn.onclick = null;
     }
   } else {
+    // TOP-01: no workflow selected — mirror the title-only reason into the
+    // visible reason line so the block cause is never hover-only.
     primaryBtn.disabled = true;
     primaryBtn.title = "Select a workflow to run";
+    if (reason) {
+      reason.appendChild(el("p", {
+        "data-testid": "topbar-gate-reason",
+        text: "Select a workflow to run",
+        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+      }));
+    }
   }
   right.appendChild(primaryBtn);
 
@@ -12775,6 +13714,24 @@ function renderWorkspaceTopBar(state, context, actions) {
       _drainNextGroup(state, context, actions);
     });
     right.appendChild(runQueueBtn);
+    // TOP-01: the Run-queue button's disabled causes were title-only
+    // (hover-only). Mirror them into the visible topbar reason line — no
+    // new hover-only reasons. The queued-identity block reason
+    // (pg._queueBlockedReason) surfaces here too.
+    try {
+      var _qWhy = pg._queueBlockedReason || "";
+      if (!queue.length) _qWhy = _qWhy || "Queue is empty — queue a run first";
+      else if (_shellGate) _qWhy = _shellGate;
+      else if (_isRunActive(state)) _qWhy = "Run in progress";
+      else if (pg._batchApplying) _qWhy = "Batch running";
+      if (_qWhy && runQueueBtn.disabled && reason) {
+        reason.appendChild(el("p", {
+          "data-testid": "topbar-queue-reason",
+          text: _qWhy,
+          style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
+        }));
+      }
+    } catch (_eQ) {}
 
     // View queued runs: opens the queue viewer (per-run data + delete).
     var viewQueueBtn = el("button", {
@@ -12911,9 +13868,13 @@ function renderToolSubmenu(state, context, actions) {
       text: _postSubmenuNote(sub),
     }));
   } else if (_isPlaceholderSubtool(sub)) {
+    // GEN-03: single placeholderCopy phrasing (1-line notice; the preserved
+    // detail lives in the shelf/canvas notices, mirrored here as title).
+    var _subCopy = placeholderCopy(sub);
     body.appendChild(el("span", {
       class: "comfymodal-studio-tool-submenu-note",
-      text: (STUDIO_SUBTOOL_LABELS[sub] || sub) + " arrives in a later phase — execution is disabled.",
+      text: _subCopy.line,
+      title: _subCopy.detail,
     }));
   }
 
@@ -13823,12 +14784,13 @@ async function _linkUrlAsSource(state, context, actions, role, url, prefix) {
   }
   var store = _shelfStore(state);
   var identity = _selectionIdentity(store);
+  var _pgen = _presetAsyncToken();
   _setLinkState(state, true, "");
   _refreshShelfSection(state, context, actions);
   try {
     var hit = await _resolveVerifiedCanvasFile(state, url);
     if (hit && hit.filename) {
-      if (_selectionIdentity(_shelfStore(state)) !== identity) return "";
+      if (_presetAsyncStale(_pgen) || _selectionIdentity(_shelfStore(state)) !== identity) return "";
       commitShelfValue(state, context, actions, role, hit.filename);
       var keptFile = store.controlValues ? store.controlValues[role] : "";
       if (!keptFile) bomb("saving the value (it was rejected)", hit.filename);
@@ -13851,7 +14813,7 @@ async function _linkUrlAsSource(state, context, actions, role, url, prefix) {
     }
     var mod = await import("./studio-field-blocks.js");
     var name = await mod.uploadImageBlob(blob, mod.uniqueImageName(prefix || "studio-link"));
-    if (_selectionIdentity(_shelfStore(state)) !== identity) return "";
+    if (_presetAsyncStale(_pgen) || _selectionIdentity(_shelfStore(state)) !== identity) return "";
     // The tab's bundle can predate a Wizard save (new versions): when the
     // role is unknown, refresh the same version once before giving up.
     var _storeNow = _shelfStore(state);
@@ -13952,12 +14914,13 @@ async function _shelfUseHistoryAsSource(state, context, actions, role, url) {
   if (!url) return;
   var store = _shelfStore(state);
   var identity = _selectionIdentity(store);
+  var _pgen = _presetAsyncToken();
   // Prefer the on-drive file when the URL resolves to one (no duplicate).
   // Verified: phantom annotated names fall through to fetch → upload below.
   var hit = null;
   try { hit = await _resolveVerifiedCanvasFile(state, url); } catch (_e) { hit = null; }
   if (hit && hit.filename) {
-    if (_selectionIdentity(_shelfStore(state)) !== identity) return;
+    if (_presetAsyncStale(_pgen) || _selectionIdentity(_shelfStore(state)) !== identity) return;
     commitShelfValue(state, context, actions, role, hit.filename);
     if (state.playground) state.playground.sourceFollowsCanvas = true;
     _recordImageEdge(state, hit.filename, url);
@@ -13969,6 +14932,7 @@ async function _shelfUseHistoryAsSource(state, context, actions, role, url) {
   }
   var name = await _linkUrlAsSource(state, context, actions, role, url, "studio-history");
   if (!name) return;
+  if (_presetAsyncStale(_pgen)) return;
   _setCanvasImage(state, _lineageDisplayUrl(name), context);
   _clearBoundMask(state, context, actions);
   _refreshShelfSection(state, context, actions);
@@ -14018,19 +14982,29 @@ function _shelfRenderInput(role, entry, value, onChange, extra) {
     return block.render(imgProps);
   }
   // Model/file roles without options stay read-only: the value comes from
-  // the preset/graph (upload is out of scope, same as the mapped controls).
+  // the workflow/graph (upload is out of scope, same as the mapped
+  // controls). EDIT-02/PRS-01: preserved value visible as read-only text
+  // with an inline reason (not title-only); "preset" renamed to workflow.
   if (kind === "model-picker") {
     var opts = (entry && entry.enum_options) || [];
     if (!opts.length) {
+      var roWrap = el("div", { style: "display:flex;flex-direction:column;gap:2px;" });
       var ro = el("input", {
         type: "text",
         class: "comfymodal-input comfymodal-studio-text-input",
         value: value !== undefined && value !== null ? String(value) : "",
         disabled: true,
-        title: "File selection is out of scope — value preserved from preset/graph.",
+        "aria-readonly": "true",
+        title: "File selection is out of scope — value preserved from workflow/graph.",
         "data-testid": testid,
       });
-      return ro;
+      roWrap.appendChild(ro);
+      roWrap.appendChild(el("span", {
+        class: "comfymodal-studio-control-note",
+        text: "Value preserved from the workflow — editing is not available here.",
+        style: "font-size:var(--font-size-xs);color:var(--color-text-muted);",
+      }));
+      return roWrap;
     }
     return block.render({ value: value, testid: testid, label: _shelfDisplayName(role, entry), models: opts, onChange: onChange });
   }
@@ -14192,9 +15166,31 @@ function commitShelfValue(state, context, actions, role, rawValue) {
   var schema = ready.wf.getControlSchema(ready.store);
   var validation = ready.wf.validateMappedValues(ready.store.controlValues || {}, schema);
   ready.store.setControlValues(validation.values);
+  // The prompt roles are mapping-independent core state: on a stale-mapping
+  // version the prompt role is absent from the control schema (its node is
+  // not in the graph) while scalar roles like seed survive, so validation
+  // above would strip every prompt keystroke even though the editor keeps
+  // showing it — and preset capture would then save "". Preserve a
+  // committed prompt string in the store (the run-payload builder
+  // re-validates, so nothing schema-unknown reaches the backend).
+  try {
+    if ((role === "prompt" || role === "positive_prompt")
+      && typeof rawValue === "string" && rawValue !== ""
+      && ready.store.controlValues[role] !== rawValue) {
+      var _kept = Object.assign({}, ready.store.controlValues);
+      _kept[role] = rawValue;
+      ready.store.setControlValues(_kept);
+    }
+  } catch (_eKeep) {}
   ready.store.setReasons((validation.errors || []).map(function (e) { return e.message; }));
   _syncMappedShelfInput(role, ready.store.controlValues[role]);
   _syncWorkflowGating(state, context, actions);
+  // Phase 12: preset-covered config edits mark the active preset dirty (never
+  // autosave the preset record). Image-kind roles are runtime pixels, not
+  // preset config, so they never dirty the preset.
+  try {
+    if (!ready.wf.isImageControlRole(role, schema[role])) _markPresetDirty(state);
+  } catch (_eDirty) {}
   var pg = state.playground;
   if (pg._shelfSaveTimer) clearTimeout(pg._shelfSaveTimer);
   pg._shelfSaveTimer = setTimeout(function () {
@@ -14609,24 +15605,118 @@ function renderShelfSection(state, context, actions) {
 }
 
 function _populateShelfSection(section, state, context, actions) {
+  // SEL-01: shelf-homed Select/Inpaint controls mount here (after the
+  // prompt card) when Edit → Select is active on a ready shelf. Detach the
+  // live host BEFORE clearing so the paint session (moved here by
+  // _rehomePaintControlsToShelf, listeners intact) survives re-renders —
+  // but only when the host belongs to the LIVE selection identity. A
+  // same-type workflow switch drops the stale host so the new selection's
+  // controls mount fresh (never a preserved stale session).
+  var _keepPaintHost = section.querySelector
+    ? section.querySelector('[data-testid="inpaint-shelf-controls"]') : null;
+  var _liveSelId = "";
+  try { _liveSelId = _selectionIdentity(_shelfStore(state)); } catch (_eSel) { _liveSelId = ""; }
+  try {
+    var _hostId = (state && state.playground && state.playground._paintHostIdentity) || "";
+    if (_keepPaintHost && _liveSelId && _hostId && _hostId !== _liveSelId) _keepPaintHost = null;
+  } catch (_eHostId) {}
+  if (_keepPaintHost && _keepPaintHost.parentNode) {
+    _keepPaintHost.parentNode.removeChild(_keepPaintHost);
+  }
+  // EXP: same detach-before-clear for the Expand host (identity-keyed like
+  // Select — a same-type switch drops the stale host).
+  var _keepExpandHost = section.querySelector
+    ? section.querySelector('[data-testid="expand-shelf-controls"]') : null;
+  try {
+    var _expHostId = (state && state.playground && state.playground._expandHostIdentity) || "";
+    if (_keepExpandHost && _liveSelId && _expHostId && _expHostId !== _liveSelId) _keepExpandHost = null;
+  } catch (_eExpHostId) {}
+  if (_keepExpandHost && _keepExpandHost.parentNode) {
+    _keepExpandHost.parentNode.removeChild(_keepExpandHost);
+  }
   while (section.firstChild) section.removeChild(section.firstChild);
   var store = _shelfStore(state);
   if (!store || !store.workflowId) {
-    section.appendChild(el("p", {
+    if (_keepPaintHost) { /* paint needs a workflow — drop the orphan */ }
+    if (_keepExpandHost) { /* expand needs a workflow — drop the orphan */ }
+    // GEN-02: the dead-end note gains a next-action button (same panel,
+    // no extra clicks on the common path).
+    var _emptyWrap = el("div", { style: "margin:4px 0;" });
+    _emptyWrap.appendChild(el("p", {
       class: "comfymodal-studio-control-note",
       "data-testid": "shelf-empty",
       text: "Select a Workflow to see its fields.",
+      style: "margin:0 0 6px;",
     }));
+    var _emptyPick = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": "shelf-empty-pick",
+      text: "Choose workflow",
+      title: "Focus the workflow picker",
+    });
+    _emptyPick.addEventListener("click", function () { _focusWorkflowSelector(); });
+    _emptyWrap.appendChild(_emptyPick);
+    section.appendChild(_emptyWrap);
     return;
   }
 
   var ready = _shelfReady(state);
   if (!ready) {
-    section.appendChild(el("p", {
+    if (_keepPaintHost) { /* paint needs a mapped shelf — drop the orphan */ }
+    if (_keepExpandHost) { /* expand needs a mapped shelf — drop the orphan */ }
+    // GEN-02: unmapped workflows gain next-action buttons: pick another
+    // workflow, or repair the mapping in the Workflow Setup Wizard
+    // (same panel, no extra clicks on the common path).
+    var _unmappedWrap = el("div", { style: "margin:4px 0;" });
+    _unmappedWrap.appendChild(el("p", {
       class: "comfymodal-studio-control-note",
       "data-testid": "shelf-unmapped",
       text: "This Workflow has no mapped fields yet.",
+      style: "margin:0 0 6px;",
     }));
+    var _unmappedRow = el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;" });
+    var _unmappedPick = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": "shelf-unmapped-pick",
+      text: "Choose a different workflow",
+      title: "Open the workflow picker",
+    });
+    _unmappedPick.addEventListener("click", function () {
+      try { _openShelfPickerDialog(state, context, actions); } catch (_ePick) {}
+    });
+    _unmappedRow.appendChild(_unmappedPick);
+    var _unmappedMap = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": "shelf-unmapped-map",
+      text: "Map fields in the Wizard",
+      title: "Open the Workflow Setup Wizard to map this workflow's fields",
+    });
+    _unmappedMap.addEventListener("click", function () {
+      try {
+        var _st = _shelfStore(state);
+        var _wid = _st && _st.workflowId ? String(_st.workflowId) : "";
+        var _ver = _st && _st.workflowVersionId ? String(_st.workflowVersionId) : "";
+        var _api = (context && context.apiBase) || "/comfymodal";
+        import("./studio-workflow-setup-wizard.js").then(function (mod) {
+          if (!mod || typeof mod.openWorkflowSetupWizard !== "function") return;
+          mod.openWorkflowSetupWizard(function () {
+            try { _refreshShelfSection(state, context, actions); } catch (_eR) {}
+            try { if (context && context.setPage) context.setPage("playground"); } catch (_eP) {}
+          }, _api, {
+            workflowId: _wid,
+            workflowVersionId: _ver,
+            initialStep: "features",
+            initialMapping: null,
+          });
+        }).catch(function () {});
+      } catch (_eMap) {}
+    });
+    _unmappedRow.appendChild(_unmappedMap);
+    _unmappedWrap.appendChild(_unmappedRow);
+    section.appendChild(_unmappedWrap);
     return;
   }
   var entries = _shelfEntries(state);
@@ -14636,6 +15726,45 @@ function _populateShelfSection(section, state, context, actions) {
     var promptCard = _shelfFieldCard(state, context, actions, entries, promptRole, null, true);
     if (promptCard) section.appendChild(promptCard);
   }
+
+  // SEL-01: the Select/Inpaint conventional controls live in this
+  // shelf host (populated by _rehomePaintControlsToShelf on full renders,
+  // preserved live across shelf-only refreshes via _keepPaintHost).
+  try {
+    if (activeToolOf(state) === "inpaint" || _isSelectOnI2I(state)
+      || (activeModeOf(state) === "edit" && activeSubtoolOf(state) === "select")) {
+      if (_keepPaintHost && _keepPaintHost.firstChild) {
+        section.appendChild(_keepPaintHost);
+      } else {
+        var _paintHost = el("div", {
+          "data-testid": "inpaint-shelf-controls",
+          style: "margin:8px 0;",
+        });
+        _paintHost.appendChild(ShelfSectionTitle("Select"));
+        section.appendChild(_paintHost);
+      }
+    }
+  } catch (_ePaintHost) {}
+
+  // EXP: the Expand/Outpaint dimensions + method + Save form lives in this
+  // shelf host (populated by _rehomeExpandControlsToShelf; same identity
+  // keying as Select via _keepExpandHost). The canvas keeps the image +
+  // direct overlays only.
+  try {
+    if (activeToolOf(state) === "outpaint" || _isExpandOnI2I(state)
+      || (activeModeOf(state) === "edit" && activeSubtoolOf(state) === "expand")) {
+      if (_keepExpandHost && _keepExpandHost.firstChild) {
+        section.appendChild(_keepExpandHost);
+      } else {
+        var _expandHost = el("div", {
+          "data-testid": "expand-shelf-controls",
+          style: "margin:8px 0;",
+        });
+        _expandHost.appendChild(ShelfSectionTitle("Expand"));
+        section.appendChild(_expandHost);
+      }
+    }
+  } catch (_eExpandHost) {}
 
   // Phase 8: references are an ordered collection beside the ordinary
   // controls — rendered only in the References view, never as mapped
@@ -14752,11 +15881,20 @@ function _populateShelfSection(section, state, context, actions) {
 
 // Re-populate the mounted Shelf section in place. When a Workflow was just
 // selected (no Shelf mounted yet), mount it after the workflow selector.
+// Either way, re-attempt the Select control rehome afterwards: late async
+// mounts (editor or shelf arriving after the full render) must not leave
+// the controls stranded in the center.
 function _refreshShelfSection(state, context, actions) {
   _syncShelfLegacyVisibility(state);
   var section = document.querySelector('[data-testid="shelf-section"]');
   if (section && section.isConnected) {
     _populateShelfSection(section, state, context, actions);
+    try {
+      var _panel = document.querySelector('[data-testid="control-panel"]');
+      var _ws = document.querySelector('[data-testid="workspace"]') || document;
+      _rehomePaintControlsToShelf(_panel, _ws, state);
+      _rehomeExpandControlsToShelf(_panel, _ws, state);
+    } catch (_eRe) {}
     return;
   }
   if (!_isModernRunSelected(state)) return;
@@ -14974,4 +16112,1324 @@ async function _performShelfSwitch(state, context, actions, nextId, reuse) {
   // Old output stays visible but stale until a new run completes.
   if (hadOutput) pg._shelfStaleOutput = true;
   if (context && context.setPage) context.setPage("playground");
+}
+
+// ── Studio V3 presets (Phase 12, frontend lane) ──────────────────────────
+// Compact picker/menu wired into the workflow selector section (see
+// _populateWorkflowSelectorInner) + the explicit Load pipeline:
+//
+//   shape-validate -> cancel pending async -> CLEAR image-bearing runtime +
+//   persisted restoration pointers -> hydrate config (omitted sections reset
+//   to neutral, never inherit) -> revalidate workflow/methods/mappings ->
+//   render.
+//
+// NEVER auto-runs/submits. Edits mark dirty, never autosave the preset
+// record. Output settings are a Playground-scoped override (never POST
+// global settings). Style load restores the base prompt and the submit path
+// composes the fragment exactly once (see _studioStyleForRun).
+
+// Selection-generation guard for all upload/guidance/history callbacks (see
+// _materializeUrlToFile, _linkUrlAsSource, _linkUrlAsReferenceCard,
+// _linkUrlAsGuidanceGuide, _shelfUseHistoryAsSource). A preset Load bumps
+// the generation; in-flight completions observe the stale token and abandon
+// instead of writing into the freshly hydrated state.
+var _presetAsyncGen = 0;
+function _presetAsyncToken() { return _presetAsyncGen; }
+function _presetAsyncStale(token) { return token !== _presetAsyncGen; }
+
+// Dirty tracking: edits mark the active preset dirty, never autosave it.
+// _notePresetEdit is for state-less setters (style selection); the picker
+// syncs the pending flag onto state at render. _markPresetDirty sets state
+// directly when a preset is active.
+var _presetDirtyPending = false;
+function _notePresetEdit() { _presetDirtyPending = true; }
+function _markPresetDirty(state) {
+  try {
+    var pg = state && state.playground;
+    if (pg && pg._activePresetId) pg._presetDirty = true;
+    else _presetDirtyPending = true;
+  } catch (_e) { _presetDirtyPending = true; }
+}
+function _syncPresetDirtyPending(state) {
+  try {
+    var pg = state && state.playground;
+    if (_presetDirtyPending && pg && pg._activePresetId) pg._presetDirty = true;
+  } catch (_e) {}
+  _presetDirtyPending = false;
+}
+
+/**
+ * CLEAR all image-bearing runtime + persisted restoration pointers for a
+ * preset Load: canvas outputs, submitted-source stash, image control values,
+ * saved method masks (savedMask*), reference card files, guide images, sketch
+ * session pixels/base, paint canvases, compare slots, and the auto
+ * history-preview pointer. Config (prompts, methods, references method,
+ * guidance engagement, sketch settings, post recipe, output options) is
+ * untouched — the hydrate step owns it. Never throws.
+ */
+function clearPresetImageState(state) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  var store = null;
+  try { store = _shelfStore(state); } catch (_e) { store = null; }
+  // Outputs + submitted-source stash. A preset Load is a full replace: the
+  // working canvas image is an output owner, so clear the in-memory pointer
+  // AND its sessionStorage restore key (otherwise the stale image returns
+  // on the next workspace mount while the preset shows other config).
+  try {
+    pg.lastRunOutput = null;
+    pg._selectedRun = null;
+    pg._submittedSource = "";
+    pg.sourceFollowsCanvas = false;
+    pg.canvasImageUrl = "";
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        sessionStorage.removeItem("comfymodal.studio.playground.canvas.v1");
+      }
+    } catch (_eSS) {}
+  } catch (_e1) {}
+  // Image control values (runtime pixels, never preset config).
+  try {
+    if (store && store.controlValues && typeof store.controlValues === "object") {
+      var wf = pg._workflowRunModule;
+      var schema = {};
+      try { schema = (wf && wf.getControlSchema(store)) || {}; } catch (_eS) { schema = {}; }
+      ["source_image", "mask"].forEach(function (role) {
+        if (Object.prototype.hasOwnProperty.call(store.controlValues, role)) {
+          delete store.controlValues[role];
+        }
+      });
+      Object.keys(store.controlValues).forEach(function (role) {
+        try {
+          if (wf && typeof wf.isImageControlRole === "function"
+            && wf.isImageControlRole(role, schema[role])) {
+            delete store.controlValues[role];
+          }
+        } catch (_eR) {}
+      });
+      try {
+        if (wf && typeof wf.validateMappedValues === "function") {
+          var v = wf.validateMappedValues(store.controlValues, schema);
+          store.controlValues = v.values || {};
+        }
+      } catch (_eV) {}
+    }
+  } catch (_e2) {}
+  // Persisted mask pointers (bound to the previous source image).
+  try {
+    if (store && store.workflowId) {
+      saveWorkflowMethods(store.workflowId, { savedMask: "", savedMaskSource: "" });
+    }
+  } catch (_e3) {}
+  try { _clearBoundMask(state, null, null); } catch (_e3b) {}
+  // Reference card files (labels are config and hydrate separately).
+  try {
+    if (store && store.workflowId) {
+      saveReferenceCards(store.workflowId, store.workflowVersionId || "", []);
+    }
+  } catch (_e4) {}
+  try {
+    var t = _referenceTracker(state);
+    if (t) { t.busy = {}; t.errors = {}; t.seq = {}; t.pending = {}; }
+  } catch (_e4b) {}
+  // Guide images (guidance engagement is config and hydrates separately).
+  try {
+    var g = _guidanceOf(state);
+    if (g) {
+      g.guideImages = {};
+      g.guideBusy = false;
+      g.guideError = "";
+      var draft = null;
+      try { draft = _guidanceDraftOf(state); } catch (_eD) { draft = null; }
+      if (draft) draft.guideImage = "";
+    }
+  } catch (_e5) {}
+  // Sketch pixels/base + paint canvases (settings hydrate separately).
+  try {
+    var box = _liveSketchBox();
+    if (box && box._sketchSession) {
+      try { box._sketchSession.reset(); } catch (_eS2) {}
+      try {
+        if (typeof box._sketchSession.setBaseImage === "function") {
+          var _r = box._sketchSession.setBaseImage(null);
+          if (_r && typeof _r.catch === "function") _r.catch(function () {});
+        }
+      } catch (_eB) {}
+    }
+  } catch (_e6) {}
+  try { _clearPaintOverlays(); } catch (_e6b) {}
+  // Compare slots: cleared through the compare module's own session API
+  // (the module owns that state — never by deleting PG props here).
+  // Compare preset-id selections are experiment config and stay.
+  try {
+    if (typeof clearCompareSession === "function") clearCompareSession();
+  } catch (_e7) {}
+  // Auto history-preview pointer (stored run history itself is untouched).
+  try { _clearPlaygroundPreviewId(); } catch (_e8) {}
+  // Pending preset async is cancelled by the caller's generation bump; stale
+  // in-flight busy flags must not strand the UI as busy.
+  try {
+    if (pg._refUpload && typeof pg._refUpload === "object") {
+      pg._refUpload.busy = {};
+    }
+  } catch (_e9) {}
+}
+
+/**
+ * Resolve a dedicated-override workflow id to the backend pair shape
+ * ({workflow_id, workflow_version_id}|null) via the workflow library's
+ * latest version. Unresolvable ids degrade to null — a half-override can
+ * never satisfy the contract, so it is not carried.
+ */
+function _presetOverridePair(state, workflowId) {
+  var id = String(workflowId || "").trim();
+  if (!id) return null;
+  try {
+    var store = _shelfStore(state);
+    var library = (store && Array.isArray(store.library)) ? store.library : [];
+    for (var i = 0; i < library.length; i++) {
+      var w = library[i];
+      if (w && String(w.workflow_id) === id) {
+        var ver = w.latest_version_id != null ? String(w.latest_version_id) : "";
+        if (ver) return { workflow_id: id, workflow_version_id: ver };
+        return null;
+      }
+    }
+  } catch (_e) {}
+  return null;
+}
+
+/**
+ * Gather owner-native snapshots for preset capture (best-effort; absent
+ * owners are skipped and stay absent downstream). No projection here —
+ * capturePresetState (web/studio-presets.js) projects through the closed
+ * allowlists. Never includes image bytes/pointers (callers must still treat
+ * the result as untrusted until validated).
+ */
+function capturePlaygroundPresetState(state) {
+  var owners = {};
+  var pg = state && state.playground;
+  var store = null;
+  try { store = _shelfStore(state); } catch (_e) { store = null; }
+  // Core: prompts + scalar controls + shell mode. The visible prompt is
+  // resolved from the structured draft (structured mode) or either prompt
+  // alias — never the store alone: validated commits drop schema-unknown
+  // roles, so on a stale-mapping version the prompt keystrokes never reach
+  // store.controlValues while scalar roles like seed survive (the editor DOM
+  // keeps showing them). resolvePresetPrompt owns that priority; the
+  // projection below re-applies it identically.
+  try {
+    var cv = (store && store.controlValues && typeof store.controlValues === "object")
+      ? store.controlValues
+      : {};
+    var promptParts = null;
+    var promptMode = (pg && pg._promptMode) || "text";
+    try {
+      var _drafts = (pg && pg._structuredPromptParts) || {};
+      var _hit = _drafts[_structuredDraftKey(state)];
+      if (_hit && typeof _hit === "object") promptParts = _hit;
+    } catch (_eP) { promptParts = null; }
+    owners.core = {
+      positive_prompt: cv.positive_prompt != null ? cv.positive_prompt : "",
+      prompt: cv.prompt != null ? cv.prompt : "",
+      structuredParts: promptParts,
+      promptMode: promptMode,
+      negative_prompt: cv.negative_prompt != null ? cv.negative_prompt : "",
+      controls: Object.assign({}, cv),
+      activeMode: activeModeOf(state),
+      activeSubtool: activeSubtoolOf(state),
+      skipTextGenerate: !!(store && store.skipTextGenerate),
+    };
+  } catch (_eCore) {}
+  // Styles: selection + raw (uncomposed) base prompt. The base is the user
+  // prompt as resolved above — the catalog style fragment composes once at
+  // submit time (_studioStyleForRun), so it is never stored here.
+  try {
+    var sel = loadStyleSelection();
+    var basePrompt = "";
+    try {
+      basePrompt = resolvePresetPrompt(owners.core || {});
+    } catch (_eB) { basePrompt = ""; }
+    owners.styles = {
+      setId: sel.setId || "",
+      selectedId: sel.selectedId || "",
+      basePrompt: basePrompt,
+    };
+  } catch (_eStyles) {}
+  // Layout: persisted native draft (text config only; bg pixels live in the
+  // editor closure and are never in the draft).
+  try {
+    var draft = loadLayoutDraft();
+    if (draft) owners.layout = draft;
+  } catch (_eLayout) {}
+  // Methods: per-workflow prefs with overrides resolved to the backend pair
+  // shape (savedMask* are image pointers; the allowlist projection drops them
+  // downstream; bare string ids degrade to null there when unresolvable, so
+  // resolve them here while the library is at hand).
+  try {
+    if (store && store.workflowId) {
+      var methodPrefs = loadWorkflowMethods(store.workflowId);
+      owners.methods = {
+        inpaintMethod: methodPrefs.inpaintMethod,
+        inpaintOverride: _presetOverridePair(state, methodPrefs.inpaintOverride),
+        expandMethod: methodPrefs.expandMethod,
+        expandOverride: _presetOverridePair(state, methodPrefs.expandOverride),
+        padTop: methodPrefs.padTop,
+        padRight: methodPrefs.padRight,
+        padBottom: methodPrefs.padBottom,
+        padLeft: methodPrefs.padLeft,
+      };
+    }
+  } catch (_eMethods) {}
+  // References: method + pair override + cards (projection keeps non-empty
+  // labels only).
+  try {
+    var prefs = (store && store.workflowId) ? loadWorkflowMethods(store.workflowId) : {};
+    owners.references = {
+      method: prefs.referenceMethod || "",
+      override: _presetOverridePair(state, prefs.referenceOverride),
+      cards: _referenceCardsOf(state),
+    };
+  } catch (_eRefs) {}
+  // Guidance: confirmed-mapping config only (never the guide image).
+  try {
+    owners.guidance = snapshotGuidanceForPreset(_guidancePresetInput(state));
+  } catch (_eGuidance) {}
+  // Sketch: tool settings + dims (never pixels/base). The panels drive the
+  // live ENGINE directly, so engine.getState() is the true source for tool
+  // keys; the session only learns settings through setToolSettings (preset
+  // apply + the engine-mirror subscription below). Either way the snapshot
+  // helper allowlists settings + dims, so strokes/base can never leak.
+  try {
+    var liveBox = _liveSketchBox();
+    var session = liveBox && liveBox._sketchSession;
+    var _engine = liveBox && liveBox._sketchEngine;
+    var engineState = null;
+    try {
+      if (_engine && typeof _engine.getState === "function") engineState = _engine.getState() || null;
+    } catch (_eES) { engineState = null; }
+    if (session && typeof session.getToolSettings === "function") {
+      owners.sketch = snapshotSketchSettingsForPreset(session, engineState);
+    } else if (engineState) {
+      var _dims = _sketchBlankDims(state);
+      owners.sketch = snapshotSketchSettingsForPreset(
+        { getToolSettings: function () { return {}; }, width: _dims.width, height: _dims.height },
+        engineState
+      );
+    }
+  } catch (_eSketch) {}
+  // Post: last saved allowlisted recipe (or defaults when never saved).
+  try {
+    var liveRecipe = null;
+    try {
+      if (typeof window !== "undefined" && window.__ppRecipe && window.__ppRecipe.recipe) {
+        liveRecipe = window.__ppRecipe.recipe;
+      }
+    } catch (_eR) { liveRecipe = null; }
+    var postMod = null;
+    void postMod;
+    owners.post = { recipe: liveRecipe };
+  } catch (_ePost) {}
+  // Output: effective options in the FLAT contract shape (global prefs
+  // overlaid with the active Playground-scoped override, when one is active).
+  try {
+    var snap = snapshotOutputForPreset();
+    if (snap) {
+      var over = pg && pg._presetOutputSection;
+      var flat = {
+        output_format: snap.output_format,
+        quality: snap.quality,
+        auto_save_local: !!snap.auto_save_local,
+        save_folder: snap.save_folder,
+        save_metadata_sidecar: snap.save_metadata_sidecar !== false,
+        preview_default: snap.preview_default,
+        preview_codec: snap.preview_codec,
+        preview_quality: snap.preview_quality,
+      };
+      if (over && typeof over === "object") {
+        ["output_format", "quality", "auto_save_local", "save_folder", "save_metadata_sidecar",
+          "preview_default", "preview_codec", "preview_quality"].forEach(function (key) {
+          if (over[key] !== undefined) flat[key] = over[key];
+        });
+      }
+      owners.output = flat;
+    }
+  } catch (_eOutput) {}
+  return owners;
+}
+
+/**
+ * Build the resolveGuidanceState-style input the guidance preset hook needs,
+ * minus the guide image (never carried). Mirrors _syncGuidanceStatus inputs
+ * without fetching.
+ */
+function _guidancePresetInput(state) {
+  var g = null;
+  try { g = _guidanceOf(state); } catch (_e) { g = null; }
+  if (!g) return { engaged: false };
+  var store = null;
+  try { store = _shelfStore(state); } catch (_e2) { store = null; }
+  var identity = null;
+  try { identity = _guidanceIdentityOf(state); } catch (_e3) { identity = null; }
+  var key = identity && identity.status === "resolved"
+    ? _guidanceMappingKey(identity.sha, g.mode)
+    : "";
+  var cached = key && g.mappings[key] !== undefined ? g.mappings[key] : undefined;
+  var draft = null;
+  try { draft = _guidanceDraftOf(state) || {}; } catch (_e4) { draft = {}; }
+  return {
+    engaged: g.engaged === true,
+    mode: g.mode,
+    identity: identity,
+    mapping: cached !== undefined && cached !== null ? { record: cached } : null,
+    mappingUnconfirmed: false,
+    missingDependencies: [],
+    anchors: null,
+    anchorPick: String(draft.anchorPick || ""),
+    guideImage: "",
+    keepExisting: !!draft.keepExisting,
+    mechanism: draft.mechanism,
+    conditioning: { strength: draft.strength, start: draft.start, end: draft.end },
+  };
+}
+
+/**
+ * Live target context for planPresetHydration: version-bound references,
+ * catalog style ids, and the confirmed guidance mapping (read-only fetch
+ * when the cache misses; NEVER a mapping-save/confirm call). deps supports
+ * {getGuidanceMapping} for tests/browser mocks where the server is absent.
+ */
+async function _presetTargetContext(state, store, deps) {
+  var ctx = {};
+  var d = deps && typeof deps === "object" ? deps : {};
+  var wf = (state && state.playground && state.playground._workflowRunModule) || null;
+  // References: bound method + slot capacity from the live mapping.
+  try {
+    if (wf && store && typeof wf.resolveReferenceCapability === "function") {
+      var cap = wf.resolveReferenceCapability(store);
+      if (cap && cap.hasMapping) {
+        ctx.boundReferenceMethod = cap.boundMethod || "";
+        ctx.referenceSlotCount = Array.isArray(cap.refSlots) ? cap.refSlots.length : 0;
+      } else {
+        ctx.boundReferenceMethod = "";
+      }
+    }
+  } catch (_eRef) {}
+  // Styles: catalog ids for stale-id detection.
+  try {
+    var sets = _styleSets();
+    ctx.styleSetIds = sets.map(function (s) { return s && s.id; }).filter(Boolean);
+    var ids = [];
+    sets.forEach(function (s) {
+      (_styleSetStyles(s) || []).forEach(function (st) {
+        if (st && st.id) ids.push(String(st.id));
+      });
+    });
+    ctx.styleIds = ids;
+  } catch (_eStyles) {}
+  // Guidance: confirmed mapping for the live model identity (cache first;
+  // one read-only fetch on miss, stored through the existing cache lane).
+  try {
+    var g = _guidanceOf(state);
+    var identity = _guidanceIdentityOf(state);
+    if (g && identity && identity.status === "resolved") {
+      var modes = ["canny", "depth", "pose"];
+      var presetMode = d.guidanceMode && modes.indexOf(d.guidanceMode) !== -1
+        ? d.guidanceMode
+        : normalizeGuidanceMode(g.mode);
+      var key = _guidanceMappingKey(identity.sha, presetMode);
+      var cached = g.mappings[key];
+      if (cached === undefined) {
+        var fetchMapping = typeof d.getGuidanceMapping === "function"
+          ? d.getGuidanceMapping
+          : getGuidanceMapping;
+        var apiBase = (d.apiBase) || "/comfymodal";
+        var res = await fetchMapping(apiBase, identity.sha, presetMode);
+        if (res && res.status !== "error" && res.mapping && typeof res.mapping === "object") {
+          g.mappings[key] = res.mapping;
+          cached = res.mapping;
+        } else if (!res || res.status === "error") {
+          g.mappings[key] = null;
+          cached = null;
+        }
+      }
+      if (cached) {
+        var staleInfo = null;
+        try { staleInfo = _guidanceStaleInfo(state, cached); } catch (_eS) { staleInfo = null; }
+        ctx.guidanceMapping = {
+          record: cached,
+          stale: !!(staleInfo && staleInfo.stale),
+          staleDetail: staleInfo ? String(staleInfo.staleDetail || "") : "",
+        };
+      } else {
+        ctx.guidanceMapping = null;
+      }
+    } else {
+      ctx.guidanceMapping = null;
+    }
+  } catch (_eGuidance) {
+    ctx.guidanceMapping = null;
+  }
+  // Mapping fingerprint passthrough (best-effort; warn on drift).
+  try {
+    var mapping = store && (store.runContext && store.runContext.mapping);
+    ctx.mappingFingerprint = (mapping && (mapping.fingerprint || mapping.revision)) || "";
+  } catch (_eFp) {}
+  return ctx;
+}
+
+/**
+ * Explicit preset Load pipeline. Never auto-runs. Returns
+ * {ok, issues?, superseded?}.
+ */
+async function loadStudioPreset(state, context, actions, record, deps) {
+  var pg = state && state.playground;
+  if (!pg) return { ok: false, error: "Playground is not initialized." };
+  var rec = record && typeof record === "object" ? record : {};
+  var studioState = rec.studio_state !== undefined ? rec.studio_state : null;
+  // 1. Shape-validate BEFORE touching any state (fail closed on blocking).
+  var validation = null;
+  try {
+    validation = validatePresetState(studioState);
+  } catch (_eV) {
+    validation = { ok: false, issues: [{ section: "", code: "invalid", message: "Saved workflow state is invalid.", blocking: true }] };
+  }
+  if (!validation.ok) {
+    var firstBlocking = null;
+    for (var bi = 0; bi < validation.issues.length; bi++) {
+      if (validation.issues[bi].blocking) { firstBlocking = validation.issues[bi]; break; }
+    }
+    pg._presetLoadError = (firstBlocking && firstBlocking.message) || "Saved workflow state is invalid.";
+    pg._presetWarnings = [];
+    try { _rerenderWorkflowSection(state, context, actions); } catch (_eR) {}
+    return { ok: false, error: pg._presetLoadError, issues: validation.issues };
+  }
+  // 2. Cancel pending async (selection-generation guard).
+  var myGen = ++_presetAsyncGen;
+  var stale = function () { return _presetAsyncGen !== myGen; };
+  // 3. CLEAR image-bearing runtime + persisted restoration pointers.
+  try { clearPresetImageState(state); } catch (_eC) {}
+  if (stale()) return { ok: false, superseded: true };
+  // 4. Hydrate config against the live target context.
+  var store = null;
+  try { store = _shelfStore(state); } catch (_eS) { store = null; }
+  var targetCtx = {};
+  try {
+    var presetMode = null;
+    try {
+      var _g0 = studioState && studioState.guidance;
+      if (_g0 && _g0.mode) presetMode = _g0.mode;
+    } catch (_eG0) {}
+    targetCtx = await _presetTargetContext(state, store, Object.assign({}, deps, { guidanceMode: presetMode }));
+  } catch (_eT) { targetCtx = {}; }
+  if (stale()) return { ok: false, superseded: true };
+  var plan = null;
+  try {
+    plan = planPresetHydration(studioState, targetCtx);
+  } catch (_eP) {
+      pg._presetLoadError = "Saved workflow could not be planned.";
+    try { _rerenderWorkflowSection(state, context, actions); } catch (_eR2) {}
+    return { ok: false, error: pg._presetLoadError };
+  }
+  var sections = plan.sections || {};
+  var warnings = (plan.issues || []).filter(function (i) { return !i.blocking; })
+    .map(function (i) { return "[" + (i.section || "preset") + "] " + i.message; });
+  var get = function (name) {
+    return sections[name] && sections[name].value != null ? sections[name].value : null;
+  };
+  // Fingerprint drift: bounded warning, rest preserved.
+  try {
+    var recFp = rec.mapping_fingerprint != null ? String(rec.mapping_fingerprint) : "";
+    if (recFp && targetCtx.mappingFingerprint && recFp !== String(targetCtx.mappingFingerprint)) {
+      warnings.push("[workflow] Workflow mapping changed since this saved workflow was stored — method/mapping sections were revalidated against the live version.");
+    }
+  } catch (_eFp) {}
+  // Core: prompts + scalar controls (exact-version only) + shell mode.
+  try {
+    var core = get("core");
+    var wf = pg._workflowRunModule;
+    if (core && store && wf && typeof wf.applyPresetCoreOverrides === "function") {
+      var expected = rec.workflow_version_id != null ? String(rec.workflow_version_id) : undefined;
+      var applied = wf.applyPresetCoreOverrides(store, { core: core }, { expectedVersionId: expected });
+      if (applied && !applied.ok) {
+        warnings.push("[core] Saved workflow targets a different workflow version — prompt/mode restored, mapped controls left neutral.");
+      }
+    }
+    if (core) {
+      // Shell mode through the validated path (unknown pairs fall back).
+      try {
+        var shell = _validShell(core.activeMode, core.activeSubtool);
+        if (shell) {
+          pg.activeMode = shell.mode;
+          pg.activeSubtool = shell.subtool;
+          try { saveShellSelection(shell.mode, shell.subtool); } catch (_eSh) {}
+        }
+      } catch (_eShell) {}
+      try {
+        if (store) store.setSkipTextGenerate(core.skipTextGenerate === true);
+      } catch (_eSkip) {}
+    }
+  } catch (_eCore) {}
+  if (stale()) return { ok: false, superseded: true };
+  // Styles: selection + raw base prompt; submit-time composes the fragment
+  // exactly once (see _studioStyleForRun). Missing id -> bounded warning.
+  try {
+    var styles = get("styles");
+    var stylesPresent = sections.styles && sections.styles.present;
+    if (stylesPresent && styles) {
+      var styleWarning = null;
+      for (var wi = 0; wi < warnings.length; wi++) {
+        if (warnings[wi].indexOf("[styles]") === 0) styleWarning = warnings[wi];
+      }
+      if (styles.selectedId) {
+        var found = null;
+        try { found = _styleById(styles.selectedId); } catch (_eF) { found = null; }
+        if (!found) {
+          if (!styleWarning) warnings.push("[styles] Style '" + styles.selectedId + "' is not in the catalog — style left unset, rest preserved.");
+          try { saveStyleSelection({ selectedId: "", setId: "" }); } catch (_eCS) {}
+        } else {
+          var setFor = null;
+          try { setFor = _styleSetForId(styles.selectedId); } catch (_eSF) {}
+          try {
+            saveStyleSelection({ selectedId: styles.selectedId, setId: (setFor && setFor.id) || styles.setId || "" });
+          } catch (_eSS) {}
+        }
+      } else {
+        try { saveStyleSelection({ selectedId: "", setId: styles.setId || "" }); } catch (_eCS2) {}
+      }
+      // Base prompt restores raw (uncomposed); composition happens once at submit.
+      // Written mapping-independently like the core prompt above (a stale
+      // schema would otherwise strip it back to ""). Clearing an absent
+      // prompt is a no-op — never invent the key on prompt-less versions.
+      if (typeof styles.basePrompt === "string" && store) {
+        try {
+          var schema = (wf && wf.getControlSchema(store)) || {};
+          var _hasPrompt = Object.prototype.hasOwnProperty.call(schema, "prompt")
+            || Object.prototype.hasOwnProperty.call(schema, "positive_prompt")
+            || Object.prototype.hasOwnProperty.call((store.controlValues || {}), "prompt")
+            || Object.prototype.hasOwnProperty.call((store.controlValues || {}), "positive_prompt");
+          if (styles.basePrompt !== "" || _hasPrompt) {
+            store.controlValues = Object.assign({}, store.controlValues, { prompt: styles.basePrompt });
+            if (wf && typeof wf.validateMappedValues === "function") {
+              var _sv = wf.validateMappedValues(store.controlValues, schema);
+              store.controlValues = _sv.values || store.controlValues;
+              if (typeof store.controlValues.prompt !== "string") {
+                store.controlValues = Object.assign({}, store.controlValues, { prompt: styles.basePrompt });
+              }
+            }
+          }
+        } catch (_eBP) {}
+      }
+    } else if (stylesPresent === false && sections.styles) {
+      // Omitted section resets to neutral, never inherits.
+      try { saveStyleSelection({ selectedId: "" }); } catch (_eCN) {}
+    }
+  } catch (_eStyles) {}
+  // A preset replace owns the prompt: drop the version-keyed structured field
+  // breakdown so the Structured editor re-derives from the loaded prompt
+  // (subject = whole prompt) instead of showing stale pre-load parts. An
+  // empty loaded prompt therefore clears the editor (no inheritance).
+  try {
+    if (pg && pg._structuredPromptParts) delete pg._structuredPromptParts[_structuredDraftKey(state)];
+  } catch (_eSP) {}
+  // Layout: flat contract section back into the native persisted-draft lane
+  // (remount on render picks it up; bg pixels are never restored). Palette
+  // strings split back into the native lists; box type/desc/text pass
+  // through verbatim.
+  try {
+    var layout = get("layout");
+    if (sections.layout) {
+      var splitPalette = function (value) {
+        if (Array.isArray(value)) return value.slice();
+        if (typeof value === "string" && value) return value.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+        return [];
+      };
+      var native = {
+        high_level_description: layout ? String(layout.high_level_description || "") : "",
+        background: layout ? String(layout.background || "") : "",
+        style_mode: layout ? String(layout.style_mode || "none") : "none",
+        aesthetics: layout ? String(layout.aesthetics || "") : "",
+        lighting: layout ? String(layout.lighting || "") : "",
+        photo: layout ? String(layout.photo || "") : "",
+        medium: layout ? String(layout.medium || "") : "",
+        art_style: layout ? String(layout.art_style || "") : "",
+        color_palette: layout ? splitPalette(layout.color_palette) : [],
+        width: (layout && layout.width) || 1024,
+        height: (layout && layout.height) || 1024,
+        bgBrightness: (layout && layout.bgBrightness) || 25,
+        boxes: layout && Array.isArray(layout.boxes)
+          ? layout.boxes.map(function (b) {
+            var isText = b.type === "text";
+            return {
+              id: b.id || "", type: isText ? "text" : "obj",
+              kind: isText ? "text" : "object",
+              x: b.x || 0, y: b.y || 0, w: b.w || 0, h: b.h || 0,
+              label: b.desc || "", desc: b.desc || "", text: b.text || "",
+              color: "", color_palette: splitPalette(b.color_palette),
+              nobbox: !!b.nobbox, locked: !!b.locked,
+            };
+          })
+          : [],
+      };
+      try { saveLayoutDraft(native); } catch (_eLD) {}
+    }
+  } catch (_eLayout) {}
+  // Methods: whole-record replace of the known keys. Null/unchosen methods
+  // reset to the lane defaults explicitly (merge-patch would otherwise
+  // inherit stale values); lane-unknown method ids warn bounded and reset
+  // instead of silently inheriting. Pairs collapse to workflow-id strings.
+  try {
+    var methods = get("methods");
+    if (methods && store && store.workflowId) {
+      var NEUTRAL_INPAINT = "crop_stitch";
+      var NEUTRAL_EXPAND = "pad_preserve";
+      var inpaint = (typeof methods.inpaintMethod === "string" && methods.inpaintMethod)
+        ? methods.inpaintMethod
+        : null;
+      if (inpaint && PRESET_INPAINT_METHODS.indexOf(inpaint) === -1) {
+        warnings.push("[methods] Inpaint method '" + inpaint + "' is unknown to this Studio version — reset to default.");
+        inpaint = null;
+      }
+      var expand = (typeof methods.expandMethod === "string" && methods.expandMethod)
+        ? methods.expandMethod
+        : null;
+      if (expand && PRESET_EXPAND_METHODS.indexOf(expand) === -1) {
+        warnings.push("[methods] Expand method '" + expand + "' is unknown to this Studio version — reset to default.");
+        expand = null;
+      }
+      var methodPatch = {
+        inpaintMethod: inpaint || NEUTRAL_INPAINT,
+        expandMethod: expand || NEUTRAL_EXPAND,
+        padTop: (typeof methods.padTop === "number" && isFinite(methods.padTop)) ? methods.padTop : 0,
+        padRight: (typeof methods.padRight === "number" && isFinite(methods.padRight)) ? methods.padRight : 256,
+        padBottom: (typeof methods.padBottom === "number" && isFinite(methods.padBottom)) ? methods.padBottom : 0,
+        padLeft: (typeof methods.padLeft === "number" && isFinite(methods.padLeft)) ? methods.padLeft : 0,
+      };
+      var inpair = methods.inpaintOverride;
+      methodPatch.inpaintOverride = (inpair && typeof inpair === "object" && inpair.workflow_id) || "";
+      var expair = methods.expandOverride;
+      methodPatch.expandOverride = (expair && typeof expair === "object" && expair.workflow_id) || "";
+      try {
+        saveWorkflowMethods(store.workflowId, methodPatch);
+      } catch (_eM) {}
+    }
+  } catch (_eMethods) {}
+  // References: labels-only cards with fresh ids + empty files (images are
+  // picked explicitly after load); method/pair-override replace.
+  try {
+    var refs = get("references");
+    if (refs && store && store.workflowId) {
+      var refPair = refs.override;
+      try {
+        saveWorkflowMethods(store.workflowId, {
+          referenceMethod: refs.method || "",
+          referenceOverride: (refPair && typeof refPair === "object" && refPair.workflow_id) || "",
+        });
+      } catch (_eRM) {}
+      try {
+        var nextCards = (refs.cards || []).map(function (card, i) {
+          var freshId = "ref_" + Date.now().toString(36) + "_" + i;
+          try {
+            var _wfm = pg._workflowRunModule;
+            if (_wfm && typeof _wfm.makeReferenceCardId === "function") {
+              freshId = _wfm.makeReferenceCardId();
+            }
+          } catch (_eId) {}
+          return { id: freshId, file: "", label: (card && card.label) || "" };
+        });
+        _saveReferenceCardsOf(state, nextCards, true);
+      } catch (_eRC) {}
+    }
+  } catch (_eRefs) {}
+  if (stale()) return { ok: false, superseded: true };
+  // Guidance: engagement + mode + conditioning into the draft; the confirmed
+  // mapping re-resolves live (read-only). A missing/stale live mapping keeps
+  // the requested mode restored and the normal Phase-9 check
+  // (_syncGuidanceStatus below) shows its blocked/manual state with the run
+  // gate engaged — plan issues stay blocking, but the mode is never silently
+  // reset to Off. NEVER calls mapping-save/confirm APIs and never
+  // substitutes mappings.
+  try {
+    var gz = get("guidance");
+    var g = _guidanceOf(state);
+    if (g) {
+      if (!gz || gz.engaged !== true) {
+        var nextInput = resetGuidanceForPreset(_guidancePresetInput(state));
+        g.engaged = false;
+        try {
+          var _gd = _guidanceDraftOf(state);
+          if (_gd) {
+            delete _gd.presetModelSha256;
+            delete _gd.presetMappingRevision;
+          }
+        } catch (_eGD) {}
+        void nextInput;
+      } else {
+        g.engaged = true;
+        if (gz.mode) g.mode = gz.mode;
+        try {
+          var _gd2 = _guidanceDraftOf(state);
+          if (_gd2) {
+            if (gz.mode) _gd2.mode = gz.mode;
+            if (gz.conditioning && typeof gz.conditioning === "object") {
+              _gd2.strength = gz.conditioning.strength;
+              _gd2.start = gz.conditioning.start;
+              _gd2.end = gz.conditioning.end;
+            }
+            _gd2.anchorPick = "";
+            _gd2.guideImage = "";
+            _gd2.presetModelSha256 = String(gz.model_sha256 || "");
+            _gd2.presetMappingRevision = gz.mapping_revision != null ? String(gz.mapping_revision) : "";
+          }
+        } catch (_eGD2) {}
+        // Revalidate against the live mapping (read-only refresh).
+        try { _refreshGuidanceMapping(state, context, actions); } catch (_eGM) {}
+      }
+      try { _syncGuidanceStatus(state); } catch (_eGS) {}
+    }
+  } catch (_eGuidance) {}
+  // Sketch: settings via the shell hook (or pending for the next mount);
+  // base stays cleared (presets carry no pixels).
+  try {
+    var sketch = get("sketch");
+    if (sketch) {
+      var applied = false;
+      try {
+        var liveBox = _liveSketchBox();
+        var sess = liveBox && liveBox._sketchSession;
+        if (sess && typeof sess.setToolSettings === "function") {
+          var shellMod = await import("./studio-sketch-shell.js");
+          if (shellMod && typeof shellMod.applySketchSettingsFromPreset === "function") {
+            applied = shellMod.applySketchSettingsFromPreset(sess, sketch) === true;
+          }
+        }
+      } catch (_eSA) { applied = false; }
+      if (stale()) return { ok: false, superseded: true };
+      if (!applied) pg._presetSketchPending = JSON.parse(JSON.stringify(sketch));
+      else pg._presetSketchPending = null;
+    } else if (sections.sketch) {
+      pg._presetSketchPending = null;
+    }
+  } catch (_eSketch) {}
+  // Post: seed the allowlisted recipe (consumed by addItem on render);
+  // omitted -> neutral. Undo stacks drop in the hook.
+  try {
+    var post = get("post");
+    if (sections.post) {
+      try {
+        var postMod = await import("./studio-postprocess.js");
+        if (postMod && typeof postMod.applyPostRecipeForPreset === "function") {
+          postMod.applyPostRecipeForPreset(post && post.recipe ? post.recipe : null);
+        }
+      } catch (_ePA) {}
+    }
+  } catch (_ePost) {}
+  if (stale()) return { ok: false, superseded: true };
+  // Output: Playground-scoped override for this run path only.
+  try {
+    var output = get("output");
+    pg._presetOutputSection = (sections.output && sections.output.present && output) ? output : null;
+  } catch (_eOutput) {
+    pg._presetOutputSection = null;
+  }
+  // 5. Revalidate workflow/methods/mappings (fail-closed reasons surface in
+  // the existing gating line; never silent-switch anything). Prompt aliases
+  // are mapping-independent core state (see commitShelfValue): preserve them
+  // across validation so a load onto a stale-mapping version keeps the
+  // restored prompt instead of stripping it back to "".
+  try {
+    if (store && wf && typeof wf.validateMappedValues === "function") {
+      var _schema = {};
+      try { _schema = wf.getControlSchema(store) || {}; } catch (_eSC) {}
+      var _keepPrompt = null;
+      var _keepPositive = null;
+      try {
+        var _preVals = store.controlValues || {};
+        if (typeof _preVals.prompt === "string") _keepPrompt = _preVals.prompt;
+        if (typeof _preVals.positive_prompt === "string") _keepPositive = _preVals.positive_prompt;
+      } catch (_eKP) {}
+      var _mv = wf.validateMappedValues(store.controlValues || {}, _schema);
+      store.controlValues = _mv.values || {};
+      try {
+        if (_keepPrompt !== null && typeof store.controlValues.prompt !== "string") {
+          store.controlValues.prompt = _keepPrompt;
+        }
+        if (_keepPositive !== null && typeof store.controlValues.positive_prompt !== "string") {
+          store.controlValues.positive_prompt = _keepPositive;
+        }
+      } catch (_eKR) {}
+      try {
+        store.setReasons((_mv.errors || []).map(function (e) { return e.message; }));
+      } catch (_eSR) {}
+    }
+  } catch (_eReval) {}
+  try { _syncGuidanceStatus(state); } catch (_eGS2) {}
+  try { _syncWorkflowGating(state, context, actions); } catch (_eG) {}
+  // Explicit Load replaces the scope draft: persist the hydrated image-free
+  // values + the active identity, then render. NEVER auto-run.
+  var versionId = store ? String(store.workflowVersionId || "") : "";
+  var presetId = rec.preset_id != null ? String(rec.preset_id) : "";
+  var updatedAt = rec.updated_at != null ? String(rec.updated_at) : "";
+  try {
+    if (versionId && presetId) {
+      var draftValues = {};
+      Object.keys(sections).forEach(function (name) {
+        if (sections[name] && sections[name].value !== undefined) {
+          try {
+            draftValues[name] = JSON.parse(JSON.stringify(sections[name].value));
+          } catch (_eJ) {}
+        }
+      });
+      savePresetWorkingDraft(versionId, presetId, updatedAt, draftValues);
+    }
+  } catch (_eDraft) {}
+  try {
+    if (versionId) saveShelfValues(store.workflowId, versionId, store.controlValues || {});
+  } catch (_eShelf) {}
+  pg._activePresetId = presetId || "";
+  pg._presetDirty = false;
+  pg._presetLoadError = "";
+  pg._presetWarnings = warnings.slice(0, 8);
+  try { saveActivePreset({ presetId: presetId, workflowVersionId: versionId, updatedAt: updatedAt }); } catch (_eAP) {}
+  try { _rerenderWorkflowSection(state, context, actions); } catch (_eRender) {}
+  // Reconcile/remount the workspace (P1): the Load cleared the canvas owners
+  // above (canvasImageUrl + session key), but the mounted canvas DOM still
+  // shows the stale image. A full workspace pass remounts from the cleared
+  // state (empty canvas) and reconciles the shelf with the hydrated config.
+  try { if (context && context.setPage) context.setPage("playground"); } catch (_eMount) {}
+  return { ok: true, issues: plan.issues || [] };
+}
+
+/**
+ * Reload restore: re-apply the active preset ONLY when the stored identity
+ * still matches the live version + record revision exactly. Any drift
+ * clears the active preset (a stale draft never resurrects).
+ */
+async function _restoreActivePresetIfMatching(state, context, actions) {
+  var sel = null;
+  try { sel = loadActivePreset(); } catch (_e) { sel = null; }
+  if (!sel || !sel.presetId) return;
+  var store = null;
+  try { store = _shelfStore(state); } catch (_e2) { store = null; }
+  var liveVersion = store ? String(store.workflowVersionId || "") : "";
+  if (!liveVersion || String(sel.workflowVersionId || "") !== liveVersion) {
+    try { clearActivePreset(); } catch (_e3) {}
+    return;
+  }
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  var rec = null;
+  try {
+    var envelope = await getPreset(apiBase, sel.presetId);
+    rec = normalizePresetRecord(envelope);
+  } catch (_e4) { rec = null; }
+  if (!rec || String(rec.updated_at || "") !== String(sel.updatedAt || "") || !rec.updated_at) {
+    try { clearActivePreset(); } catch (_e5) {}
+    return;
+  }
+  if (String(rec.workflow_version_id || "") !== liveVersion) {
+    try { clearActivePreset(); } catch (_e6) {}
+    return;
+  }
+  await loadStudioPreset(state, context, actions, rec, { apiBase: apiBase });
+}
+
+// ── Compact saved-workflow picker/menu ───────────────────────────────────
+// Mounted inside the workflow selector section. Saved-workflow selector,
+// Save (name required + "Images are not saved with workflows." note),
+// Update-when-selected (whole-state replace), overflow Rename/Duplicate/
+// Delete/copy-forward, workflow-edited indicator. No full-screen manager.
+// ("preset" stays as the internal identifier: testids, state, API.)
+
+function _presetPickerEl(state, context, actions) {
+  var pg = state && state.playground;
+  if (!pg) return null;
+  try { _syncPresetDirtyPending(state); } catch (_e) {}
+  var store = null;
+  try { store = _shelfStore(state); } catch (_e2) { store = null; }
+  var versionId = store ? String(store.workflowVersionId || "") : "";
+  var box = el("div", {
+    class: "comfymodal-studio-preset-picker",
+    "data-testid": "preset-picker",
+    style: "margin-top:8px;padding-top:8px;border-top:1px solid var(--color-border, #333);",
+  });
+  var head = el("div", { style: "display:flex;align-items:center;gap:8px;flex-wrap:wrap;" });
+  head.appendChild(el("label", {
+    text: "Saved workflow",
+    style: "font-size:12px;color:#aaa;",
+  }));
+  var select = el("select", {
+    "data-testid": "preset-select",
+    class: "comfymodal-input",
+    "aria-label": "Saved workflow",
+    style: "max-width:220px;",
+  });
+  var none = document.createElement("option");
+  none.value = "";
+  none.textContent = "None";
+  select.appendChild(none);
+  var items = [];
+  try {
+    items = Array.isArray(pg._presetListCacheItems) ? pg._presetListCacheItems : [];
+  } catch (_eI) { items = []; }
+  items.forEach(function (p) {
+    var o = document.createElement("option");
+    o.value = String(p.preset_id || "");
+    o.textContent = String(p.name || p.preset_id || "saved workflow");
+    if (pg._activePresetId && String(p.preset_id) === String(pg._activePresetId)) o.selected = true;
+    select.appendChild(o);
+  });
+  if (!versionId) {
+    select.disabled = true;
+    select.title = "Select a workflow version first.";
+  }
+  select.addEventListener("change", function () {
+    var pid = select.value || "";
+    if (!pid) {
+      try {
+        pg._activePresetId = "";
+        pg._presetDirty = false;
+        pg._presetOutputSection = null;
+        pg._presetWarnings = [];
+        pg._presetLoadError = "";
+        clearActivePreset();
+      } catch (_eN) {}
+      try { _rerenderWorkflowSection(state, context, actions); } catch (_eR) {}
+      return;
+    }
+    select.disabled = true;
+    var apiBase = (context && context.apiBase) || "/comfymodal";
+    getPreset(apiBase, pid).then(function (envelope) {
+      select.disabled = false;
+      var rec = normalizePresetRecord(envelope);
+      if (!rec) {
+        pg._presetLoadError = "Saved workflow is no longer available.";
+        try { _rerenderWorkflowSection(state, context, actions); } catch (_eR2) {}
+        return;
+      }
+      loadStudioPreset(state, context, actions, rec, { apiBase: apiBase }).then(function () {
+        try { _rerenderWorkflowSection(state, context, actions); } catch (_eR3) {}
+      });
+    }, function () {
+      select.disabled = false;
+      pg._presetLoadError = "Saved workflow could not be loaded.";
+      try { _rerenderWorkflowSection(state, context, actions); } catch (_eR4) {}
+    });
+  });
+  head.appendChild(select);
+  // Dirty indicator. PRS-01: user-facing copy says workflow-edited;
+  // "preset" stays as the internal identifier (testid/state) only.
+  if (pg._activePresetId && pg._presetDirty) {
+    head.appendChild(el("span", {
+      "data-testid": "preset-dirty",
+      text: "• workflow edited",
+      title: "Edits since the workflow was loaded — Update to save them.",
+      style: "font-size:11px;color:#d9a441;",
+    }));
+  }
+  // Update-when-selected (whole-state replace). Disabled unless dirty.
+  if (pg._activePresetId) {
+    var updateBtn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": "preset-update",
+      text: "Update",
+      title: "Replace the saved workflow with the current state (whole-state replace).",
+    });
+    if (!pg._presetDirty) updateBtn.disabled = true;
+    updateBtn.addEventListener("click", function () {
+      updateBtn.disabled = true;
+      var apiBase = (context && context.apiBase) || "/comfymodal";
+      var owners = null;
+      try { owners = capturePlaygroundPresetState(state); } catch (_eC) { owners = {}; }
+      var built = null;
+      try {
+        built = buildPresetSavePayload({
+          name: _presetActiveName(state) || "workflow",
+          studio_state: capturePresetState(owners),
+        });
+      } catch (_eB) { built = null; }
+      if (!built || !built.ok) {
+        pg._presetLoadError = (built && built.error) || "Current state cannot be saved as a saved workflow.";
+        updateBtn.disabled = false;
+        try { _rerenderWorkflowSection(state, context, actions); } catch (_eR) {}
+        return;
+      }
+      updatePreset(apiBase, pg._activePresetId, { studio_state: built.payload.studio_state }).then(function (envelope) {
+        updateBtn.disabled = false;
+        var rec = normalizePresetRecord(envelope) || null;
+        pg._presetDirty = false;
+        if (rec && rec.updated_at) {
+          try {
+            saveActivePreset({
+              presetId: String(rec.preset_id || pg._activePresetId),
+              workflowVersionId: versionId,
+              updatedAt: String(rec.updated_at),
+            });
+          } catch (_eS) {}
+        }
+        try { _refreshPresetList(state, context, function () {
+          _rerenderWorkflowSection(state, context, actions);
+        }); } catch (_eL) {}
+      }, function () {
+        updateBtn.disabled = false;
+        pg._presetLoadError = "Saved workflow update failed.";
+        try { _rerenderWorkflowSection(state, context, actions); } catch (_eR2) {}
+      });
+    });
+    head.appendChild(updateBtn);
+  }
+  box.appendChild(head);
+  // Save row: name input + Save (name required) + images note.
+  var saveRow = el("div", { style: "display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap;" });
+  var nameInput = el("input", {
+    type: "text",
+    class: "comfymodal-input comfymodal-studio-text-input",
+    "data-testid": "preset-save-name",
+    placeholder: "New workflow name",
+    "aria-label": "New workflow name",
+    style: "max-width:180px;",
+  });
+  saveRow.appendChild(nameInput);
+  var saveBtn = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn",
+    "data-testid": "preset-save",
+    text: "Save",
+    title: "Save the current state as a saved workflow under this workflow version.",
+  });
+  if (!versionId) saveBtn.disabled = true;
+  saveBtn.addEventListener("click", function () {
+    var name = "";
+    try { name = String(nameInput.value || "").trim(); } catch (_eN) { name = ""; }
+    if (!name) {
+      pg._presetLoadError = "Name is required.";
+      try { _rerenderWorkflowSection(state, context, actions); } catch (_eR) {}
+      return;
+    }
+    saveBtn.disabled = true;
+    var apiBase = (context && context.apiBase) || "/comfymodal";
+    var owners = null;
+    try { owners = capturePlaygroundPresetState(state); } catch (_eC) { owners = {}; }
+    var built = null;
+    try {
+      built = buildPresetSavePayload({ name: name, studio_state: capturePresetState(owners) });
+    } catch (_eB) { built = null; }
+    if (!built || !built.ok) {
+        pg._presetLoadError = (built && built.error) || "Current state cannot be saved as a saved workflow.";
+      saveBtn.disabled = false;
+      try { _rerenderWorkflowSection(state, context, actions); } catch (_eR2) {}
+      return;
+    }
+    createVersionPreset(apiBase, versionId, built.payload).then(function (envelope) {
+      saveBtn.disabled = false;
+      var rec = normalizePresetRecord(envelope);
+      if (!rec) {
+        pg._presetLoadError = "Saved workflow save failed.";
+        try { _rerenderWorkflowSection(state, context, actions); } catch (_eR3) {}
+        return;
+      }
+      loadStudioPreset(state, context, actions, rec, { apiBase: apiBase }).then(function () {
+        try { _refreshPresetList(state, context, function () {
+          _rerenderWorkflowSection(state, context, actions);
+        }); } catch (_eL) {}
+      });
+    }, function () {
+      saveBtn.disabled = false;
+      pg._presetLoadError = "Saved workflow save failed.";
+      try { _rerenderWorkflowSection(state, context, actions); } catch (_eR4) {}
+    });
+  });
+  saveRow.appendChild(saveBtn);
+  saveRow.appendChild(el("span", {
+    text: "Images are not saved with workflows.",
+    style: "font-size:11px;color:#888;",
+  }));
+  box.appendChild(saveRow);
+  // Overflow: Rename / Duplicate / Delete / copy-forward.
+  if (pg._activePresetId) {
+    var overflow = el("details", { "data-testid": "preset-overflow" });
+    overflow.appendChild(el("summary", { text: "Workflow actions", style: "font-size:11px;color:#aaa;cursor:pointer;" }));
+    var mkRow = function (testid, label, placeholder, btnText, onGo) {
+      var row = el("div", { style: "display:flex;gap:6px;margin-top:4px;flex-wrap:wrap;align-items:center;" });
+      row.appendChild(el("span", { text: label, style: "font-size:11px;color:#aaa;min-width:90px;" }));
+      var input = el("input", {
+        type: "text", class: "comfymodal-input",
+        "data-testid": testid + "-input", placeholder: placeholder,
+        style: "max-width:160px;",
+      });
+      row.appendChild(input);
+      var btn = el("button", {
+        type: "button", class: "comfymodal-secondary-btn",
+        "data-testid": testid, text: btnText,
+      });
+      btn.addEventListener("click", function () { onGo(input, btn); });
+      row.appendChild(btn);
+      return row;
+    };
+    var apiBaseOf = function () { return (context && context.apiBase) || "/comfymodal"; };
+    overflow.appendChild(mkRow("preset-rename", "Rename", "New name", "Rename", function (input, btn) {
+      var name = String((input && input.value) || "").trim();
+      if (!name) { pg._presetLoadError = "Name is required."; _rerenderWorkflowSection(state, context, actions); return; }
+      btn.disabled = true;
+      updatePreset(apiBaseOf(), pg._activePresetId, { name: name }).then(function () {
+        btn.disabled = false;
+        _refreshPresetList(state, context, function () { _rerenderWorkflowSection(state, context, actions); });
+      }, function () {
+        btn.disabled = false;
+        pg._presetLoadError = "Rename failed.";
+        _rerenderWorkflowSection(state, context, actions);
+      });
+    }));
+    overflow.appendChild(mkRow("preset-duplicate", "Duplicate", "Copy name (optional)", "Duplicate", function (input, btn) {
+      var name = String((input && input.value) || "").trim();
+      btn.disabled = true;
+      duplicatePreset(apiBaseOf(), pg._activePresetId, name ? { name: name } : {}).then(function () {
+        btn.disabled = false;
+        _refreshPresetList(state, context, function () { _rerenderWorkflowSection(state, context, actions); });
+      }, function () {
+        btn.disabled = false;
+        pg._presetLoadError = "Duplicate failed.";
+        _rerenderWorkflowSection(state, context, actions);
+      });
+    }));
+    var delRow = el("div", { style: "display:flex;gap:6px;margin-top:4px;align-items:center;" });
+    delRow.appendChild(el("span", { text: "Delete", style: "font-size:11px;color:#aaa;min-width:90px;" }));
+    var delBtn = el("button", {
+      type: "button", class: "comfymodal-secondary-btn",
+      "data-testid": "preset-delete", text: "Delete saved workflow",
+    });
+    delBtn.addEventListener("click", function () {
+      delBtn.disabled = true;
+      deletePreset(apiBaseOf(), pg._activePresetId).then(function () {
+        delBtn.disabled = false;
+        pg._activePresetId = "";
+        pg._presetDirty = false;
+        pg._presetOutputSection = null;
+        try { clearActivePreset(); } catch (_eC) {}
+        _refreshPresetList(state, context, function () { _rerenderWorkflowSection(state, context, actions); });
+      }, function () {
+        delBtn.disabled = false;
+        pg._presetLoadError = "Delete failed.";
+        _rerenderWorkflowSection(state, context, actions);
+      });
+    });
+    delRow.appendChild(delBtn);
+    overflow.appendChild(delRow);
+    // Copy-forward: target version select (versions of the current workflow).
+    var versions = [];
+    try {
+      var _store = _shelfStore(state);
+      versions = (_store && Array.isArray(_store.versions)) ? _store.versions : [];
+    } catch (_eV) { versions = []; }
+    if (versions.length > 1) {
+      var copyRow = el("div", { style: "display:flex;gap:6px;margin-top:4px;flex-wrap:wrap;align-items:center;" });
+      copyRow.appendChild(el("span", { text: "Copy to version", style: "font-size:11px;color:#aaa;min-width:90px;" }));
+      var verSel = el("select", { class: "comfymodal-input", "data-testid": "preset-copy-version" });
+      versions.forEach(function (v) {
+        if (!v || !v.workflow_version_id) return;
+        if (String(v.workflow_version_id) === String(versionId)) return;
+        var o = document.createElement("option");
+        o.value = String(v.workflow_version_id);
+        o.textContent = "v" + String(v.version_number != null ? v.version_number : v.workflow_version_id);
+        verSel.appendChild(o);
+      });
+      copyRow.appendChild(verSel);
+      var copyBtn = el("button", {
+        type: "button", class: "comfymodal-secondary-btn",
+        "data-testid": "preset-copy-forward", text: "Copy",
+      });
+      copyBtn.addEventListener("click", function () {
+        if (!verSel.value) return;
+        copyBtn.disabled = true;
+        copyPresetToVersion(apiBaseOf(), pg._activePresetId, { workflow_version_id: verSel.value }).then(function () {
+          copyBtn.disabled = false;
+          _refreshPresetList(state, context, function () { _rerenderWorkflowSection(state, context, actions); });
+        }, function () {
+          copyBtn.disabled = false;
+          pg._presetLoadError = "Copy-forward failed.";
+          _rerenderWorkflowSection(state, context, actions);
+        });
+      });
+      copyRow.appendChild(copyBtn);
+      overflow.appendChild(copyRow);
+    }
+    box.appendChild(overflow);
+  }
+  // Bounded per-feature warnings + load errors (fail-closed messaging).
+  var notes = [];
+  try {
+    if (pg._presetLoadError) notes.push({ text: pg._presetLoadError, color: "#f87171" });
+    (pg._presetWarnings || []).slice(0, 8).forEach(function (w) {
+      notes.push({ text: String(w), color: "#d9a441" });
+    });
+  } catch (_eN) {}
+  notes.forEach(function (n) {
+    box.appendChild(el("div", {
+      "data-testid": "preset-note",
+      class: "comfymodal-studio-control-note",
+      text: String(n.text).slice(0, 300),
+      style: "font-size:11px;color:" + n.color + ";margin-top:4px;",
+    }));
+  });
+  // Kick off the version-scoped list load (container-scoped re-render only).
+  try { _ensurePresetList(state, context); } catch (_eL) {}
+  return box;
+}
+
+function _presetActiveName(state) {
+  try {
+    var items = (state.playground && state.playground._presetListCacheItems) || [];
+    var active = state.playground && state.playground._activePresetId;
+    for (var i = 0; i < items.length; i++) {
+      if (String(items[i].preset_id) === String(active)) return String(items[i].name || "");
+    }
+  } catch (_e) {}
+  return "";
+}
+
+/** Refresh the cached version-scoped preset list, then re-render. */
+function _refreshPresetList(state, context, done) {
+  var pg = state && state.playground;
+  var store = null;
+  try { store = _shelfStore(state); } catch (_e) { store = null; }
+  var versionId = store ? String(store.workflowVersionId || "") : "";
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  if (!versionId) {
+    if (pg) { pg._presetListCacheItems = []; pg._presetListCacheVersion = ""; }
+    if (typeof done === "function") done();
+    return;
+  }
+  listVersionPresets(apiBase, versionId).then(function (envelope) {
+    if (pg) {
+      pg._presetListCacheItems = normalizePresetList(envelope);
+      pg._presetListCacheVersion = versionId;
+    }
+    if (typeof done === "function") done();
+  }, function () {
+    if (pg && pg._presetListCacheVersion !== versionId) pg._presetListCacheItems = [];
+    if (typeof done === "function") done();
+  });
+}
+
+/** Ensure the list is loaded for the live version (no-op when cached). */
+function _ensurePresetList(state, context) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  var store = null;
+  try { store = _shelfStore(state); } catch (_e) { store = null; }
+  var versionId = store ? String(store.workflowVersionId || "") : "";
+  if (!versionId) {
+    pg._presetListCacheItems = [];
+    pg._presetListCacheVersion = "";
+    return;
+  }
+  if (pg._presetListCacheVersion === versionId && Array.isArray(pg._presetListCacheItems)) return;
+  _refreshPresetList(state, context, function () {
+    try {
+      var container = (typeof document !== "undefined")
+        ? document.querySelector('[data-testid="workflow-selector-section"]')
+        : null;
+      if (container) _populateWorkflowSelector(container, state, context, pg._runActions || null);
+    } catch (_e) {}
+  });
 }

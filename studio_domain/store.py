@@ -1,11 +1,12 @@
 """Persistence layer for the Workflow domain.
 
-``WorkflowDomainStore`` manages five JSON collections (one file each) built
+``WorkflowDomainStore`` manages six JSON collections (one file each) built
 on the shared ``StudioJsonStore`` (thread-safe, atomic tmp+os.replace):
 
 * ``.studio_workflows.json``
 * ``.studio_workflow_versions.json``
 * ``.studio_workflow_mappings.json``
+* ``.studio_workflow_presets.json``
 * ``.studio_workflow_folders.json``
 
 Immutability rules enforced here:
@@ -15,6 +16,8 @@ Immutability rules enforced here:
 * ``insert_version`` raises ``ImmutableVersionError`` if the id already exists.
 * Exactly ONE Mapping per WorkflowVersion — ``set_mapping_for_version``
   replaces the previous mapping for that version inside one atomic update.
+* WorkflowPreset records are version-scoped and cascade with their
+  workflow; preset updates replace the record inside one atomic update.
 """
 
 from __future__ import annotations
@@ -29,14 +32,17 @@ from .models import (
     ImmutableVersionError,
     Mapping,
     MappingAlreadyExistsError,
+    PresetNotFoundError,
     Workflow,
     WorkflowDomainValidationError,
+    WorkflowPreset,
     WorkflowVersion,
 )
 
 WORKFLOWS_FILENAME = ".studio_workflows.json"
 VERSIONS_FILENAME = ".studio_workflow_versions.json"
 MAPPINGS_FILENAME = ".studio_workflow_mappings.json"
+PRESETS_FILENAME = ".studio_workflow_presets.json"
 FOLDERS_FILENAME = ".studio_workflow_folders.json"
 
 
@@ -49,6 +55,7 @@ class WorkflowDomainStore:
         self.workflows = StudioJsonStore(self._root / WORKFLOWS_FILENAME)
         self.versions = StudioJsonStore(self._root / VERSIONS_FILENAME)
         self.mappings = StudioJsonStore(self._root / MAPPINGS_FILENAME)
+        self.presets = StudioJsonStore(self._root / PRESETS_FILENAME)
         self.folders = StudioJsonStore(self._root / FOLDERS_FILENAME)
         # Serializes multi-collection transactions within this process so
         # imports and cascaded deletes cannot interleave across the four
@@ -213,6 +220,13 @@ class WorkflowDomainStore:
                     if row.get("workflow_version_id") not in version_ids
                 ]
 
+            def remove_presets(rows: list[dict[str, Any]]) -> None:
+                rows[:] = [
+                    row
+                    for row in rows
+                    if row.get("workflow_version_id") not in version_ids
+                ]
+
             def remove_workflow(rows: list[dict[str, Any]]) -> None:
                 rows[:] = [
                     row for row in rows if row.get("workflow_id") != workflow_id
@@ -220,6 +234,7 @@ class WorkflowDomainStore:
 
             self.versions.update(remove_versions)
             self.mappings.update(remove_mappings)
+            self.presets.update(remove_presets)
             self.workflows.update(remove_workflow)
         return True
 
@@ -290,6 +305,69 @@ class WorkflowDomainStore:
         return data
 
 
+    # ── Workflow Presets (version-scoped) ────────────────────────────────
+
+    def list_presets(self) -> list[dict[str, Any]]:
+        return self.presets.read()
+
+    def list_presets_for_version(
+        self, workflow_version_id: str
+    ) -> list[dict[str, Any]]:
+        return [
+            p
+            for p in self.presets.read()
+            if p.get("workflow_version_id") == workflow_version_id
+        ]
+
+    def get_preset(self, preset_id: str) -> dict | None:
+        return self._find(self.presets, "preset_id", preset_id)
+
+    def insert_preset(self, preset: WorkflowPreset) -> dict[str, Any]:
+        """Insert one preset. Uniqueness is checked inside the mutator."""
+        data = preset.to_dict()
+
+        def _mutate(rows: list[dict[str, Any]]) -> None:
+            if any(row.get("preset_id") == data["preset_id"] for row in rows):
+                raise WorkflowDomainValidationError(
+                    f"preset {data['preset_id']!r} already exists"
+                )
+            rows.append(data)
+
+        self.presets.update(_mutate)
+        return data
+
+    def update_preset(self, preset: WorkflowPreset) -> dict[str, Any]:
+        """Replace one preset record inside a single atomic update."""
+        data = preset.to_dict()
+        result: dict[str, Any] = {}
+
+        def _mutate(rows: list[dict[str, Any]]) -> None:
+            for index, existing in enumerate(rows):
+                if existing.get("preset_id") != data["preset_id"]:
+                    continue
+                rows[index] = data
+                result.update(data)
+                return
+            raise PresetNotFoundError(
+                f"preset {data['preset_id']!r} not found"
+            )
+
+        self.presets.update(_mutate)
+        return result
+
+    def delete_preset(self, preset_id: str) -> bool:
+        """Delete one preset; returns False when the id does not exist."""
+        removed = {"value": False}
+
+        def _mutate(rows: list[dict[str, Any]]) -> None:
+            before = len(rows)
+            rows[:] = [r for r in rows if r.get("preset_id") != preset_id]
+            removed["value"] = len(rows) != before
+
+        self.presets.update(_mutate)
+        return bool(removed["value"])
+
+
     # ── batch access helper (for enrichment) ─────────────────────────────
 
     def snapshot_all(self) -> dict[str, list[dict[str, Any]]]:
@@ -298,6 +376,7 @@ class WorkflowDomainStore:
             "workflows": self.workflows.read(),
             "versions": self.versions.read(),
             "mappings": self.mappings.read(),
+            "presets": self.presets.read(),
                         "folders": self.folders.read(),
         }
 
@@ -308,10 +387,11 @@ class WorkflowDomainStore:
         workflow: Workflow,
         version: WorkflowVersion,
         mapping: Mapping,
+        presets: list[WorkflowPreset] | None = None,
     ) -> dict[str, Any]:
         """Insert a complete imported Workflow graph atomically.
 
-        Either ALL of {Workflow, Version, Mapping} land, or
+        Either ALL of {Workflow, Version, Mapping, Presets} land, or
         NOTHING does — a failure at any step compensates by removing exactly
         the records already appended, restoring byte-identical collections.
 
@@ -323,15 +403,19 @@ class WorkflowDomainStore:
         * all uniqueness checks run up-front AND again inside each
           per-store mutator (mutators execute under that store's own lock,
           so the write-time checks are race-free);
-        * records are applied versions → mappings → workflow,
+        * every preset is validated (id present, version linkage to the
+          imported version, no duplicate ids) BEFORE any write;
+        * records are applied versions → mappings → presets → workflow,
           with the Workflow row LAST as the commit point;
         * on any exception the compensation pass deletes exactly the ids
           this transaction added; each removal is itself an atomic
           read-modify-write, so unrelated concurrent appends survive.
+          The version graph JSON/hash is never touched by preset handling.
         """
         wf_data = workflow.to_dict()
         ver_data = version.to_dict()
         mp_data = mapping.to_dict()
+        preset_rows = [p.to_dict() for p in (presets or [])]
         if not wf_data.get("workflow_id"):
             raise WorkflowDomainValidationError("import transaction requires a workflow id")
         if not ver_data.get("workflow_version_id"):
@@ -340,6 +424,23 @@ class WorkflowDomainStore:
             raise WorkflowDomainValidationError(
                 "import mapping must reference the imported version"
             )
+        seen_preset_ids: set[str] = set()
+        for row in preset_rows:
+            preset_id = str(row.get("preset_id", "") or "")
+            if not preset_id:
+                raise WorkflowDomainValidationError(
+                    "import preset requires a preset id"
+                )
+            if preset_id in seen_preset_ids:
+                raise WorkflowDomainValidationError(
+                    f"duplicate import preset id: {preset_id}"
+                )
+            seen_preset_ids.add(preset_id)
+            if row.get("workflow_version_id") != ver_data["workflow_version_id"]:
+                raise WorkflowDomainValidationError(
+                    f"import preset {preset_id} is not associated "
+                    "with the imported version"
+                )
         with self._import_lock:
             added: list[tuple[str, str]] = []
 
@@ -379,6 +480,17 @@ class WorkflowDomainStore:
                         f"mapping {mp_data['mapping_id']!r} already exists"
                     ),
                 )
+                for row in preset_rows:
+                    preset_id = str(row.get("preset_id", ""))
+                    _append_unique(
+                        self.presets,
+                        "preset_id",
+                        preset_id,
+                        row,
+                        WorkflowDomainValidationError(
+                            f"preset {preset_id!r} already exists"
+                        ),
+                    )
                 _append_unique(
                     self.workflows,
                     "workflow_id",
@@ -396,6 +508,7 @@ class WorkflowDomainStore:
             "workflow": wf_data,
             "version": ver_data,
             "mapping": mp_data,
+            "presets": preset_rows,
         }
 
     def _compensate_import(self, added: list[tuple[str, str]]) -> None:
@@ -409,6 +522,7 @@ class WorkflowDomainStore:
             "workflow_id": self.workflows,
             "workflow_version_id": self.versions,
             "mapping_id": self.mappings,
+            "preset_id": self.presets,
         }
         for id_key, record_id in reversed(added):
             store = stores[id_key]

@@ -28,7 +28,7 @@
 // only the generic primitives (el(), registerLayerHandler) and keeps its
 // own smaller aligned-stage implementation.
 
-import { el, registerLayerHandler } from "./studio-ui.js";
+import { el, missingImageCopy, registerLayerHandler } from "./studio-ui.js";
 
 const COMPARE_NARROW_QUERY = "(max-width: 640px)";
 const DEFAULT_POSITION = 50;
@@ -243,28 +243,34 @@ function _renderTray() {
   const st = _session.getState();
   if (!st.a && !st.b) return;
   _tray.appendChild(el("span", { class: "cm-compare-tray-title", text: "Compare" }));
-  _tray.appendChild(el("span", {
-    class: "cm-compare-tray-slot",
-    "data-testid": "cm-compare-tray-a",
-    text: "A: " + (_slotText(st.a) || "not chosen"),
-  }));
-  _tray.appendChild(el("span", {
-    class: "cm-compare-tray-slot",
-    "data-testid": "cm-compare-tray-b",
-    text: "B: " + (_slotText(st.b) || "not chosen"),
-  }));
+  // CMP-01: slots are gallery links, not dead labels. Text and testids are
+  // unchanged ("A: …"/"B: …", "not chosen" when empty) so existing selectors
+  // keep matching; the button opens the pair gallery with that side armed.
+  _tray.appendChild(_traySlot("a", st.a));
+  _tray.appendChild(_traySlot("b", st.b));
+  const ready = !!(st.a && st.b);
   const openBtn = el("button", {
     class: "comfymodal-secondary-btn cm-compare-tray-btn",
     "data-testid": "cm-compare-open",
     type: "button",
     text: "Compare images",
-    disabled: !(st.a && st.b),
+    disabled: !ready,
+    // CMP-01: the disabled reason is visible inline (below) and mirrored in
+    // the title so hover/keyboard contexts agree.
+    title: ready ? "Open the comparison view" : "Pick two images to compare",
     onclick: function () {
       if (openBtn.disabled) return;
       openCompareView(openBtn);
     },
   });
   _tray.appendChild(openBtn);
+  if (!ready) {
+    _tray.appendChild(el("span", {
+      class: "cm-compare-tray-reason",
+      "data-testid": "cm-compare-open-reason",
+      text: "Pick two images to compare",
+    }));
+  }
   _tray.appendChild(el("button", {
     class: "comfymodal-secondary-btn cm-compare-tray-btn",
     "data-testid": "cm-compare-clear",
@@ -273,6 +279,46 @@ function _renderTray() {
     title: "Ends the compare selection",
     onclick: function () { _teardownSession(); },
   }));
+}
+
+// CMP-01: tray slot rendered as a gallery link button. Visuals stay with the
+// legacy slot class (unbuttoned inline so it still reads as a slot label).
+function _traySlot(side, desc) {
+  const label = (side === "a" ? "A: " : "B: ") + (_slotText(desc) || "not chosen");
+  const btn = el("button", {
+    class: "cm-compare-tray-slot",
+    "data-testid": side === "a" ? "cm-compare-tray-a" : "cm-compare-tray-b",
+    type: "button",
+    text: label,
+    title: desc ? ("Change " + side.toUpperCase() + " from gallery") : ("Choose " + side.toUpperCase() + " from gallery"),
+    style: "background:none;border:none;font:inherit;color:inherit;text-align:left;cursor:pointer;padding:0;",
+    onclick: function () { _openTrayGallery(side); },
+  });
+  return btn;
+}
+
+// CMP-01: tray-slot gallery entry — the pair picker with the live pair as
+// initials and the clicked side armed. Confirming paints the session (and
+// refreshes an open view in place via updateComparePair); with no view open
+// the user proceeds via the tray Compare button as before.
+function _openTrayGallery(side) {
+  const st = getCompareState();
+  const armedSide = side === "a" || side === "b" ? side : undefined;
+  const canvasUrl = _viewerCanvasUrl();
+  import("./studio-history-picker.js").then(function (m) {
+    if (!m || typeof m.openHistoryPicker !== "function") return;
+    m.openHistoryPicker({
+      mode: "pair",
+      initialA: st.a,
+      initialB: st.b,
+      armedSide: armedSide,
+      retainFilters: true,
+      currentCanvasUrl: canvasUrl,
+      onConfirm: function (na, nb) {
+        try { updateComparePair(na, nb); } catch (err) { /* fail-soft */ }
+      },
+    });
+  }).catch(function () { /* picker is best-effort */ });
 }
 
 /** Start/restart a session with the invoking image as A (an explicit new A
@@ -558,7 +604,8 @@ export function openCompareView(opener) {
     const note = el("div", {
       class: "cm-compare-unavailable",
       "data-testid": "cm-compare-unavailable-" + side,
-      text: "Image unavailable",
+      // HST-01: single shared missing-image copy.
+      text: missingImageCopy(),
     });
     frame.insertBefore(note, side === "b" ? bWrap.nextSibling : bWrap);
   }

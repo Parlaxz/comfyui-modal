@@ -8,7 +8,7 @@
 // Appended to document.body; Escape closes via registerLayerHandler
 // (layer 3, matching the shared preview overlay).  All DOM via el().
 
-import { el, registerLayerHandler, buildViewerShell, resolveViewerShellArgs } from "./studio-ui.js";
+import { el, registerLayerHandler, buildViewerShell, resolveViewerShellArgs, STATUS_LABELS } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
 import { _formatDuration, resolveViewerInput, loadSpanSnapshot } from "./studio-run-normalizer.js";
 import {
@@ -34,17 +34,10 @@ import { summarizeGuidanceProvenance } from "./studio-guidance.js";
 
 // ── Constants / helpers ───────────────────────────────────────────────────
 
+// HST-02: STATUS_LABELS is shared from studio-ui.js (single import across
+// feed/detail/experiment). Per-file STATUS_TONES below stays local.
 const DOWNLOAD_NOTE_TESTID = "history-v2-download-note";
 const EXPORT_NOTE_TESTID = "history-v2-export-note";
-
-const STATUS_LABELS = {
-  completed: "Completed",
-  completed_with_failures: "Completed with failures",
-  failed: "Failed",
-  canceled: "Canceled",
-  interrupted: "Interrupted",
-  running: "Running",
-};
 
 // Shared chip tones (I3 taxonomy): STATUS → data-tone.  Legacy status-*
 // classes stay verbatim; status meaning never changes.
@@ -207,7 +200,8 @@ export function buildGuidanceSection(record) {
   });
   if (children.length === 0) return null;
   const section = el("div", { class: "comfymodal-studio-history-v2-section" }, [
-    el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Guidance" }),
+    // HST-02: real heading (was a div).
+    el("h3", { class: "comfymodal-studio-history-v2-section-title", text: "Guidance" }),
   ].concat(children));
   section.setAttribute("data-testid", "history-v2-guidance");
   return section;
@@ -584,8 +578,9 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
   function _section(title, rows) {
     const children = (rows || []).filter(function (r) { return r != null; });
     if (children.length === 0) return null;
+    // HST-02: real heading (was a div) so AT heading nav reaches sections.
     return el("div", { class: "comfymodal-studio-history-v2-section" }, [
-      el("div", { class: "comfymodal-studio-history-v2-section-title", text: title }),
+      el("h3", { class: "comfymodal-studio-history-v2-section-title", text: title }),
     ].concat(children));
   }
 
@@ -595,7 +590,8 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       ? record.featuredOutput.index
       : 0;
     const wrap = el("div", { class: "comfymodal-studio-history-v2-section" }, [
-      el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Other outputs" }),
+      // HST-02: real heading (was a div).
+      el("h3", { class: "comfymodal-studio-history-v2-section-title", text: "Other outputs" }),
     ]);
     if (outputs.length === 0) {
       wrap.appendChild(el("div", { class: "comfymodal-studio-history-v2-row-value", text: "No outputs" }));
@@ -1198,7 +1194,8 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
     }
 
     return el("div", { class: "comfymodal-studio-history-v2-section" }, [
-      el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Actions" }),
+      // HST-02: real heading (was a div).
+      el("h3", { class: "comfymodal-studio-history-v2-section-title", text: "Actions" }),
       btn,
       note,
     ]);
@@ -1232,7 +1229,8 @@ export async function renderGenerationDetail(generationId, repo, callbacks) {
       // el() only flattens one level, so a nested errors.map() array would
       // throw "parameter 1 is not of type 'Node'" and blank the overlay.
       sections.push(el("div", { class: "comfymodal-studio-history-v2-section comfymodal-studio-history-v2-section-error comfymodal-studio-history-v2-overflow-section" }, [
-        el("div", { class: "comfymodal-studio-history-v2-section-title", text: "Errors" }),
+        // HST-02: real heading (was a div).
+        el("h3", { class: "comfymodal-studio-history-v2-section-title", text: "Errors" }),
       ].concat(errors.map(function (e) {
         const code = (e && e.code) ? e.code : "error";
         const message = (e && e.message) ? String(e.message) : "";
