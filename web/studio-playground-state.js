@@ -844,7 +844,8 @@ export const SHELL_SUBTOOLS = Object.freeze({
 // Later-phase placeholders: visible but with no execution path. Simple
 // membership list — labels live with the caller. Single source for the
 // shell run gate shared by the playground topbar and experiment submits.
-export const SHELL_PLACEHOLDERS = Object.freeze(["guidance", "upscale"]);
+// Phase 9 implements Guidance, so only Upscale remains placeholder here.
+export const SHELL_PLACEHOLDERS = Object.freeze(["upscale"]);
 
 /**
  * Honest execution gate for views with no runnable workflow path: Post
