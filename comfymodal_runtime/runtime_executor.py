@@ -4859,6 +4859,12 @@ def _build_sampling_wrapper() -> Callable:
                 return executor(*args, **kwargs)
             _sampler_wrapper_dedup.add(dedup_key)
 
+        # Ideogram single-iteration CUDA profile ownership flags.  Defined
+        # here (before any fallible setup) so the wrapper finally below can
+        # reference them even when setup raises before the arm block runs.
+        _ideo_profile_cap = None
+        _ideo_profile_owned = False
+
         # Extract step count from sigma argument (torch tensor length).
         sigmas = kwargs.get("sigmas") if "sigmas" in kwargs else (
             args[1] if len(args) > 1 else None
@@ -5137,6 +5143,34 @@ def _build_sampling_wrapper() -> Callable:
                 )
             except Exception:
                 pass
+        # ── Ideogram single-iteration CUDA profile: arm (flag-gated) ──
+        # PromptExecutor-compatible seam: this SAMPLER_SAMPLE wrapper
+        # provably fires on the run_plan_stream/PromptExecutor path
+        # (proven by sampler-boundary tracebacks; the Golden run_closure
+        # arm never fires there).  Flag-off path: arm returns None and the
+        # two ownership flags below stay falsy — zero behavior change.
+        # Single-owner: when Golden (or an earlier sampler) already armed,
+        # arm returns the existing capture and this invocation does NOT own
+        # finalize; the owner finalizes exactly once.
+        try:
+            from comfymodal_runtime import ideogram_cuda_profile as _ideo_prof_arm
+            if _ideo_prof_arm.get_active() is None:
+                _ideo_profile_cap = _ideo_prof_arm.arm_ideogram_profile(
+                    request_id=str(getattr(trace, "request_id", "") or ""),
+                    patcher=_patch,
+                )
+                _ideo_profile_owned = _ideo_profile_cap is not None
+            else:
+                _ideo_profile_cap = _ideo_prof_arm.get_active()
+        except Exception:
+            _ideo_profile_cap = None
+            _ideo_profile_owned = False
+        try:
+            from comfymodal_runtime import ideogram_cuda_profile as _ideo_proof
+            _ideo_proof.emit_kitchen_backend_proof()
+            _ideo_proof.install_int8_selection_counter()
+        except Exception:
+            pass
         # ── V2 VAE CPU page prefetch (sampling_start hook) ──────────────
         # CPU-only, bounded readiness work submitted through the bridge's
         # coordinator pool (never the mutation lane).  Disabled mode is a
@@ -5213,6 +5247,16 @@ def _build_sampling_wrapper() -> Callable:
                         )
                     except Exception:
                         pass
+            # ── Ideogram single-iteration CUDA profile step anchor ──
+            # This callback IS the per-completed-step seam on the
+            # PromptExecutor path (same args[0]-is-index convention the
+            # production deep profile above relies on for step
+            # classification).  Observe-only, never raises.
+            try:
+                from comfymodal_runtime import ideogram_cuda_profile as _ideo_prof_cb
+                _ideo_prof_cb.notify_step_index(cb_args[0] if cb_args else None)
+            except Exception:
+                pass
             if not _first_step_fired:
                 _first_step_fired = True
                 try:
@@ -5432,6 +5476,24 @@ def _build_sampling_wrapper() -> Callable:
                         )
                     except Exception:
                         pass
+            # ── Ideogram single-iteration CUDA profile: finalize (owned only)
+            # Bounded stop+export with the same guarantees as the Golden
+            # path, then emit the artifact dict as an ideogram_cuda_profile
+            # trace event so it flows back in the result trace (the Chrome
+            # trace volume path rides along for off-container retrieval).
+            # Owned-only: a capture armed by Golden (or an earlier sampler)
+            # is finalized by its owner, never here.  Flag-off: both flags
+            # are falsy → single check, zero behavior change.  Never raises.
+            try:
+                if _ideo_profile_cap is not None and _ideo_profile_owned:
+                    from comfymodal_runtime import ideogram_cuda_profile as _ideo_prof_fin
+                    _ideo_prof_fin.finalize_sampler_profile(
+                        _ideo_profile_cap,
+                        trace,
+                        owned=True,
+                    )
+            except Exception:
+                pass
             # ── Sampler wait-on-activation variance (diagnostic-only) ──
             # Emits a dedicated event separating the sampler wait on
             # activation from sampling duration, using the existing
@@ -5502,6 +5564,19 @@ def _build_sampling_wrapper() -> Callable:
                         "request_id": str(getattr(trace, "request_id", "") or ""),
                     },
                 )
+            except Exception:
+                pass
+            # ── Kitchen INT8 live selection totals (measurement-only) ───
+            # Prints which backend actually served int8_linear during this
+            # sampling span (e.g. {'cuda': 204, 'total': 204}).  Never raises.
+            try:
+                from comfymodal_runtime import ideogram_cuda_profile as _ideo_prof_tot
+                _totals = _ideo_prof_tot.int8_selection_totals()
+                if _totals.get("total"):
+                    print(
+                        f"[v2.kitchen_backend_proof] live_int8_selections={_totals}",
+                        flush=True,
+                    )
             except Exception:
                 pass
 

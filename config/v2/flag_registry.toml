@@ -2635,8 +2635,8 @@ type = "enum"
 default = "off"
 enum_values = ["off", "torch", "nsys"]
 consumed_at = "request"
-change_requires = "run"
-runtime_exposed = false
+change_requires = "deploy"
+runtime_exposed = true
 owner = "ideogram-cuda-profile"
 description = "Flag-gated single steady-state Ideogram iteration CUDA profiling (cond + uncond + CFG/guider/sampler). Disabled by default; observe-only, one request/iteration only. torch = re-scoped Kineto capture (shapes/memory/stacks off); nsys = NVTX ranges only, never run Torch/Kineto + nsys CUDA collection simultaneously."
 
@@ -2645,8 +2645,8 @@ name = "COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_ITERATION"
 type = "int"
 default = "3"
 consumed_at = "request"
-change_requires = "run"
-runtime_exposed = false
+change_requires = "deploy"
+runtime_exposed = true
 owner = "ideogram-cuda-profile"
 description = "Zero-based sampler iteration captured by the Ideogram CUDA profile (default 3 = 4th of 16, after stabilization). Invalid or negative values fall back to 3."
 min = 0
@@ -2657,10 +2657,20 @@ name = "COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_BLOCK_RANGES"
 type = "bool"
 default = "0"
 consumed_at = "request"
-change_requires = "run"
-runtime_exposed = false
+change_requires = "deploy"
+runtime_exposed = true
 owner = "ideogram-cuda-profile"
 description = "Emit optional per-DiT-block COND/UNCOND record_function ranges (max 68) inside the captured Ideogram iteration only, when a stable shared DiT block seam is confirmed. Disabled by default."
+
+[[flag]]
+name = "COMFYMODAL_V2_ENABLE_TRITON_BACKEND"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "deploy"
+runtime_exposed = true
+owner = "ideogram-int8"
+description = "Opt into ComfyUI's --enable-triton-backend for the comfy-kitchen Triton backend (kept off upstream by default). Baked into the image env at deploy; read once at container startup before comfy.quant_ops import. Default off: zero behavior change. Intended for INT8-linear workloads where the Triton INT8 GEMM outranks the eager torch._int_mm fallback."
 
 [[flag]]
 name = "COMFYMODAL_V2_WORKFLOW_ID"

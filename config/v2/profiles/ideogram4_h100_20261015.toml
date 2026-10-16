@@ -44,8 +44,8 @@ method = "run_plan_stream"
 
 [resources]
 gpu = "h100!"
-cpu = 4
-memory_mb = 16384
+cpu = 12
+memory_mb = 24576
 min_containers = 0
 # Scaledown is in seconds: containers exit ~1s after use (cost-owned; every
 # run cold-starts by design, no idle H100 billing).
@@ -63,16 +63,58 @@ gap_seconds = 35.0
 policy = "forbid"
 
 [environment]
+# ── model-free snapshot (do NOT bake CLIP/UNET/VAE into the snapshot) ──
+# Production base mandates COMFYMODAL_V2_ENV_PROFILE=production, which in
+# turn REQUIRES COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1 (RuntimeError otherwise)
+# — that pair is what turned every capture into 20GB of slow legacy reads.
+# run_plan_stream itself needs no baked models (the restore-only default app
+# runs it on inherit): use inherit + snapshot off so captures stay ~50s and
+# models load per-request like every normal deployment.
+COMFYMODAL_V2_ENV_PROFILE = "inherit"
+COMFYMODAL_V2_CPU_MODEL_SNAPSHOT = "0"
+COMFYMODAL_V2_VAE_SNAPSHOT = "0"
 # ── memory (deploy-baked; keep all three pinned to [resources].memory_mb) ──
 # Convention from source_race_h100/golden_p1: inherited production values
-# (8192) must not disagree with the 16384 override above.
-COMFYMODAL_V2_MEMORY_MB = "16384"
-COMFYMODAL_V2_MEMORY_REQUEST = "16384"
-COMFYMODAL_V2_BASELINE_MEMORY_REQUEST = "16384"
+# (8192) must not disagree with the override above. Shape matches the
+# known-good c0 H100 profile (cpu 12 / mem 24576) so snapshot builds holding
+# 2x INT8 UNET + FP8 CLIP + VAE do not OOM a small container.
+COMFYMODAL_V2_MEMORY_MB = "24576"
+COMFYMODAL_V2_MEMORY_REQUEST = "24576"
+COMFYMODAL_V2_BASELINE_MEMORY_REQUEST = "24576"
+COMFYMODAL_V2_CPU_REQUEST = "12"
 # ── exact placement (deploy-baked; redeploy on change) ────────────────
 # Single region pin "us" (not "us-central"); no cloud pin. Matches the
 # Golden convention (golden_p1.toml): cloud pinning is not supported.
 COMFYMODAL_V2_REGION = "us"
+# ── ported c0 optimizations (ONLY flags proven to engage on run_plan_stream)
+# A gating survey (consumers in modal_app/generic-loaders/clip-qd-reader)
+# showed all COMFYMODAL_GOLDEN_* transport/schedule/C0/IO-process flags are
+# INERT without Golden orchestration (DynamicVRAM), so they were removed.
+# These engage without it:
+# - MINIMAL_GPU_TEARDOWN: V2 teardown policy, method-independent.
+# - CLIP_QD_READER / GENERIC_OVERLAP: consumed by generic loader selection.
+# - GOLDEN_ATTENTION_BACKEND=comfy_kitchen: read on stream execution. This is
+#   not a tuning extra: the task baseline assumes attention_comfy_kitchen_int8
+#   (1088 calls) but our runs resolved attention "missing". Restoring it is
+#   baseline correctness.
+COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN = "1"
+COMFYMODAL_V2_CLIP_QD_READER = "1"
+COMFYMODAL_V2_GENERIC_OVERLAP = "1"
+COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND = "comfy_kitchen"
+# ── CUDA profiler (deploy-baked for the profiled run only) ────────────
+# The hooks read container os.environ; request --set does not reach the
+# container (strict request-diagnostic allowlist). Bake torch/iter3/blocks
+# for exactly one profiled run, then revert to off + redeploy.
+# Validation runs stay unprofiled: honest s/it, no profiler perturbation.
+COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE = "off"
+COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_ITERATION = "3"
+COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_BLOCK_RANGES = "0"
+# ── Kitchen Triton backend (INT8 fallback rescue) ──────────────────────
+# Comfy disables the kitchen Triton backend by default; the container ships
+# triton via the cu130 torch dependency and H100 satisfies the SM80+ INT8
+# constraint. Registry priority (cuda > triton > eager) keeps this a no-op
+# wherever the native CUDA path serves; elsewhere Triton outranks eager.
+COMFYMODAL_V2_ENABLE_TRITON_BACKEND = "1"
 # ── canonical workflow selection (request-scoped; no redeploy on change) ─
 COMFYMODAL_V2_WORKFLOW_ID = "wf_81513286bb304e9f"
 COMFYMODAL_V2_WORKFLOW_VERSION_ID = "wv_f3baf54d8f784b64"

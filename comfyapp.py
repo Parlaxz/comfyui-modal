@@ -1,4 +1,4 @@
-﻿import contextlib
+import contextlib
 import hashlib
 import inspect
 import json
@@ -15603,6 +15603,41 @@ class _ComfyAPIMixin:
         # Instrumentation counters for cache diagnostics
         self._cpu_cache_hits: dict[str, int] = {}
         self._cpu_cache_misses: dict[str, int] = {}
+        # ── Minimum offline checkpoint-load diagnostic (measurement-only) ──
+        # Cheap start/end resource.getrusage(RUSAGE_THREAD) snapshots + one
+        # concise [model_load_diag] line per native load. No /proc reads, no
+        # model scans, no thread monitoring, no syscalls. Gated on the
+        # existing COMFYMODAL_PROFILING switch (PROFILING_ENABLED); no new
+        # config. Never changes load semantics; every helper is fail-open.
+        _diag_state: dict[str, Any] = {"safetensors_version": None, "resolved": False}
+
+        def _diag_rusage_snapshot() -> tuple | None:
+            try:
+                import resource as _rsrc
+                if not (hasattr(_rsrc, "getrusage") and hasattr(_rsrc, "RUSAGE_THREAD")):
+                    return None
+                _u = _rsrc.getrusage(_rsrc.RUSAGE_THREAD)
+                return (float(_u.ru_utime), float(_u.ru_stime), int(_u.ru_minflt), int(_u.ru_majflt))
+            except Exception:
+                return None
+
+        def _diag_safetensors_version() -> str:
+            if _diag_state["resolved"]:
+                _v = _diag_state["safetensors_version"]
+                return _v if isinstance(_v, str) else "unavailable"
+            _ver: str = "unavailable"
+            try:
+                from importlib import metadata as _md
+                _ver = str(_md.version("safetensors"))
+            except Exception:
+                try:
+                    import safetensors as _st_mod
+                    _ver = str(getattr(_st_mod, "__version__", "unavailable"))
+                except Exception:
+                    _ver = "unavailable"
+            _diag_state["safetensors_version"] = _ver
+            _diag_state["resolved"] = True
+            return _ver
 
         def cached_load(path, *args, **kwargs):
             import copy
@@ -15713,8 +15748,10 @@ class _ComfyAPIMixin:
                         loader_type=_ctx_loader_type or "unknown",
                         canonical_path=miss_key,
                     ) as _coord_state:
+                        _native_rusage_start = _diag_rusage_snapshot()
                         result = original_load(path, *args, **kwargs)
                 else:
+                    _native_rusage_start = _diag_rusage_snapshot()
                     result = original_load(path, *args, **kwargs)
                 duration_ms = self._profile_ms(started)
                 try:
@@ -15731,6 +15768,34 @@ class _ComfyAPIMixin:
                 # Accumulate into execution-profile accumulator
                 acc = getattr(self, "_exec_model_load_io_ms", 0.0)
                 self._exec_model_load_io_ms = acc + duration_ms
+                # Offline diag: end snapshot after all timings, then one
+                # concise line. Active-read metric meaning is untouched.
+                _native_rusage_end = _diag_rusage_snapshot()
+                if PROFILING_ENABLED:
+                    try:
+                        _mm_mod = sys.modules.get("comfy.memory_management")
+                        _aimdo = getattr(_mm_mod, "aimdo_enabled", "unavailable") if _mm_mod is not None else "unavailable"
+                        _dis_mmap = getattr(comfy_utils, "DISABLE_MMAP", "unavailable")
+                        _mmap_torch = getattr(comfy_utils, "MMAP_TORCH_FILES", "unavailable")
+                        _orig_fn = getattr(original_load, "__qualname__", None) or getattr(original_load, "__name__", "?")
+                        _orig_name = f"{getattr(original_load, '__module__', '?')}.{_orig_fn}"
+                        _dev = kwargs.get("device", "unspecified")
+                        if _native_rusage_start is not None and _native_rusage_end is not None:
+                            _ru_status = "available"
+                            _ru_u = round(_native_rusage_end[0] - _native_rusage_start[0], 6)
+                            _ru_s = round(_native_rusage_end[1] - _native_rusage_start[1], 6)
+                            _ru_min = _native_rusage_end[2] - _native_rusage_start[2]
+                            _ru_maj = _native_rusage_end[3] - _native_rusage_start[3]
+                        else:
+                            _ru_status = "unavailable"
+                            _ru_u = _ru_s = _ru_min = _ru_maj = "unavailable"
+                        print(f"[model_load_diag] file={filename} wall_ms={duration_ms} device={_dev} "
+                              f"orig_loader={_orig_name} disable_mmap={_dis_mmap} mmap_torch_files={_mmap_torch} "
+                              f"aimdo_enabled={_aimdo} safetensors={_diag_safetensors_version()} "
+                              f"rusage_user_s={_ru_u} rusage_system_s={_ru_s} rusage_minflt={_ru_min} rusage_majflt={_ru_maj} "
+                              f"rusage_status={_ru_status} gate=COMFYMODAL_PROFILING=1")
+                    except Exception:
+                        pass
                 return result
             except Exception as _cl_exc:
                 _fail_active_model_read(miss_key, error=f"{_cl_exc}")
@@ -18694,6 +18759,18 @@ class _ComfyAPIMixin:
         import folder_paths  # safe GÃ‡Ã¶ no comfy deps
         import utils.extra_config  # establishes utils as the /utils/ package
         import utils.mime_types  # reinforces utils package before comfy loads
+
+        # ── Optional comfy-kitchen Triton backend (Ideogram INT8) ─────────
+        # Stock ``comfy/quant_ops.py`` disables the kitchen Triton backend
+        # unless ``comfy.cli_args.args.enable_triton_backend`` is set at ITS
+        # import time.  Set the already-parsed args flag here (before any
+        # comfy import below) only when explicitly requested via env.
+        # Default off: zero behavior change for every other profile.
+        if os.environ.get(
+            "COMFYMODAL_V2_ENABLE_TRITON_BACKEND", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}:
+            import comfy.cli_args as _triton_cli_args
+            _triton_cli_args.args.enable_triton_backend = True
 
         # Match upstream main.py's AIMDO ordering for the isolated Golden
         # profile.  This must happen before importing comfy model modules:

@@ -10429,6 +10429,13 @@ class ModalRuntimeEntrypoint:
             if _golden_serial_profile_active() and golden_model_transport_enabled():
                 from .golden_model_transport import get_golden_model_transport
                 get_golden_model_transport().initialize_cuda()
+            # Retry after CUDA initialization if restore-entry visibility was
+            # deferred by the runtime.
+            try:
+                from . import ideogram_cuda_profile as _ideo_restore
+                _ideo_restore.repair_kitchen_gpu_backends_after_restore()
+            except Exception:
+                pass
             if isinstance(value, tuple) and len(value) == 2:
                 return {"device": str(value[0]), "diagnostics": value[1]}
             return {"result": value}
@@ -12713,6 +12720,13 @@ class ModalRuntimeEntrypoint:
         restore_method_start_wall_ns: int = remote_python_resume_wall_ns
         restore_method_start_mono_ns: int = remote_python_resume_mono_ns
         _restore_perf_start = time.perf_counter()
+        # Repair snapshot-time CPU capability decisions before the Golden fast
+        # return or any model/inference path can observe stale kitchen state.
+        try:
+            from . import ideogram_cuda_profile as _ideo_restore
+            _ideo_restore.repair_kitchen_gpu_backends_after_restore()
+        except Exception:
+            pass
         if _golden_minimal_restore_enabled():
             # ── Golden Parallel minimal restore (Golden Serial default) ──
             # A new from-first-principles post-snapshot contract that runs

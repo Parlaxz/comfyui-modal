@@ -63,6 +63,18 @@ EVENT_NAME = "ideogram_cuda_profile"
 FLAG_BACKEND = "COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE"
 FLAG_ITERATION = "COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_ITERATION"
 FLAG_BLOCK_RANGES = "COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_BLOCK_RANGES"
+# Export dir override (container os.environ read; explicit value always wins).
+FLAG_PROFILE_DIR = "COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_DIR"
+
+# Already-mounted persistent volumes, used as the default export base so the
+# Chrome trace is retrievable off-container.  Keep in sync with
+# ``modal_app.PROFILE_PATH`` / ``modal_app.RUNTIME_STATE_PATH`` (duplicated,
+# not imported: this module must stay import-light for FAST_UNIT).
+# NOTE: the profile volume is mounted only when V2 full-trace is enabled;
+# the runtime-state volume is always mounted.
+PROFILE_MOUNT_PATH = "/mnt/comfymodal_profiles"
+RUNTIME_STATE_MOUNT_PATH = "/mnt/comfymodal_runtime_state"
+EXPORT_SUBDIR = "ideogram_cuda_profile"
 
 BACKEND_OFF = "off"
 BACKEND_TORCH = "torch"
@@ -136,7 +148,8 @@ class _IdeogramCapture:
         "forward_notifications", "callback_notifications",
         "torch_profiler", "torch_started", "torch_start_thread",
         "torch_skip_reason", "torch_stop_ms", "torch_export_ms",
-        "torch_export_path", "torch_export_timeout",
+        "torch_export_path", "torch_export_timeout", "torch_export_volume",
+        "torch_export_commit",
         "warnings", "finalized",
     )
 
@@ -185,6 +198,8 @@ class _IdeogramCapture:
         self.torch_export_ms: float | None = None
         self.torch_export_path: str | None = None
         self.torch_export_timeout = False
+        self.torch_export_volume: str | None = None
+        self.torch_export_commit: str | None = None
         self.warnings: list[str] = []
         self.finalized = False
 
@@ -422,6 +437,22 @@ def notify_sampler_step(index: Any) -> None:
                 # Late-open fallback (forwards missed the anchor, e.g. hooks
                 # attached after sampling began); the span is partial.
                 cap.pending_late = True
+    except Exception:
+        pass
+
+
+def notify_step_index(value: Any) -> None:
+    """Notify from a raw sampler-callback index value (never raises).
+
+    Applies the same int extraction the sampler seams use (``args[0]`` is
+    the completed-step index; bools / non-ints count as unknown).  Exists
+    so the PromptExecutor-compatible SAMPLER_SAMPLE wrapper can feed step
+    indices without duplicating the extraction rule.
+    """
+    try:
+        notify_sampler_step(
+            value if isinstance(value, int) and not isinstance(value, bool) else None
+        )
     except Exception:
         pass
 
@@ -725,6 +756,68 @@ def _wrap_callback(callback: Any) -> Any:
 
 # ── Finalize (once, outside the iteration wall, bounded export) ───────────────
 
+# ── Export placement + volume commit (retrieval) ────────────────────────────
+
+def _resolve_export_base() -> tuple[str, str]:
+    """Return ``(directory, volume_kind)`` for the Chrome trace export.
+
+    Precedence: explicit ``COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_DIR`` env,
+    then the already-mounted profile volume (read by
+    ``tools/golden_profile_pipeline.py``), then the always-mounted
+    runtime-state volume, then the local tempdir (unreachable off-container,
+    last resort).  Flag semantics unchanged: this only runs for an armed
+    (flag-on) capture.
+    """
+    try:
+        _explicit = str(os.environ.get(FLAG_PROFILE_DIR, "") or "").strip()
+    except Exception:
+        _explicit = ""
+    if _explicit:
+        return _explicit, "explicit_env"
+    for _mount, _kind in (
+        (PROFILE_MOUNT_PATH, "profile"),
+        (RUNTIME_STATE_MOUNT_PATH, "runtime_state"),
+    ):
+        try:
+            if os.path.isdir(_mount):
+                return os.path.join(_mount, EXPORT_SUBDIR), _kind
+        except Exception:
+            continue
+    return os.path.join(tempfile.gettempdir(), EXPORT_SUBDIR), "local_temp"
+
+
+def _commit_export_volume(export_path: str | None, volume_kind: str | None) -> str:
+    """Best-effort sync commit of the volume holding the export (never raises).
+
+    Reuses the existing ``modal_app._MODAL_RESOURCES`` volume handle (no new
+    Modal infrastructure).  Runs post-sampling only, for flag-on captures.
+    Returns a short status string recorded on the artifact.
+    """
+    try:
+        if not export_path or volume_kind not in ("profile", "runtime_state"):
+            return "skipped_no_volume_handle"
+        try:
+            from comfymodal_runtime import modal_app as _modal_app
+        except Exception:
+            return "skipped_no_volume_handle"
+        _resources = getattr(_modal_app, "_MODAL_RESOURCES", None)
+        _volume = None
+        try:
+            _volume = (_resources or {}).get(
+                "profile_volume" if volume_kind == "profile" else "runtime_state_volume"
+            )
+        except Exception:
+            _volume = None
+        _commit = getattr(_volume, "commit", None)
+        if not callable(_commit):
+            return "skipped_no_volume_handle"
+        _started = time.perf_counter()
+        _commit()
+        return f"committed_{round((time.perf_counter() - _started) * 1000, 3)}ms"
+    except Exception as exc:
+        return f"commit_failed:{type(exc).__name__}"
+
+
 def _stop_and_export_torch(cap: _IdeogramCapture) -> None:
     """Stop the Kineto profiler on the finalize thread; bounded export."""
     _profiler = cap.torch_profiler
@@ -749,8 +842,8 @@ def _stop_and_export_torch(cap: _IdeogramCapture) -> None:
         _warn(cap, str(cap.torch_skip_reason))
         return
     try:
-        _dir = str(os.environ.get("COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_DIR", "") or "")
-        _base = _dir if _dir else os.path.join(tempfile.gettempdir(), "ideogram_cuda_profile")
+        _base, _volume_kind = _resolve_export_base()
+        cap.torch_export_volume = str(_volume_kind)
         os.makedirs(_base, exist_ok=True)
         _name = f"ideogram_iter{int(cap.iteration)}_{str(cap.request_id or 'norequest')[:24]}_torch_trace.json"
         _path = os.path.join(_base, _name)
@@ -765,6 +858,9 @@ def _stop_and_export_torch(cap: _IdeogramCapture) -> None:
                 _future.result(timeout=FINALIZE_TIMEOUT_S)
                 cap.torch_export_ms = round((time.perf_counter() - _export_started) * 1000, 3)
                 cap.torch_export_path = str(_path)
+                cap.torch_export_commit = _commit_export_volume(
+                    cap.torch_export_path, cap.torch_export_volume
+                )
             except concurrent.futures.TimeoutError:
                 cap.torch_export_timeout = True
                 _warn(cap, f"torch_export_timeout_s:{FINALIZE_TIMEOUT_S}")
@@ -885,6 +981,8 @@ def finalize_ideogram_profile(cap: Any | None, attention: dict | None = None) ->
             "torch_export_ms": cap.torch_export_ms,
             "torch_export_path": cap.torch_export_path,
             "torch_export_timeout": bool(cap.torch_export_timeout),
+            "torch_export_volume": cap.torch_export_volume,
+            "torch_export_commit": cap.torch_export_commit,
             "torch_finalize_timeout_s": float(FINALIZE_TIMEOUT_S),
             # GPU tail + teardown disclosure.
             "gpu_tail_note": ("async GPU tail via the existing safe completion "
@@ -913,3 +1011,386 @@ def finalize_ideogram_profile(cap: Any | None, attention: dict | None = None) ->
             "hook_fired": False,
             "error": type(exc).__name__,
         }
+
+
+# ── PromptExecutor-path finalize (SAMPLER_SAMPLE wrapper seam) ────────────────
+
+def finalize_sampler_profile(
+    cap: Any | None,
+    trace: Any | None,
+    *,
+    owned: bool,
+    attention: dict | None = None,
+) -> dict | None:
+    """Finalize an owned capture and emit the artifact event (never raises).
+
+    Called from the production SAMPLER_SAMPLE wrapper's ``finally`` so the
+    run_plan_stream/PromptExecutor path gets the same bounded stop+export as
+    the Golden path.  Single-owner rule: only the seam that armed the
+    capture passes ``owned=True`` (it observed no active capture before
+    arming); a seam that found an existing capture passes ``owned=False``
+    and never finalizes.  Returns the artifact, or None when there is
+    nothing to do (flag off / unowned).  The emitted ``ideogram_cuda_profile``
+    trace event flows back in the result trace, carrying the Chrome trace
+    volume path for off-container retrieval.
+    """
+    try:
+        if cap is None or not owned:
+            return None
+        artifact = finalize_ideogram_profile(cap, attention=attention)
+        try:
+            _emit = getattr(trace, "emit", None)
+            if callable(_emit):
+                _emit(EVENT_NAME, phase="execution", metadata=dict(artifact))
+        except Exception:
+            pass
+        return artifact
+    except Exception:
+        return None
+
+
+# ── Post-restore kitchen GPU backend repair (state-only) ──────────────
+# Root cause it repairs: kitchen CUDA/Triton backends evaluate
+# ``torch.cuda.is_available()`` once at import inside
+# ``comfy_kitchen.backends.<name>._register()``.  During snapshot build that
+# import happens inside comfymodal's CPU-snapshot mock window
+# (``torch.cuda.is_available = lambda: False``), so both backends
+# ``mark_unavailable`` and the dead registry state is snapshotted into the
+# serving container.  Re-running the existing ``_register()`` routines with
+# real CUDA visible re-registers capabilities (``registry.register``
+# overwrites caps and pops ``mark_unavailable``) — no math, no weights, no
+# priority change.  Safe to repeat; guarded to once per process.
+_repair_done = False
+
+
+def repair_kitchen_gpu_backends_after_restore() -> dict:
+    """Re-run kitchen GPU backend registration with real CUDA visible.
+
+    Runs only when ``torch.cuda.is_available()`` is true (i.e. after the
+    snapshot mock is gone).  Clears the registry's possibly-stale cached
+    compute capability first.  Triton is repaired only when not explicitly
+    disabled (respects Comfy default-off / ``--disable-triton-backend``).
+    Never raises.  Returns a result dict.
+    """
+    global _repair_done
+    if _repair_done:
+        return {"repaired": False, "reason": "already_done"}
+    result: dict = {"repaired": False, "reason": "", "cuda": None, "triton": None}
+    try:
+        import torch as _torch
+    except Exception:
+        result["reason"] = "torch_unimportable"
+        return result
+    try:
+        _cuda_visible = bool(_torch.cuda.is_available())
+    except Exception:
+        _cuda_visible = False
+    if not _cuda_visible:
+        result["reason"] = "cuda_not_visible"
+        return result
+    _disabled_before = None
+    _priority_before = None
+    try:
+        import comfy_kitchen as _ck
+        _reg = _ck.registry
+    except Exception as exc:
+        result["reason"] = f"kitchen_unimportable:{type(exc).__name__}"
+        return result
+    # Stale GPU-derived cache: ``_compute_capability`` is a cached_property
+    # that may have been evaluated (as None) while CUDA was mocked away
+    # during snapshot build.  Drop it so the next validation recomputes.
+    try:
+        _reg.__dict__.pop("_compute_capability", None)
+    except Exception:
+        pass
+    try:
+        _disabled_before = set(getattr(_reg, "_disabled", set()) or set())
+        _priority_before = list(getattr(_reg, "_priority", []) or [])
+    except Exception:
+        _disabled_before = None
+        _priority_before = None
+    try:
+        from comfy_kitchen.backends import cuda as _ck_cuda
+        _ck_cuda._register()
+        result["cuda"] = "rerun"
+    except Exception as exc:
+        result["cuda"] = f"failed:{type(exc).__name__}"
+    try:
+        _disabled = _disabled_before if _disabled_before is not None else (
+            getattr(_reg, "_disabled", set()) or set()
+        )
+        if "triton" in _disabled:
+            result["triton"] = "skipped:disabled"
+        else:
+            from comfy_kitchen.backends import triton as _ck_triton
+            _ck_triton._register()
+            result["triton"] = "rerun"
+    except Exception as exc:
+        result["triton"] = f"failed:{type(exc).__name__}"
+    finally:
+        # Native registration owns capabilities/unavailable state, but it must
+        # not rewrite user/backend policy state.
+        try:
+            if _disabled_before is not None:
+                _reg._disabled.clear()
+                _reg._disabled.update(_disabled_before)
+        except Exception:
+            pass
+        try:
+            if _priority_before is not None:
+                _reg._priority[:] = _priority_before
+        except Exception:
+            pass
+    _complete = (
+        result["cuda"] == "rerun"
+        and result["triton"] in {"rerun", "skipped:disabled"}
+    )
+    try:
+        _infos = _reg.list_backends()
+    except Exception:
+        _infos = None
+    if isinstance(_infos, dict):
+        try:
+            _disabled_now = set(getattr(_reg, "_disabled", set()) or set())
+        except Exception:
+            _disabled_now = set()
+
+        def _avail(_name):
+            _info = _infos.get(_name)
+            if not isinstance(_info, dict):
+                return False
+            if _name in _disabled_now or bool(_info.get("disabled")):
+                return False
+            return bool(_info.get("available"))
+
+        _cuda_ok = result["cuda"] == "rerun" and _avail("cuda")
+        if result["triton"] == "skipped:disabled":
+            _triton_ok = True
+        else:
+            _triton_ok = result["triton"] == "rerun" and _avail("triton")
+        _complete = bool(_cuda_ok and _triton_ok)
+        if not _complete and not result["reason"]:
+            result["reason"] = "backend_unavailable"
+    result["repaired"] = _complete
+    if _complete:
+        _repair_done = True
+    try:
+        print(
+        f"{PROOF_TAG} repair_after_restore cuda={result['cuda']} "
+            f"triton={result['triton']}",
+            flush=True,
+        )
+    except Exception:
+        pass
+    return result
+
+
+# ── Kitchen INT8 backend proof (measurement-only) ──────────────────────
+# Answers "which backend serves int8_linear and why" from inside the serving
+# container, where the registry state (CUDA ext import, cublasLt dlopen,
+# disabled flags) cannot be observed offline.  Observe-only: tiny synthetic
+# tensors, no model weights touched, never raises into sampling.
+PROOF_TAG = "[v2.kitchen_backend_proof]"
+_proof_emitted = False
+_selection_wrap_installed = False
+_selection_counts: dict = {}
+
+
+def _cuda_runtime_identity() -> dict:
+    """Read the live CUDA identity without allocating or synchronizing."""
+    identity = {
+        "visible": False,
+        "device_index": None,
+        "name": None,
+        "compute_capability": None,
+    }
+    try:
+        import torch as _torch
+        identity["visible"] = bool(_torch.cuda.is_available())
+        if not identity["visible"]:
+            return identity
+        identity["device_index"] = int(_torch.cuda.current_device())
+        try:
+            identity["name"] = str(_torch.cuda.get_device_name(identity["device_index"]))
+        except Exception:
+            pass
+        try:
+            identity["compute_capability"] = tuple(
+                int(value) for value in _torch.cuda.get_device_capability(identity["device_index"])
+            )
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return identity
+
+
+def emit_kitchen_backend_proof() -> dict:
+    """Log once-per-process which kitchen backend serves Ideogram INT8.
+
+    Reports kitchen version, CUDA ext availability (+import error),
+    ``HAS_CUBLASLT``, per-backend ``int8_linear`` eligibility for
+    Ideogram-shaped kwargs (bf16 act, int8 weight, fp32 scale, convrot),
+    and the registry's actual dispatch winner.  Returns the proof dict
+    (empty when already emitted or kitchen is unimportable).
+    """
+    global _proof_emitted
+    if _proof_emitted:
+        return {}
+    _proof_emitted = True
+    proof: dict = {}
+    proof["cuda_runtime"] = _cuda_runtime_identity()
+    proof["cuda_visible"] = proof["cuda_runtime"]["visible"]
+    proof["cuda_device_index"] = proof["cuda_runtime"]["device_index"]
+    proof["gpu_name"] = proof["cuda_runtime"]["name"]
+    proof["actual_compute_capability"] = proof["cuda_runtime"]["compute_capability"]
+    try:
+        import comfy_kitchen as _ck
+    except Exception as exc:
+        print(f"{PROOF_TAG} kitchen_import=failed error={type(exc).__name__}", flush=True)
+        proof["kitchen_import"] = False
+        return proof
+    try:
+        from importlib import metadata as _md
+        proof["kitchen_version"] = _md.version("comfy-kitchen")
+    except Exception:
+        proof["kitchen_version"] = getattr(_ck, "__version__", "unknown")
+    try:
+        from comfy_kitchen.backends import cuda as _ck_cuda
+        proof["cuda_ext_available"] = bool(getattr(_ck_cuda, "_EXT_AVAILABLE", False))
+        proof["cuda_ext_error"] = str(getattr(_ck_cuda, "_EXT_ERROR", None))
+        _c = getattr(_ck_cuda, "_C", None)
+        proof["has_cublaslt"] = bool(getattr(_c, "HAS_CUBLASLT", False)) if _c is not None else False
+    except Exception as exc:
+        proof["cuda_ext_available"] = False
+        proof["cuda_ext_error"] = f"backend_import_failed:{type(exc).__name__}"
+        proof["has_cublaslt"] = False
+    backends: dict = {}
+    try:
+        backends = _ck.registry.list_backends()
+    except Exception:
+        backends = {}
+    for _name in ("cuda", "triton", "eager"):
+        _b = backends.get(_name, {}) if isinstance(backends, dict) else {}
+        _caps = _b.get("capabilities", []) if isinstance(_b, dict) else []
+        proof[f"{_name}"] = {
+            "available": bool(_b.get("available", False)) if isinstance(_b, dict) else False,
+            "disabled": bool(_b.get("disabled", False)) if isinstance(_b, dict) else False,
+            "reason": _b.get("unavailable_reason") if isinstance(_b, dict) else None,
+            "int8_linear": "int8_linear" in list(_caps),
+        }
+    # Synthetic Ideogram-shaped call through the REAL dispatch (tiny tensors,
+    # freed immediately; mirrors bf16 act + int8 weight + fp32 scale + convrot).
+    proof["synth_dispatched"] = None
+    proof["synth_detail"] = {}
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _dev = _torch.device("cuda", _torch.cuda.current_device())
+            _kwargs = {
+                "x": _torch.zeros((16, 1024), dtype=_torch.bfloat16, device=_dev),
+                "weight": _torch.zeros((2048, 1024), dtype=_torch.int8, device=_dev),
+                "weight_scale": _torch.ones((), dtype=_torch.float32, device=_dev),
+                "bias": None,
+                "out_dtype": _torch.bfloat16,
+                "convrot": True,
+                "convrot_groupsize": 256,
+                "input_act": "swiglu",
+                "input_act_weight": None,
+                "input_act_eps": 0.0,
+                "residual": None,
+                "residual_scale": None,
+            }
+            for _name in ("cuda", "triton", "eager"):
+                try:
+                    _r = _ck.registry.validate_backend_for_call(_name, "int8_linear", _kwargs)
+                    proof["synth_detail"][_name] = (
+                        "ok" if _r.success
+                        else f"{_r.failed_param}: {_r.failure_reason}"
+                    )
+                except Exception as exc:
+                    proof["synth_detail"][_name] = f"validate_error:{type(exc).__name__}"
+            try:
+                proof["synth_dispatched"] = _ck.registry.get_capable_backend("int8_linear", _kwargs)
+            except Exception as exc:
+                proof["synth_dispatched"] = f"none:{type(exc).__name__}"
+            del _kwargs
+        else:
+            proof["synth_dispatched"] = "skipped:no_cuda"
+    except Exception as exc:
+        proof["synth_dispatched"] = f"skipped:{type(exc).__name__}"
+    try:
+        _cc = None
+        try:
+            _cc = _ck.registry._compute_capability  # cached_property, no driver init beyond query
+        except Exception:
+            _cc = None
+        proof["registry_compute_capability"] = _cc
+        print(
+            f"{PROOF_TAG} kitchen={proof.get('kitchen_version')} "
+            f"ext_available={proof.get('cuda_ext_available')} "
+            f"ext_error={proof.get('cuda_ext_error')} "
+            f"HAS_CUBLASLT={proof.get('has_cublaslt')} "
+            f"cuda_visible={proof.get('cuda_visible')} "
+            f"gpu_name={proof.get('gpu_name')} "
+            f"actual_cc={proof.get('actual_compute_capability')} "
+            f"registry_cc={_cc}",
+            flush=True,
+        )
+        for _name in ("cuda", "triton", "eager"):
+            _b = proof.get(_name, {})
+            print(
+                f"{PROOF_TAG} backend={_name} available={_b.get('available')} "
+                f"disabled={_b.get('disabled')} reason={_b.get('reason')} "
+                f"int8_linear={_b.get('int8_linear')} "
+                f"synth={proof.get('synth_detail', {}).get(_name)}",
+                flush=True,
+            )
+        print(f"{PROOF_TAG} dispatch_winner=int8_linear->{proof.get('synth_dispatched')}", flush=True)
+    except Exception:
+        pass
+    return proof
+
+
+def install_int8_selection_counter() -> bool:
+    """Count live ``int8_linear`` registry selections (measurement-only).
+
+    Wraps ``registry.get_capable_backend`` once per process; the wrapper only
+    increments a counter for ``func_name == "int8_linear"`` and always calls
+    through.  Totals are read via :func:`int8_selection_totals`.
+    """
+    global _selection_wrap_installed
+    if _selection_wrap_installed:
+        return True
+    try:
+        import comfy_kitchen as _ck
+        _reg = _ck.registry
+        _orig = _reg.get_capable_backend
+
+        def _counting(func_name: str, kwargs: Any = None) -> Any:
+            try:
+                _backend = _orig(func_name, kwargs)
+            except Exception:
+                raise
+            try:
+                if func_name == "int8_linear":
+                    _selection_counts[_backend] = _selection_counts.get(_backend, 0) + 1
+            except Exception:
+                pass
+            return _backend
+
+        _reg.get_capable_backend = _counting  # type: ignore[method-assign]
+        _selection_wrap_installed = True
+        return True
+    except Exception:
+        return False
+
+
+def int8_selection_totals() -> dict:
+    """Live ``int8_linear`` selection counts + total (measurement-only)."""
+    try:
+        _counts = dict(_selection_counts)
+        _counts["total"] = sum(v for v in _counts.values() if isinstance(v, int))
+        return _counts
+    except Exception:
+        return {}

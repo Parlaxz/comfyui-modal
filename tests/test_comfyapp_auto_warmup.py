@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMFYAPP_PATH = REPO_ROOT / "comfyapp.py"
@@ -357,6 +359,109 @@ class ModelCpuCachePatchTests(unittest.TestCase):
 
         result = fake_utils.load_torch_file("/tmp/models/b/demo.safetensors")
         self.assertEqual(result, {"tensor": "b"})
+
+
+class ModelLoadDiagTests(unittest.TestCase):
+    """Minimum offline checkpoint-load diagnostic (measurement-only)."""
+
+    def _make_patched(self, monkey_target=None):
+        from comfyapp import _ComfyAPIMixin
+        inst = object.__new__(_ComfyAPIMixin)
+        inst._model_cpu_cache = {}
+
+        def fake_original_load(path, *args, **kwargs):
+            return {"tensor": "from_disk"}
+
+        fake_mod = types.ModuleType("fake_comfy_utils_diag")
+        fake_mod.load_torch_file = fake_original_load
+        fake_mod.DISABLE_MMAP = True
+        inst._patch_model_cpu_cache(fake_mod)
+        return inst, fake_mod, fake_original_load
+
+    @pytest.mark.fast_unit
+    def test_diag_reports_cpu_and_fault_deltas(self):
+        import comfyapp as _ca
+
+        _, fake_mod, fake_original = self._make_patched()
+        snapshots = [
+            SimpleNamespace(ru_utime=1.0, ru_stime=0.5, ru_minflt=10, ru_majflt=1),
+            SimpleNamespace(ru_utime=1.25, ru_stime=0.75, ru_minflt=15, ru_majflt=2),
+        ]
+        fake_resource = types.ModuleType("resource")
+        fake_resource.RUSAGE_THREAD = 1
+        fake_resource.getrusage = mock.Mock(side_effect=snapshots)
+        with (
+            mock.patch.dict(sys.modules, {"resource": fake_resource}),
+            mock.patch.object(_ca, "PROFILING_ENABLED", True),
+            mock.patch("builtins.print") as print_mock,
+        ):
+            result = fake_mod.load_torch_file("/models/unet/diag.safetensors", device="cpu")
+        self.assertEqual(result, {"tensor": "from_disk"})
+        lines = [
+            str(call.args[0]) for call in print_mock.call_args_list
+            if call.args and str(call.args[0]).startswith("[model_load_diag]")
+        ]
+        self.assertEqual(len(lines), 1, "exactly one concise diag line per model load")
+        line = lines[0]
+        self.assertIn("file=diag.safetensors", line)
+        self.assertIn("device=cpu", line)
+        self.assertIn(fake_original.__qualname__, line)
+        self.assertIn("disable_mmap=True", line)
+        self.assertIn("rusage_user_s=0.25", line)
+        self.assertIn("rusage_system_s=0.25", line)
+        self.assertIn("rusage_minflt=5", line)
+        self.assertIn("rusage_majflt=1", line)
+        self.assertIn("rusage_status=available", line)
+        self.assertIn("gate=COMFYMODAL_PROFILING=1", line)
+
+    @pytest.mark.fast_unit
+    def test_diag_reports_unavailable_without_resource_support(self):
+        import comfyapp as _ca
+
+        _, fake_mod, _ = self._make_patched()
+        fake_resource = types.ModuleType("resource")  # no getrusage/RUSAGE_THREAD
+        with (
+            mock.patch.dict(sys.modules, {"resource": fake_resource}),
+            mock.patch.object(_ca, "PROFILING_ENABLED", True),
+            mock.patch("builtins.print") as print_mock,
+        ):
+            result = fake_mod.load_torch_file("/models/clip/diag.safetensors")
+        self.assertEqual(result, {"tensor": "from_disk"})
+        lines = [
+            str(call.args[0]) for call in print_mock.call_args_list
+            if call.args and str(call.args[0]).startswith("[model_load_diag]")
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("rusage_status=unavailable", lines[0])
+        self.assertIn("rusage_user_s=unavailable", lines[0])
+
+    @pytest.mark.fast_unit
+    def test_diag_gated_off_without_profiling(self):
+        import comfyapp as _ca
+
+        _, fake_mod, _ = self._make_patched()
+        with (
+            mock.patch.object(_ca, "PROFILING_ENABLED", False),
+            mock.patch("builtins.print") as print_mock,
+        ):
+            result = fake_mod.load_torch_file("/models/vae/diag.safetensors")
+        self.assertEqual(result, {"tensor": "from_disk"})
+        lines = [
+            str(call.args[0]) for call in print_mock.call_args_list
+            if call.args and str(call.args[0]).startswith("[model_load_diag]")
+        ]
+        self.assertEqual(lines, [], "diag must stay silent unless COMFYMODAL_PROFILING is on")
+
+    @pytest.mark.fast_unit
+    def test_diag_adds_no_proc_reads(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
+        start = source.find("Minimum offline checkpoint-load diagnostic")
+        self.assertNotEqual(start, -1)
+        block = source[start:start + 8000]
+        self.assertNotIn("/proc/self", block)
+        self.assertNotIn("capture_proc_self_io", block)
+        self.assertNotIn("meminfo", block)
+        self.assertNotIn("env_flag", block)
 
 
 class SnapshotPreloadProfileTests(unittest.TestCase):
