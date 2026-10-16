@@ -763,3 +763,162 @@ class RealKjWrapperIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Compile observability (additive): refresh event + milestone ordering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.fast_unit
+class CompileRefreshEventTests(unittest.TestCase):
+    def _live_scope(self, **overrides):
+        scope = tcp.install_sampling_compile_scope(
+            policy=_regional_policy(), scope_id="req-42")
+        scope.update(overrides)
+        return scope
+
+    def test_refresh_line_has_all_required_fields(self):
+        scope = self._live_scope()
+        model = _Model(blocks=_blocks(3))
+        discovery = tcp.discover_compile_regions(model)
+        tcp.prepare_compile_targets(
+            scope, diffusion_model=model, kj_probe=_kj_available(),
+            compile_fn=lambda b, p: b,
+        )
+        event = tcp.build_compile_refresh_event(
+            scope, diffusion_model=model, discovery=discovery)
+        line = event["line"]
+        self.assertTrue(line.startswith("[compile.refresh]"))
+        self.assertIn("request=req-42", line)
+        # NOTE: RegionDiscoveryTests mutates _Model.__name__ globally, so
+        # assert the live class name dynamically (real-model-visible).
+        self.assertIn(f"model={type(model).__name__}", line)
+        self.assertIn("mode=regional", line)
+        self.assertIn("regions=1", line)
+        self.assertIn("state=READY", line)
+        details = event["details"]
+        self.assertEqual(details["request"], "req-42")
+        self.assertEqual(details["model_class"], type(model).__name__)
+        self.assertEqual(details["mode"], "regional")
+        self.assertEqual(details["regions"], 1)
+        self.assertEqual(details["state"], "READY")
+        self.assertTrue(details["on_pre_run_executed"])
+
+    def test_refresh_single_line_no_block_spam_no_verbose_output(self):
+        scope = self._live_scope()
+        model = _Model(blocks=_blocks(4))
+        discovery = tcp.discover_compile_regions(model)
+        tcp.prepare_compile_targets(
+            scope, diffusion_model=model, kj_probe=_kj_available(),
+            compile_fn=lambda b, p: b,
+        )
+        event = tcp.build_compile_refresh_event(
+            scope, diffusion_model=model, discovery=discovery)
+        line = event["line"]
+        self.assertNotIn("\n", line)
+        lowered = line.lower()
+        for spam in ("block_index", "targets=", "inductor", "dynamo",
+                     "guard", "recompile trace", "cache hit"):
+            self.assertNotIn(spam, lowered, spam)
+        self.assertNotIn("targets", event["details"])
+
+    def test_refresh_missing_model_and_scope_degrades_honestly(self):
+        event = tcp.build_compile_refresh_event(None, diffusion_model=None)
+        self.assertIn("model=none", event["line"])
+        self.assertIn("regions=0", event["line"])
+        self.assertIn("state=unknown", event["line"])
+        self.assertFalse(event["details"]["hits_claimed"])
+
+
+@pytest.mark.fast_unit
+class CompileMilestoneOrderingTests(unittest.TestCase):
+    EXPECTED = [
+        "compile_refresh_enter",
+        "compile_refresh_result",
+        "compile_region_prepare",
+        "torch_compile_invoked",
+        "compiled_region_first_call_enter",
+        "compiled_region_first_call_exit",
+        "compile_summary",
+    ]
+
+    def test_fake_scope_lifecycle_ordering(self):
+        scope = tcp.install_sampling_compile_scope(policy=_regional_policy())
+        self.assertEqual(scope["events"], ["installed"])
+        for milestone in self.EXPECTED:
+            self.assertTrue(tcp.record_compile_milestone(scope, milestone),
+                            milestone)
+        tail = scope["events"][-len(self.EXPECTED):]
+        self.assertEqual(tail, self.EXPECTED)
+        # Milestones reuse the existing events list; no parallel store.
+        self.assertNotIn("milestones", scope)
+
+    def test_unknown_milestone_and_bad_scope_rejected_without_mutation(self):
+        scope = tcp.install_sampling_compile_scope(policy=_regional_policy())
+        before = list(scope["events"])
+        self.assertFalse(tcp.record_compile_milestone(scope, "dynamo_trace_verbose"))
+        self.assertFalse(tcp.record_compile_milestone(None, "compile_summary"))
+        self.assertFalse(tcp.record_compile_milestone({}, "compile_summary"))
+        self.assertFalse(tcp.record_compile_milestone(
+            {"events": "not-a-list"}, "compile_summary"))
+        self.assertEqual(scope["events"], before)
+
+
+@pytest.mark.fast_unit
+class CompileRefreshHonestyTests(unittest.TestCase):
+    def test_no_hit_claims_in_refresh_or_summary(self):
+        scope = tcp.install_sampling_compile_scope(
+            policy=_regional_policy(), cache_namespace="ns9")
+        model = _Model(blocks=_blocks(2))
+        discovery = tcp.discover_compile_regions(model)
+        tcp.prepare_compile_targets(
+            scope, diffusion_model=model, kj_probe=_kj_available(),
+            compile_fn=lambda b, p: b,
+        )
+        event = tcp.build_compile_refresh_event(
+            scope, diffusion_model=model, discovery=discovery)
+        self.assertFalse(event["details"]["hits_claimed"])
+        self.assertNotIn("hit", event["line"].lower())
+        summary = tcp.summarize_compile_sample(scope)
+        self.assertFalse(summary["details"]["cache"]["hits_claimed"])
+        self.assertNotIn("hit", summary["line"].lower())
+
+@pytest.mark.fast_unit
+class CacheRootPreferenceTests(unittest.TestCase):
+    def setUp(self):
+        self._saved_env = os.environ.get(cc.ENV_CACHE_ROOT)
+        self._saved_mount = cc.PERSISTENT_STATE_MOUNT
+        os.environ.pop(cc.ENV_CACHE_ROOT, None)
+
+    def tearDown(self):
+        if self._saved_env is None:
+            os.environ.pop(cc.ENV_CACHE_ROOT, None)
+        else:
+            os.environ[cc.ENV_CACHE_ROOT] = self._saved_env
+        cc.PERSISTENT_STATE_MOUNT = self._saved_mount
+
+    def test_env_override_wins(self):
+        os.environ[cc.ENV_CACHE_ROOT] = "/custom/cache-root"
+        self.assertEqual(cc.default_cache_root(), "/custom/cache-root")
+
+    def test_persistent_mount_preferred_when_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cc.PERSISTENT_STATE_MOUNT = tmp
+            root = cc.default_cache_root()
+            self.assertTrue(root.startswith(tmp))
+            self.assertTrue(root.endswith(os.path.join(".inductor-cache", "v1")))
+
+    def test_tmpdir_fallback_without_mount(self):
+        cc.PERSISTENT_STATE_MOUNT = os.path.join(
+            tempfile.gettempdir(), "definitely-absent-comfymodal-mount")
+        root = cc.default_cache_root()
+        self.assertTrue(root.startswith(tempfile.gettempdir()))
+        self.assertIn("comfymodal-compiler-cache", root)
+
+    def test_paths_build_under_chosen_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cc.PERSISTENT_STATE_MOUNT = tmp
+            paths = cc.compiler_cache_paths("abc123")
+            self.assertTrue(paths["namespace_dir"].startswith(tmp))
+            self.assertTrue(paths["inductor_dir"].startswith(tmp))

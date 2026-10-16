@@ -46,6 +46,13 @@ ENV_CACHE_ROOT = "COMFYMODAL_COMPILER_CACHE_ROOT"
 ENV_INDUCTOR_DIR = "TORCHINDUCTOR_CACHE_DIR"
 ENV_TRITON_DIR = "TRITON_CACHE_DIR"
 
+# Persistent runtime-state mount.  Must match modal_app.RUNTIME_STATE_PATH
+# (duplicated as a literal so this module stays dependency-light: stdlib
+# only, no runtime imports).  Used only when the mount actually exists, so
+# local dev machines without it keep the ephemeral tmpdir default.
+PERSISTENT_STATE_MOUNT = "/mnt/comfymodal_runtime_state"
+PERSISTENT_CACHE_SUBPATH = os.path.join(".inductor-cache", "v1")
+
 DEFAULT_TARGET_BYTES = 20 * 1024**3
 DEFAULT_MAX_IDLE_DAYS = 30
 SECONDS_PER_DAY = 86400.0
@@ -75,6 +82,11 @@ def default_cache_root() -> str:
     override = os.environ.get(ENV_CACHE_ROOT, "").strip()
     if override:
         return override
+    try:
+        if os.path.isdir(PERSISTENT_STATE_MOUNT):
+            return os.path.join(PERSISTENT_STATE_MOUNT, PERSISTENT_CACHE_SUBPATH)
+    except Exception:
+        pass
     return os.path.join(tempfile.gettempdir(), "comfymodal-compiler-cache")
 
 
@@ -286,3 +298,137 @@ def prune_compiler_cache(
             except OSError as exc:
                 errors.append({"path": path, "error": type(exc).__name__})
     return {**plan, "deleted": deleted, "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# Cache metadata snapshots (cheap pre/post evidence for later comparison)
+# ---------------------------------------------------------------------------
+#
+# Pre/post snapshots capture namespace, effective dirs, artifact count,
+# total size, and latest mtime in a SINGLE symlink-safe walk (lstat
+# semantics, never follows symlinks — same discipline as
+# ``_namespace_size_bytes``).  No hashing, no repeated deep scans: the
+# digest-relevant identity stays in ``compiler_cache_namespace``; these
+# snapshots exist only so a later compile-evidence comparison can tell
+# "cache grew / stayed empty" without re-walking.
+
+
+def _scan_dir_file_stats(path: str) -> tuple[int, int, float, bool]:
+    """Single-pass ``(count, bytes, latest_mtime, ok)`` for regular files.
+
+    Symlink-safe: symlinks are never followed or counted.  ``ok`` is
+    ``False`` when the walk itself failed (missing/unreadable root);
+    partial results are still returned best-effort.
+    """
+    count = 0
+    total = 0
+    latest = 0.0
+    ok = True
+    try:
+        if os.path.islink(path) or not os.path.isdir(path):
+            return 0, 0, 0.0, False
+    except OSError:
+        return 0, 0, 0.0, False
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as iterator:
+                entries = list(iterator)
+        except OSError:
+            ok = False
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    try:
+                        stat = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        ok = False
+                        continue
+                    count += 1
+                    total += stat.st_size
+                    if stat.st_mtime > latest:
+                        latest = float(stat.st_mtime)
+            except OSError:
+                ok = False
+                continue
+    return count, total, latest, ok
+
+
+def snapshot_cache_metadata(
+    namespace: str, *, root: str | None = None
+) -> dict[str, Any]:
+    """Capture cheap cache metadata for ``namespace`` in one walk.
+
+    Returns namespace, effective dirs, artifact count, total size, and
+    latest mtime.  Never hashes payloads and never scans twice.  A
+    missing namespace degrades to zeros (``namespace_exists=False``);
+    an empty/invalid namespace raises ``ValueError`` like
+    :func:`compiler_cache_paths`.
+    """
+    paths = compiler_cache_paths(namespace, root=root)
+    namespace_dir = paths["namespace_dir"]
+    try:
+        exists = bool(
+            os.path.isdir(namespace_dir)
+            and not os.path.islink(namespace_dir)
+        )
+    except OSError:
+        exists = False
+    count, total, latest, ok = _scan_dir_file_stats(namespace_dir)
+    return {
+        "namespace": str(namespace),
+        "root": paths["root"],
+        "dirs": dict(paths),
+        "namespace_exists": exists,
+        "artifact_count": count,
+        "total_bytes": total,
+        "latest_mtime": latest,
+        "scanned_ok": bool(ok and exists),
+    }
+
+
+def diff_cache_snapshots(
+    before: Mapping[str, Any] | None, after: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Pure diff of two :func:`snapshot_cache_metadata` snapshots.
+
+    Reports artifact/byte deltas and whether the latest mtime advanced.
+    Never raises; uncomparable inputs yield ``comparable=False`` with a
+    reason instead of fabricated zeros.
+    """
+    try:
+        if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+            return {"comparable": False, "reason": "snapshot_not_a_mapping"}
+        namespace_before = str(before.get("namespace", ""))
+        namespace_after = str(after.get("namespace", ""))
+        if not namespace_before or namespace_before != namespace_after:
+            return {"comparable": False, "reason": "namespace_mismatch",
+                    "before": namespace_before, "after": namespace_after}
+        count_before = int(before.get("artifact_count", 0) or 0)
+        count_after = int(after.get("artifact_count", 0) or 0)
+        bytes_before = int(before.get("total_bytes", 0) or 0)
+        bytes_after = int(after.get("total_bytes", 0) or 0)
+        mtime_before = float(before.get("latest_mtime", 0.0) or 0.0)
+        mtime_after = float(after.get("latest_mtime", 0.0) or 0.0)
+        return {
+            "comparable": True,
+            "namespace": namespace_before,
+            "artifact_count_before": count_before,
+            "artifact_count_after": count_after,
+            "artifact_delta": count_after - count_before,
+            "total_bytes_before": bytes_before,
+            "total_bytes_after": bytes_after,
+            "total_bytes_delta": bytes_after - bytes_before,
+            "latest_mtime_before": mtime_before,
+            "latest_mtime_after": mtime_after,
+            "mtime_advanced": bool(mtime_after > mtime_before),
+        }
+    except Exception as exc:
+        return {"comparable": False,
+                "reason": f"diff_failed:{type(exc).__name__}"}

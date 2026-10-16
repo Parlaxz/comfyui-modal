@@ -48,6 +48,7 @@ from . import validation as val_mod
 from . import provenance as prov_mod
 from . import deployment_receipt as receipt_mod
 from . import golden_guard as golden_guard_mod
+from . import run_lifecycle as lifecycle_mod
 from .experiment_evidence import (
     finalize_experiment_evidence,
     golden_arm_identity,
@@ -105,6 +106,8 @@ _MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 # registry flags + this block and its call sites.
 IDEOGRAM4_H100_PROFILE = "ideogram4_h100_20261015"
 IDEOGRAM4_H100_APP = "ideogram4-h100-profile-20261015"
+IDEOGRAM4_RTX_PROFILE = "ideogram4_rtxpro_20261015"
+IDEOGRAM4_RTX_APP = "ideogram4-rtxpro-profile-20261015"
 IDEOGRAM4_WORKFLOW_ID = "wf_81513286bb304e9f"
 IDEOGRAM4_WORKFLOW_VERSION_ID = "wv_f3baf54d8f784b64"
 IDEOGRAM4_WORKFLOW_NAME = "Ideogram 4 Comfy UI Default"
@@ -115,6 +118,12 @@ IDEOGRAM4_GRAPH_DEFAULT_STEPS = 20
 # Hard invariant for real dispatch on this profile (dry-run may show either).
 IDEOGRAM4_REQUIRED_STEPS = 16
 IDEOGRAM4_EXPECTED_GPU = "h100!"
+IDEOGRAM4_RTX_EXPECTED_GPU = "rtx-pro-6000"
+# Profile -> exact GPU (no pool). Both isolated Ideogram profiles resolve here.
+IDEOGRAM4_PROFILE_GPUS = {
+    IDEOGRAM4_H100_PROFILE: IDEOGRAM4_EXPECTED_GPU,
+    IDEOGRAM4_RTX_PROFILE: IDEOGRAM4_RTX_EXPECTED_GPU,
+}
 IDEOGRAM4_WORKFLOW_ID_FLAG = "COMFYMODAL_V2_WORKFLOW_ID"
 IDEOGRAM4_WORKFLOW_VERSION_FLAG = "COMFYMODAL_V2_WORKFLOW_VERSION_ID"
 IDEOGRAM4_WORKFLOW_STEPS_FLAG = "COMFYMODAL_V2_WORKFLOW_STEPS"
@@ -214,7 +223,7 @@ def _resolve_workflow_selection(
     workflow_id = _ideogram4_flag_value(config, IDEOGRAM4_WORKFLOW_ID_FLAG)
     workflow_version_id = _ideogram4_flag_value(config, IDEOGRAM4_WORKFLOW_VERSION_FLAG)
     steps_raw = _ideogram4_flag_value(config, IDEOGRAM4_WORKFLOW_STEPS_FLAG)
-    is_profile = profile == IDEOGRAM4_H100_PROFILE
+    is_profile = profile in IDEOGRAM4_PROFILE_GPUS
     # The steps flag default "0" means "graph default" (unset): only a
     # positive value counts as an explicit workflow input.
     steps_unset = (not steps_raw) or steps_raw == "0"
@@ -232,12 +241,13 @@ def _resolve_workflow_selection(
         )
     if is_profile:
         # Exact placement: this profile exists for one GPU with no pool.
+        expected_gpu = IDEOGRAM4_PROFILE_GPUS[profile]
         gpu = str(getattr(config.resources, "gpu", "") or "")
         alt = str(getattr(config.resources, "gpu_alt", "") or "").strip()
         fallbacks = list(getattr(config.resources, "gpu_fallbacks", ()) or ())
-        if gpu != IDEOGRAM4_EXPECTED_GPU or alt or fallbacks:
+        if gpu != expected_gpu or alt or fallbacks:
             raise GateError(
-                f"ideogram profile placement must be exactly gpu={IDEOGRAM4_EXPECTED_GPU!r} "
+                f"ideogram profile placement must be exactly gpu={expected_gpu!r} "
                 f"with no alt/fallback pool; got gpu={gpu!r} alt={alt!r} fallbacks={fallbacks!r}"
             )
         cloud = _ideogram4_flag_value(config, "COMFYMODAL_V2_CLOUD")
@@ -319,7 +329,7 @@ def _validate_workflow_selection(selection: dict) -> None:
 
 def _require_ideogram4_dispatch_steps(selection: dict, *, command: str) -> None:
     """Enforce the 16-step hard invariant for real dispatch on this profile."""
-    if str(selection.get("profile") or "") != IDEOGRAM4_H100_PROFILE:
+    if str(selection.get("profile") or "") not in IDEOGRAM4_PROFILE_GPUS:
         return
     effective = int(selection.get("steps", {}).get("effective", 0))
     if effective != IDEOGRAM4_REQUIRED_STEPS:
@@ -4369,6 +4379,35 @@ def cmd_run(args, repo_root: Path) -> int:
               f"deploy_fingerprint={current} run_fingerprint="
               f"{val_mod._bound_run_fingerprint(fingerprints, bound_receipt)}")
         print(f"[v2ctl.run] command={command}")
+        # ── Early local manifest (durable evidence) ────────────────────
+        # Written as soon as the run starts (status=running) so a timeout
+        # or cancellation always leaves a discoverable manifest; the
+        # request id is filled in as soon as it is known.  Best-effort:
+        # a manifest failure must never block dispatch.
+        early_manifest_path = None
+        try:
+            early_manifest_path = lifecycle_mod.write_early_run_manifest(
+                repo_root,
+                profile=config.profile_name,
+                invocation_id=invocation_id,
+                target=requested_target,
+                deploy_fingerprint=current,
+                workspace_id=(
+                    bound_receipt.deployment_identity.get("modal_workspace", "")
+                    if bound_receipt is not None else ""
+                ),
+                environment=(
+                    bound_receipt.deployment_identity.get("modal_environment", "")
+                    if bound_receipt is not None else ""
+                ),
+                workflow_selection=workflow_selection,
+                supervisor=lifecycle_mod.current_supervisor_record(),
+                backend_command=command,
+            )
+            print(f"[v2ctl.run] early_manifest={early_manifest_path}")
+        except Exception as exc:  # noqa: BLE001 - manifest must not block dispatch
+            print(f"[v2ctl.run] WARNING: early manifest unwritable: {exc}", file=sys.stderr)
+            early_manifest_path = None
         try:
             result = _make_backend_runner(repo_root, env_builder, workspace_binding).run(
                 spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
@@ -4388,7 +4427,40 @@ def cmd_run(args, repo_root: Path) -> int:
                     }
                     if bound_receipt is not None else None
                 ))
-        except Exception:
+        except KeyboardInterrupt:
+            # Local cancellation: record it on the early manifest, then
+            # propagate (main() reports exit 130).  Never masks the signal.
+            if early_manifest_path is not None:
+                try:
+                    lifecycle_mod.update_run_manifest(
+                        early_manifest_path,
+                        status=lifecycle_mod.STATUS_CANCELLED,
+                        error="KeyboardInterrupt",
+                    )
+                except Exception:
+                    pass
+            raise
+        except Exception as run_exc:
+            # A timeout MUST leave a discoverable manifest containing the
+            # request id (parsed from the killed child's partial stdout by
+            # the backend runner); any other backend failure is recorded
+            # as failed.  The manifest update never masks the original error.
+            if isinstance(run_exc, BackendError) and getattr(run_exc, "timed_out", False):
+                _early_status = lifecycle_mod.STATUS_TIMEOUT
+                _early_request_id = str(getattr(run_exc, "request_id", "") or "")
+            else:
+                _early_status = lifecycle_mod.STATUS_FAILED
+                _early_request_id = ""
+            if early_manifest_path is not None:
+                try:
+                    lifecycle_mod.update_run_manifest(
+                        early_manifest_path,
+                        status=_early_status,
+                        request_id=_early_request_id,
+                        error=f"{type(run_exc).__name__}: {run_exc}"[:1024],
+                    )
+                except Exception:
+                    pass
             if is_experiment_profile(config):
                 try:
                     finalize_experiment_evidence(
@@ -4427,6 +4499,16 @@ def cmd_run(args, repo_root: Path) -> int:
             deployment_receipt=bound_receipt,
             workflow_selection=workflow_selection,
         )
+        if early_manifest_path is not None:
+            try:
+                lifecycle_mod.update_run_manifest(
+                    early_manifest_path,
+                    status=lifecycle_mod.STATUS_COMPLETED,
+                    request_id=result.request_id or "",
+                    final_manifest=str(run_manifest),
+                )
+            except Exception:
+                pass
         if result.artifacts.run_artifact is not None:
             pass
         print(f"[v2ctl.run] exit={result.exit_code} manifest={run_manifest}")
@@ -4488,6 +4570,103 @@ def cmd_run(args, repo_root: Path) -> int:
     except (V2CtlError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
+
+def cmd_run_cancel(args, repo_root: Path) -> int:
+    """Cancel a specific run/request without touching the app.
+
+    Run/request-scoped only: delivers the cooperative cancel primitive for
+    the resolved ``request_id`` (live transport handle first, else the
+    run's control Queue at ``partition=request_id``).  This command NEVER
+    stops or deletes a Modal app; an app-wide stop exists only as a
+    last-resort fallback in the external bounded supervisor.
+    """
+    manifest_arg = str(getattr(args, "manifest", "") or "").strip()
+    request_id = str(getattr(args, "request_id", "") or "").strip()
+    manifest_status = ""
+    manifest_doc: dict | None = None
+    if manifest_arg:
+        manifest_doc = lifecycle_mod.read_run_manifest(manifest_arg)
+        if manifest_doc is None:
+            print(f"ERROR: cannot read run manifest {manifest_arg!r}", file=sys.stderr)
+            return 2
+        request_id = request_id or str(manifest_doc.get("request_id", "") or "").strip()
+        manifest_status = str(manifest_doc.get("status", "") or "")
+    if not request_id and bool(getattr(args, "latest", False)):
+        profile = str(getattr(args, "profile", "") or "").strip() or None
+        running = lifecycle_mod.find_running_manifests(repo_root, profile=profile)
+        if running:
+            manifest_arg, manifest_doc = running[0][0], running[0][1]
+            request_id = str(manifest_doc.get("request_id", "") or "").strip()
+            manifest_status = str(manifest_doc.get("status", "") or "")
+    if not request_id:
+        print(
+            "ERROR: no request id: pass --request-id, --manifest <early-manifest>, "
+            "or --latest (newest running manifest)",
+            file=sys.stderr,
+        )
+        return 2
+    reason = str(getattr(args, "reason", "") or "operator_cancel")
+    if bool(getattr(args, "dry_run", False)):
+        plan = lifecycle_mod.describe_cancel_plan(
+            request_id,
+            reason=reason,
+            manifest_status=manifest_status,
+            queue_name=lifecycle_mod.control_queue_name(),
+        )
+        print(json.dumps(plan, indent=2, sort_keys=True))
+        return 0
+    try:
+        binding = _workspace_binding_for_args(args, repo_root)
+    except (V2CtlError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    queue_name = lifecycle_mod.control_queue_name()
+    put_timeout = getattr(args, "cancel_timeout", 30.0)
+    try:
+        put_timeout = float(put_timeout)
+    except (TypeError, ValueError):
+        put_timeout = 30.0
+
+    def _put(message: dict, partition: str) -> bool:
+        return lifecycle_mod.modal_control_queue_put(
+            queue_name, message, partition, timeout_s=put_timeout
+        )
+
+    try:
+        # Config-owned credentials only, restored afterwards; secrets never
+        # printed (the verdict detail is bounded and credential-free).
+        with _workspace_process_environment(binding):
+            verdict = lifecycle_mod.request_run_cancel(
+                request_id,
+                reason=reason,
+                queue_put=_put,
+                manifest_status=manifest_status,
+            )
+    except (V2CtlError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"[v2ctl.run-cancel] request_id={request_id} "
+        f"outcome={verdict.get('outcome')} via={verdict.get('via')} "
+        f"detail={verdict.get('detail')}"
+    )
+    if manifest_arg and verdict.get("outcome") in (
+        "pending", "confirmed",
+    ):
+        try:
+            lifecycle_mod.update_run_manifest(
+                manifest_arg,
+                status=lifecycle_mod.STATUS_CANCELLED,
+                request_id=request_id,
+            )
+        except Exception:
+            pass
+    if verdict.get("outcome") in (
+        "pending", "confirmed", "completed_before_cancel",
+    ):
+        return 0
+    return 1
 
 
 def cmd_gate(args, repo_root: Path) -> int:
@@ -5234,6 +5413,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser(
+        "run-cancel",
+        help="cancel a specific run/request without stopping the app",
+    )
+    p.add_argument("--request-id", default=None, help="remote request id to cancel")
+    p.add_argument("--manifest", default=None, help="early run manifest path (request id + status load from here)")
+    p.add_argument("--latest", action="store_true", help="select the newest running manifest when --request-id/--manifest are absent")
+    p.add_argument("--reason", default="operator_cancel", help="cancel reason recorded with the request")
+    p.add_argument("--cancel-timeout", type=float, default=30.0, help="control-queue put timeout seconds")
+    p.set_defaults(func=cmd_run_cancel)
 
     p = sub.add_parser("gate")
     p.set_defaults(func=cmd_gate)

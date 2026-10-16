@@ -33,6 +33,7 @@ from tools.v2_control.backend import (  # noqa: E402
     BackendResult,
     BackendRunner,
     BackendSpec,
+    decode_partial_child_output,
     detect_crash_loop,
 )
 from tools.v2_control.environment import EnvironmentBuilder  # noqa: E402
@@ -912,3 +913,40 @@ def test_artifact_set_all_none_by_default():
     assert artifacts.summary_artifact is None
     assert artifacts.campaign_manifest is None
     assert artifacts.console_capture is None
+
+
+# ---------------------------------------------------------------------------
+# Timeout/cancellation plumbing: partial output + request id survive timeout
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.fast_unit
+def test_decode_partial_child_output_shapes():
+    assert decode_partial_child_output(None) == ""
+    assert decode_partial_child_output(b"request_id=req-1\n") == "request_id=req-1\n"
+    assert decode_partial_child_output("already-text") == "already-text"
+    assert decode_partial_child_output(b"\xff\xfe") != ""
+
+
+@pytest.mark.fast_unit
+def test_backend_timeout_preserves_partial_request_id(tmp_path):
+    """A backend timeout MUST NOT lose the request id with partial stdout."""
+    code = (
+        "import sys, time; "
+        "sys.stdout.write('request_id=req-timeout-9\\n'); sys.stdout.flush(); "
+        "time.sleep(30)"
+    )
+    spec = BackendSpec(
+        name="sleeper",
+        executable=[sys.executable, "-c", code],
+        kind="test_fake",
+        description="prints a request id then hangs",
+    )
+    runner = BackendRunner(tmp_path, EnvironmentBuilder())
+    with pytest.raises(BackendError) as excinfo:
+        runner.run(spec, config=_Config(), timeout_seconds=1)
+    err = excinfo.value
+    assert getattr(err, "timed_out", False) is True
+    assert getattr(err, "request_id", "") == "req-timeout-9"
+    assert "request_id=req-timeout-9" in getattr(err, "partial_stdout", "")
+    assert "timed out" in str(err)

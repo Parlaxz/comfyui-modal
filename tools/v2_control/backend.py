@@ -464,6 +464,24 @@ def detect_crash_loop(output: str) -> dict[str, str] | None:
         return None
 
 
+def decode_partial_child_output(value: Any) -> str:
+    """Decode partial child output carried by ``subprocess.TimeoutExpired``.
+
+    Never raises; returns ``""`` when nothing decodable is present.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    try:
+        return str(value or "")
+    except Exception:
+        return ""
+
+
 class BackendRunner:
     """Runs a BackendSpec through subprocess with a sanitized child env."""
 
@@ -700,9 +718,25 @@ class BackendRunner:
                         **kwargs,
                     )
         except subprocess.TimeoutExpired as exc:
-            raise BackendError(
+            # Timeout/cancellation plumbing: preserve the partial child
+            # output on the error so the caller can leave a discoverable
+            # run manifest containing the request id (a timeout MUST NOT
+            # lose the request id with the killed child's stdout).
+            timeout_error = BackendError(
                 f"backend {spec.name} timed out after {timeout_seconds}s"
-            ) from exc
+            )
+            timeout_error.timed_out = True
+            timeout_error.partial_stdout = decode_partial_child_output(
+                getattr(exc, "stdout", None)
+            )
+            timeout_error.partial_stderr = decode_partial_child_output(
+                getattr(exc, "stderr", None)
+            )
+            from .run_lifecycle import extract_request_id as _extract_request_id
+            timeout_error.request_id = _extract_request_id(
+                timeout_error.partial_stdout
+            )
+            raise timeout_error from exc
         except OSError as exc:
             raise BackendError(
                 f"backend {spec.name} failed to spawn: {exc}"

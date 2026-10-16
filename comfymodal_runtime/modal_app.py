@@ -1453,6 +1453,352 @@ if CUSTOM_NODE_DELIVERY not in ("image", "volume"):
 RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
 
 
+# ── Durable run evidence (request-scoped, volume-backed) ─────────────────
+# Small lifecycle/compiler/model-load events, keyed by request id, persisted
+# as one JSONL file per request under the ALREADY-mounted persistent
+# runtime-state volume (``RUNTIME_STATE_PATH`` — survives app stop/deletion
+# because the Modal Volume owns it; no new volume, no new platform).
+#
+# Ownership reuse: writes go through ``ModalMountedStateVolume`` +
+# the raw volume's commit (``commit.aio()`` when present, thread fallback
+# otherwise) — the same reload/commit paths as the validation-certificate
+# seam.  ``record_*`` only appends to a bounded in-memory buffer (safe at
+# any point, including during sampling); ``flush_run_evidence`` performs
+# the single volume write+commit and runs ONLY at quiescent boundaries
+# (request end / cancel / generator-closed in ``run_plan_stream``'s
+# finally).  Profiler output can never land here: the event-type allowlist
+# below has no profiler/trace entry and every event is byte-capped.
+#
+# This section is self-contained (stdlib only; volume class and resources
+# injectable) so fast_unit tests can exec it with fakes without importing
+# this module.
+RUN_EVIDENCE_SCHEMA_VERSION = 1
+RUN_EVIDENCE_DIRNAME = "run_evidence"
+RUN_EVIDENCE_EVENT_TYPES = frozenset({
+    "request_start",
+    "request_terminal",
+    "compile_finalize",
+    "model_load",
+})
+RUN_EVIDENCE_MAX_EVENT_BYTES = 2048
+RUN_EVIDENCE_MAX_EVENTS_PER_REQUEST = 128
+RUN_EVIDENCE_MAX_FILE_BYTES = 256 * 1024
+RUN_EVIDENCE_MAX_STRING_BYTES = 240
+RUN_EVIDENCE_MAX_DEPTH = 5
+_RUN_EVIDENCE_SENSITIVE_PARTS = (
+    "prompt", "text", "secret", "token", "password", "credential",
+    "authorization", "api_key", "access_key", "cookie",
+)
+_RUN_EVIDENCE_BUFFERS: dict[str, list[dict[str, Any]]] = {}
+
+
+def _run_evidence_safe_id(request_id: Any) -> str:
+    """Filename-safe request id (alnum plus ``_-.``; else ``_``)."""
+    text = str(request_id or "").strip()
+    if not text:
+        return "unknown"
+    kept = "".join(
+        ch if (ch.isalnum() or ch in "_-.") else "_" for ch in text
+    ).strip("._")[:128]
+    return kept or "unknown"
+
+
+def run_evidence_relpath(request_id: Any) -> str:
+    """Volume-relative JSONL path for one request's evidence file."""
+    return f"{RUN_EVIDENCE_DIRNAME}/{_run_evidence_safe_id(request_id)}.jsonl"
+
+
+def _run_evidence_json_safe(value: Any, key: str = "", depth: int = 0) -> Any:
+    """Bounded JSON-safe projection (redacts sensitive keys, caps size)."""
+    if depth > RUN_EVIDENCE_MAX_DEPTH:
+        return "<truncated>"
+    lowered = str(key or "").lower().replace("-", "_")
+    if any(part in lowered for part in _RUN_EVIDENCE_SENSITIVE_PARTS):
+        return "<redacted>"
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:RUN_EVIDENCE_MAX_STRING_BYTES]
+    if isinstance(value, Mapping):
+        return {
+            str(k)[:64]: _run_evidence_json_safe(v, str(k), depth + 1)
+            for k, v in list(value.items())[:64]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_run_evidence_json_safe(v, key, depth + 1) for v in value[:64]]
+    try:
+        return str(value)[:RUN_EVIDENCE_MAX_STRING_BYTES]
+    except Exception:
+        return "<unrepresentable>"
+
+
+def record_run_evidence_event(
+    request_id: Any,
+    event_type: str,
+    fields: Mapping[str, Any] | None = None,
+    *,
+    _buffers: dict[str, list[dict[str, Any]]] | None = None,
+    _time: Any = None,
+) -> bool:
+    """Buffer one small evidence event (memory only — never volume I/O).
+
+    Returns ``True`` when buffered.  ``False`` (never raises) when the
+    event type is not allowlisted, the request buffer is full, or the
+    encoded event exceeds the per-event byte cap.
+    """
+    try:
+        if str(event_type or "") not in RUN_EVIDENCE_EVENT_TYPES:
+            return False
+        buffers = _buffers if _buffers is not None else _RUN_EVIDENCE_BUFFERS
+        rid = str(request_id or "").strip() or "unknown"
+        now = _time() if callable(_time) else time.time()
+        raw_fields = dict(fields) if isinstance(fields, Mapping) else {}
+        try:
+            raw_len = len(json.dumps(
+                {"fields": raw_fields}, sort_keys=True, default=str,
+            ).encode("utf-8"))
+        except Exception:
+            return False
+        if raw_len > RUN_EVIDENCE_MAX_EVENT_BYTES:
+            # Fail closed on oversized payloads (never silently truncate a
+            # large blob into misleading evidence); small events proceed.
+            return False
+        event = {
+            "schema": RUN_EVIDENCE_SCHEMA_VERSION,
+            "request_id": rid,
+            "type": str(event_type),
+            "ts": now,
+            "fields": _run_evidence_json_safe(raw_fields),
+        }
+        try:
+            encoded_len = len(
+                json.dumps(event, sort_keys=True).encode("utf-8")
+            )
+        except Exception:
+            return False
+        if encoded_len > RUN_EVIDENCE_MAX_EVENT_BYTES:
+            return False
+        slot = buffers.get(rid)
+        if slot is None:
+            slot = []
+            buffers[rid] = slot
+        if len(slot) >= RUN_EVIDENCE_MAX_EVENTS_PER_REQUEST:
+            return False
+        slot.append(event)
+        return True
+    except Exception:
+        return False
+
+
+def read_run_evidence_events(
+    request_id: Any,
+    *,
+    _volume: Any = None,
+    _resources: Any = None,
+    _volume_cls: Any = None,
+    _root: Any = None,
+) -> list[dict[str, Any]]:
+    """Read one request's persisted evidence events (oldest first).
+
+    Reloads the volume before reading (same reload ownership as the
+    certificate seam).  Returns ``[]`` on any failure; never raises.
+    """
+    try:
+        volume = _volume
+        if volume is None:
+            resources = _resources
+            if resources is None:
+                try:
+                    resources = globals().get("_MODAL_RESOURCES", {}) or {}
+                except Exception:
+                    resources = {}
+            modal_volume = None
+            try:
+                modal_volume = (
+                    resources.get("runtime_state_volume")
+                    if isinstance(resources, Mapping) else None
+                )
+            except Exception:
+                modal_volume = None
+            if modal_volume is None:
+                return []
+            cls = _volume_cls
+            if cls is None:
+                try:
+                    from .runtime_state import (  # type: ignore[import-not-found]
+                        ModalMountedStateVolume as _MSV,
+                    )
+                    cls = _MSV
+                except Exception:
+                    return []
+            root = _root if _root is not None else RUNTIME_STATE_PATH
+            volume = cls(root, modal_volume)
+        reload_fn = getattr(volume, "reload", None)
+        if callable(reload_fn):
+            try:
+                reload_fn()
+            except Exception:
+                pass
+        try:
+            raw = volume.read_bytes(run_evidence_relpath(request_id))
+        except Exception:
+            return []
+        if not raw:
+            return []
+        if len(raw) > RUN_EVIDENCE_MAX_FILE_BYTES + 65536:
+            return []
+        events: list[dict[str, Any]] = []
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(item, dict):
+                events.append(item)
+            if len(events) >= RUN_EVIDENCE_MAX_EVENTS_PER_REQUEST + 1:
+                break
+        return events
+    except Exception:
+        return []
+
+
+async def flush_run_evidence(
+    request_id: Any,
+    outcome: str = "",
+    *,
+    _buffers: dict[str, list[dict[str, Any]]] | None = None,
+    _volume: Any = None,
+    _resources: Any = None,
+    _volume_cls: Any = None,
+    _root: Any = None,
+    _time: Any = None,
+) -> dict[str, Any]:
+    """Write one request's buffered events to the volume (quiescent only).
+
+    Single atomic write + volume commit per call.  The buffer is drained
+    only on success (a failed flush keeps bounded events for a later
+    boundary).  Never raises; returns a ``{"flushed": bool, ...}`` record.
+    """
+    outcome_text = str(outcome or "")
+    try:
+        buffers = _buffers if _buffers is not None else _RUN_EVIDENCE_BUFFERS
+        rid = str(request_id or "").strip() or "unknown"
+        slot = buffers.get(rid) or []
+        now = _time() if callable(_time) else time.time()
+        marker = {
+            "schema": RUN_EVIDENCE_SCHEMA_VERSION,
+            "request_id": rid,
+            "type": "request_flush",
+            "ts": now,
+            "fields": {"outcome": outcome_text[:64], "event_count": len(slot)},
+        }
+        pending = list(slot) + [marker]
+        # Bound the file: drop oldest non-terminal events first (the flush
+        # marker is always kept).  Pure size cap — no hashing, no scans.
+        while len(pending) > 1:
+            try:
+                size = len(
+                    "\n".join(
+                        json.dumps(item, sort_keys=True) for item in pending
+                    ).encode("utf-8")
+                )
+            except Exception:
+                return {"flushed": False, "reason": "encode_failed",
+                        "request_id": rid}
+            if size <= RUN_EVIDENCE_MAX_FILE_BYTES:
+                break
+            dropped = False
+            for index, item in enumerate(pending[:-1]):
+                if item.get("type") != "request_terminal":
+                    pending.pop(index)
+                    dropped = True
+                    break
+            if not dropped:
+                pending.pop(0)
+        try:
+            payload = (
+                "\n".join(
+                    json.dumps(item, sort_keys=True) for item in pending
+                ) + "\n"
+            ).encode("utf-8")
+        except Exception:
+            return {"flushed": False, "reason": "encode_failed",
+                    "request_id": rid}
+        volume = _volume
+        if volume is None:
+            resources = _resources
+            if resources is None:
+                try:
+                    resources = globals().get("_MODAL_RESOURCES", {}) or {}
+                except Exception:
+                    resources = {}
+            modal_volume = None
+            try:
+                modal_volume = (
+                    resources.get("runtime_state_volume")
+                    if isinstance(resources, Mapping) else None
+                )
+            except Exception:
+                modal_volume = None
+            if modal_volume is None:
+                return {"flushed": False, "reason": "no_volume",
+                        "request_id": rid, "event_count": len(slot)}
+            cls = _volume_cls
+            if cls is None:
+                try:
+                    from .runtime_state import (  # type: ignore[import-not-found]
+                        ModalMountedStateVolume as _MSV,
+                    )
+                    cls = _MSV
+                except Exception:
+                    return {"flushed": False, "reason": "no_volume_cls",
+                            "request_id": rid}
+            root = _root if _root is not None else RUNTIME_STATE_PATH
+            volume = cls(root, modal_volume)
+        try:
+            volume.write_bytes(run_evidence_relpath(rid), payload)
+        except Exception as exc:
+            return {"flushed": False,
+                    "reason": f"write_failed:{type(exc).__name__}",
+                    "request_id": rid}
+        try:
+            commit_fn = getattr(volume, "commit", None)
+            if commit_fn is None:
+                return {"flushed": False, "reason": "no_commit",
+                        "request_id": rid}
+            if asyncio.iscoroutinefunction(commit_fn):
+                await commit_fn()
+            else:
+                aio_method = getattr(commit_fn, "aio", None)
+                if callable(aio_method):
+                    await aio_method()
+                else:
+                    await asyncio.to_thread(commit_fn)
+        except Exception as exc:
+            return {"flushed": False,
+                    "reason": f"commit_failed:{type(exc).__name__}",
+                    "request_id": rid}
+        try:
+            buffers.pop(rid, None)
+        except Exception:
+            pass
+        return {"flushed": True, "reason": "committed", "request_id": rid,
+                "event_count": len(slot), "bytes": len(payload)}
+    except Exception as exc:
+        try:
+            rid_fallback = str(request_id or "").strip() or "unknown"
+        except Exception:
+            rid_fallback = "unknown"
+        return {"flushed": False,
+                "reason": f"flush_failed:{type(exc).__name__}",
+                "request_id": rid_fallback}
+
+
 def _ensure_custom_nodes_compat_symlink() -> None:
     """Verify the image-baked import symlink reaches the mounted Volume.
 
@@ -18655,6 +19001,30 @@ class ModalRuntimeEntrypoint:
                 # request finally; never fails execution.
                 try:
                     _finalize_request_compile_scope(_compile_scope_record)
+                    _compile_finalize_error = ""
+                except Exception as _compile_finalize_exc:
+                    _compile_finalize_error = type(_compile_finalize_exc).__name__
+                # ── Durable run evidence: compiler scope outcome ─────────
+                # Compact install-record mode marker for later
+                # compile-evidence comparison (buffer-only; flushed at the
+                # request boundary).  The pinned finalize call above is
+                # byte-identical (wiring-contract); this record only reads
+                # the already-available scope record, never its outcome.
+                try:
+                    try:
+                        _compile_finalize_mode = str(
+                            (_compile_scope_record or {}).get("policy_mode", "")
+                            or ""
+                        )
+                    except Exception:
+                        _compile_finalize_mode = ""
+                    record_run_evidence_event(
+                        _watchdog_request_id, "compile_finalize",
+                        {
+                            "policy_mode": _compile_finalize_mode,
+                            "finalize_error": _compile_finalize_error,
+                        },
+                    )
                 except Exception:
                     pass
                 try:
@@ -22445,6 +22815,13 @@ class ModalRuntimeEntrypoint:
         control_partition: Any = None,
     ) -> AsyncIterator[dict[str, Any]]:
         self._lazy_init_snapshot_state()
+        # ── Durable run evidence: request lifecycle open ─────────────────
+        # Best-effort, sampling-safe (memory buffer only; the single volume
+        # write+commit happens in the finally below).  Never fails dispatch.
+        try:
+            record_run_evidence_event(request_id, "request_start")
+        except Exception:
+            pass
         # ── E40 Lane B/A: per-run authority seeding ──────────────────────
         # One resolved-config truth per run; loader-selection registry is
         # reset and seeded with requested==effective from that authority.
@@ -22524,6 +22901,16 @@ class ModalRuntimeEntrypoint:
                 if not terminal_started and event.get("type") in {"result", "error", "cancelled"}:
                     terminal_started = True
                     self._terminal_response_delivered = True
+                    # ── Durable run evidence: lifecycle terminal ─────────
+                    # Best-effort buffer-only record (covers result, error,
+                    # and cooperative-cancel terminals alike).
+                    try:
+                        record_run_evidence_event(
+                            request_id, "request_terminal",
+                            {"terminal_status": str(event.get("type", "unknown"))},
+                        )
+                    except Exception:
+                        pass
                     if diagnostics is not None:
                         diagnostics.set_identity(request_id=event.get("request_id", request_id))
                         diagnostics.emit(
@@ -22581,6 +22968,14 @@ class ModalRuntimeEntrypoint:
                     end_mono_ns=_cleanup_end_mono_ns,
                     request_id=str(request_id or ""),
                 )
+                try:
+                    record_run_evidence_event(
+                        request_id, "request_terminal",
+                        {"terminal_status": "exception",
+                         "error": type(exc).__name__},
+                    )
+                except Exception:
+                    pass
                 yield _err_event
         finally:
             # Capture whether a real terminal result/error event was produced
@@ -22620,6 +23015,40 @@ class ModalRuntimeEntrypoint:
                         pass
             try:
                 await self._finalize_deferred_commit(request_id=request_id)
+            except Exception:
+                pass
+            # ── Durable run evidence: quiescent-boundary flush ───────────
+            # Request end / cancel / generator-closed all funnel through
+            # this finally.  The single volume write+commit per request
+            # happens here — never during sampling.  The model-load event
+            # is derived from the already-available per-request restore
+            # timing (small scalars only, "absent"-tolerant, no new I/O).
+            # Best-effort; never fails teardown.
+            try:
+                _evidence_outcome = (
+                    "completed" if _terminal_was_yielded else "generator_closed"
+                )
+                try:
+                    _restore_timing_snapshot = self._restore_timing or {}
+                except Exception:
+                    _restore_timing_snapshot = {}
+                try:
+                    record_run_evidence_event(
+                        request_id, "model_load",
+                        {
+                            "restore_session_id": str(
+                                _restore_timing_snapshot.get(
+                                    "restore_session_id", "") or ""
+                            ),
+                            "restore_method_end": str(
+                                _restore_timing_snapshot.get(
+                                    "restore_method_end_mono_ns", "absent")
+                            ),
+                        },
+                    )
+                except Exception:
+                    pass
+                await flush_run_evidence(request_id, _evidence_outcome)
             except Exception:
                 pass
             if diagnostics is not None:

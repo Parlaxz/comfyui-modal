@@ -852,3 +852,125 @@ def summarize_compile_sample(scope: dict[str, Any], *, debug: bool = False) -> d
         details["regions"] = regions
         details["events"] = list(scope.get("events") or [])
     return {"line": line, "details": details}
+
+
+# ---------------------------------------------------------------------------
+# Compile observability: refresh event + request-scoped milestones (additive)
+# ---------------------------------------------------------------------------
+# Wire-ready only.  The parent wiring lane owns WHEN these run (single call
+# at the ON_PRE_RUN seam after the live model is resolved and regional
+# discovery has run); this module only formats content.  No torch / KJ /
+# Dynamo / Inductor imports, no per-block spam, no kernel instrumentation.
+#
+# Phase map for a future log reader (milestone -> phase it proves):
+# * compile_refresh_enter          -> model loading (live model resolve start)
+# * compile_refresh_result         -> discovery outcome (regions-N / reason)
+# * compile_region_prepare         -> wrapper creation (lazy targets armed)
+# * torch_compile_invoked          -> torch.compile call (Dynamo/Inductor start)
+# * compiled_region_first_call_enter/exit -> first compiled call brackets
+#   Dynamo/Inductor compile vs compiled execution (enter=compile running,
+#   exit=compiled artifact now serving)
+# * compile_summary                -> end-of-scope aggregate summary
+# Model loading vs discovery vs wrapper creation vs first compiled call vs
+# compile vs execution are therefore separable by milestone order alone.
+
+COMPILE_REFRESH_PREFIX = "[compile.refresh]"
+
+COMPILE_MILESTONES = (
+    "compile_refresh_enter",
+    "compile_refresh_result",
+    "compile_region_prepare",
+    "torch_compile_invoked",
+    "compiled_region_first_call_enter",
+    "compiled_region_first_call_exit",
+    "compile_summary",
+)
+
+_MILESTONE_SET = frozenset(COMPILE_MILESTONES)
+
+
+def record_compile_milestone(scope: Any, milestone: str) -> bool:
+    """Append one lightweight milestone to the existing ``scope["events"]``.
+
+    Reuses the scope events list created by
+    :func:`install_sampling_compile_scope`; never creates a parallel store.
+    Unknown milestones, non-dict scopes, or missing/non-list ``events``
+    return ``False`` without mutating anything.
+    """
+    if not isinstance(scope, dict):
+        return False
+    if milestone not in _MILESTONE_SET:
+        return False
+    events = scope.get("events")
+    if not isinstance(events, list):
+        return False
+    events.append(milestone)
+    return True
+
+
+def build_compile_refresh_event(
+    scope: dict[str, Any] | None = None,
+    *,
+    request_id: str | None = None,
+    diffusion_model: Any = None,
+    discovery: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the single ``[compile.refresh]`` aggregate event.
+
+    Call exactly once per request at the ON_PRE_RUN seam, after the live
+    model is resolved and regional discovery has run.  The returned
+    ``line`` is one line with ``request/model/mode/regions/state`` — enough
+    to answer ON_PRE_RUN-executed / real-model-visible / regions-N /
+    policy-state.  Per-block detail and Dynamo/Inductor verbosity are never
+    included; cache hits are never claimed (upstream-owned).
+    """
+    policy: Any = scope.get("policy") if isinstance(scope, dict) else None
+    latch: Any = scope.get("latch") if isinstance(scope, dict) else None
+    scope_regions: Any = scope.get("regions") if isinstance(scope, dict) else None
+    scope_id: Any = scope.get("scope_id") if isinstance(scope, dict) else None
+
+    if request_id is not None and str(request_id).strip():
+        request = str(request_id).strip()
+    elif isinstance(scope_id, str) and scope_id.strip():
+        request = scope_id.strip()
+    else:
+        request = "unknown"
+
+    model_class = type(diffusion_model).__name__ if diffusion_model is not None else "none"
+    if isinstance(policy, CompilePolicy):
+        mode = policy.mode
+        requested_mode = policy.requested_mode
+    else:
+        mode = "unknown"
+        requested_mode = "unknown"
+
+    if isinstance(discovery, dict) and isinstance(discovery.get("regions"), list):
+        regions_count = len(discovery["regions"])
+        discovery_reason = str(discovery.get("reason", ""))
+    elif isinstance(scope_regions, list):
+        regions_count = len(scope_regions)
+        discovery_reason = ""
+    else:
+        regions_count = 0
+        discovery_reason = ""
+
+    latch_state = latch.state if isinstance(latch, CompileFallbackLatch) else "unknown"
+
+    line = (
+        f"{COMPILE_REFRESH_PREFIX} "
+        f"request={request} model={model_class} mode={mode} "
+        f"regions={regions_count} state={latch_state}"
+    )
+    details: dict[str, Any] = {
+        "request": request,
+        "model_class": model_class,
+        "mode": mode,
+        "requested_mode": requested_mode,
+        "regions": regions_count,
+        "state": latch_state,
+        "discovery_reason": discovery_reason,
+        "on_pre_run_executed": True,
+        # Cache-hit honesty: routing only, never a hit claim.
+        "hits_claimed": False,
+    }
+    return {"line": line, "details": details}
