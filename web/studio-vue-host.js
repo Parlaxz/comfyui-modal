@@ -43,6 +43,7 @@ let _backdropListener = null;
 let _wizardListenersRegistered = false;
 let _closeBtn = null;
 let _graphCaptureCancel = null;
+let _parkedLegacyOverlay = null;
 
 // ── Future wizard seam ───────────────────────────────────────────────
 // Phase 1 does not port the workflow wizard. When it arrives, the wizard
@@ -93,6 +94,31 @@ function _inertBackground(inert) {
       node.removeAttribute("data-vue-inert-restore");
     }
   });
+}
+
+// The legacy Studio overlay paints at z-index 9999, above the Vue frame
+// (z-index 60). While the Vue Studio owns the viewport, park a visible
+// legacy overlay and restore it on close, so a legacy auto-reopen (reload
+// with a pending wizard draft reopens legacy) can never swallow Vue clicks.
+// The legacy resume path itself is untouched: it is restored on close.
+function _parkLegacyOverlay() {
+  try {
+    const overlay = document.querySelector(".comfymodal-testing-overlay");
+    if (!overlay || overlay.style.display === "none") return;
+    const computed = typeof getComputedStyle === "function" ? getComputedStyle(overlay) : null;
+    if (computed && (computed.display === "none" || computed.visibility === "hidden")) return;
+    _parkedLegacyOverlay = { overlay, display: overlay.style.display };
+    overlay.style.display = "none";
+  } catch (_) {}
+}
+
+function _restoreLegacyOverlay() {
+  try {
+    if (!_parkedLegacyOverlay) return;
+    const parked = _parkedLegacyOverlay;
+    _parkedLegacyOverlay = null;
+    if (document.body.contains(parked.overlay)) parked.overlay.style.display = parked.display;
+  } catch (_) {}
 }
 
 function _ensureHostStyle() {
@@ -264,6 +290,7 @@ export async function openStudioVue(page) {
   _triggerEl = document.activeElement;
   document.body.classList.add("comfymodal-vue-scroll-lock");
   _inertBackground(true);
+  _parkLegacyOverlay();
   _root.style.display = "flex";
   _isOpen = true;
   _addEscListener();
@@ -313,6 +340,7 @@ export function closeStudioVue() {
   _removeEscListener();
   _isOpen = false;
   _inertBackground(false);
+  _restoreLegacyOverlay();
   document.body.classList.remove("comfymodal-vue-scroll-lock");
   if (_triggerEl && typeof _triggerEl.focus === "function") {
     _triggerEl.focus();

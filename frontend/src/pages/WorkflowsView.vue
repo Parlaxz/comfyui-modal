@@ -29,6 +29,9 @@ const wizardStep = computed(() => WIZARD_STEPS[wizardStepIndex.value]);
 
 onMounted(async () => {
   await Promise.all([workflows.initialize(), infrastructure.initialize()]);
+  // Reload resume: a pending bounded draft reopens the wizard at its saved
+  // step. Ordinary navigation never triggers this path.
+  await workflows.maybeResumeWizard().catch(() => false);
 });
 
 async function search() {
@@ -143,6 +146,122 @@ async function saveMappingEdit() {
     // Validation errors surface through store error state.
   }
 }
+
+interface DependencyRow {
+  key: string;
+  filename: string;
+  folder: string;
+  state: string;
+  nonessential: boolean;
+  hasSource: boolean;
+  message: string;
+  raw: Record<string, unknown>;
+}
+
+interface DependencyNodeRow {
+  key: string;
+  name: string;
+  state: string;
+  message: string;
+  raw: Record<string, unknown>;
+}
+
+const dependencyPayload = computed(() => (workflows.dependencies ?? {}) as Record<string, unknown>);
+
+const dependencyModelRows = computed<DependencyRow[]>(() => {
+  const raw = dependencyPayload.value.models;
+  if (!Array.isArray(raw)) return [];
+  const nonessential = new Set(
+    Array.isArray((dependencyPayload.value.nonessential_keys ?? dependencyPayload.value.nonessential) as unknown[])
+      ? ((dependencyPayload.value.nonessential_keys ?? dependencyPayload.value.nonessential) as unknown[]).map(String)
+      : [],
+  );
+  return raw
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .map((item, index) => {
+      const key = String(item.key || item.filename || `model-${index}`);
+      const sourceUrls = Array.isArray(item.source_urls) ? item.source_urls : [];
+      return {
+        key,
+        filename: String(item.filename || key),
+        folder: String(item.folder || ""),
+        state: String(item.state || "unknown"),
+        nonessential: nonessential.has(key),
+        hasSource: sourceUrls.length > 0 || typeof item.remote_model === "object",
+        message: workflows.dependencyInstallMessage[key] ?? "",
+        raw: item,
+      };
+    });
+});
+
+const dependencyNodeRows = computed<DependencyNodeRow[]>(() => {
+  const raw = dependencyPayload.value.custom_nodes;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .map((item, index) => {
+      const key = String(item.name || item.cnr_id || `node-${index}`);
+      return {
+        key,
+        name: String(item.name || key),
+        state: String(item.state || "unknown"),
+        message: workflows.dependencyInstallMessage[key] ?? "",
+        raw: item,
+      };
+    });
+});
+
+const dependencySummaryLine = computed(() => {
+  const summary = dependencyPayload.value.summary;
+  if (summary && typeof summary === "object") {
+    const record = summary as Record<string, unknown>;
+    const installed = Number(record.installed ?? 0);
+    const missing = Number(record.missing ?? 0);
+    return `${installed} installed · ${missing} missing · ${missing === 0 ? "ready" : "attention"}`;
+  }
+  if (!workflows.dependencies) return "not loaded";
+  return `${dependencyModelRows.value.length + dependencyNodeRows.value.length} requirements`;
+});
+
+const runnableText = computed(() => {
+  const state = workflows.versionState as Record<string, unknown> | null;
+  if (state && typeof state.runnable === "boolean") {
+    return state.runnable ? "Runnable" : "Not runnable — resolve dependencies";
+  }
+  const version = workflows.selectedVersion as unknown as Record<string, unknown> | null;
+  if (version && typeof version.runnable === "boolean") {
+    return version.runnable ? "Runnable" : "Not runnable — resolve dependencies";
+  }
+  return "";
+});
+
+async function toggleNonessential(key: string, value: boolean) {
+  const current = new Set(
+    dependencyModelRows.value.filter((row) => row.nonessential).map((row) => row.key),
+  );
+  if (value) current.add(key);
+  else current.delete(key);
+  await workflows.markNonessential([...current]).catch(() => undefined);
+}
+
+async function installDependencyModel(row: DependencyRow) {
+  const source = row.raw.remote_model && typeof row.raw.remote_model === "object"
+    ? (row.raw.remote_model as Record<string, unknown>)
+    : row.raw;
+  const url = String(source.url || source.download_url || "");
+  const payload: Record<string, unknown> = url
+    ? { url, filename: row.filename, save_path: row.folder }
+    : { filename: row.filename, folder: row.folder };
+  try {
+    await infrastructure.installModel(payload);
+  } catch {
+    // Errors surface through the operations registry + infrastructure error.
+  }
+}
+
+async function installDependencyNode(row: DependencyNodeRow) {
+  await workflows.installDependencyNode(row.raw);
+}
 </script>
 
 <template>
@@ -190,6 +309,7 @@ async function saveMappingEdit() {
           <StudioButton size="sm" variant="outline" data-testid="vue-version-capture" @click="workflows.captureVersion({})">Capture version</StudioButton>
           <StudioButton size="sm" variant="outline" data-testid="vue-workflow-delete" @click="workflows.deleteSelectedWorkflow()">Delete workflow</StudioButton>
         </div>
+        <p class="cmst:mt-2 cmst:text-xs cmst:opacity-70" data-testid="vue-version-runnable">{{ runnableText }}</p>
         <div class="cmst:mt-3 cmst:grid cmst:grid-cols-1 cmst:gap-2 cmst:sm:grid-cols-2">
           <label class="cmst:flex cmst:flex-col cmst:gap-1 cmst:text-sm">Name<input v-model="editName" class="cmst:h-9 cmst:rounded-md cmst:border cmst:border-solid cmst:border-cmst-border cmst:bg-cmst-bg cmst:px-2" /></label>
           <label class="cmst:flex cmst:flex-col cmst:gap-1 cmst:text-sm">Folder<input v-model="editFolder" class="cmst:h-9 cmst:rounded-md cmst:border cmst:border-solid cmst:border-cmst-border cmst:bg-cmst-bg cmst:px-2" /></label>
@@ -203,8 +323,22 @@ async function saveMappingEdit() {
             <textarea v-model="mappingText" rows="3" class="cmst:mt-2 cmst:w-full cmst:rounded cmst:border cmst:border-solid cmst:border-cmst-border cmst:bg-cmst-surface cmst:p-2 cmst:text-xs" placeholder='{"bindings": {...}}' />
             <StudioButton class="cmst:mt-1" size="sm" data-testid="vue-mapping-save" @click="saveMappingEdit">Save mapping</StudioButton>
           </div>
-          <div class="cmst:rounded-md cmst:bg-cmst-bg cmst:p-3 cmst:text-sm">Dependencies<br /><strong>{{ workflows.dependencies ? "loaded" : "not loaded" }}</strong>
-            <pre v-if="workflows.dependencies" class="cmst:mt-2 cmst:max-h-32 cmst:overflow-auto cmst:text-xs">{{ JSON.stringify(workflows.dependencies, null, 1).slice(0, 800) }}</pre>
+          <div class="cmst:rounded-md cmst:bg-cmst-bg cmst:p-3 cmst:text-sm" data-testid="vue-dependencies">
+            <p>Dependencies<br /><strong>{{ dependencySummaryLine }}</strong></p>
+            <ul class="cmst:mt-2 cmst:flex cmst:max-h-56 cmst:flex-col cmst:gap-1 cmst:overflow-auto">
+              <li v-for="row in dependencyModelRows" :key="`model-${row.key}`" class="cmst:rounded cmst:border cmst:border-solid cmst:border-cmst-border cmst:p-2 cmst:text-xs" data-testid="dependency-model-row">
+                <span>{{ row.filename }} ({{ row.folder }}) · {{ row.state }}</span>
+                <span class="cmst:ml-2" data-testid="dependency-model-state">{{ row.state }}</span>
+                <label class="cmst:ml-2"><input type="checkbox" :checked="row.nonessential" @change="toggleNonessential(row.key, ($event.target as HTMLInputElement).checked)" /> nonessential</label>
+                <StudioButton v-if="row.state === 'missing' && row.hasSource" class="cmst:ml-2" size="sm" variant="ghost" data-testid="dependency-model-install-now" @click="installDependencyModel(row)">Install now</StudioButton>
+                <span v-if="row.message" class="cmst:ml-2" data-testid="dependency-model-install-note">{{ row.message }}</span>
+              </li>
+              <li v-for="row in dependencyNodeRows" :key="`node-${row.key}`" class="cmst:rounded cmst:border cmst:border-solid cmst:border-cmst-border cmst:p-2 cmst:text-xs" data-testid="dependency-node-row">
+                <span>{{ row.name }} · {{ row.state }}</span>
+                <StudioButton v-if="row.state === 'missing'" class="cmst:ml-2" size="sm" variant="ghost" data-testid="dependency-node-install-now" @click="installDependencyNode(row)">Install now</StudioButton>
+                <span v-if="row.message" class="cmst:ml-2" data-testid="dependency-node-install-note">{{ row.message }}</span>
+              </li>
+            </ul>
           </div>
           <div class="cmst:rounded-md cmst:bg-cmst-bg cmst:p-3 cmst:text-sm">Portability<br /><strong>{{ workflows.portability ? "analyzed" : "not analyzed" }}</strong>
             <div class="cmst:mt-2 cmst:flex cmst:gap-1">

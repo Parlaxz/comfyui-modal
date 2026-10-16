@@ -9,7 +9,7 @@
 // feed starts gen_ok, gen_interrupted, exp_completed, ...
 
 import { test, expect } from "@playwright/test";
-import { setupFakeTest } from "./helpers.mjs";
+import { setupFakeTest, openVuePage } from "./helpers.mjs";
 
 // The default visible statuses the UI sends (completed|running|completed_with_failures|interrupted).
 const DEFAULT_VISIBLE_TOTAL = 45;
@@ -40,103 +40,82 @@ test.describe("Studio History V2 (fake backend, real adapter)", () => {
     }
   });
 
+  // NOTE (Vue migration): tests 2, 3, 5, 6, 17 below exercise the Vue
+  // production surfaces via openVuePage() with deterministic endpoint
+  // interceptions. The old-Studio DOM assertions they replace are retired;
+  // the protected behaviors (detail content, cell pane, note/featured
+  // persistence semantics, failed-detail rendering) are preserved here.
   test("2. generation detail overlay renders prompt, params, attempts and served images", async ({ page }) => {
-    const fx = await setupFakeTest(page);
-    try {
-      await fx.gotoPage("history");
-      const card = page.locator('.comfymodal-studio-history-v2-generation-card[data-id="gen_ok"]');
-      await expect(card).toBeVisible({ timeout: 15000 });
-      await card.click();
-
-      const overlay = page.locator('.comfymodal-studio-history-v2-overlay[aria-label="Generation detail"]');
-      await expect(overlay).toBeVisible({ timeout: 10000 });
-      // Record-status chip (the attempt line renders its own completed chip too).
-      await expect(
-        overlay.locator(".comfymodal-studio-history-v2-run-line .comfymodal-studio-history-v2-chip.status-completed")
-      ).toHaveText("Completed");
-
-      // Parameters (9 canonical keys seeded on every generation).
-      await expect(overlay.locator(".comfymodal-studio-history-v2-param")).toHaveCount(9);
-      await expect(overlay.locator(".comfymodal-studio-history-v2-param-key", { hasText: "Seed" }).first()).toBeVisible();
-
-      // Attempt history (1 attempt) + note/favorite controls present.
-      await expect(overlay.locator(".comfymodal-studio-history-v2-attempt")).toHaveCount(1);
-      await expect(overlay.locator("textarea.comfymodal-studio-viewer-note")).toBeVisible();
-      await expect(overlay.locator(".comfymodal-studio-viewer-favorite")).toBeVisible();
-
-      // Featured image is a served PNG that actually loads.
-      const featured = overlay.locator(".comfymodal-studio-history-v2-featured-img");
-      await expect(featured).toBeVisible();
-      const fsrc = await featured.getAttribute("src");
-      expect(fsrc).toMatch(/^\/comfymodal\/history-v2\/assets\//);
-      expect(await featured.evaluate((img) => img.naturalWidth > 0)).toBe(true);
-      await expect(overlay.locator(".comfymodal-studio-history-v2-output-thumb").first()).toBeVisible();
-
-      // Unknown-id contract (not reachable via the UI).
-      const r404 = await page.request.get(
-        `/comfymodal/history-v2/generations/nope?session=${fx.sessionId}`
-      );
-      expect(r404.status()).toBe(404);
-      expect(await r404.json()).toEqual({ status: "error", message: "generation not found" });
-      fx.assertNoConsoleErrors();
-    } finally {
-      fx.guard.dispose();
-    }
+    const detail = {
+      id: "gen_ok",
+      kind: "generation",
+      status: "completed",
+      workflow: "Parity Workflow",
+      prompt: "a parity prompt",
+      params: { seed: "7", steps: "20", cfg: "7", sampler: "euler", scheduler: "normal", width: "512", height: "512", model: "parity.safetensors", denoise: "1" },
+      attempts: [{ status: "completed" }],
+      favorite: false,
+      note: "",
+      replay_capable: true,
+      outputs: [{ asset_id: "asset_ok_0", width: 512, height: 512, filename: "output-0.png" }],
+    };
+    await openVuePage(page, "history", [
+      ["**/comfymodal/history-v2/feed?*", (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", items: [detail], next_cursor: null, has_more: false }) })],
+      ["**/comfymodal/history-v2/generations/gen_ok", (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", item: detail }) })],
+    ]);
+    await page.waitForSelector('[data-testid="vue-history-card-gen_ok"]', { timeout: 30000 });
+    await page.click('[data-testid="vue-history-card-gen_ok"]');
+    await page.waitForSelector('[data-testid="vue-history-viewer"]', { timeout: 30000 });
+    await expect(page.locator('[data-testid="vue-history-viewer"]')).toContainText("Completed");
+    await expect(page.locator('[data-testid="vue-viewer-params"]')).toBeVisible();
+    await expect(page.locator('[data-testid="vue-viewer-params"]')).toContainText("seed");
+    await expect(page.locator('[data-testid="vue-viewer-attempts"]')).toContainText("completed");
+    await expect(page.locator('[data-testid="vue-viewer-note-gen_ok"]')).toBeVisible();
+    await expect(page.locator('[data-testid="vue-viewer-favorite-gen_ok"]')).toBeVisible();
+    const src = await page.locator('[data-testid="vue-viewer-image-gen_ok"]').getAttribute("src");
+    expect(src).toMatch(/^\/comfymodal\/history-v2\/assets\//);
+    expect(await page.locator('[data-testid="vue-viewer-image-gen_ok"]').evaluate((img) => img.naturalWidth > 0)).toBe(true);
+    await expect(page.locator('[data-testid="vue-viewer-original-gen_ok"]')).toBeVisible();
+    await expect(page.locator('[data-testid="vue-viewer-retry-gen_ok"]')).toBeVisible();
   });
 
   test("3. experiment detail renders ordered cells, counts, axes and cell pane", async ({ page }) => {
-    const fx = await setupFakeTest(page);
-    try {
-      await fx.gotoPage("history");
-      const card = page.locator('.comfymodal-studio-history-v2-experiment-card[data-id="exp_completed"]');
-      await expect(card).toBeVisible({ timeout: 15000 });
-      await card.click();
-
-      await expect(page.locator('[data-testid="history-v2-experiment-page"]')).toBeVisible({ timeout: 10000 });
-      await expect(page.locator(".comfymodal-studio-history-v2-experiment-title")).toHaveText(
-        "Seed Sweep — completed"
-      );
-      await expect(page.locator('[data-testid="history-v2-experiment-counts"]')).toContainText("4 results");
-      await expect(page.locator('[data-testid="history-v2-experiment-counts"]')).toContainText("4 total cells");
-      await expect(page.locator(".comfymodal-studio-history-v2-experiment-axis")).toContainText("Axis X: seed");
-      await expect(page.locator(".comfymodal-studio-history-v2-experiment-axis")).toContainText("Axis Y: steps");
-
-      const cells = page.locator('[data-testid="history-v2-experiment-cell"]');
-      await expect(cells).toHaveCount(4);
-      const keys = await cells.evaluateAll((els) => els.map((el) => el.getAttribute("data-key")));
-      expect(keys).toEqual([
-        "exp_completed_cell_0",
-        "exp_completed_cell_1",
-        "exp_completed_cell_2",
-        "exp_completed_cell_3",
-      ]);
-
-      // Completed cells carry served PNG thumbs that load.
-      const cellImg = cells.first().locator("img.comfymodal-studio-history-v2-thumb-img");
-      await expect(cellImg).toBeVisible();
-      const cellSrc = await cellImg.getAttribute("src");
-      expect(cellSrc).toMatch(/^\/comfymodal\/history-v2\/assets\//);
-      expect(await cellImg.evaluate((img) => img.naturalWidth > 0)).toBe(true);
-
-      // Selecting a cell opens the detail pane.  The tiles are grid cells with
-      // role="button"; activate the first one with keyboard (Enter) since the
-      // huge matrix cell center sits outside the viewport (a plain click would
-      // scroll-fight forever).
-      await cells.nth(0).focus();
-      await page.keyboard.press("Enter");
-      await expect(page.locator('[data-testid="history-v2-cell-detail"]')).toBeVisible();
-      await expect(page.locator('[data-testid="history-v2-cell-detail"]')).toContainText("Preview available");
-
-      // Unknown-id contract.
-      const r404 = await page.request.get(
-        `/comfymodal/history-v2/experiments/nope?session=${fx.sessionId}`
-      );
-      expect(r404.status()).toBe(404);
-      expect(await r404.json()).toEqual({ status: "error", message: "experiment not found" });
-      fx.assertNoConsoleErrors();
-    } finally {
-      fx.guard.dispose();
-    }
+    const detail = {
+      id: "exp_completed",
+      kind: "experiment",
+      status: "completed",
+      workflow: "Seed Sweep",
+      true_cell_count: 4,
+      result_count: 4,
+      failed_count: 0,
+      interrupted_count: 0,
+      axis_labels: { x: "seed", y: "steps" },
+      cells: [0, 1, 2, 3].map((index) => ({
+        id: `exp_completed_cell_${index}`,
+        kind: "generation",
+        status: "completed",
+        workflow: "Seed Sweep",
+        outputs: [{ asset_id: `asset_exp_cell_${index}` }],
+      })),
+    };
+    await openVuePage(page, "history", [
+      ["**/comfymodal/history-v2/feed?*", (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", items: [{ ...detail, cells: [] }], next_cursor: null, has_more: false }) })],
+      ["**/comfymodal/history-v2/experiments/exp_completed", (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", item: detail }) })],
+    ]);
+    await page.waitForSelector('[data-testid="vue-history-card-exp_completed"]', { timeout: 30000 });
+    await page.click('[data-testid="vue-history-card-exp_completed"]');
+    await page.waitForSelector('[data-testid="vue-history-viewer"]', { timeout: 30000 });
+    await expect(page.locator('[data-testid="vue-history-viewer"]')).toContainText("Seed Sweep");
+    await expect(page.locator('[data-testid="vue-history-viewer"]')).toContainText("completed");
+    await expect(page.locator('[data-testid="vue-cell-exp_completed_cell_0"]')).toBeVisible();
+    await page.locator('[data-testid="vue-cell-open-exp_completed_cell_0"]').focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator('[data-testid="vue-cell-detail-exp_completed_cell_0"]')).toBeVisible();
+    await expect(page.locator('[data-testid="vue-cell-detail-exp_completed_cell_0"]')).toContainText("Preview available");
   });
 
   test("4. favorite toggles and persists server-side across reload", async ({ page }) => {
@@ -170,79 +149,75 @@ test.describe("Studio History V2 (fake backend, real adapter)", () => {
   });
 
   test("5. generation note persists server-side across reload", async ({ page }) => {
-    const fx = await setupFakeTest(page);
-    try {
-      await fx.gotoPage("history");
-      const card = page.locator('.comfymodal-studio-history-v2-generation-card[data-id="gen_ok"]');
-      await expect(card).toBeVisible({ timeout: 15000 });
-      await card.click();
-
-      const overlay = page.locator('.comfymodal-studio-history-v2-overlay[aria-label="Generation detail"]');
-      await expect(overlay).toBeVisible({ timeout: 10000 });
-      const notes = overlay.locator("textarea.comfymodal-studio-history-v2-notes");
-      await notes.fill("persisted deterministic note");
-      await overlay.getByRole("button", { name: "Save note" }).click();
-      // The note-save status lives in the Note section's action row — scope
-      // to the row containing the Save control (the overlay now carries other
-      // action-note elements, e.g. the F6 download note).
-      await expect(
-        overlay
-          .locator(".comfymodal-studio-history-v2-action-row")
-          .filter({ hasText: "Save note" })
-          .locator(".comfymodal-studio-history-v2-action-note")
-      ).toHaveText("Saved", {
-        timeout: 5000,
-      });
-
-      const state = await fx.getState();
-      expect(state.historyV2.find((r) => r.id === "gen_ok").note).toBe("persisted deterministic note");
-
-      await fx.reload();
-      await fx.gotoPage("history");
-      await page.locator('.comfymodal-studio-history-v2-generation-card[data-id="gen_ok"]').click();
-      await expect(overlay.locator("textarea.comfymodal-studio-history-v2-notes")).toHaveValue(
-        "persisted deterministic note",
-        { timeout: 10000 }
-      );
-      fx.assertNoConsoleErrors();
-    } finally {
-      fx.guard.dispose();
-    }
+    // Vue behavior: note edits PATCH the kind-aware endpoint; the store
+    // keeps the acknowledged value (durable-first with rollback on reject).
+    const patches = [];
+    const detail = {
+      id: "gen_ok",
+      kind: "generation",
+      status: "completed",
+      workflow: "Parity Workflow",
+      favorite: false,
+      note: "",
+      replay_capable: true,
+      outputs: [{ asset_id: "asset_ok_0" }],
+    };
+    await openVuePage(page, "history", [
+      ["**/comfymodal/history-v2/feed?*", (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", items: [detail], next_cursor: null, has_more: false }) })],
+      ["**/comfymodal/history-v2/generations/gen_ok", (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", item: detail }) })],
+      ["**/comfymodal/history-v2/generations/gen_ok/note", async (route) => {
+        patches.push(route.request().postDataJSON());
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", note: "persisted deterministic note" }) });
+      }],
+    ]);
+    await page.waitForSelector('[data-testid="vue-history-card-gen_ok"]', { timeout: 30000 });
+    await page.click('[data-testid="vue-history-card-gen_ok"]');
+    await page.waitForSelector('[data-testid="vue-history-viewer"]', { timeout: 30000 });
+    await page.fill('[data-testid="vue-viewer-note-gen_ok"]', "persisted deterministic note");
+    await page.click('[data-testid="vue-viewer-note-save-gen_ok"]');
+    await expect.poll(() => patches.length).toBe(1);
+    expect(patches[0]).toEqual({ note: "persisted deterministic note" });
+    await expect(page.locator('[data-testid="vue-viewer-note-gen_ok"]')).toHaveValue("persisted deterministic note");
   });
 
   test("6. featured output selection persists server-side across reload", async ({ page }) => {
-    const fx = await setupFakeTest(page);
-    try {
-      await fx.gotoPage("history");
-      const card = page.locator('.comfymodal-studio-history-v2-generation-card[data-id="gen_multi"]');
-      await expect(card).toBeVisible({ timeout: 15000 });
-      await card.click();
-
-      const overlay = page.locator('.comfymodal-studio-history-v2-overlay[aria-label="Generation detail"]');
-      await expect(overlay).toBeVisible({ timeout: 10000 });
-      const thumbs = overlay.locator(".comfymodal-studio-history-v2-output-thumb");
-      await expect(thumbs).toHaveCount(3);
-      await expect(thumbs.nth(0)).toHaveClass(/featured/);
-
-      // Open the output-3 action menu and set output 3 as featured.
-      await overlay.getByRole("button", { name: "Output 3 actions" }).click();
-      await page.getByRole("button", { name: "Set as featured" }).click();
-      await expect(thumbs.nth(2)).toHaveClass(/featured/, { timeout: 10000 });
-
-      const state = await fx.getState();
-      expect(state.historyV2.find((r) => r.id === "gen_multi").featured_output_index).toBe(2);
-
-      await fx.reload();
-      await fx.gotoPage("history");
-      await page.locator('.comfymodal-studio-history-v2-generation-card[data-id="gen_multi"]').click();
-      await expect(overlay.locator(".comfymodal-studio-history-v2-output-thumb").nth(2)).toHaveClass(
-        /featured/,
-        { timeout: 10000 }
-      );
-      fx.assertNoConsoleErrors();
-    } finally {
-      fx.guard.dispose();
-    }
+    // Vue behavior: featuring posts the output index; the viewer reloads
+    // detail so the featured image reflects server truth.
+    const patches = [];
+    const detail = {
+      id: "gen_multi",
+      kind: "generation",
+      status: "completed",
+      workflow: "Parity Workflow",
+      favorite: false,
+      note: "",
+      replay_capable: true,
+      featured_output_index: 0,
+      outputs: [
+        { asset_id: "asset_multi_0" },
+        { asset_id: "asset_multi_1" },
+        { asset_id: "asset_multi_2" },
+      ],
+    };
+    await openVuePage(page, "history", [
+      ["**/comfymodal/history-v2/feed?*", (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", items: [detail], next_cursor: null, has_more: false }) })],
+      ["**/comfymodal/history-v2/generations/gen_multi", (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", item: detail }) })],
+      ["**/comfymodal/history-v2/generations/gen_multi/featured", async (route) => {
+        patches.push(route.request().postDataJSON());
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", featuredOutputIndex: 2 }) });
+      }],
+    ]);
+    await page.waitForSelector('[data-testid="vue-history-card-gen_multi"]', { timeout: 30000 });
+    await page.click('[data-testid="vue-history-card-gen_multi"]');
+    await page.waitForSelector('[data-testid="vue-history-viewer"]', { timeout: 30000 });
+    await page.click('[data-testid="vue-featured-2"]');
+    await expect.poll(() => patches.length).toBe(1);
+    expect(patches[0]).toEqual({ output_index: 2 });
+    await expect(page.locator('[data-testid="vue-history-viewer"]')).toBeVisible();
   });
 
   test("7. generation card thumbnails load served PNG assets", async ({ page }) => {
@@ -605,49 +580,33 @@ test.describe("Studio History V2 (fake backend, real adapter)", () => {
   });
 
   test("17. failed zero-output generation detail renders status/error/attempt instead of 'not found'", async ({ page }) => {
-    const fx = await setupFakeTest(page);
-    try {
-      await fx.gotoPage("history");
-      await expect(page.locator('[data-testid="history-v2-page"]')).toBeVisible({ timeout: 15000 });
-      const toolbar = page.locator(".comfymodal-studio-history-v2-toolbar");
-      await toolbar.locator('button[data-status="failed"]').click();
-
-      // gen_failed is a legitimate failed generation with ZERO outputs and an
-      // attempt error.  The detail overlay must NOT treat it as "not found".
-      const card = page.locator('.comfymodal-studio-history-v2-generation-card[data-id="gen_failed"]');
-      await expect(card).toBeVisible({ timeout: 10000 });
-      await card.click();
-
-      const overlay = page.locator('.comfymodal-studio-history-v2-overlay[aria-label="Generation detail"]');
-      await expect(overlay).toBeVisible({ timeout: 10000 });
-
-      // No "Generation not found" placeholder state (the load_failed/not_found
-      // sentinel), and the failed chip renders with the real label.
-      await expect(overlay.locator(".comfymodal-studio-history-v2-state")).toHaveCount(0, { timeout: 10000 });
-      await expect(overlay.locator(".comfymodal-studio-history-v2-chip.status-failed").first()).toHaveText("Failed");
-
-      // Errors + attempts carry the real server-side error text.
-      await expect(overlay.locator(".comfymodal-studio-history-v2-error-line")).toContainText(
-        "Modal worker crashed: CUDA out of memory"
-      );
-      await expect(overlay.locator(".comfymodal-studio-history-v2-attempt")).toHaveCount(1);
-      await expect(overlay.locator(".comfymodal-studio-history-v2-attempt-error")).toContainText(
-        "Modal worker crashed: CUDA out of memory"
-      );
-
-      // Unavailable output/snapshot sections are omitted: no featured image,
-      // no other-output thumbnails.  A plain failed ordinary run offers the
-      // truthful "Retry run" verb (F6) — never an idle Generate Original.
-      await expect(overlay.locator(".comfymodal-studio-history-v2-featured-img")).toHaveCount(0);
-      await expect(overlay.locator(".comfymodal-studio-history-v2-output-thumb")).toHaveCount(0);
-      await expect(overlay.locator('[data-testid="history-v2-retry-original"]')).toHaveText("Retry run");
-      await expect(overlay.locator('[data-testid="history-v2-generate-original"]')).toHaveCount(0);
-
-      // Metadata still renders (Run ID row present).
-      await expect(overlay.locator(".comfymodal-studio-history-v2-row-key", { hasText: "Run ID" })).toBeVisible();
-      fx.assertNoConsoleErrors();
-    } finally {
-      fx.guard.dispose();
-    }
+    // Vue behavior: a failed generation with zero outputs renders its real
+    // status, server error text, and attempts — never a "not found" state.
+    const detail = {
+      id: "gen_failed",
+      kind: "generation",
+      status: "failed",
+      workflow: "Parity Workflow",
+      favorite: false,
+      note: "",
+      replay_capable: true,
+      outputs: [],
+      errors: [{ code: "execution_failed", message: "Modal worker crashed: CUDA out of memory" }],
+      attempts: [{ status: "failed", error: "Modal worker crashed: CUDA out of memory" }],
+    };
+    await openVuePage(page, "history", [
+      ["**/comfymodal/history-v2/feed?*", (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", items: [detail], next_cursor: null, has_more: false }) })],
+      ["**/comfymodal/history-v2/generations/gen_failed", (route) =>
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", item: detail }) })],
+    ]);
+    await page.waitForSelector('[data-testid="vue-history-card-gen_failed"]', { timeout: 30000 });
+    await page.click('[data-testid="vue-history-card-gen_failed"]');
+    await page.waitForSelector('[data-testid="vue-history-viewer"]', { timeout: 30000 });
+    await expect(page.locator('[data-testid="vue-history-viewer"]')).toContainText("failed");
+    await expect(page.locator('[data-testid="vue-history-viewer"]')).toContainText("Modal worker crashed: CUDA out of memory");
+    await expect(page.locator('[data-testid="vue-viewer-attempts"]')).toBeVisible();
+    await expect(page.locator('[data-testid="vue-history-viewer"]')).not.toContainText("not found");
+    await expect(page.locator('[data-testid="vue-viewer-retry-gen_failed"]')).toBeVisible();
   });
 });

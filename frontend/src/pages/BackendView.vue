@@ -2,6 +2,7 @@
 import { onMounted, ref } from "vue";
 import { ServerCog, RefreshCw } from "@lucide/vue";
 import { useInfrastructureStore } from "../stores/infrastructure";
+import { inferModelFilename } from "../api/infrastructure";
 import StudioButton from "../components/StudioButton.vue";
 import StudioCard from "../components/StudioCard.vue";
 import { studioPageClass } from "../components/studioPanels";
@@ -22,6 +23,7 @@ const credentialMessage = ref("");
 const modelSearch = ref("");
 const modelUrl = ref("");
 const modelFolder = ref("diffusion_models");
+const modelInstallMessage = ref("");
 const showLog = ref(false);
 
 onMounted(async () => {
@@ -108,7 +110,14 @@ async function saveCredential(kind: "hf" | "civitai") {
 
 async function installFromUrl() {
   if (!modelUrl.value.trim()) return;
-  await infrastructure.installModel({ url: modelUrl.value.trim(), folder: modelFolder.value }).catch(() => undefined);
+  modelInstallMessage.value = "Installing…";
+  try {
+    const url = modelUrl.value.trim();
+    await infrastructure.installModel({ url, filename: inferModelFilename(url), save_path: modelFolder.value });
+    modelInstallMessage.value = "Install request accepted.";
+  } catch (cause) {
+    modelInstallMessage.value = cause instanceof Error ? cause.message : "Install failed.";
+  }
   modelUrl.value = "";
 }
 </script>
@@ -292,6 +301,7 @@ async function installFromUrl() {
           </select>
           <StudioButton size="sm" data-testid="vue-model-install" @click="installFromUrl">Install</StudioButton>
         </div>
+        <p v-if="modelInstallMessage" class="cmst:mt-2 cmst:text-xs" data-testid="vue-model-install-message" role="status">{{ modelInstallMessage }}</p>
       </StudioCard>
     </template>
 

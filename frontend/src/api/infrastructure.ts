@@ -43,6 +43,16 @@ export async function triggerPushPlugins() { return requestJson<Record<string, u
 export async function triggerRebuildDependencies() { return requestJson<Record<string, unknown>>("/studio/custom-nodes/sync/rebuild-dependencies", { method: "POST" }); }
 export async function getCustomNodeSyncOperationStatus(syncId: string) { return requestJson<Record<string, unknown>>(`/studio/custom-nodes/sync/status/${encodeURIComponent(syncId)}`); }
 export async function installSingleModel(item: Record<string, unknown>) { return requestJson<Record<string, unknown>>("/model/install", { method: "POST", body: item }); }
+/** Pure: infer a model filename from a pasted download URL (mirrors the legacy helper). */
+export function inferModelFilename(url: string): string {
+  const clean = String(url || "").split("?")[0].split("#")[0];
+  const segment = clean.split("/").filter(Boolean).pop() || "";
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
 export async function modelDownloadStatus(downloadId: string) { return requestJson<Record<string, unknown>>(`/download/status/${encodeURIComponent(downloadId || "")}`); }
 export async function requestModelInstall(body: Record<string, unknown>) { return requestJson<Record<string, unknown>>("/studio/models/install-request", { method: "POST", body }); }
 export async function requestCustomNodeInstall(body: Record<string, unknown>) { return requestJson<Record<string, unknown>>("/studio/custom-nodes/install-request", { method: "POST", body }); }

@@ -18,6 +18,15 @@ import {
 import { createLatestTask } from "../async/latest";
 import { createCrossTabInvalidation, publishCrossTabInvalidation } from "../compatibility/crossTab";
 import { useOperationsStore } from "./operations";
+import {
+  buildManagerPackIndex,
+  getManagerMappings,
+  getManagerPackList,
+  performManagerInstall,
+  resolveNodeInstall,
+  type ManagerPackIndex,
+} from "../api/manager";
+import { useInfrastructureStore } from "./infrastructure";
 
 const WIZARD_DRAFT_KEY = "comfymodal.studio.wizard.draft.v1";
 
@@ -49,6 +58,8 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
   const methodCompat = ref<unknown>(null);
   const manifestPreview = ref<unknown>(null);
   const detailTask = createLatestTask();
+  const managerIndex = ref<ManagerPackIndex | null>(null);
+  const dependencyInstallMessage = ref<Record<string, string>>({});
   let stopCrossTab: (() => void) | null = null;
 
   function select(id: string | null): void { selectedId.value = id; }
@@ -125,6 +136,51 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
     const versionId = selectedVersion.value?.workflow_version_id ?? "";
     try { wizardDraft.value = parseWizardDraft(sessionStorage.getItem(WIZARD_DRAFT_KEY), workflowId, versionId) ?? buildWizardDraft({ workflowId, versionId, featureType: normalizeWorkflowType(selectedWorkflow.value?.workflow_type) }); } catch { wizardDraft.value = buildWizardDraft({ workflowId, versionId }); }
     wizardOpen.value = true;
+  }
+
+  /** Reload resume (mirrors the legacy once-per-load rule): on a real page
+    reload with a bounded draft pending, reopen the wizard at its saved step
+    for the same workflow/version. Ordinary in-app navigation never resumes. */
+  function pageWasReloaded(): boolean {
+    try {
+      const entries = typeof performance !== "undefined" && typeof performance.getEntriesByType === "function"
+        ? performance.getEntriesByType("navigation")
+        : [];
+      const kind = entries && entries[0] && (entries[0] as unknown as Record<string, unknown>).type;
+      if (kind) return kind === "reload" || kind === "back_forward";
+      const legacy = (performance as unknown as { navigation?: { type?: number } }).navigation;
+      return !!legacy && legacy.type !== 0;
+    } catch {
+      return false;
+    }
+  }
+
+  async function maybeResumeWizard(): Promise<boolean> {
+    if (wizardOpen.value || !pageWasReloaded()) return false;
+    let raw: string | null = null;
+    try {
+      raw = sessionStorage.getItem(WIZARD_DRAFT_KEY);
+    } catch {
+      return false;
+    }
+    if (!raw) return false;
+    let draft: WizardDraft | null = null;
+    try {
+      const parsed = JSON.parse(raw) as Partial<WizardDraft>;
+      if (parsed.v !== 1 || !parsed.workflowId || !parsed.versionId) return false;
+      draft = buildWizardDraft(parsed);
+    } catch {
+      return false;
+    }
+    try {
+      await selectWorkflow(draft.workflowId);
+    } catch {
+      return false;
+    }
+    if (selectedVersion.value?.workflow_version_id !== draft.versionId) return false;
+    wizardDraft.value = draft;
+    wizardOpen.value = true;
+    return true;
   }
 
   function updateWizard(patch: Partial<WizardDraft>): void {
@@ -214,6 +270,40 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
     if (!selectedId.value) return;
     await setNonessentialDependencies(selectedId.value, keys);
     if (selectedVersion.value) await selectVersion(selectedVersion.value.workflow_version_id);
+  }
+
+  /** Lazy Manager pack index (loaded once; shared by all dependency rows). */
+  async function loadManagerIndex(): Promise<ManagerPackIndex | null> {
+    if (managerIndex.value) return managerIndex.value;
+    try {
+      const [packsResponse, mappingsResponse] = await Promise.all([
+        getManagerPackList(),
+        getManagerMappings(),
+      ]);
+      const packs = ((packsResponse?.data ?? {}) as Record<string, unknown>).node_packs;
+      const mappings = ((mappingsResponse?.data ?? {}) as Record<string, unknown>);
+      managerIndex.value = buildManagerPackIndex(
+        (packs ?? {}) as Record<string, Record<string, unknown>>,
+        mappings as Record<string, unknown>,
+      );
+    } catch {
+      managerIndex.value = null;
+    }
+    return managerIndex.value;
+  }
+
+  /** Explicit per-row custom-node install through ComfyUI-Manager. Never reboots. */
+  async function installDependencyNode(node: Record<string, unknown>): Promise<void> {
+    const key = String(node.name || node.cnr_id || "node");
+    const index = await loadManagerIndex();
+    const plan = resolveNodeInstall(node, index);
+    dependencyInstallMessage.value = { ...dependencyInstallMessage.value, [key]: "Installing…" };
+    const result = await performManagerInstall(plan);
+    dependencyInstallMessage.value = { ...dependencyInstallMessage.value, [key]: result.message };
+    if (result.ok) {
+      const infrastructure = useInfrastructureStore();
+      await infrastructure.loadInventory().catch(() => undefined);
+    }
   }
 
   async function saveCompatibility(patch: Record<string, unknown>): Promise<void> {
@@ -356,10 +446,11 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
     versionState, methodCompat, manifestPreview,
     query, loading, error, wizardOpen, wizardDraft, wizardSaving, wizardError,
     select, clear, loadList, initialize, selectWorkflow, selectVersion, loadMappingCandidates, openWizard,
-    updateWizard, setWizardStep, closeWizard, updateMetadata,
+    updateWizard, setWizardStep, closeWizard, updateMetadata, maybeResumeWizard,
     toggleFavorite, createNewWorkflow, importNewWorkflow, deleteSelectedWorkflow,
     createFolder, captureVersion, saveMapping,
-    markNonessential, saveCompatibility, recheckPortability,
+    markNonessential, saveCompatibility, recheckPortability, loadManagerIndex,
+    installDependencyNode, dependencyInstallMessage,
     exportManifest, previewManifestImport, commitManifestImport,
     sanitizePresetState, createPreset, savePreset, removePreset,
     duplicateCurrentPreset, copyPresetForward,

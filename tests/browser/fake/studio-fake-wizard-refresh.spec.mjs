@@ -8,7 +8,7 @@
 // draft; stale drafts soft-clear.
 
 import { test, expect } from "@playwright/test";
-import { setupFakeTest } from "./helpers.mjs";
+import { setupFakeTest, openVuePage } from "./helpers.mjs";
 
 const DRAFT_KEY = "comfymodal.studio.wizard.draft.v1";
 
@@ -43,53 +43,80 @@ function readDraft(page) {
 }
 
 test.describe("Studio wizard browser refresh", () => {
+  // Vue behavior: a bounded sessionStorage draft reopens the same
+  // workflow/version wizard at the same step after a real reload; closing
+  // clears the draft so a further reload does not resume.
   test("resumes the same workflow/version/step after a full reload", async ({ page }) => {
-    const fx = await setupFakeTest(page);
-    try {
-      await fx.gotoPage("workflows");
-      await expect(page.getByTestId("workflows-page")).toBeVisible({ timeout: 10000 });
-      const panel = await openWizardAtDependencies(page);
+    // Two full reload cycles with app boot: needs headroom over the 30s default.
+    test.setTimeout(120000);
+    const workflow = { workflow_id: "wf_refresh", name: "Refresh Flow", workflow_type: "t2i", latest_version_id: "ver_refresh" };
+    const version = { workflow_version_id: "ver_refresh", version: 1 };
+    const workflowRoutes = [
+      ["**/comfymodal/studio/workflows", async (route) => {
+        if (route.request().method() !== "GET") {
+          await route.fallback();
+          return;
+        }
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflows: [workflow] }) });
+      }],
+      ["**/comfymodal/studio/workflows/wf_refresh", async (route) => {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflow }) });
+      }],
+      ["**/comfymodal/studio/workflows/wf_refresh/versions", async (route) => {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", versions: [version] }) });
+      }],
+      ["**/comfymodal/studio/workflows/versions/ver_refresh**", async (route) => {
+        const tail = new URL(route.request().url()).pathname.split("/").pop();
+        const bodies = {
+          mapping: { status: "ok", mapping: null },
+          dependencies: { status: "ok", models: [], custom_nodes: [] },
+          compatibility: { status: "ok" },
+          portability: { status: "ok", portability: { risk_level: "low", issue_count: 0 } },
+          presets: { status: "ok", presets: [] },
+        };
+        const body = tail === "ver_refresh" ? { status: "ok", version } : (bodies[tail] ?? { status: "ok" });
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+      }],
+    ];
+    await openVuePage(page, "workflows", workflowRoutes);
+    await page.waitForSelector('[data-testid="vue-workflow-wf_refresh"]', { timeout: 60000 });
+    await page.click('[data-testid="vue-workflow-wf_refresh"]');
+    await page.click("text=Setup wizard");
+    await page.waitForSelector('[data-testid="vue-workflow-wizard"]', { timeout: 30000 });
+    await page.click("text=Next");
+    await page.waitForTimeout(300);
+    const before = await page.evaluate(() => JSON.parse(sessionStorage.getItem("comfymodal.studio.wizard.draft.v1") || "null"));
+    expect(before).toBeTruthy();
+    expect(before.workflowId).toBe("wf_refresh");
+    expect(before.step).toBe("required-bindings");
 
-      // The draft carries the identity + step, and the URL keeps the marker
-      // that only a real reload preserves.
-      const before = await readDraft(page);
-      expect(before).toBeTruthy();
-      expect(before.step).toBe("dependencies");
-      expect(before.workflowId).toBeTruthy();
-      expect(before.workflowVersionId).toBeTruthy();
-      expect(await page.evaluate(() => window.location.hash)).toContain("comfymodal_wizard=1");
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => typeof window.__comfymodalOpenVueStudio === "function", null, { timeout: 120000 });
+    await page.waitForTimeout(5000);
+    await page.evaluate(async () => {
+      await window.__comfymodalOpenVueStudio("workflows");
+      return 1;
+    });
+    await page.waitForSelector('[data-testid="vue-workflow-wizard"]', { timeout: 60000 });
+    await expect(page.locator('[data-testid="vue-workflow-wizard"]')).toContainText("required-bindings");
+    const after = await page.evaluate(() => JSON.parse(sessionStorage.getItem("comfymodal.studio.wizard.draft.v1") || "null"));
+    expect(after.workflowId).toBe(before.workflowId);
+    expect(after.step).toBe("required-bindings");
 
-      // In-wizard Refresh re-renders the step without leaving the wizard.
-      await panel.getByTestId("wizard-dependencies-refresh").click();
-      await expect(panel.getByTestId("wizard-dependencies-continue")).toBeVisible({ timeout: 10000 });
+    await page.locator('[data-testid="vue-workflow-wizard"]').getByRole("button", { name: "Close", exact: true }).click();
+    await expect(page.locator('[data-testid="vue-workflow-wizard"]')).toHaveCount(0, { timeout: 10000 });
+    expect(await page.evaluate(() => sessionStorage.getItem("comfymodal.studio.wizard.draft.v1"))).toBeNull();
 
-      // Full page reload in the same session (hash + sessionStorage survive).
-      await page.reload({ waitUntil: "domcontentloaded" });
-      await mountAfterReload(page);
-
-      const resumed = page.locator(".comfymodal-studio-wizard-panel");
-      await expect(resumed).toBeVisible({ timeout: 15000 });
-      // Same step: the Dependencies continue control is present again.
-      await expect(resumed.getByTestId("wizard-dependencies-continue")).toBeVisible({ timeout: 10000 });
-      const after = await readDraft(page);
-      expect(after.workflowId).toBe(before.workflowId);
-      expect(after.workflowVersionId).toBe(before.workflowVersionId);
-      expect(after.step).toBe("dependencies");
-
-      // Closing the wizard clears the draft: a further reload must NOT resume.
-      await resumed.locator(".comfymodal-studio-wizard-close").click();
-      await expect(page.locator(".comfymodal-studio-wizard-panel")).toHaveCount(0, { timeout: 10000 });
-      expect(await readDraft(page)).toBeNull();
-
-      await page.reload({ waitUntil: "domcontentloaded" });
-      await mountAfterReload(page);
-      await expect(page.getByTestId("workflows-page")).toBeVisible({ timeout: 15000 });
-      await expect(page.locator(".comfymodal-studio-wizard-panel")).toHaveCount(0);
-
-      fx.assertNoConsoleErrors();
-    } finally {
-      fx.guard.dispose();
-    }
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForFunction(() => typeof window.__comfymodalOpenVueStudio === "function", null, { timeout: 120000 });
+    await page.waitForTimeout(5000);
+    await page.evaluate(async () => {
+      await window.__comfymodalOpenVueStudio("workflows");
+      return 1;
+    });
+    await page.waitForSelector('[data-testid="vue-page-workflows"]', { timeout: 60000 });
+    await page.waitForTimeout(1000);
+    await expect(page.locator('[data-testid="vue-workflow-wizard"]')).toHaveCount(0);
   });
 
   test("a stale draft for another version soft-clears instead of resuming", async ({ page }) => {

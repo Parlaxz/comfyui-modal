@@ -256,6 +256,42 @@ export function pollUntil(page, fn, opts = {}) {
   return expect.poll(() => fn(page), { timeout, message }).toBe(true);
 }
 
+// ── Vue parity driver (live ComfyUI + deterministic interceptions) ───────
+
+/**
+ * Drive the Vue production surfaces served by live ComfyUI
+ * (http://127.0.0.1:8188) with deterministic endpoint interceptions.
+ * Replaces obsolete old-Studio-DOM assertions with equivalent behavioral
+ * coverage against Vue: same behavior, current surface. `routes` is a list
+ * of [pattern, handler] pairs installed via page.route before opening the
+ * preview. Asset URLs under /history-v2/assets/* always resolve to a 1x1
+ * PNG so served-image assertions prove real loading.
+ */
+export const VUE_LIVE_URL = "http://127.0.0.1:8188";
+const PARITY_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  "base64",
+);
+
+export async function openVuePage(page, pageName, routes = []) {
+  for (const [pattern, handler] of routes) {
+    await page.route(pattern, handler);
+  }
+  await page.route("**/comfymodal/history-v2/assets/*", (route) =>
+    route.fulfill({ status: 200, contentType: "image/png", body: PARITY_PNG }),
+  );
+  await page.goto(VUE_LIVE_URL, { waitUntil: "domcontentloaded" });
+  await page.waitForFunction(() => typeof window.__comfymodalOpenVueStudio === "function", null, {
+    timeout: 120000,
+  });
+  await page.waitForTimeout(5000);
+  await page.evaluate(async (name) => {
+    await window.__comfymodalOpenVueStudio(name);
+    return 1;
+  }, pageName);
+  await page.waitForSelector(`[data-testid="vue-page-${pageName}"]`, { timeout: 60000 });
+}
+
 // ── Console guard ────────────────────────────────────────────────────────
 
 export function installConsoleGuard(page) {

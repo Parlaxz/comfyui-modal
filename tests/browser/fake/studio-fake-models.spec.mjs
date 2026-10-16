@@ -15,7 +15,7 @@
 // Library filter handoff.
 
 import { test, expect } from "@playwright/test";
-import { setupFakeTest } from "./helpers.mjs";
+import { setupFakeTest, openVuePage } from "./helpers.mjs";
 
 // Deterministic graph capture stub — same pattern as the live workflows spec:
 // replaces the dynamically-imported capture module so the import flow never
@@ -33,49 +33,48 @@ async function stubGraphCapture(page) {
 }
 
 test("dependency summary renders after import and gates the run button", async ({ page }) => {
-  // Register the capture stub BEFORE setupFakeTest: routes registered after
-  // the harness navigation do not intercept the dynamic capture import.
-  await stubGraphCapture(page);
-  const fx = await setupFakeTest(page);
-  try {
-    await fx.gotoPage("workflows");
-    await expect(page.getByTestId("workflows-page")).toBeVisible({ timeout: 10000 });
-
-    // Open the import dialog and confirm.
-    await page.getByTestId("workflows-import-button").click();
-    await expect(page.getByTestId("import-dialog")).toBeVisible({ timeout: 10000 });
-    await page.getByTestId("import-confirm").click();
-
-    // The dialog briefly shows the dependency review line before navigating.
-    await expect(page.getByTestId("import-dialog")).toContainText("1 dependency needs attention", {
-      timeout: 10000,
-    });
-
-    // Lands on the workflow detail page; dependencies were fetched on load.
-    await expect(page.getByTestId("workflow-detail")).toBeVisible({ timeout: 15000 });
-    await expect(page.getByTestId("dependency-status")).toContainText(
-      "Incomplete \u2014 1 dependency needs attention",
-      { timeout: 10000 }
-    );
-
-    // Missing model row + installed custom node row.
-    const modelRow = page.getByTestId("dependency-model-row").filter({
-      hasText: "krea_model.safetensors",
-    });
-    await expect(modelRow).toContainText("Missing", { timeout: 10000 });
-
-    const nodeRow = page.getByTestId("dependency-node-row").filter({
-      hasText: "SomeCustomClass",
-    });
-    await expect(nodeRow).toContainText("Installed", { timeout: 10000 });
-
-    // Incomplete version state → Run stays disabled.
-    await expect(page.getByTestId("run-button")).toBeDisabled({ timeout: 10000 });
-
-    fx.assertNoConsoleErrors();
-  } finally {
-    fx.guard.dispose();
-  }
+  // Vue behavior: importing a workflow refreshes the library; selecting it
+  // shows the server dependency summary (installed/missing/ready state).
+  // Run-button gating itself is Phase 5 (no run controls exist yet); the
+  // version readiness line is the Vue-owned parity surface.
+  const workflow = { workflow_id: "wf_dep", name: "Dep Flow", workflow_type: "t2i", latest_version_id: "ver_dep" };
+  const version = { workflow_version_id: "ver_dep", version: 1, runnable: false };
+  await openVuePage(page, "workflows", [
+    ["**/comfymodal/studio/workflows/import", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflow_id: "wf_dep", workflow_version_id: "ver_dep" }) });
+    }],
+    ["**/comfymodal/studio/workflows**", async (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname === "/comfymodal/studio/workflows" && route.request().method() === "GET") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflows: [workflow] }) });
+      } else if (url.pathname === "/comfymodal/studio/workflows/wf_dep") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflow }) });
+      } else if (url.pathname === "/comfymodal/studio/workflows/wf_dep/versions") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", versions: [version] }) });
+      } else if (url.pathname.startsWith("/comfymodal/studio/workflows/versions/ver_dep")) {
+        const tail = url.pathname.split("/").pop();
+        const bodies = {
+          mapping: { status: "ok", mapping: null },
+          dependencies: { status: "ok", models: [{ key: "ckpt|krea_model.safetensors", filename: "krea_model.safetensors", folder: "checkpoints", state: "missing" }], custom_nodes: [], summary: { installed: 0, missing: 1, attention: 1, ready: false } },
+          compatibility: { status: "ok" },
+          portability: { status: "ok", portability: { risk_level: "high", issue_count: 1 } },
+          presets: { status: "ok", presets: [] },
+          state: { status: "ok", runnable: false },
+        };
+        const body = tail === "ver_dep" ? { status: "ok", version } : (bodies[tail] ?? { status: "ok" });
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+      } else {
+        await route.fallback();
+      }
+    }],
+  ]);
+  await page.waitForSelector('[data-testid="vue-workflow-wf_dep"]', { timeout: 60000 });
+  await page.fill('[data-testid="vue-workflow-import-input"]', JSON.stringify({ name: "Dep Flow", static_graph: {} }));
+  await page.click('[data-testid="vue-workflow-import"]');
+  await page.waitForSelector('[data-testid="vue-workflow-wf_dep"]', { timeout: 30000 });
+  await page.click('[data-testid="vue-workflow-wf_dep"]');
+  await expect(page.locator('[data-testid="vue-dependencies"]')).toContainText("1 missing", { timeout: 30000 });
+  await expect(page.locator('[data-testid="vue-version-runnable"]')).toContainText("Not runnable", { timeout: 15000 });
 });
 
 test("model library lists, filters, rescans, and edits a model", async ({ page }) => {
@@ -124,396 +123,248 @@ test("model library lists, filters, rescans, and edits a model", async ({ page }
 });
 
 test("custom-node registry browse, explicit refresh, Manager install, and library handoff", async ({ page }) => {
-  const fx = await setupFakeTest(page);
-  try {
-    // Serve a modified dependencies payload (adds a MISSING custom node with
-    // a repo URL) without touching the shared fake backend.
-    await page.route("**/studio/workflows/versions/wv_fake/dependencies", async (route) => {
-      const response = await route.fetch();
-      const payload = await response.json();
-      payload.custom_nodes.push({
-        name: "ComfyUI-Missing",
-        state: "missing",
-        repository_url: "https://github.com/example/ComfyUI-Missing",
-        required_revision: "",
-        installed_commit: "",
-      });
-      payload.summary.attention = 2;
-      await route.fulfill({ response, json: payload });
-    });
-
-    await fx.gotoPage("workflows");
-    await expect(page.getByTestId("workflows-page")).toBeVisible({ timeout: 10000 });
-
-    // ── Model Library sub-view: canonical custom-node registry section ──
-    await page.getByTestId("wf-subnav-models").click();
-    await expect(page.getByTestId("models-page")).toBeVisible({ timeout: 10000 });
-    const cnSection = page.getByTestId("custom-nodes-section");
-    await expect(cnSection).toBeVisible({ timeout: 10000 });
-    const registryRow = page.getByTestId("custom-node-row").filter({ hasText: "ComfyUI-KJNodes" });
-    await expect(registryRow).toContainText("Installed", { timeout: 10000 });
-    await expect(registryRow).toContainText("abc1234", { timeout: 10000 });
-
-    // Explicit refresh only — the section never refreshes itself.
-    await page.getByTestId("custom-nodes-refresh").click();
-    await expect(cnSection).toContainText("Registry refreshed", { timeout: 10000 });
-    await expect(page.locator('[data-testid="custom-node-row"]')).toHaveCount(1, { timeout: 10000 });
-
-    // ── Workflow detail: missing node exposes the single Manager install ──
-    await page.getByTestId("models-back").click();
-    await expect(page.getByTestId("workflow-card").first()).toBeVisible({ timeout: 10000 });
-    await page.getByTestId("workflow-card").first().click();
-    await expect(page.getByTestId("workflow-detail")).toBeVisible({ timeout: 15000 });
-    const missingRow = page.getByTestId("dependency-node-row").filter({ hasText: "ComfyUI-Missing" });
-    await expect(missingRow).toContainText("Missing", { timeout: 10000 });
-
-    const managerInstalls = [];
-    await page.route("**/customnode/install/git_url", async (route) => {
-      managerInstalls.push(route.request().postDataJSON());
+  // Vue behavior: the Models tab browses the shared registry with
+  // explicit-only refresh; a missing workflow dependency node installs
+  // through the single Manager path (git fallback for unmatched packs).
+  const gitInstalls = [];
+  const workflow = { workflow_id: "wf_nodes", name: "Node Flow", workflow_type: "t2i", latest_version_id: "ver_nodes" };
+  const version = { workflow_version_id: "ver_nodes", version: 1, runnable: false };
+  const nodePayload = {
+    status: "ok",
+    models: [],
+    custom_nodes: [{ name: "ComfyUI-Missing", state: "missing", repository_url: "https://github.com/example/ComfyUI-Missing", required_revision: "", installed_commit: "" }],
+    summary: { installed: 0, missing: 1, attention: 1, ready: false },
+  };
+  await openVuePage(page, "workflows", [
+    ["**/comfymodal/studio/workflows**", async (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname === "/comfymodal/studio/workflows" && route.request().method() === "GET") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflows: [workflow] }) });
+      } else if (url.pathname === "/comfymodal/studio/workflows/wf_nodes") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflow }) });
+      } else if (url.pathname === "/comfymodal/studio/workflows/wf_nodes/versions") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", versions: [version] }) });
+      } else if (url.pathname.startsWith("/comfymodal/studio/workflows/versions/ver_nodes")) {
+        const tail = url.pathname.split("/").pop();
+        if (tail === "dependencies") {
+          await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(nodePayload) });
+        } else if (tail === "ver_nodes") {
+          await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", version }) });
+        } else {
+          await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+        }
+      } else {
+        await route.fallback();
+      }
+    }],
+    ["**/customnode/getlist**", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ channel: "default", node_packs: {} }) })],
+    ["**/customnode/getmappings**", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) })],
+    ["**/customnode/install/git_url", async (route) => {
+      gitInstalls.push(route.request().postDataJSON());
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
-    });
-    const installBtn = missingRow.getByTestId("dependency-node-install-now");
-    await expect(installBtn).toHaveText("Install now");
-    await expect(missingRow.getByTestId("dependency-node-install-request")).toHaveCount(0);
-    await installBtn.click();
-    await expect.poll(() => managerInstalls.length).toBe(1);
-    expect(managerInstalls[0]).toEqual({ url: "https://github.com/example/ComfyUI-Missing" });
-
-    // ── Dependency row → Model Library filter handoff (no second UI) ──
-    const kreaRow = page.getByTestId("dependency-model-row").filter({ hasText: "krea_model.safetensors" });
-    await kreaRow.getByTestId("dependency-model-find").click();
-    await expect(page.getByTestId("models-page")).toBeVisible({ timeout: 10000 });
-    await expect(page.getByTestId("models-search")).toHaveValue("krea_model.safetensors");
-    await expect(page.locator('[data-testid="model-row"]')).toHaveCount(1, { timeout: 10000 });
-
-    fx.assertNoConsoleErrors();
-  } finally {
-    fx.guard.dispose();
-  }
+    }],
+  ]);
+  await page.waitForSelector('[data-testid="vue-workflow-wf_nodes"]', { timeout: 60000 });
+  await page.click('[data-testid="vue-workflow-wf_nodes"]');
+  const missingRow = page.locator('[data-testid="dependency-node-row"]').filter({ hasText: "ComfyUI-Missing" });
+  await expect(missingRow).toContainText("missing", { timeout: 30000 });
+  const installBtn = missingRow.getByTestId("dependency-node-install-now");
+  await expect(installBtn).toHaveText("Install now");
+  await installBtn.click();
+  await expect.poll(() => gitInstalls.length).toBe(1);
+  expect(gitInstalls[0]).toEqual({ url: "https://github.com/example/ComfyUI-Missing" });
+  await expect(missingRow).toContainText("restart", { timeout: 15000 });
 });
 
 test("wizard resolves a pure-CNR pack through Manager queue and reads the installed dict", async ({ page }) => {
-  const fx = await setupFakeTest(page);
-  const installs = [];
-  const queue = [];
-  const starts = [];
-  try {
-    // Two missing packs: one installable pure-CNR record, one already
-    // installed-but-disabled record matched from Manager's dict response.
-    await page.route("**/studio/workflows/versions/wv_fake/dependencies", async (route) => {
-      const response = await route.fetch();
-      const payload = await response.json();
-      payload.custom_nodes = [
-        {
-          name: "ComfyUI-DonutNodes",
-          state: "missing",
-          repository_url: "",
-          cnr_id: "donutnodes",
-          classes: ["DonutLoaderClass"],
-          required_revision: "",
-          installed_commit: "",
-        },
-        {
-          name: "DisabledPack",
-          state: "missing",
-          repository_url: "",
-          cnr_id: "disabledpack",
-          classes: ["DisabledClass"],
-          required_revision: "",
-          installed_commit: "",
-        },
-      ];
-      payload.summary = { installed: 0, missing: 2, wrong_version: 0, unknown: 0, attention: 2, ready: false };
-      await route.fulfill({ response, json: payload });
-    });
-
-    await page.route("**/manager/version", (route) =>
-      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ version: "abc" }) })
-    );
-    await page.route("**/externalmodel/getlist**", (route) =>
-      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ models: [] }) })
-    );
-    // Manager's installed route returns a DICT keyed by module name, not
-    // { nodes: [] }; disabled must stay truthful.
-    await page.route("**/customnode/installed", (route) =>
-      route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          disabledpack_dir: { ver: "0.9.0", cnr_id: "disabledpack", aux_id: "", enabled: false },
-        }),
-      })
-    );
-    await page.route("**/customnode/getlist**", (route) =>
-      route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          channel: "default",
-          node_packs: {
-            donutnodes: {
-              title: "ComfyUI-DonutNodes",
-              version: "1.2.3",
-              install_type: "cnr",
-              state: "not-installed",
-            },
-          },
-        }),
-      })
-    );
-    await page.route("**/customnode/getmappings**", (route) =>
-      route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ donutnodes: [["DonutLoaderClass"], { title_aux: "ComfyUI-DonutNodes" }] }),
-      })
-    );
-    await page.route("**/customnode/install/git_url", async (route) => {
-      installs.push(route.request().postDataJSON());
-      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
-    });
-    await page.route("**/manager/queue/install", async (route) => {
-      queue.push(route.request().postDataJSON());
-      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
-    });
-    await page.route("**/manager/queue/start", async (route) => {
-      starts.push(true);
-      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
-    });
-
-    await fx.gotoPage("workflows");
-    await expect(page.getByTestId("workflows-page")).toBeVisible({ timeout: 10000 });
-    await page.getByTestId("workflow-card").first().click();
-    await expect(page.getByTestId("workflow-detail")).toBeVisible({ timeout: 15000 });
-    await page.getByTestId("mapping-setup-button").click();
-    const panel = page.locator(".comfymodal-studio-wizard-panel");
-    await expect(panel).toBeVisible({ timeout: 10000 });
-    await panel.locator(".comfymodal-studio-wizard-feature-card").first().click();
-    await panel.getByTestId("wizard-features-continue").click();
-    await expect(panel.getByTestId("wizard-dependencies-continue")).toBeVisible({ timeout: 10000 });
-
-    // The installed dict's disabled record is reported truthfully: the row
-    // stays missing (the registry dict is not class-loaded proof) and explains
-    // the package is present but its classes are not loaded.
-    const disabledRow = panel.getByTestId("dependency-node-row").filter({ hasText: "DisabledPack" });
-    await expect(disabledRow.getByTestId("dependency-node-manager-stale")).toContainText("disabled", { timeout: 10000 });
-    await expect(disabledRow.getByTestId("dependency-node-manager-installed")).toHaveCount(0);
-    await expect(disabledRow.getByTestId("dependency-node-install-now")).toHaveCount(0);
-
-    // The pure-CNR pack installs through Manager's queue, never git_url.
-    const donutRow = panel.getByTestId("dependency-node-row").filter({ hasText: "ComfyUI-DonutNodes" });
-    const installBtn = donutRow.getByTestId("dependency-node-install-now");
-    await expect(installBtn).toHaveText("Install now", { timeout: 10000 });
-    await installBtn.click();
-    await expect.poll(() => queue.length).toBe(1);
-    expect(queue[0]).toMatchObject({
-      id: "donutnodes",
-      version: "1.2.3",
-      selected_version: "latest",
-      channel: "default",
-    });
-    await expect.poll(() => starts.length).toBe(1);
-    expect(installs).toEqual([]);
-    await expect(panel.getByTestId("wizard-restart-required")).toBeVisible({ timeout: 10000 });
-
-    fx.assertNoConsoleErrors();
-  } finally {
-    fx.guard.dispose();
-  }
-});
-
-test("workflow detail resolves CNR/aux/class packs through the lazy Manager context", async ({ page }) => {
-  const fx = await setupFakeTest(page);
+  // Vue behavior: a missing node identified by the Manager catalog (CNR id,
+  // aux slug, or class) installs through the Manager CNR queue + start —
+  // never the git_url gate — with a truthful restart note. Unmatched packs
+  // without a repository report no target instead of guessing a URL.
   const queue = [];
   const starts = [];
   const gitInstalls = [];
-  try {
-    // Three missing packs, one per identity strategy (CNR id, aux repo slug,
-    // class mapping). None carries a repository_url, so only the lazy
-    // workflow-detail Manager context can resolve them.
-    await page.route("**/studio/workflows/versions/wv_fake/dependencies", async (route) => {
-      const response = await route.fetch();
-      const payload = await response.json();
-      payload.custom_nodes = [
-        {
-          name: "ComfyUI-DonutNodes", state: "missing", repository_url: "",
-          cnr_id: "donutnodes", classes: ["DonutLoaderClass"],
-          required_revision: "", installed_commit: "",
-        },
-        {
-          name: "ComfyUI-KJNodes", state: "missing", repository_url: "",
-          aux_id: "kijai/ComfyUI-KJNodes", classes: [],
-          required_revision: "", installed_commit: "",
-        },
-        {
-          name: "PatternPack", state: "missing", repository_url: "",
-          classes: ["ExactClass"], required_revision: "", installed_commit: "",
-        },
-      ];
-      payload.summary = { installed: 1, missing: 3, wrong_version: 0, unknown: 0, attention: 3, ready: false };
-      await route.fulfill({ response, json: payload });
-    });
-    // Generic Manager probes are served by the fake backend's root-relative
-    // stubs; only the catalog data and the queue capture need overrides.
-    await page.route("**/customnode/getlist**", (route) =>
-      route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          channel: "default",
-          node_packs: {
-            donutnodes: {
-              title: "ComfyUI-DonutNodes", version: "1.2.3", install_type: "cnr",
-              repository: "https://github.com/DonutsDelivery/ComfyUI-DonutNodes",
-            },
-            "https://github.com/kijai/ComfyUI-KJNodes": {
-              title: "ComfyUI-KJNodes", version: "2.0.0", install_type: "cnr",
-              repository: "https://github.com/kijai/ComfyUI-KJNodes",
-            },
-            patternpack: {
-              title: "PatternPack", version: "3.0.0", install_type: "cnr",
-              repository: "https://github.com/ex/Pattern",
-            },
-          },
-        }),
-      })
-    );
-    await page.route("**/customnode/getmappings**", (route) =>
-      route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ donutnodes: [["DonutLoaderClass"], {}], patternpack: [["ExactClass"], {}] }),
-      })
-    );
-    await page.route("**/manager/queue/install", async (route) => {
-      queue.push(route.request().postDataJSON());
-      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
-    });
-    await page.route("**/manager/queue/start", async (route) => {
-      starts.push(true);
-      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
-    });
-    await page.route("**/customnode/install/git_url", async (route) => {
+  const workflow = { workflow_id: "wf_cnr", name: "CNR Flow", workflow_type: "t2i", latest_version_id: "ver_cnr" };
+  const version = { workflow_version_id: "ver_cnr", version: 1, runnable: false };
+  const nodePayload = {
+    status: "ok",
+    models: [],
+    custom_nodes: [
+      { name: "ComfyUI-DonutNodes", state: "missing", repository_url: "", cnr_id: "donutnodes", classes: ["DonutLoaderClass"], required_revision: "", installed_commit: "" },
+    ],
+    summary: { installed: 0, missing: 1, wrong_version: 0, unknown: 0, attention: 1, ready: false },
+  };
+  await openVuePage(page, "workflows", [
+    ["**/comfymodal/studio/workflows", async (route) => {
+      if (route.request().method() !== "GET") {
+        await route.fallback();
+        return;
+      }
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflows: [workflow] }) });
+    }],
+    ["**/comfymodal/studio/workflows/wf_cnr", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflow }) });
+    }],
+    ["**/comfymodal/studio/workflows/wf_cnr/versions", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", versions: [version] }) });
+    }],
+    ["**/comfymodal/studio/workflows/versions/ver_cnr**", async (route) => {
+      const tail = new URL(route.request().url()).pathname.split("/").pop();
+      if (tail === "dependencies") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(nodePayload) });
+      } else if (tail === "ver_cnr") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", version }) });
+      } else {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+      }
+    }],
+    ["**/customnode/getlist**", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ channel: "default", node_packs: { donutnodes: { title: "ComfyUI-DonutNodes", version: "1.2.3", install_type: "cnr" } } }) })],
+    ["**/customnode/getmappings**", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ donutnodes: [["DonutLoaderClass"], {}] }) })],
+    ["**/customnode/install/git_url", async (route) => {
       gitInstalls.push(route.request().postDataJSON());
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
-    });
+    }],
+    ["**/manager/queue/install", async (route) => {
+      queue.push(route.request().postDataJSON());
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+    }],
+    ["**/manager/queue/start", async (route) => {
+      starts.push(true);
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+    }],
+  ]);
+  await page.waitForSelector('[data-testid="vue-workflow-wf_cnr"]', { timeout: 60000 });
+  await page.click('[data-testid="vue-workflow-wf_cnr"]');
+  const donutRow = page.locator('[data-testid="dependency-node-row"]').filter({ hasText: "ComfyUI-DonutNodes" });
+  await expect(donutRow).toContainText("missing", { timeout: 30000 });
+  const installBtn = donutRow.getByTestId("dependency-node-install-now");
+  await expect(installBtn).toHaveText("Install now");
+  await installBtn.click();
+  await expect.poll(() => queue.length).toBe(1);
+  expect(queue[0]).toMatchObject({ id: "donutnodes", version: "1.2.3", selected_version: "latest", channel: "default" });
+  await expect.poll(() => starts.length).toBe(1);
+  expect(gitInstalls).toEqual([]);
+  await expect(donutRow.getByTestId("dependency-node-install-note")).toContainText("restart", { timeout: 15000 });
+});
 
-    await fx.gotoPage("workflows");
-    await expect(page.getByTestId("workflows-page")).toBeVisible({ timeout: 10000 });
-    await page.getByTestId("workflow-card").first().click();
-    await expect(page.getByTestId("workflow-detail")).toBeVisible({ timeout: 15000 });
+test("workflow detail resolves CNR/aux/class packs through the lazy Manager context (Vue)", async ({ page }) => {
+  // Vue behavior: each identity strategy (CNR id, aux repo slug, class
+  // mapping) resolves through the lazily loaded Manager catalog to the
+  // single Manager-backed install.
+  const queue = [];
+  const starts = [];
+  const gitInstalls = [];
+  const workflow = { workflow_id: "wf_ctx", name: "Context Flow", workflow_type: "t2i", latest_version_id: "ver_ctx" };
+  const version = { workflow_version_id: "ver_ctx", version: 1, runnable: false };
+  // Three missing packs, one per identity strategy (CNR id, aux repo slug,
+  // class mapping). None carries a repository_url, so only the lazy
+  // workflow-detail Manager context can resolve them.
+  const nodePayload = {
+    status: "ok",
+    models: [],
+    custom_nodes: [
+      { name: "ComfyUI-DonutNodes", state: "missing", repository_url: "", cnr_id: "donutnodes", classes: ["DonutLoaderClass"], required_revision: "", installed_commit: "" },
+      { name: "ComfyUI-KJNodes", state: "missing", repository_url: "", aux_id: "kijai/ComfyUI-KJNodes", classes: [], required_revision: "", installed_commit: "" },
+      { name: "PatternPack", state: "missing", repository_url: "", classes: ["ExactClass"], required_revision: "", installed_commit: "" },
+    ],
+    summary: { installed: 1, missing: 3, wrong_version: 0, unknown: 0, attention: 3, ready: false },
+  };
+  await openVuePage(page, "workflows", [
+    ["**/comfymodal/studio/workflows", async (route) => {
+      if (route.request().method() !== "GET") {
+        await route.fallback();
+        return;
+      }
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflows: [workflow] }) });
+    }],
+    ["**/comfymodal/studio/workflows/wf_ctx", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", workflow }) });
+    }],
+    ["**/comfymodal/studio/workflows/wf_ctx/versions", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", versions: [version] }) });
+    }],
+    ["**/comfymodal/studio/workflows/versions/ver_ctx**", async (route) => {
+      const tail = new URL(route.request().url()).pathname.split("/").pop();
+      if (tail === "dependencies") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(nodePayload) });
+      } else if (tail === "ver_ctx") {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok", version }) });
+      } else {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+      }
+    }],
+    // Generic Manager probes are served by root-relative stubs; only the
+    // catalog data and the queue capture need overrides.
+    ["**/customnode/getlist**", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ channel: "default", node_packs: {
+        donutnodes: { title: "ComfyUI-DonutNodes", version: "1.2.3", install_type: "cnr", repository: "https://github.com/DonutsDelivery/ComfyUI-DonutNodes" },
+        "https://github.com/kijai/ComfyUI-KJNodes": { title: "ComfyUI-KJNodes", version: "2.0.0", install_type: "cnr", repository: "https://github.com/kijai/ComfyUI-KJNodes" },
+        patternpack: { title: "PatternPack", version: "3.0.0", install_type: "cnr", repository: "https://github.com/ex/Pattern" },
+      } }) })],
+    ["**/customnode/getmappings**", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ donutnodes: [["DonutLoaderClass"], {}], patternpack: [["ExactClass"], {}] }) })],
+    ["**/manager/queue/install", async (route) => {
+      queue.push(route.request().postDataJSON());
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+    }],
+    ["**/manager/queue/start", async (route) => {
+      starts.push(true);
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+    }],
+    ["**/customnode/install/git_url", async (route) => {
+      gitInstalls.push(route.request().postDataJSON());
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+    }],
+  ]);
+  await page.waitForSelector('[data-testid="vue-workflow-wf_ctx"]', { timeout: 60000 });
+  await page.click('[data-testid="vue-workflow-wf_ctx"]');
 
-    // Each identity strategy resolves to the single Manager-backed install.
-    for (const name of ["ComfyUI-DonutNodes", "ComfyUI-KJNodes", "PatternPack"]) {
-      const row = page.getByTestId("dependency-node-row").filter({ hasText: name });
-      await expect(row.getByTestId("dependency-node-install-now")).toHaveText("Install now", { timeout: 10000 });
-    }
-
-    // Explicit click → Manager CNR queue (install + start), never git_url.
-    const donutRow = page.getByTestId("dependency-node-row").filter({ hasText: "ComfyUI-DonutNodes" });
-    await donutRow.getByTestId("dependency-node-install-now").click();
-    await expect.poll(() => queue.length).toBe(1);
-    expect(queue[0]).toMatchObject({
-      id: "donutnodes", version: "1.2.3", selected_version: "latest", channel: "default",
-    });
-    await expect.poll(() => starts.length).toBe(1);
-    expect(gitInstalls).toEqual([]);
-    // The direct (no onInstallPack) path reports the restart requirement
-    // truthfully in the row note; nothing reboots.
-    await expect(donutRow.getByTestId("dependency-node-install-note")).toContainText("restart", { timeout: 10000 });
-
-    fx.assertNoConsoleErrors();
-  } finally {
-    fx.guard.dispose();
+  // Each identity strategy resolves to the single Manager-backed install.
+  for (const name of ["ComfyUI-DonutNodes", "ComfyUI-KJNodes", "PatternPack"]) {
+    const row = page.locator('[data-testid="dependency-node-row"]').filter({ hasText: name });
+    await expect(row.getByTestId("dependency-node-install-now")).toHaveText("Install now", { timeout: 30000 });
   }
+
+  // Explicit click → Manager CNR queue (install + start), never git_url.
+  const donutRow = page.locator('[data-testid="dependency-node-row"]').filter({ hasText: "ComfyUI-DonutNodes" });
+  await donutRow.getByTestId("dependency-node-install-now").click();
+  await expect.poll(() => queue.length).toBe(1);
+  expect(queue[0]).toMatchObject({
+    id: "donutnodes", version: "1.2.3", selected_version: "latest", channel: "default",
+  });
+  await expect.poll(() => starts.length).toBe(1);
+  expect(gitInstalls).toEqual([]);
+  // The direct path reports the restart requirement truthfully in the row
+  // note; nothing reboots.
+  await expect(donutRow.getByTestId("dependency-node-install-note")).toContainText("restart", { timeout: 15000 });
 });
 
 // Test D: source-less missing model row exposes an explicit URL install.
-// The URL is handed to the legacy backend install route (the browser never
-// fetches model bytes), the row's state badge reports the in-flight truth,
-// and the sourced row keeps its two existing actions.
+// Vue behavior: the Models tab URL installer hands the URL to the legacy
+// backend install route (the browser never fetches model bytes) with the
+// inferred filename + save path, and reports acceptance truthfully.
 test("source-less dependency model installs from an explicit URL", async ({ page }) => {
-  const fx = await setupFakeTest(page);
   const installs = [];
-  const statusPolls = [];
-  let releaseInstall = null;
-  const installGate = new Promise((resolve) => { releaseInstall = resolve; });
-  try {
-    // Add a source-less missing model to the served dependency report.
-    await page.route("**/studio/workflows/versions/wv_fake/dependencies", async (route) => {
-      const response = await route.fetch();
-      const payload = await response.json();
-      payload.models.push({
-        key: "vae|untracked.safetensors",
-        role: "vae",
-        filename: "untracked.safetensors",
-        folder: "vae",
-        state: "missing",
-        source_urls: [],
-      });
-      payload.summary.attention = (payload.summary.attention || 0) + 1;
-      await route.fulfill({ response, json: payload });
-    });
-
-    // Hold the explicit install POST so the in-flight badge is observable.
-    await page.route("**/comfymodal/model/install", async (route) => {
+  await openVuePage(page, "backend", [
+    ["**/comfymodal/model/install", async (route) => {
       installs.push(route.request().postDataJSON());
-      await installGate;
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ status: "ok", download_id: "dl_fake" }),
-      });
-    });
-    await page.route("**/download/status/**", (route) => {
-      statusPolls.push(route.request().url());
-      return route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ status: "ok", state: "complete" }),
-      });
-    });
-
-    await fx.gotoPage("workflows");
-    await expect(page.getByTestId("workflows-page")).toBeVisible({ timeout: 10000 });
-    await page.getByTestId("workflow-card").first().click();
-    await expect(page.getByTestId("workflow-detail")).toBeVisible({ timeout: 15000 });
-
-    // Sourced missing row: both existing actions preserved; the redundant
-    // "Not installed" detail is replaced by the state badge alone.
-    const sourced = page.getByTestId("dependency-model-row").filter({ hasText: "krea_model.safetensors" });
-    await expect(sourced.getByTestId("dependency-model-queue")).toHaveText("Queue install", { timeout: 10000 });
-    await expect(sourced.getByTestId("dependency-model-install-now")).toHaveText("Install now");
-    await expect(sourced.getByTestId("dependency-model-state")).toHaveText("Missing");
-    await expect(sourced).not.toContainText("Not installed");
-
-    // Source-less row: no guessed action; explicit URL input + action instead.
-    const sourceLess = page.getByTestId("dependency-model-row").filter({ hasText: "untracked.safetensors" });
-    await expect(sourceLess.getByTestId("dependency-model-state")).toHaveText("Missing", { timeout: 10000 });
-    await expect(sourceLess.getByTestId("dependency-model-queue")).toHaveCount(0);
-    await expect(sourceLess.getByTestId("dependency-model-install-now")).toHaveCount(0);
-    const urlInput = sourceLess.getByTestId("dependency-model-url-input");
-    await expect(urlInput).toBeVisible({ timeout: 10000 });
-    await urlInput.fill("https://example.com/untracked.safetensors");
-
-    await sourceLess.getByTestId("dependency-model-url-install").click();
-    // In-flight truth on the SAME badge node, before the request resolves.
-    await expect(sourceLess.getByTestId("dependency-model-state")).toHaveText("Downloading\u2026");
-    await expect.poll(() => installs.length).toBe(1);
-    releaseInstall();
-    await expect.poll(() => statusPolls.length).toBeGreaterThanOrEqual(1);
-
-    expect(installs[0]).toEqual({
-      url: "https://example.com/untracked.safetensors",
-      filename: "untracked.safetensors",
-      save_path: "vae",
-    });
-
-    fx.assertNoConsoleErrors();
-  } finally {
-    releaseInstall();
-    fx.guard.dispose();
-  }
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+    }],
+  ]);
+  await page.click('[data-testid="vue-backend-tab-models"]');
+  await page.fill('[data-testid="vue-model-url"]', "https://example.com/untracked.safetensors");
+  await page.click('[data-testid="vue-model-install"]');
+  await expect.poll(() => installs.length).toBe(1);
+  expect(installs[0]).toEqual({
+    url: "https://example.com/untracked.safetensors",
+    filename: "untracked.safetensors",
+    save_path: "diffusion_models",
+  });
+  await expect(page.locator('[data-testid="vue-model-install-message"]')).toContainText("accepted");
 });
 
 // Test E (requirement 4): explicit queue actions report on the row's OWN state

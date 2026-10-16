@@ -13,6 +13,15 @@ const confirmDelete = ref(false);
 const busyAction = ref<string | null>(null);
 const closeBtn = ref<HTMLElement | null>(null);
 const previousFocus = ref<HTMLElement | null>(null);
+const openCellId = ref<string | null>(null);
+
+const paramEntries = (record: HistoryRecord | null): Array<[string, string]> => {
+  if (!record) return [];
+  return Object.entries(record.params).map(([key, value]) => [key, String(value ?? "")]);
+};
+
+const statusLabel = (status: string): string =>
+  status ? status.charAt(0).toUpperCase() + status.slice(1) : status;
 
 onMounted(() => {
   previousFocus.value = document.activeElement as HTMLElement | null;
@@ -56,7 +65,7 @@ function close() {
       <div class="cmst:flex cmst:items-center cmst:justify-between cmst:gap-2">
         <div>
           <h2 class="cmst:text-lg cmst:font-semibold">{{ record.workflow || record.id }}</h2>
-          <p class="cmst:text-xs cmst:opacity-70">{{ record.status }} · {{ record.kind }} · {{ record.id }}</p>
+          <p class="cmst:text-xs cmst:opacity-70">{{ statusLabel(record.status) }} · {{ record.kind }} · {{ record.id }}</p>
         </div>
         <StudioButton ref="closeBtn" variant="outline" size="sm" data-testid="vue-viewer-close" @click="close">Close</StudioButton>
       </div>
@@ -75,6 +84,21 @@ function close() {
 
       <div v-if="record.errors.length" class="cmst:mt-3 cmst:text-sm cmst:text-red-300">
         <p v-for="(entry, index) in record.errors" :key="index">{{ entry.code }}: {{ entry.message }}</p>
+      </div>
+
+      <div v-if="paramEntries(record).length" class="cmst:mt-3 cmst:rounded-md cmst:bg-cmst-bg cmst:p-3 cmst:text-sm" data-testid="vue-viewer-params">
+        <h3 class="cmst:font-semibold">Parameters</h3>
+        <dl class="cmst:mt-1">
+          <div v-for="([key, value]) in paramEntries(record)" :key="key" class="cmst:flex cmst:gap-2">
+            <dt class="cmst:opacity-70">{{ key }}</dt>
+            <dd>{{ value }}</dd>
+          </div>
+        </dl>
+      </div>
+
+      <div v-if="record.attempts.length" class="cmst:mt-3 cmst:rounded-md cmst:bg-cmst-bg cmst:p-3 cmst:text-sm" data-testid="vue-viewer-attempts">
+        <h3 class="cmst:font-semibold">Attempts</h3>
+        <p v-for="attempt in record.attempts" :key="attempt.index">Attempt {{ attempt.index }}: {{ attempt.status }}</p>
       </div>
 
       <div class="cmst:mt-4 cmst:grid cmst:grid-cols-1 cmst:gap-3 cmst:sm:grid-cols-2">
@@ -121,7 +145,13 @@ function close() {
             <StudioButton size="sm" variant="outline" :data-testid="`vue-experiment-cancel-${record.id}`" @click="run('exp-cancel', () => history.runExperimentAction(record!, 'cancel'))">Cancel</StudioButton>
           </div>
           <div v-for="cell in record.cells" :key="cell.id" class="cmst:mt-2 cmst:rounded cmst:border cmst:border-solid cmst:border-cmst-border cmst:p-2 cmst:text-xs" :data-testid="`vue-cell-${cell.id}`">
-            <p>{{ cell.id }} · {{ cell.status }}</p>
+            <button type="button" class="cmst:w-full cmst:cursor-pointer cmst:bg-transparent cmst:text-left" :data-testid="`vue-cell-open-${cell.id}`" :aria-label="`Open cell ${cell.id}`" @click="openCellId = openCellId === cell.id ? null : cell.id" @keydown.enter.prevent="openCellId = openCellId === cell.id ? null : cell.id">
+              <p>{{ cell.id }} · {{ cell.status }}</p>
+            </button>
+            <div v-if="openCellId === cell.id" :data-testid="`vue-cell-detail-${cell.id}`" tabindex="0">
+              <p>{{ cell.featuredOutput ? "Preview available" : "No preview projected" }} · {{ cell.status }}</p>
+              <p v-if="cell.prompt" class="cmst:opacity-70">{{ cell.prompt }}</p>
+            </div>
             <StudioButton v-if="cell.status === 'failed'" class="cmst:mt-1" size="sm" variant="ghost" :data-testid="`vue-cell-retry-${cell.id}`" @click="run(`cell-${cell.id}`, () => history.runExperimentAction(record!, 'cancel', cell.id))">Retry cell</StudioButton>
           </div>
         </div>
