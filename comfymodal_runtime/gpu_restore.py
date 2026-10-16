@@ -37,9 +37,15 @@ Providers (fixed ordered tuple ``_PROVIDERS``):
       attention flag with live CUDA, fills newly-available registry entries,
       and re-runs the exact upstream selection sequence into the
       ``optimized_attention`` / ``optimized_attention_masked`` module
-      globals.  Honors explicit backend flags and never forces a backend
-      (an enabled-but-unavailable Kitchen flag reports error instead of the
-      upstream ``exit(-1)``).
+      globals (explicit flags win; a Kitchen request without availability
+      reports error instead of upstream ``exit(-1)``).
+  _repair_attention_consumer_aliases   -- rebinds proven stale consumer
+      aliases (explicit table, identity-gated) to the repaired source
+      objects after selection completes: direct by-value imports of the
+      attention globals across model modules, plus the frozen Kitchen
+      availability flag copy.  Only holders of the exact pre-repair object
+      are rebound; custom overrides and already-correct holders are
+      preserved; unimported modules are skipped.
   _repair_comfy_attention_device_limits -- repairs the snapshot-stale
       ``SDP_BATCH_LIMIT`` (2**31) back to the NVIDIA serving value (2**15) on
       NVIDIA devices only.  Already-correct values and nonstandard overrides
@@ -53,10 +59,10 @@ Known debt (deliberately OUT of scope here, do not implement in this module):
   - Sage/Flash package re-imports (owned by the existing Sage policy and
     deferred custom-node retry; this module never imports attention
     packages),
-  - direct from-import references captured during snapshot import (e.g. a
-    model module holding the old ``optimized_attention_masked`` object keeps
-    it; in-module ``CrossAttention`` callers and future imports observe the
-    repaired globals),
+  - direct from-import references not covered by the explicit consumer-alias
+    table (custom-node aliases with unverifiable sys.modules keys; in-module
+    ``CrossAttention`` callers and future imports observe the repaired
+    globals without any alias work),
   - quant_ops replay (this coordinator never imports or touches quant_ops).
 
 Import contract: stdlib-only imports at module load.  All heavy components
@@ -81,6 +87,7 @@ _REPAIR_TAG = "[v2.kitchen_backend_proof]"
 _KITCHEN_KEY = "kitchen_gpu_backends"
 _MM_KEY = "model_management_derived_state"
 _ATTN_SELECT_KEY = "attention_backend_selection"
+_ALIASES_KEY = "attention_consumer_aliases"
 _ATTENTION_KEY = "comfy_attention_device_limits"
 
 _TERMINAL_OUTCOMES = ("complete", "not-applicable")
@@ -92,9 +99,17 @@ _provider_done: dict[str, bool] = {
     _KITCHEN_KEY: False,
     _MM_KEY: False,
     _ATTN_SELECT_KEY: False,
+    _ALIASES_KEY: False,
     _ATTENTION_KEY: False,
 }
 _provider_reports: dict[str, dict[str, Any]] = {}
+
+# Pre-repair source objects captured by the attention-selection provider
+# before it rebinds the module globals.  The consumer-alias provider uses
+# these identities to rebind ONLY holders of the known-stale object (never
+# custom overrides, never already-correct holders).  Empty until selection
+# completes.
+_LAST_SELECTION_BEFORE: dict[str, Any] = {}
 
 
 def _cuda_visibility() -> tuple[Any | None, bool]:
@@ -604,6 +619,19 @@ def _repair_attention_backend_selection() -> dict[str, Any]:
         ck = sys.modules.get("comfy_kitchen")
         probe = getattr(ck, "int8_attention_is_available", None) if ck is not None else None
         old_kitchen = bool(getattr(attn_mod, "COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE", False))
+        try:
+            # Capture pre-repair source objects HERE, before the probe below
+            # mutates the flag: the consumer-alias provider rebinds only
+            # holders identical to these stashed values.
+            _LAST_SELECTION_BEFORE["optimized_attention"] = getattr(
+                attn_mod, "optimized_attention", None
+            )
+            _LAST_SELECTION_BEFORE["optimized_attention_masked"] = getattr(
+                attn_mod, "optimized_attention_masked", None
+            )
+            _LAST_SELECTION_BEFORE["kitchen_available"] = old_kitchen
+        except Exception:
+            pass
         if callable(probe):
             try:
                 new_kitchen = bool(probe())
@@ -702,6 +730,199 @@ def _repair_attention_backend_selection() -> dict[str, Any]:
         return result
 
 
+# Consumer aliases holding snapshot-frozen attention bindings.
+#
+# Each entry is ``(consumer module, attribute, source key)`` where source key
+# selects which repaired source object applies: "masked" (the repaired
+# ``optimized_attention_masked``), "unmasked" (the repaired
+# ``optimized_attention``), or "kitchen_flag" (the re-probed boolean).
+# Every entry below was verified offline: the consumer module imports the
+# name from ``comfy.ldm.modules.attention`` AND calls it on a live runtime
+# path (grep evidence per entry group; see the test contract).  Custom-node
+# aliases are deliberately excluded: hyphenated package directories make
+# their ``sys.modules`` keys uncertain, and blind rebinding there cannot be
+# verified offline (documented follow-up, mechanism already supports them).
+_ATTENTION_CONSUMER_ALIASES: tuple[tuple[str, str, str], ...] = (
+    # Masked path (verified import + live masked call).
+    ("comfy.ldm.ideogram4.model", "optimized_attention_masked", "masked"),
+    ("comfy.ldm.boogu.model", "optimized_attention_masked", "masked"),
+    ("comfy.ldm.krea2.model", "optimized_attention_masked", "masked"),
+    ("comfy.ldm.lumina.model", "optimized_attention_masked", "masked"),
+    ("comfy.ldm.omnigen.omnigen2", "optimized_attention_masked", "masked"),
+    ("comfy.ldm.qwen_image.model", "optimized_attention_masked", "masked"),
+    ("comfy.audio_encoders.whisper", "optimized_attention_masked", "masked"),
+    ("comfy.audio_encoders.wav2vec2", "optimized_attention_masked", "masked"),
+    # Unmasked path (verified import + live bare call).
+    ("comfy.ldm.ace.ace_step15", "optimized_attention", "unmasked"),
+    ("comfy.ldm.ace.attention", "optimized_attention", "unmasked"),
+    ("comfy.ldm.audio.dit", "optimized_attention", "unmasked"),
+    ("comfy.ldm.audio.vae_sa3", "optimized_attention", "unmasked"),
+    ("comfy.ldm.aura.mmdit", "optimized_attention", "unmasked"),
+    ("comfy.ldm.cascade.common", "optimized_attention", "unmasked"),
+    ("comfy.ldm.cldm.cldm", "optimized_attention", "unmasked"),
+    ("comfy.ldm.cogvideo.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.cosmos.blocks", "optimized_attention", "unmasked"),
+    ("comfy.ldm.cosmos.predict2", "optimized_attention", "unmasked"),
+    ("comfy.ldm.ernie.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.flux.math", "optimized_attention", "unmasked"),
+    ("comfy.ldm.genmo.joint_model.asymm_models_joint", "optimized_attention", "unmasked"),
+    ("comfy.ldm.genmo.joint_model.utils", "optimized_attention", "unmasked"),
+    ("comfy.ldm.genmo.vae.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.hidream.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.hidream_o1.attention", "optimized_attention", "unmasked"),
+    ("comfy.ldm.hunyuan_video.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.hunyuan3dv2_1.hunyuandit", "optimized_attention", "unmasked"),
+    ("comfy.ldm.hydit.attn_layers", "optimized_attention", "unmasked"),
+    ("comfy.ldm.hydit.poolers", "optimized_attention", "unmasked"),
+    ("comfy.ldm.joyimage.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.kandinsky5.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.lens.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.minimax.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.pixart.blocks", "optimized_attention", "unmasked"),
+    ("comfy.ldm.pixeldit.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.pixeldit.modules", "optimized_attention", "unmasked"),
+    ("comfy.ldm.qwen_image21.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.sam3.detector", "optimized_attention", "unmasked"),
+    ("comfy.ldm.sam3.sam", "optimized_attention", "unmasked"),
+    ("comfy.ldm.sam3.tracker", "optimized_attention", "unmasked"),
+    ("comfy.ldm.sam3d_body.model.transformer", "optimized_attention", "unmasked"),
+    ("comfy.ldm.sensenova.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.supir.supir_modules", "optimized_attention", "unmasked"),
+    ("comfy.ldm.trellis2.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.triposplat.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.wan.ar_model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.wan.model", "optimized_attention", "unmasked"),
+    ("comfy.ldm.wan.model_animate", "optimized_attention", "unmasked"),
+    ("comfy.ldm.wan.model_animate2", "optimized_attention", "unmasked"),
+    ("comfy.ldm.wan.model_multitalk", "optimized_attention", "unmasked"),
+    ("comfy.ldm.wan.model_wandancer", "optimized_attention", "unmasked"),
+    # Frozen flag copy (verified import + live runtime check).
+    ("comfy.ldm.minimax.vae", "COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE", "kitchen_flag"),
+)
+
+
+def _repair_attention_consumer_aliases() -> dict[str, Any]:
+    """Rebind proven stale consumer aliases to repaired source objects.
+
+    Runs strictly after the attention-selection provider: it requires that
+    provider terminally complete (otherwise defers with reason
+    ``selection_pending``).  For each table entry whose module is imported,
+    compares the holder against the pre-repair source object captured in
+    ``_LAST_SELECTION_BEFORE``: identical-to-stale rebinds to the repaired
+    object; already-repaired holders count unchanged; anything else
+    (deliberate custom overrides) is preserved untouched.  Missing modules
+    are skipped.  Never raises; never scans modules beyond the explicit
+    table; never touches policy, models, or weights.
+    """
+    result: dict[str, Any] = {
+        "provider": _ALIASES_KEY,
+        "outcome": "deferred",
+        "repaired": False,
+        "reason": "",
+        "checked": 0,
+        "rebound": 0,
+        "unchanged": 0,
+        "preserved_custom": 0,
+        "missing": 0,
+    }
+    if not _provider_done.get(_ATTN_SELECT_KEY):
+        result["reason"] = "selection_pending"
+        return result
+    if not _LAST_SELECTION_BEFORE:
+        result["reason"] = "selection_state_unavailable"
+        return result
+    attn_mod: Any = sys.modules.get("comfy.ldm.modules.attention")
+    if attn_mod is None:
+        result["reason"] = "attention_module_unavailable"
+        return result
+    try:
+        repaired_masked = getattr(attn_mod, "optimized_attention_masked", None)
+        repaired_unmasked = getattr(attn_mod, "optimized_attention", None)
+        repaired_flag = bool(
+            getattr(attn_mod, "COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE", False)
+        )
+        stale_masked = _LAST_SELECTION_BEFORE.get("optimized_attention_masked")
+        stale_unmasked = _LAST_SELECTION_BEFORE.get("optimized_attention")
+        stale_flag = _LAST_SELECTION_BEFORE.get("kitchen_available")
+    except Exception as exc:
+        result["outcome"] = "error"
+        result["reason"] = f"source_read_failed:{type(exc).__name__}"
+        return result
+    checked = rebound = unchanged = custom = missing = 0
+    try:
+        for dotted_path, attr, kind in _ATTENTION_CONSUMER_ALIASES:
+            checked += 1
+            try:
+                consumer = sys.modules.get(dotted_path)
+            except Exception:
+                consumer = None
+            if consumer is None:
+                missing += 1
+                continue
+            if kind == "kitchen_flag":
+                try:
+                    current = getattr(consumer, attr, None)
+                except Exception:
+                    custom += 1
+                    continue
+                if current == repaired_flag:
+                    unchanged += 1
+                elif stale_flag is not None and current == stale_flag:
+                    try:
+                        setattr(consumer, attr, repaired_flag)
+                    except Exception:
+                        custom += 1
+                        continue
+                    rebound += 1
+                else:
+                    custom += 1
+                continue
+            if kind == "masked":
+                stale, repaired = stale_masked, repaired_masked
+            else:
+                stale, repaired = stale_unmasked, repaired_unmasked
+            if repaired is None:
+                custom += 1
+                continue
+            try:
+                current = getattr(consumer, attr, None)
+            except Exception:
+                custom += 1
+                continue
+            if current is repaired:
+                unchanged += 1
+            elif stale is not None and current is stale:
+                try:
+                    setattr(consumer, attr, repaired)
+                except Exception:
+                    custom += 1
+                    continue
+                rebound += 1
+            else:
+                custom += 1
+    except Exception as exc:
+        result["outcome"] = "error"
+        result["reason"] = f"alias_walk_failed:{type(exc).__name__}"
+        return result
+    result["checked"] = checked
+    result["rebound"] = rebound
+    result["unchanged"] = unchanged
+    result["preserved_custom"] = custom
+    result["missing"] = missing
+    result["repaired"] = True
+    result["outcome"] = "complete"
+    try:
+        print(
+            f"[gpu_restore.refs] checked={checked} stale={rebound} "
+            f"rebound={rebound} unchanged={unchanged} custom={custom} "
+            f"missing={missing}",
+            flush=True,
+        )
+    except Exception:
+        pass
+    return result
+
+
 # Fixed ordered provider chain: kitchen backends first, derived
 # model-management state second (attention selection reads its predicates),
 # attention selection third, attention device limits last (inert until logical
@@ -710,12 +931,14 @@ _PROVIDERS: tuple[Any, ...] = (
     _repair_kitchen_gpu_backends,
     _repair_model_management_derived_state,
     _repair_attention_backend_selection,
+    _repair_attention_consumer_aliases,
     _repair_comfy_attention_device_limits,
 )
 _PROVIDER_KEY: dict[str, str] = {
     "_repair_kitchen_gpu_backends": _KITCHEN_KEY,
     "_repair_model_management_derived_state": _MM_KEY,
     "_repair_attention_backend_selection": _ATTN_SELECT_KEY,
+    "_repair_attention_consumer_aliases": _ALIASES_KEY,
     "_repair_comfy_attention_device_limits": _ATTENTION_KEY,
 }
 
@@ -731,6 +954,7 @@ def begin_gpu_restore() -> dict[str, Any]:
         for key in _provider_done:
             _provider_done[key] = False
         _provider_reports.clear()
+        _LAST_SELECTION_BEFORE.clear()
         return {"reset": True, "pending": sorted(_provider_done)}
     except Exception:
         return {"reset": False, "pending": sorted(_provider_done)}

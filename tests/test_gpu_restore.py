@@ -187,6 +187,7 @@ def test_full_lifecycle_complete(monkeypatch):
         "reset": True,
         "pending": [
             "attention_backend_selection",
+            "attention_consumer_aliases",
             "comfy_attention_device_limits",
             "kitchen_gpu_backends",
             "model_management_derived_state",
@@ -197,6 +198,7 @@ def test_full_lifecycle_complete(monkeypatch):
     assert report["pending"] == []
     assert sorted(report["completed"]) == [
         "attention_backend_selection",
+        "attention_consumer_aliases",
         "comfy_attention_device_limits",
         "kitchen_gpu_backends",
         "model_management_derived_state",
@@ -256,6 +258,7 @@ def test_cpu_no_gpu_safety_no_mutation_no_guard(monkeypatch):
         "kitchen_gpu_backends": False,
         "model_management_derived_state": False,
         "attention_backend_selection": False,
+        "attention_consumer_aliases": False,
         "comfy_attention_device_limits": False,
     }
 
@@ -699,3 +702,134 @@ def test_attention_provider_order_after_mm(monkeypatch):
     names = [fn.__name__ for fn in gr._PROVIDERS]
     assert names.index("_repair_model_management_derived_state") < names.index(
         "_repair_attention_backend_selection")
+
+# -- attention consumer aliases --------------------------
+
+def _install_attn_selectable(monkeypatch, *, kitchen_flag=False,
+                             selected="attention_sub_quad"):
+    am = _install_attn_mod(monkeypatch, kitchen_flag=kitchen_flag,
+                           selected=selected)
+    return am
+
+
+def _install_consumer(monkeypatch, dotted, attr, value):
+    parts = dotted.split(".")
+    top = sys.modules.get(parts[0])
+    if top is None:
+        top = types.ModuleType(parts[0])
+        monkeypatch.setitem(sys.modules, parts[0], top)
+    mod = types.ModuleType(dotted)
+    setattr(mod, attr, value)
+    monkeypatch.setitem(sys.modules, dotted, mod)
+    parent = sys.modules.get(".".join(parts[:-1]))
+    if parent is not None:
+        try:
+            setattr(parent, parts[-1], mod)
+        except Exception:
+            pass
+    return mod
+
+
+def _install_alias_world(monkeypatch, *, probe=True, stale_fn="attention_sub_quad"):
+    cuda = _CudaFake(visible=True)
+    _install_torch(monkeypatch, cuda)
+    mm = _install_mm_full(monkeypatch)
+    mm.ENABLE_PYTORCH_ATTENTION = True
+    _install_cli_args(monkeypatch)
+    am = _install_attn_mod(monkeypatch)
+    _install_ck_probe(monkeypatch, value=probe)
+    stale = getattr(am, stale_fn)
+    _install_consumer(monkeypatch, "comfy.ldm.ideogram4.model",
+                      "optimized_attention_masked", stale)
+    _install_consumer(monkeypatch, "comfy.ldm.flux.math",
+                      "optimized_attention", stale)
+    return SimpleNamespace(cuda=cuda, mm=mm, am=am, stale=stale)
+
+
+def test_aliases_rebind_stale_holders(monkeypatch):
+    env = _install_alias_world(monkeypatch)
+    report = gr.repair_gpu_capabilities_after_restore()
+    sel = report["providers"]["attention_backend_selection"]
+    assert sel["outcome"] == "complete"
+    assert sel["after"] == "pytorch"
+    out = report["providers"]["attention_consumer_aliases"]
+    assert out["outcome"] == "complete"
+    assert out["rebound"] >= 2
+    ide = sys.modules["comfy.ldm.ideogram4.model"]
+    flx = sys.modules["comfy.ldm.flux.math"]
+    assert ide.optimized_attention_masked.__name__ == "attention_pytorch"
+    assert flx.optimized_attention.__name__ == "attention_pytorch"
+
+
+def test_aliases_preserve_custom_override(monkeypatch):
+    env = _install_alias_world(monkeypatch)
+    custom_called = []
+    def _custom(*a, **k):
+        custom_called.append(True)
+    _custom.__name__ = "custom_attn"
+    _install_consumer(monkeypatch, "comfy.ldm.wan.model",
+                      "optimized_attention", _custom)
+    report = gr.repair_gpu_capabilities_after_restore()
+    out = report["providers"]["attention_consumer_aliases"]
+    assert out["outcome"] == "complete"
+    assert out["preserved_custom"] >= 1
+    assert sys.modules["comfy.ldm.wan.model"].optimized_attention is _custom
+
+
+def test_aliases_missing_modules_skipped(monkeypatch):
+    _install_alias_world(monkeypatch)
+    report = gr.repair_gpu_capabilities_after_restore()
+    out = report["providers"]["attention_consumer_aliases"]
+    assert out["outcome"] == "complete"
+    assert out["missing"] > 0
+    assert out["checked"] == len(gr._ATTENTION_CONSUMER_ALIASES)
+
+
+def test_aliases_defer_without_selection(monkeypatch):
+    _install_alias_world(monkeypatch)
+    gr.begin_gpu_restore()
+    out = gr._repair_attention_consumer_aliases()
+    assert out["outcome"] == "deferred"
+    assert out["reason"] == "selection_pending"
+
+
+def test_aliases_kitchen_flag_rebound(monkeypatch):
+    _install_alias_world(monkeypatch, probe=True)
+    mm_vae = types.ModuleType("comfy.ldm.minimax.vae")
+    mm_vae.COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE = False
+    monkeypatch.setitem(sys.modules, "comfy.ldm.minimax.vae", mm_vae)
+    report = gr.repair_gpu_capabilities_after_restore()
+    out = report["providers"]["attention_consumer_aliases"]
+    assert out["outcome"] == "complete"
+    assert mm_vae.COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE is True
+    assert out["rebound"] >= 1
+
+
+def test_aliases_already_correct_noop(monkeypatch):
+    env = _install_alias_world(monkeypatch)
+    report = gr.repair_gpu_capabilities_after_restore()
+    first = report["providers"]["attention_consumer_aliases"]
+    assert first["outcome"] == "complete"
+    gr._provider_done[gr._ALIASES_KEY] = False
+    second = gr.repair_gpu_capabilities_after_restore()
+    out = second["providers"]["attention_consumer_aliases"]
+    assert out["outcome"] == "complete"
+    assert out["rebound"] == 0
+    assert out["unchanged"] >= 2
+
+
+def test_alias_table_contract():
+    kinds = {"masked", "unmasked", "kitchen_flag"}
+    seen = set()
+    for path, attr, kind in gr._ATTENTION_CONSUMER_ALIASES:
+        assert kind in kinds
+        assert path.startswith("comfy.")
+        assert (path, attr) not in seen
+        seen.add((path, attr))
+        if kind == "kitchen_flag":
+            assert attr == "COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE"
+        elif kind == "masked":
+            assert attr == "optimized_attention_masked"
+        else:
+            assert attr == "optimized_attention"
+    assert len(gr._ATTENTION_CONSUMER_ALIASES) >= 40
