@@ -170,8 +170,11 @@ def _install_full(
         monkeypatch, registry, cuda=cuda, triton_failure=triton_failure
     )
     mm = _install_mm(monkeypatch, cpu_state=cpu_state, limit=limit) if with_mm else None
+    _install_cli_args(monkeypatch)
+    am = _install_attn_mod(monkeypatch)
+    _install_ck_probe(monkeypatch, value=True)
     return SimpleNamespace(
-        cuda=cuda, registry=registry, calls=calls, fail=fail, mm=mm
+        cuda=cuda, registry=registry, calls=calls, fail=fail, mm=mm, am=am
     )
 
 
@@ -182,14 +185,21 @@ def test_full_lifecycle_complete(monkeypatch):
     env = _install_full(monkeypatch)
     assert gr.begin_gpu_restore() == {
         "reset": True,
-        "pending": ["comfy_attention_device_limits", "kitchen_gpu_backends"],
+        "pending": [
+            "attention_backend_selection",
+            "comfy_attention_device_limits",
+            "kitchen_gpu_backends",
+            "model_management_derived_state",
+        ],
     }
     report = gr.repair_gpu_capabilities_after_restore()
     assert report["outcome"] == "complete"
     assert report["pending"] == []
     assert sorted(report["completed"]) == [
+        "attention_backend_selection",
         "comfy_attention_device_limits",
         "kitchen_gpu_backends",
+        "model_management_derived_state",
     ]
     kitchen = report["providers"]["kitchen_gpu_backends"]
     assert kitchen["outcome"] == "complete"
@@ -244,6 +254,8 @@ def test_cpu_no_gpu_safety_no_mutation_no_guard(monkeypatch):
     # CUDA-invisible must NOT consume the once-guard.
     assert gr._provider_done == {
         "kitchen_gpu_backends": False,
+        "model_management_derived_state": False,
+        "attention_backend_selection": False,
         "comfy_attention_device_limits": False,
     }
 
@@ -504,3 +516,186 @@ def test_new_restore_resets_inherited_completion(monkeypatch):
     assert report["outcome"] == "complete"
     assert env.calls["cuda"] > calls_after_first["cuda"]
     assert env.calls["triton"] > calls_after_first["triton"]
+
+# -- model_management derived-state provider --------------------------
+
+def _install_cli_args(monkeypatch, **flags):
+    cli = types.ModuleType("comfy.cli_args")
+    defaults = dict(
+        use_pytorch_cross_attention=False,
+        use_split_cross_attention=False,
+        use_quad_cross_attention=False,
+        use_sage_attention=False,
+        use_flash_attention=False,
+        use_ck_attention=False,
+        async_offload=None,
+        disable_async_offload=False,
+        fast=[],
+    )
+    defaults.update(flags)
+    cli.args = SimpleNamespace(**defaults)
+    monkeypatch.setitem(sys.modules, "comfy.cli_args", cli)
+    return cli.args
+
+
+def _install_mm_full(monkeypatch, *, cpu_state="GPU", ratio=0.4,
+                     pytorch_attn=False, streams=0, tvn=(2, 14),
+                     nvidia=True, amd=False):
+    mm = types.ModuleType("comfy.model_management")
+    mm.CPUState = SimpleNamespace(CPU="CPU", GPU="GPU")
+    mm.cpu_state = cpu_state
+    mm.MIN_WEIGHT_MEMORY_RATIO = ratio
+    mm.ENABLE_PYTORCH_ATTENTION = pytorch_attn
+    mm.NUM_STREAMS = streams
+    mm.torch_version_numeric = tvn
+    mm.XFORMERS_IS_AVAILABLE = False
+    mm.PRIORITIZE_FP16 = False
+    mm.is_nvidia = lambda: bool(nvidia) and mm.cpu_state == "GPU"
+    mm.is_amd = lambda: bool(amd)
+    mm.is_intel_xpu = lambda: False
+    mm.is_ascend_npu = lambda: False
+    mm.is_mlu = lambda: False
+    mm.is_ixuca = lambda: False
+    mm.xformers_enabled = lambda: False
+    monkeypatch.setitem(sys.modules, "comfy.model_management", mm)
+    return mm
+
+
+def _install_attn_mod(monkeypatch, *, kitchen_flag=False, selected="attention_sub_quad"):
+    am = types.ModuleType("comfy.ldm.modules.attention")
+    def _fn(name):
+        def _f(*a, **k):
+            raise AssertionError("fake attention fn called")
+        _f.__name__ = name
+        return _f
+    for _name in ("attention_sage", "attention_flash", "attention_xformers",
+                  "attention_pytorch", "attention_sub_quad", "attention_split",
+                  "attention_comfy_kitchen_int8", "attention3_sage"):
+        setattr(am, _name, _fn(_name))
+    am.optimized_attention = getattr(am, selected)
+    am.optimized_attention_masked = getattr(am, selected)
+    am.COMFY_KITCHEN_INT8_ATTENTION_IS_AVAILABLE = kitchen_flag
+    am.SAGE_ATTENTION_IS_AVAILABLE = False
+    am.SAGE_ATTENTION3_IS_AVAILABLE = False
+    am.FLASH_ATTENTION_IS_AVAILABLE = False
+    am.REGISTERED_ATTENTION_FUNCTIONS = {}
+    def _register(name, fn):
+        if name not in am.REGISTERED_ATTENTION_FUNCTIONS:
+            am.REGISTERED_ATTENTION_FUNCTIONS[name] = fn
+    am.register_attention_function = _register
+    monkeypatch.setitem(sys.modules, "comfy.ldm.modules.attention", am)
+    return am
+
+
+def _install_ck_probe(monkeypatch, value=True, raises=False):
+    ck = sys.modules.get("comfy_kitchen")
+    if ck is None:
+        ck = types.ModuleType("comfy_kitchen")
+        monkeypatch.setitem(sys.modules, "comfy_kitchen", ck)
+    def _probe():
+        if raises:
+            raise RuntimeError("fake probe failure")
+        return value
+    ck.int8_attention_is_available = _probe
+    return ck
+
+
+def _install_mm_full_stack(monkeypatch, *, visible=True, cpu_state="GPU",
+                           ratio=0.4, pytorch_attn=False, streams=0,
+                           kitchen_flag=False, selected="attention_sub_quad",
+                           probe=True, **cli_flags):
+    cuda = _CudaFake(visible=visible)
+    _install_torch(monkeypatch, cuda)
+    mm = _install_mm_full(monkeypatch, cpu_state=cpu_state, ratio=ratio,
+                          pytorch_attn=pytorch_attn, streams=streams)
+    _install_cli_args(monkeypatch, **cli_flags)
+    am = _install_attn_mod(monkeypatch, kitchen_flag=kitchen_flag,
+                           selected=selected)
+    _install_ck_probe(monkeypatch, value=probe)
+    return SimpleNamespace(cuda=cuda, mm=mm, am=am)
+
+
+def test_mm_derived_repaired_on_nvidia(monkeypatch):
+    _install_mm_full_stack(monkeypatch)
+    out = gr.repair_gpu_capabilities_after_restore()
+    assert out["providers"]["model_management_derived_state"]["outcome"] == "complete"
+    mm = sys.modules["comfy.model_management"]
+    assert mm.MIN_WEIGHT_MEMORY_RATIO == 0.0
+    assert mm.ENABLE_PYTORCH_ATTENTION is True
+    assert mm.NUM_STREAMS == 2
+
+
+def test_mm_explicit_flags_preserved(monkeypatch):
+    _install_mm_full_stack(monkeypatch, use_split_cross_attention=True,
+                           async_offload=4)
+    out = gr.repair_gpu_capabilities_after_restore()
+    assert out["providers"]["model_management_derived_state"]["outcome"] == "complete"
+    mm = sys.modules["comfy.model_management"]
+    assert mm.ENABLE_PYTORCH_ATTENTION is False
+    assert mm.NUM_STREAMS == 4
+
+
+def test_mm_inert_while_cpu_state_then_repairs(monkeypatch):
+    env = _install_mm_full_stack(monkeypatch, cpu_state="CPU")
+    first = gr.repair_gpu_capabilities_after_restore()
+    assert first["providers"]["model_management_derived_state"]["outcome"] == "deferred"
+    assert env.mm.MIN_WEIGHT_MEMORY_RATIO == 0.4
+    env.mm.cpu_state = "GPU"
+    second = gr.repair_gpu_capabilities_after_restore()
+    assert second["providers"]["model_management_derived_state"]["outcome"] == "complete"
+    assert env.mm.MIN_WEIGHT_MEMORY_RATIO == 0.0
+
+
+def test_mm_cuda_invisible_no_mutation(monkeypatch):
+    env = _install_mm_full_stack(monkeypatch, visible=False)
+    out = gr.repair_gpu_capabilities_after_restore()
+    assert out["providers"]["model_management_derived_state"]["outcome"] == "deferred"
+    assert env.mm.ENABLE_PYTORCH_ATTENTION is False
+
+
+def test_attention_selection_pytorch_on_nvidia(monkeypatch):
+    _install_mm_full_stack(monkeypatch)
+    out = gr.repair_gpu_capabilities_after_restore()
+    prov = out["providers"]["attention_backend_selection"]
+    assert prov["outcome"] == "complete"
+    assert prov["after"] == "pytorch"
+    assert prov["kitchen_available"] is True
+    assert "comfy_kitchen_int8" in prov["registered_added"]
+    am = sys.modules["comfy.ldm.modules.attention"]
+    assert am.optimized_attention.__name__ == "attention_pytorch"
+    assert am.optimized_attention_masked.__name__ == "attention_pytorch"
+
+
+def test_attention_explicit_sage_flag_not_forced(monkeypatch):
+    _install_mm_full_stack(monkeypatch, use_sage_attention=True)
+    out = gr.repair_gpu_capabilities_after_restore()
+    prov = out["providers"]["attention_backend_selection"]
+    assert prov["outcome"] == "complete"
+    assert prov["after"] == "sage"
+
+
+def test_attention_kitchen_requested_unavailable_errors(monkeypatch):
+    _install_mm_full_stack(monkeypatch, use_ck_attention=True, probe=False)
+    out = gr.repair_gpu_capabilities_after_restore()
+    prov = out["providers"]["attention_backend_selection"]
+    assert prov["outcome"] == "error"
+    assert prov["reason"] == "kitchen_requested_unavailable"
+    am = sys.modules["comfy.ldm.modules.attention"]
+    assert am.optimized_attention.__name__ == "attention_sub_quad"
+
+
+def test_attention_from_import_limitation_documented(monkeypatch):
+    env = _install_mm_full_stack(monkeypatch)
+    am = env.am
+    stale_ref = am.optimized_attention_masked
+    out = gr.repair_gpu_capabilities_after_restore()
+    assert out["providers"]["attention_backend_selection"]["outcome"] == "complete"
+    assert stale_ref.__name__ == "attention_sub_quad"
+    assert am.optimized_attention_masked.__name__ == "attention_pytorch"
+
+
+def test_attention_provider_order_after_mm(monkeypatch):
+    _install_mm_full_stack(monkeypatch)
+    names = [fn.__name__ for fn in gr._PROVIDERS]
+    assert names.index("_repair_model_management_derived_state") < names.index(
+        "_repair_attention_backend_selection")
