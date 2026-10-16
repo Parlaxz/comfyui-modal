@@ -16740,34 +16740,48 @@ class _ComfyAPIMixin:
         self._offload_devices_patched = True
 
     def _enable_torch_compile_on_unet(self) -> None:
-        """Apply ``torch.compile`` directly to ``diffusion_model._forward``
-        on any loaded diffusion model.
+        """RETIRED: dormant direct-compile hook (now a no-op diagnostic).
 
-        Unlike the old approach (``set_torch_compile_wrapper`` which hooked into
-        ``APPLY_MODEL`` wrappers with ``fullgraph=True``), this compiles the
-        inner ``_forward`` method of the Flux/UNET module directly.  This avoids:
+        This hook previously patched ``load_models_gpu`` to compile the
+        inner ``_forward`` method directly.  It never engaged (it returned
+        early on every path) and direct ``torch.compile`` is disabled on
+        this branch: Dynamo tracing hits "invalid argument to
+        getCurrentStream" CUDA errors in the post-restore CUDA context, and
+        SageAttention's pre-compiled CUDA/Blackwell kernels already provide
+        optimal performance.
 
-        - Graph breaks from ``WrapperExecutor`` dispatch in Flux's ``forward()``
-        - Wrapper overhead on every denoising step
-        - ``fullgraph=True`` raising on Python-level control flow
-
-        Enabled by ``COMFYMODAL_ENABLE_TORCH_COMPILE=1`` env var.
+        Compilation is now owned by ``comfymodal_runtime.torch_compile_policy``
+        (resolve/install/attach/prepare/release lifecycle wired in
+        ``comfymodal_runtime.modal_app`` through KJNodes' EXISTING public
+        ``set_torch_compile_wrapper`` path).  The legacy
+        ``COMFYMODAL_ENABLE_TORCH_COMPILE`` flag is deprecate-not-OR: it
+        never enables compilation; when set it only produces diagnostics
+        via the policy resolver below.  This method patches nothing,
+        imports no torch, and never raises.
         """
-        if not ENABLE_TORCH_COMPILE:
+        if getattr(self, "_torch_compile_retired_logged", False):
             return
-        if getattr(self, "_torch_compile_enabled", False):
-            return
-        import comfy.model_management as _mm
-        import torch
+        self._torch_compile_retired_logged = True
+        try:
+            from comfymodal_runtime.torch_compile_policy import (
+                resolve_compile_policy,
+            )
 
-        # torch.compile is disabled on this branch.  It triggers
-        # "invalid argument to getCurrentStream" CUDA errors during Dynamo
-        # tracing in the post-restore CUDA context GÃ‡Ã¶ a known interaction
-        # between torch.compile and Modal's memory snapshot infrastructure.
-        # SageAttention's pre-compiled CUDA/Blackwell kernels already provide
-        # optimal performance; torch.compile adds overhead without benefit.
-        if not ENABLE_TORCH_COMPILE:
-            return
+            _policy, _diagnostics = resolve_compile_policy()
+            _reasons = ",".join(
+                str(reason)
+                for reason in (_diagnostics.get("reasons") or [])
+            )
+            print(
+                "[comfyapp.torch_compile_retired] "
+                f"requested={_diagnostics.get('requested_mode', 'off')} "
+                f"actual={_diagnostics.get('actual_mode', 'off')} "
+                f"reasons={_reasons or 'off_by_default'}",
+                flush=True,
+            )
+        except Exception:
+            pass
+        return
 
     def _compute_workflow_struct_hash(self, workflow: dict) -> str:
         import hashlib
@@ -17117,12 +17131,12 @@ class _ComfyAPIMixin:
         """
         self._wait_for_restore_preload_before_request(workflow)
 
-        # Enable torch.compile on UNET models if configured.
-        # Patches load_models_gpu so any diffusion model loaded during this
-        # execution (or any subsequent one) gets compiled via ComfyUI's
-        # set_torch_compile_wrapper.  The compile triggers lazily on the
-        # first forward pass during the denoising loop.
-        self._enable_torch_compile_on_unet()
+        # torch.compile: the dormant direct-compile hook is retired (it is a
+        # no-op diagnostic now; the legacy COMFYMODAL_ENABLE_TORCH_COMPILE
+        # flag is deprecate-not-OR and never enables compilation).
+        # Compilation lifecycle is owned by
+        # comfymodal_runtime.torch_compile_policy as wired in
+        # comfymodal_runtime.modal_app; this execution path stays eager.
 
         import execution
 

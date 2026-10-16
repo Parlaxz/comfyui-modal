@@ -5089,6 +5089,30 @@ def _build_sampling_wrapper() -> Callable:
         except Exception:
             pass
         _sampler_boundary_line("sampling_start", start_meta)
+        # ── torch.compile ON_PRE_RUN refresh (deferred install follow-up) ──
+        # The request install in modal_app defers prepare when no diffusion
+        # model is observable pre-execution (latch stays UNTRIED, regions=0).
+        # The live guider patcher IS observable here pre-first-forward, so
+        # re-invoke prepare once via the modal_app refresh seam, which
+        # resolves the effective diffusion model itself (unet_forward_probe
+        # chain) and leaves the latch untouched on any miss.  Best-effort:
+        # runs only when modal_app publishes this request's scope record
+        # (module-level _compile_scope_record; until then a silent no-op).
+        # Never raises, never constructs a model, never fails sampling.
+        try:
+            from comfymodal_runtime import modal_app as _compile_modal_app
+            _compile_refresh = getattr(
+                _compile_modal_app, "_refresh_request_compile_scope_on_pre_run", None
+            )
+            _compile_record = getattr(
+                _compile_modal_app, "_compile_scope_record", None
+            )
+            if _compile_refresh is not None and _compile_record is not None:
+                _compile_live = _patch if _patch is not None else sampler_self
+                if _compile_live is not None:
+                    _compile_refresh(_compile_record, _compile_live)
+        except Exception:
+            pass
         # ── LANE 9: UNET readiness vs sampling-start demand slack ─────────
         # Diagnostic-only: reports how early/late the retained UNET was ready
         # relative to actual sampling start.  Positive slack_ms means the UNET

@@ -1049,140 +1049,46 @@ def finalize_sampler_profile(
         return None
 
 
-# ── Post-restore kitchen GPU backend repair (state-only) ──────────────
-# Root cause it repairs: kitchen CUDA/Triton backends evaluate
-# ``torch.cuda.is_available()`` once at import inside
-# ``comfy_kitchen.backends.<name>._register()``.  During snapshot build that
-# import happens inside comfymodal's CPU-snapshot mock window
-# (``torch.cuda.is_available = lambda: False``), so both backends
-# ``mark_unavailable`` and the dead registry state is snapshotted into the
-# serving container.  Re-running the existing ``_register()`` routines with
-# real CUDA visible re-registers capabilities (``registry.register``
-# overwrites caps and pops ``mark_unavailable``) — no math, no weights, no
-# priority change.  Safe to repeat; guarded to once per process.
-_repair_done = False
+# ── Post-restore kitchen GPU backend repair: compat wrapper (Part A4) ──
+# Canonical implementation relocated to ``gpu_restore`` (single
+# implementation).  This entrypoint delegates so existing callers keep
+# working; it carries no logic of its own.
+_repair_done = False  # legacy guard; the canonical once-guard lives in gpu_restore
 
 
 def repair_kitchen_gpu_backends_after_restore() -> dict:
-    """Re-run kitchen GPU backend registration with real CUDA visible.
+    """Compat wrapper: delegate to the canonical ``gpu_restore`` provider.
 
-    Runs only when ``torch.cuda.is_available()`` is true (i.e. after the
-    snapshot mock is gone).  Clears the registry's possibly-stale cached
-    compute capability first.  Triton is repaired only when not explicitly
-    disabled (respects Comfy default-off / ``--disable-triton-backend``).
-    Never raises.  Returns a result dict.
+    Never raises.  Returns the provider result dict (legacy
+    ``repaired``/``reason``/``cuda``/``triton`` keys plus ``outcome``).
     """
-    global _repair_done
-    if _repair_done:
-        return {"repaired": False, "reason": "already_done"}
-    result: dict = {"repaired": False, "reason": "", "cuda": None, "triton": None}
     try:
-        import torch as _torch
+        from .gpu_restore import _repair_kitchen_gpu_backends as _canonical
     except Exception:
-        result["reason"] = "torch_unimportable"
-        return result
-    try:
-        _cuda_visible = bool(_torch.cuda.is_available())
-    except Exception:
-        _cuda_visible = False
-    if not _cuda_visible:
-        result["reason"] = "cuda_not_visible"
-        return result
-    _disabled_before = None
-    _priority_before = None
-    try:
-        import comfy_kitchen as _ck
-        _reg = _ck.registry
-    except Exception as exc:
-        result["reason"] = f"kitchen_unimportable:{type(exc).__name__}"
-        return result
-    # Stale GPU-derived cache: ``_compute_capability`` is a cached_property
-    # that may have been evaluated (as None) while CUDA was mocked away
-    # during snapshot build.  Drop it so the next validation recomputes.
-    try:
-        _reg.__dict__.pop("_compute_capability", None)
-    except Exception:
-        pass
-    try:
-        _disabled_before = set(getattr(_reg, "_disabled", set()) or set())
-        _priority_before = list(getattr(_reg, "_priority", []) or [])
-    except Exception:
-        _disabled_before = None
-        _priority_before = None
-    try:
-        from comfy_kitchen.backends import cuda as _ck_cuda
-        _ck_cuda._register()
-        result["cuda"] = "rerun"
-    except Exception as exc:
-        result["cuda"] = f"failed:{type(exc).__name__}"
-    try:
-        _disabled = _disabled_before if _disabled_before is not None else (
-            getattr(_reg, "_disabled", set()) or set()
-        )
-        if "triton" in _disabled:
-            result["triton"] = "skipped:disabled"
-        else:
-            from comfy_kitchen.backends import triton as _ck_triton
-            _ck_triton._register()
-            result["triton"] = "rerun"
-    except Exception as exc:
-        result["triton"] = f"failed:{type(exc).__name__}"
-    finally:
-        # Native registration owns capabilities/unavailable state, but it must
-        # not rewrite user/backend policy state.
         try:
-            if _disabled_before is not None:
-                _reg._disabled.clear()
-                _reg._disabled.update(_disabled_before)
+            from comfymodal_runtime.gpu_restore import (
+                _repair_kitchen_gpu_backends as _canonical,
+            )
         except Exception:
-            pass
-        try:
-            if _priority_before is not None:
-                _reg._priority[:] = _priority_before
-        except Exception:
-            pass
-    _complete = (
-        result["cuda"] == "rerun"
-        and result["triton"] in {"rerun", "skipped:disabled"}
-    )
+            return {
+                "provider": "kitchen_gpu_backends",
+                "outcome": "error",
+                "repaired": False,
+                "reason": "gpu_restore_unavailable",
+                "cuda": None,
+                "triton": None,
+            }
     try:
-        _infos = _reg.list_backends()
-    except Exception:
-        _infos = None
-    if isinstance(_infos, dict):
-        try:
-            _disabled_now = set(getattr(_reg, "_disabled", set()) or set())
-        except Exception:
-            _disabled_now = set()
-
-        def _avail(_name):
-            _info = _infos.get(_name)
-            if not isinstance(_info, dict):
-                return False
-            if _name in _disabled_now or bool(_info.get("disabled")):
-                return False
-            return bool(_info.get("available"))
-
-        _cuda_ok = result["cuda"] == "rerun" and _avail("cuda")
-        if result["triton"] == "skipped:disabled":
-            _triton_ok = True
-        else:
-            _triton_ok = result["triton"] == "rerun" and _avail("triton")
-        _complete = bool(_cuda_ok and _triton_ok)
-        if not _complete and not result["reason"]:
-            result["reason"] = "backend_unavailable"
-    result["repaired"] = _complete
-    if _complete:
-        _repair_done = True
-    try:
-        print(
-        f"{PROOF_TAG} repair_after_restore cuda={result['cuda']} "
-            f"triton={result['triton']}",
-            flush=True,
-        )
-    except Exception:
-        pass
-    return result
+        return _canonical()
+    except Exception as exc:  # never raise into restore/execution seams
+        return {
+            "provider": "kitchen_gpu_backends",
+            "outcome": "error",
+            "repaired": False,
+            "reason": f"wrapper_failed:{type(exc).__name__}",
+            "cuda": None,
+            "triton": None,
+        }
 
 
 # ── Kitchen INT8 backend proof (measurement-only) ──────────────────────

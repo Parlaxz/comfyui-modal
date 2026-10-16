@@ -305,6 +305,1049 @@ _V2_CRITICAL_PATH_FIELDS: tuple[str, ...] = (
 )
 
 
+# ── torch.compile policy wiring ──────────────────────────────────────────
+# The ONLY compile seam in modal_app.py (the gpu_restore seams elsewhere in
+# this file belong to the restore lane and are untouched).
+#
+# Lifecycle (order pinned by tests/test_torch_compile_wiring.py):
+#   restore/process scope: ensure_compile_cache_bound() — before first
+#     compile use; verifies the effective resolver paths.
+#   request scope: _install_request_compile_scope() =
+#       resolve -> install -> attach (before any wrapper merge) ->
+#       readiness gate -> ON_PRE_RUN prepare_compile_targets
+#     ... sampling (executor.execute merges APPLY_MODEL wrappers) ...
+#     _finalize_request_compile_scope() =
+#       finish -> summarize (one [compile] line) -> release (ON_DETACH,
+#       idempotent, runs in the request finally).
+#
+# Readiness: compile runs only after CUDA init + gpu_restore complete +
+# CUDA execution device.  Default is OFF: with flags unset every helper
+# short-circuits to eager without wrappers, I/O, or env mutation.
+#
+# KJ path: execution goes through KJNodes' EXISTING public wrapper
+# (comfy_api.torch_helpers.set_torch_compile_wrapper).  _kj_wrapper_kwargs()
+# maps the policy onto that exact verified call signature; when the
+# capability is absent the install path records kj_capability_missing and
+# stays eager (never raises).  Explicit wrapper application to a live
+# patcher is validation-only via apply_kj_compile_to_patcher(); the default
+# request path arms the scope and attaches the policy but never mutates a
+# shared patcher.
+_COMPILE_RECOMPILE_LIMIT_ENV = "COMFYMODAL_TORCH_COMPILE_RECOMPILE_LIMIT"
+_COMPILE_RECOMPILE_BUDGET_ENV = "COMFYMODAL_TORCH_COMPILE_RECOMPILE_BUDGET"
+_COMPILE_CACHE_BINDING: dict[str, Any] | None = None
+
+
+def _compile_alias_env(env: Any) -> Any:
+    """Copy RECOMPILE_LIMIT onto the policy's RECOMPILE_BUDGET key.
+
+    The registry/Profile control surface is COMFYMODAL_TORCH_COMPILE_*
+    (LIMIT), while torch_compile_policy resolves COMFYMODAL_TORCH_COMPILE_
+    RECOMPILE_BUDGET.  When the budget key is absent, the limit value is
+    aliased in so validation control has one knob.  Pure: never touches
+    os.environ; returns the input unchanged when it is not a mapping.
+    """
+    if env is None or not isinstance(env, Mapping):
+        return env
+    try:
+        items = dict(env)
+    except Exception:
+        return env
+    try:
+        limit = items.get(_COMPILE_RECOMPILE_LIMIT_ENV)
+        budget = items.get(_COMPILE_RECOMPILE_BUDGET_ENV)
+        if (
+            limit is not None
+            and str(limit).strip() != ""
+            and (budget is None or str(budget).strip() == "")
+        ):
+            items[_COMPILE_RECOMPILE_BUDGET_ENV] = limit
+    except Exception:
+        pass
+    return items
+
+
+def resolve_request_compile_policy(
+    *,
+    env: Any = None,
+    argv: Any = None,
+    external_compile_owner: str = "",
+    disable_comfy_compiler: bool | None = None,
+    _resolve: Any = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Resolve the effective compile policy for one request scope.
+
+    Applies the RECOMPILE_LIMIT -> RECOMPILE_BUDGET alias, then delegates
+    to torch_compile_policy.resolve_compile_policy (which owns the
+    deprecate-not-OR legacy-flag diagnostics).  Never raises: an
+    unimportable policy module yields (None, reason diagnostics).
+    """
+    if env is None:
+        try:
+            if (
+                os.environ.get(_COMPILE_RECOMPILE_LIMIT_ENV, "").strip()
+                != ""
+                and os.environ.get(
+                    _COMPILE_RECOMPILE_BUDGET_ENV, ""
+                ).strip()
+                == ""
+            ):
+                env = dict(os.environ)
+                env[_COMPILE_RECOMPILE_BUDGET_ENV] = env[
+                    _COMPILE_RECOMPILE_LIMIT_ENV
+                ]
+        except Exception:
+            env = None
+    else:
+        env = _compile_alias_env(env)
+    if _resolve is None:
+        try:
+            from . import torch_compile_policy as _tcp_mod
+
+            _resolve = _tcp_mod.resolve_compile_policy
+        except Exception as exc:
+            return None, {
+                "requested_mode": "off",
+                "actual_mode": "off",
+                "reasons": [f"torch_compile_policy_unimportable:{type(exc).__name__}"],
+            }
+    try:
+        return _resolve(
+            env=env,
+            argv=argv,
+            external_compile_owner=external_compile_owner,
+            disable_comfy_compiler=disable_comfy_compiler,
+        )
+    except Exception as exc:
+        return None, {
+            "requested_mode": "off",
+            "actual_mode": "off",
+            "reasons": [f"resolve_failed:{type(exc).__name__}"],
+        }
+
+
+def _compile_toolchain_identity() -> dict[str, Any]:
+    """Best-effort toolchain identity for cache-namespace derivation.
+
+    Only torch/CUDA/Triton/arch/python versions are collected (extra keys
+    are ignored by compiler_cache_namespace by construction).  Missing
+    components degrade to "unknown"; never raises, performs no math, and
+    allocates nothing.
+    """
+    ident: dict[str, Any] = {}
+    try:
+        torch_mod: Any = __import__("torch")
+        ident["torch_version"] = str(
+            getattr(torch_mod, "__version__", "unknown") or "unknown"
+        )
+        try:
+            ident["cuda_version"] = str(
+                getattr(getattr(torch_mod, "version", None), "cuda", None)
+                or "unknown"
+            )
+        except Exception:
+            ident["cuda_version"] = "unknown"
+        try:
+            cuda_mod = getattr(torch_mod, "cuda", None)
+            probe = getattr(cuda_mod, "is_available", None) if cuda_mod is not None else None
+            if callable(probe) and bool(probe()):
+                try:
+                    cap = cuda_mod.get_device_capability(0)
+                    ident["arch"] = f"sm_{int(cap[0])}{int(cap[1])}"
+                except Exception:
+                    ident["arch"] = "unknown"
+            else:
+                ident["arch"] = "unknown"
+        except Exception:
+            ident["arch"] = "unknown"
+    except Exception:
+        ident["torch_version"] = "unknown"
+        ident["cuda_version"] = "unknown"
+        ident["arch"] = "unknown"
+    try:
+        triton_mod: Any = __import__("triton")
+        ident["triton_version"] = str(
+            getattr(triton_mod, "__version__", "unknown") or "unknown"
+        )
+    except Exception:
+        ident["triton_version"] = "unknown"
+    try:
+        ident["python_version"] = str(platform.python_version())
+    except Exception:
+        ident["python_version"] = "unknown"
+    return ident
+
+
+def ensure_compile_cache_bound(
+    *,
+    policy: Any = None,
+    root: str | None = None,
+    env: Any = None,
+    _resolve: Any = None,
+    _cache_mod: Any = None,
+    _identity: Any = None,
+) -> dict[str, Any]:
+    """Bind the compiler cache at restore/process scope (before first use).
+
+    Off by default: when the resolved policy mode is "off" this performs no
+    I/O and mutates no environment (returns bound=False, reason mode_off).
+    Otherwise it derives the toolchain namespace, binds routing directories,
+    verifies the effective resolver paths exist, and memoizes the binding.
+    Never raises.
+    """
+    global _COMPILE_CACHE_BINDING
+    try:
+        if policy is None:
+            policy, _diagnostics = resolve_request_compile_policy(
+                env=env, _resolve=_resolve
+            )
+            if policy is None:
+                return {
+                    "bound": False,
+                    "reason": "policy_unresolvable",
+                    "namespace": "",
+                    "paths": {},
+                    "applied": {},
+                }
+        if str(getattr(policy, "mode", "off") or "off") == "off":
+            return {
+                "bound": False,
+                "reason": "mode_off",
+                "namespace": "",
+                "paths": {},
+                "applied": {},
+            }
+        if _cache_mod is None:
+            try:
+                from . import compiler_cache as _cc_mod
+
+                _cache_mod = _cc_mod
+            except Exception as exc:
+                return {
+                    "bound": False,
+                    "reason": f"compiler_cache_unimportable:{type(exc).__name__}",
+                    "namespace": "",
+                    "paths": {},
+                    "applied": {},
+                }
+        ident = (
+            dict(_identity)
+            if isinstance(_identity, Mapping)
+            else _compile_toolchain_identity()
+        )
+        try:
+            namespace = _cache_mod.compiler_cache_namespace(ident)
+            bound = _cache_mod.bind_compiler_cache(
+                namespace, root=root, apply_env=True
+            )
+        except Exception as exc:
+            return {
+                "bound": False,
+                "reason": f"bind_failed:{type(exc).__name__}",
+                "namespace": "",
+                "paths": {},
+                "applied": {},
+            }
+        if bound.get("refused_symlink"):
+            return {
+                "bound": False,
+                "reason": "refused_symlink",
+                "namespace": str(bound.get("namespace", "")),
+                "paths": {},
+                "applied": {},
+            }
+        try:
+            paths_ok = os.path.isdir(
+                bound.get("inductor_dir", "")
+            ) and os.path.isdir(bound.get("triton_dir", ""))
+        except Exception:
+            paths_ok = False
+        if not paths_ok:
+            return {
+                "bound": False,
+                "reason": "paths_unverified",
+                "namespace": str(bound.get("namespace", "")),
+                "paths": {},
+                "applied": {},
+            }
+        if (
+            isinstance(_COMPILE_CACHE_BINDING, dict)
+            and _COMPILE_CACHE_BINDING.get("namespace") == namespace
+        ):
+            return {
+                "bound": True,
+                "already": True,
+                "reason": "already_bound",
+                "namespace": namespace,
+                "paths": dict(_COMPILE_CACHE_BINDING.get("paths", {})),
+                "applied": dict(_COMPILE_CACHE_BINDING.get("applied", {})),
+            }
+        record = {
+            "namespace": namespace,
+            "paths": {
+                "root": bound.get("root", ""),
+                "namespace_dir": bound.get("namespace_dir", ""),
+                "inductor_dir": bound.get("inductor_dir", ""),
+                "triton_dir": bound.get("triton_dir", ""),
+            },
+            "applied": dict(bound.get("applied", {}) or {}),
+        }
+        _COMPILE_CACHE_BINDING = record
+        return {
+            "bound": True,
+            "already": False,
+            "reason": "bound",
+            **record,
+        }
+    except Exception as exc:
+        return {
+            "bound": False,
+            "reason": f"ensure_failed:{type(exc).__name__}",
+            "namespace": "",
+            "paths": {},
+            "applied": {},
+        }
+
+
+def _compile_cuda_initialized(_torch: Any = None) -> bool:
+    """True when torch.cuda.is_available(); fail-closed on any error."""
+    try:
+        torch_mod = _torch if _torch is not None else __import__("torch")
+        cuda_mod = getattr(torch_mod, "cuda", None)
+        probe = getattr(cuda_mod, "is_available", None) if cuda_mod is not None else None
+        return bool(probe()) if callable(probe) else False
+    except Exception:
+        return False
+
+
+def _compile_gpu_restore_complete(_state: Any = None) -> bool:
+    """True when every gpu_restore provider reached a terminal outcome.
+
+    Reads the restore lane's once-guard without mutating it; unknown or
+    incomplete state is fail-closed (not complete).
+    """
+    try:
+        state = _state
+        if state is None:
+            try:
+                from . import gpu_restore as _gr_mod
+            except Exception:
+                return False
+            state = getattr(_gr_mod, "_provider_done", None)
+        if not isinstance(state, dict) or not state:
+            return False
+        return all(bool(done) for done in state.values())
+    except Exception:
+        return False
+
+
+def _compile_execution_device_is_cuda(_mm: Any = None) -> bool:
+    """True when model_management resolves the execution device to CUDA."""
+    try:
+        mm = _mm
+        if mm is None:
+            try:
+                import comfy.model_management as _mmm  # type: ignore[import-not-found]
+            except Exception:
+                return False
+            mm = _mmm
+        device = mm.get_torch_device()
+        return str(getattr(device, "type", "") or "") == "cuda"
+    except Exception:
+        return False
+
+
+def _compile_ready_for_request(
+    policy: Any,
+    *,
+    snapshot_capturing: bool = False,
+    external_compile_owner: str = "",
+    _cuda_ok: Any = None,
+    _restore_ok: Any = None,
+    _device_ok: Any = None,
+) -> dict[str, Any]:
+    """Readiness gate: CUDA init + gpu_restore complete + CUDA device.
+
+    Runs after attach and before ON_PRE_RUN prepare.  Any unmet gate
+    short-circuits to ready=False; never raises.
+    """
+    try:
+        if policy is None:
+            return {"ready": False, "reason": "no_policy"}
+        if str(getattr(policy, "mode", "off") or "off") == "off":
+            return {"ready": False, "reason": "mode_off"}
+        if snapshot_capturing:
+            return {"ready": False, "reason": "snapshot_capture_active"}
+        owner = (
+            external_compile_owner
+            or str(getattr(policy, "external_compile_owner", "") or "")
+        ).strip()
+        if owner:
+            return {"ready": False, "reason": "external_compile_owner"}
+        cuda_ok = _cuda_ok() if callable(_cuda_ok) else _compile_cuda_initialized()
+        if not cuda_ok:
+            return {"ready": False, "reason": "cuda_not_initialized"}
+        restore_ok = (
+            _restore_ok() if callable(_restore_ok) else _compile_gpu_restore_complete()
+        )
+        if not restore_ok:
+            return {"ready": False, "reason": "gpu_restore_incomplete"}
+        device_ok = (
+            _device_ok()
+            if callable(_device_ok)
+            else _compile_execution_device_is_cuda()
+        )
+        if not device_ok:
+            return {"ready": False, "reason": "execution_device_not_cuda"}
+        return {"ready": True, "reason": "ready"}
+    except Exception as exc:
+        return {"ready": False, "reason": f"readiness_failed:{type(exc).__name__}"}
+
+
+def _kj_dynamic_for_policy(policy: Any) -> Any:
+    """Map the policy dynamic enum onto the KJ wrapper dynamic flag.
+
+    Verified against TorchCompileModelAdvanced: "true" -> True,
+    "false" -> False, "auto" -> None.
+    """
+    raw = str(getattr(policy, "dynamic", "auto") or "auto").strip().lower()
+    return {"true": True, "false": False}.get(raw)
+
+
+def _kj_wrapper_kwargs_for_policy(policy: Any, keys: Any) -> dict[str, Any]:
+    """Build kwargs for the verified set_torch_compile_wrapper signature.
+
+    Verified against the installed ComfyUI source
+    (comfy_api/torch_helpers/__init__.py) and KJNodes call sites
+    (ComfyUI-KJNodes/nodes/model_optimization_nodes.py)::
+
+        set_torch_compile_wrapper(model, backend, options=None, mode=None,
+                                  fullgraph=False, dynamic=None,
+                                  keys=["diffusion_model"], *args, **kwargs)
+
+    Fixed codegen contract: Inductor backend from the policy, options None,
+    mode None (default; never max-autotune), fullgraph from the policy
+    (False), dynamic mapped from the policy enum.  Pure.
+    """
+    try:
+        key_list = list(keys) if keys else ["diffusion_model"]
+    except Exception:
+        key_list = ["diffusion_model"]
+    if not key_list:
+        key_list = ["diffusion_model"]
+    return {
+        "backend": str(getattr(policy, "backend", "inductor") or "inductor"),
+        "options": None,
+        "mode": None,
+        "fullgraph": bool(getattr(policy, "fullgraph", False)),
+        "dynamic": _kj_dynamic_for_policy(policy),
+        "keys": key_list,
+    }
+
+
+def apply_kj_compile_to_patcher(
+    patcher: Any,
+    scope: Any,
+    *,
+    _wrapper: Any = None,
+) -> dict[str, Any]:
+    """Apply the KJ compile wrapper to a live patcher (validation-only).
+
+    NOT invoked by the default request path: it mutates patcher wrapper
+    state, so validation calls it explicitly with an observable patcher.
+    Derives region keys from scope["regions"], attaches the policy first,
+    then calls the wrapper with the verified signature.  On failure the
+    scope latch trips terminally to eager; never raises.
+    """
+    try:
+        if not isinstance(scope, dict):
+            return {"applied": False, "reason": "no_scope", "keys": []}
+        policy = scope.get("policy")
+        if policy is None or str(getattr(policy, "mode", "off") or "off") == "off":
+            return {"applied": False, "reason": "mode_off", "keys": []}
+        regions = scope.get("regions") or []
+        keys: list[str] = []
+        try:
+            for region in regions:
+                if not isinstance(region, Mapping):
+                    continue
+                container = str(region.get("container", "") or "")
+                try:
+                    count = int(region.get("block_count", 0) or 0)
+                except Exception:
+                    count = 0
+                if not container or count <= 0:
+                    continue
+                keys.extend(
+                    f"diffusion_model.{container}.{i}" for i in range(count)
+                )
+        except Exception:
+            keys = []
+        if not keys:
+            keys = ["diffusion_model"]
+        wrapper = _wrapper
+        if wrapper is None:
+            try:
+                from . import torch_compile_policy as _tcp_probe
+            except Exception as exc:
+                return {
+                    "applied": False,
+                    "reason": f"torch_compile_policy_unimportable:{type(exc).__name__}",
+                    "keys": [],
+                }
+            probe = _tcp_probe.probe_kj_compile_capability()
+            if not probe.get("available"):
+                try:
+                    latch = scope.get("latch")
+                    marker = getattr(latch, "mark_eager_skipped", None)
+                    if callable(marker):
+                        marker(str(probe.get("reason", "kj_capability_missing")))
+                except Exception:
+                    pass
+                return {
+                    "applied": False,
+                    "reason": str(
+                        probe.get("reason", "kj_capability_missing")
+                    ),
+                    "keys": [],
+                }
+            wrapper = probe.get("wrapper")
+        try:
+            from . import torch_compile_policy as _tcp_attach
+
+            _tcp_attach.attach_compile_policy(patcher, policy)
+        except Exception:
+            pass
+        try:
+            kwargs = _kj_wrapper_kwargs_for_policy(policy, keys)
+            wrapper(model=patcher, **kwargs)
+        except Exception as exc:
+            try:
+                latch = scope.get("latch")
+                marker = getattr(latch, "mark_eager_failed", None)
+                if callable(marker):
+                    marker(f"apply_failed:{type(exc).__name__}")
+            except Exception:
+                pass
+            return {
+                "applied": False,
+                "reason": f"apply_failed:{type(exc).__name__}",
+                "keys": keys,
+            }
+        return {"applied": True, "reason": "applied", "keys": keys}
+    except Exception as exc:
+        return {
+            "applied": False,
+            "reason": f"apply_failed:{type(exc).__name__}",
+            "keys": [],
+        }
+
+
+def _install_request_compile_scope(
+    executor_state: Any = None,
+    *,
+    diffusion_model: Any = None,
+    snapshot_capturing: bool = False,
+    external_compile_owner: str = "",
+    env: Any = None,
+    argv: Any = None,
+    _resolve: Any = None,
+    _install: Any = None,
+    _attach: Any = None,
+    _ready: Any = None,
+    _prepare: Any = None,
+    _probe: Any = None,
+) -> dict[str, Any]:
+    """Install the request sampling compile scope (attach before merge).
+
+    Ordered attach points: resolve -> install -> attach (before the
+    executor merges APPLY_MODEL wrappers) -> readiness gate -> ON_PRE_RUN
+    prepare_compile_targets.  No live diffusion model is observable
+    pre-execution, so when the policy mode is not off the install-time
+    prepare is DEFERRED (recorded, latch left UNTRIED) instead of latching
+    terminal no_diffusion_model; the ON_PRE_RUN seam
+    (_refresh_request_compile_scope_on_pre_run) prepares once with the
+    effective post-load model.  Mode off has no later prepare pending, so
+    it keeps the immediate terminal mode_off record, and a validation
+    supplied model still prepares inline.  Never raises.
+    """
+    record: dict[str, Any] = {
+        "scope": None,
+        "prepared": False,
+        "reason": "not_installed",
+        "policy_mode": "off",
+        "attached": False,
+    }
+    try:
+        resolve = _resolve if _resolve is not None else resolve_request_compile_policy
+        try:
+            policy, diagnostics = resolve(
+                env=env,
+                argv=argv,
+                external_compile_owner=external_compile_owner,
+            )
+        except TypeError:
+            policy, diagnostics = resolve(env=env, argv=argv)
+        if policy is None:
+            record["reason"] = "policy_unresolvable"
+            record["diagnostics"] = (
+                diagnostics if isinstance(diagnostics, dict) else {}
+            )
+            return record
+        record["policy_mode"] = str(getattr(policy, "mode", "off") or "off")
+        record["diagnostics"] = (
+            diagnostics if isinstance(diagnostics, dict) else {}
+        )
+        if _install is None:
+            try:
+                from . import torch_compile_policy as _tcp_install
+
+                _install = _tcp_install.install_sampling_compile_scope
+            except Exception as exc:
+                record["reason"] = (
+                    f"torch_compile_policy_unimportable:{type(exc).__name__}"
+                )
+                return record
+        try:
+            binding = (
+                _COMPILE_CACHE_BINDING
+                if isinstance(_COMPILE_CACHE_BINDING, dict)
+                else {}
+            )
+            scope = _install(
+                policy=policy,
+                cache_namespace=str(binding.get("namespace", "") or ""),
+                cache_dir=str(
+                    (binding.get("paths", {}) or {}).get("namespace_dir", "")
+                    or ""
+                ),
+                scope_id="",
+            )
+        except Exception as exc:
+            record["reason"] = f"install_failed:{type(exc).__name__}"
+            return record
+        record["scope"] = scope
+        if _attach is None:
+            try:
+                from . import torch_compile_policy as _tcp_attach
+
+                _attach = _tcp_attach.attach_compile_policy
+            except Exception:
+                _attach = None
+        if executor_state is None or _attach is None:
+            record["attached"] = False
+            record["attach_via"] = "none"
+            record["attach_reason"] = (
+                "no_executor_state" if executor_state is None else "no_attach_fn"
+            )
+        else:
+            try:
+                attach_result = _attach(executor_state, policy)
+            except Exception as exc:
+                attach_result = {
+                    "attached": False,
+                    "via": "none",
+                    "reason": type(exc).__name__,
+                }
+            if not isinstance(attach_result, dict):
+                attach_result = {"attached": False, "via": "none"}
+            record["attached"] = bool(attach_result.get("attached"))
+            record["attach_via"] = str(attach_result.get("via", "none"))
+        ready_fn = _ready if _ready is not None else _compile_ready_for_request
+        try:
+            readiness = ready_fn(
+                policy,
+                snapshot_capturing=snapshot_capturing,
+                external_compile_owner=external_compile_owner,
+            )
+        except Exception as exc:
+            readiness = {
+                "ready": False,
+                "reason": f"readiness_failed:{type(exc).__name__}",
+            }
+        if not isinstance(readiness, dict):
+            readiness = {"ready": False, "reason": "readiness_invalid"}
+        record["readiness"] = readiness
+        if diffusion_model is None and str(
+            getattr(policy, "mode", "off") or "off"
+        ) != "off":
+            # Deferred ON_PRE_RUN prepare: no live diffusion model is
+            # observable pre-execution, and prepare_compile_targets marks
+            # no_diffusion_model terminally (EAGER_SKIPPED leaves nothing
+            # for the later prepare — the latch never leaves EAGER_*).  Skip
+            # the install-time prepare so the latch stays UNTRIED; the
+            # ON_PRE_RUN seam prepares once with the effective post-load
+            # model.  Mode off has no later prepare pending, so it falls
+            # through to the immediate terminal record below.
+            record["prepared"] = False
+            record["prepare_reason"] = "deferred_no_diffusion_model"
+            record["reason"] = "deferred_no_diffusion_model"
+            record["deferred"] = True
+            return record
+        if _prepare is None:
+            try:
+                from . import torch_compile_policy as _tcp_prepare
+
+                _prepare = _tcp_prepare.prepare_compile_targets
+            except Exception:
+                _prepare = None
+        if _probe is None:
+            try:
+                from . import torch_compile_policy as _tcp_probe
+
+                _probe = _tcp_probe.probe_kj_compile_capability
+            except Exception:
+                _probe = None
+        if _prepare is None:
+            record["prepared"] = False
+            record["prepare_reason"] = "no_prepare_fn"
+            record["reason"] = "no_prepare_fn"
+            return record
+        try:
+            if _probe is None:
+                prepared = _prepare(
+                    scope,
+                    diffusion_model=diffusion_model,
+                    snapshot_capturing=snapshot_capturing,
+                    external_compile_owner=external_compile_owner,
+                )
+            else:
+                prepared = _prepare(
+                    scope,
+                    diffusion_model=diffusion_model,
+                    kj_probe=_probe,
+                    snapshot_capturing=snapshot_capturing,
+                    external_compile_owner=external_compile_owner,
+                )
+        except Exception as exc:
+            prepared = {
+                "prepared": False,
+                "ready": False,
+                "reason": f"prepare_failed:{type(exc).__name__}",
+            }
+        if not isinstance(prepared, dict):
+            prepared = {"prepared": False, "ready": False, "reason": "prepare_invalid"}
+        record["prepared"] = bool(prepared.get("prepared"))
+        record["prepare_reason"] = str(prepared.get("reason", ""))
+        record["reason"] = str(
+            prepared.get("reason", "") or readiness.get("reason", "")
+        )
+        if record["prepared"] and diffusion_model is not None:
+            # Stamp the prepared model identity so the ON_PRE_RUN seam can
+            # no-op when it observes the same effective model.
+            try:
+                scope["compile_prepared_model_id"] = id(diffusion_model)
+            except Exception:
+                pass
+        return record
+    except Exception as exc:
+        record["reason"] = f"install_failed:{type(exc).__name__}"
+        return record
+
+
+def _refresh_request_compile_scope_on_pre_run(
+    record_or_scope: Any,
+    patcher_or_model: Any = None,
+    *,
+    snapshot_capturing: bool = False,
+    external_compile_owner: str = "",
+    _prepare: Any = None,
+    _probe: Any = None,
+    _ready: Any = None,
+    _resolve_model: Any = None,
+) -> dict[str, Any]:
+    """Re-prepare the request compile scope once the live model is observable.
+
+    ON_PRE_RUN seam (post model load/patch, post gpu_restore, post
+    readiness, pre-first-forward): re-invokes prepare_compile_targets on the
+    SAME scope with the effective diffusion model resolved from the live
+    patcher/model object.  Never constructs a model; resolution defaults to
+    the real unet_forward_probe.resolve_diffusion_model chain (the same
+    helper the sampler boundary uses: patcher.model.diffusion_model, then
+    patcher.diffusion_model, then BaseModel/raw shapes).
+
+    Gates (all must hold; any miss leaves the latch exactly as-is and never
+    raises): a scope exists, the policy mode is not off, the latch is not
+    terminally EAGER_*, no snapshot capture is active, and readiness holds.
+    With no observable model the prior state is kept (never forced to
+    failure).  Idempotent within the request: the same effective model
+    identity is a no-op; a changed identity re-prepares.
+    """
+    outcome: dict[str, Any] = {
+        "prepared": False,
+        "reason": "not_refreshed",
+    }
+    try:
+        if isinstance(record_or_scope, dict):
+            inner = record_or_scope.get("scope")
+            scope = inner if isinstance(inner, dict) else record_or_scope
+        else:
+            scope = record_or_scope
+        if not isinstance(scope, dict):
+            outcome["reason"] = "no_scope"
+            return outcome
+        policy = scope.get("policy")
+        if policy is None or str(getattr(policy, "mode", "off") or "off") == "off":
+            outcome["reason"] = "mode_off"
+            return outcome
+        latch = scope.get("latch")
+        try:
+            from . import torch_compile_policy as _tcp_states
+
+            _eager_states = (
+                _tcp_states.LATCH_EAGER_FAILED,
+                _tcp_states.LATCH_EAGER_SKIPPED,
+            )
+        except Exception:
+            _eager_states = ("EAGER_FAILED", "EAGER_SKIPPED")
+        latch_state = str(getattr(latch, "state", "") or "")
+        if latch_state in _eager_states:
+            # Terminal: a failed/skipped scope never re-arms.
+            outcome["reason"] = str(
+                getattr(latch, "reason", "") or latch_state
+            )
+            outcome["latch_state"] = latch_state
+            return outcome
+        if snapshot_capturing:
+            outcome["reason"] = "snapshot_capture_active"
+            outcome["latch_state"] = latch_state
+            return outcome
+        ready_fn = _ready if _ready is not None else _compile_ready_for_request
+        try:
+            readiness = ready_fn(
+                policy,
+                snapshot_capturing=snapshot_capturing,
+                external_compile_owner=external_compile_owner,
+            )
+        except Exception as exc:
+            readiness = {
+                "ready": False,
+                "reason": f"readiness_failed:{type(exc).__name__}",
+            }
+        if not isinstance(readiness, dict) or not readiness.get("ready"):
+            outcome["reason"] = (
+                str(readiness.get("reason", "not_ready"))
+                if isinstance(readiness, dict)
+                else "readiness_invalid"
+            )
+            outcome["latch_state"] = latch_state
+            return outcome
+        resolve_model = _resolve_model
+        if resolve_model is None:
+            try:
+                from . import unet_forward_probe as _ufp_mod
+
+                resolve_model = _ufp_mod.resolve_diffusion_model
+            except Exception:
+                resolve_model = None
+        if resolve_model is None:
+            outcome["reason"] = "no_model_resolver"
+            outcome["latch_state"] = latch_state
+            return outcome
+        diffusion_model = None
+        if patcher_or_model is not None:
+            try:
+                resolved = resolve_model(patcher_or_model)
+            except Exception:
+                resolved = None
+            if isinstance(resolved, tuple) and len(resolved) == 2:
+                diffusion_model = resolved[1]
+            else:
+                diffusion_model = resolved
+        if diffusion_model is None:
+            outcome["reason"] = "no_diffusion_model"
+            outcome["latch_state"] = latch_state
+            return outcome
+        try:
+            model_id = id(diffusion_model)
+        except Exception:
+            model_id = None
+        if (
+            model_id is not None
+            and scope.get("compile_prepared_model_id") == model_id
+            and scope.get("ready")
+        ):
+            outcome["prepared"] = True
+            outcome["reason"] = "already_prepared"
+            outcome["latch_state"] = latch_state
+            outcome["model_id"] = model_id
+            return outcome
+        if _prepare is None:
+            try:
+                from . import torch_compile_policy as _tcp_prepare
+
+                _prepare = _tcp_prepare.prepare_compile_targets
+            except Exception:
+                _prepare = None
+        if _probe is None:
+            try:
+                from . import torch_compile_policy as _tcp_probe
+
+                _probe = _tcp_probe.probe_kj_compile_capability
+            except Exception:
+                _probe = None
+        if _prepare is None:
+            outcome["reason"] = "no_prepare_fn"
+            outcome["latch_state"] = latch_state
+            return outcome
+        try:
+            if _probe is None:
+                prepared = _prepare(
+                    scope,
+                    diffusion_model=diffusion_model,
+                    snapshot_capturing=snapshot_capturing,
+                    external_compile_owner=external_compile_owner,
+                )
+            else:
+                prepared = _prepare(
+                    scope,
+                    diffusion_model=diffusion_model,
+                    kj_probe=_probe,
+                    snapshot_capturing=snapshot_capturing,
+                    external_compile_owner=external_compile_owner,
+                )
+        except Exception as exc:
+            prepared = {
+                "prepared": False,
+                "ready": False,
+                "reason": f"prepare_failed:{type(exc).__name__}",
+            }
+        if not isinstance(prepared, dict):
+            prepared = {
+                "prepared": False,
+                "ready": False,
+                "reason": "prepare_invalid",
+            }
+        outcome["prepared"] = bool(prepared.get("prepared"))
+        outcome["reason"] = str(prepared.get("reason", ""))
+        outcome["latch_state"] = str(
+            prepared.get("latch_state", "") or latch_state
+        )
+        if outcome["prepared"] and model_id is not None:
+            try:
+                scope["compile_prepared_model_id"] = model_id
+            except Exception:
+                pass
+            outcome["model_id"] = model_id
+        return outcome
+    except Exception as exc:
+        outcome["reason"] = f"refresh_failed:{type(exc).__name__}"
+        return outcome
+
+
+def _finalize_request_compile_scope(
+    record_or_scope: Any,
+    *,
+    recompiles_observed: int = 0,
+    _finish: Any = None,
+    _summarize: Any = None,
+    _release: Any = None,
+) -> dict[str, Any]:
+    """Finalize the request sampling compile scope (ON_DETACH cleanup).
+
+    Ordered: finish (recompile accounting) -> summarize (one [compile]
+    line) -> release (idempotent, drops compiled refs).  Restores eager
+    state; never raises.
+    """
+    outcome: dict[str, Any] = {
+        "finished": False,
+        "released": False,
+        "line": "",
+        "emitted": False,
+        "reason": "not_finalized",
+    }
+    try:
+        scope: Any = None
+        record_diagnostics: dict[str, Any] = {}
+        if isinstance(record_or_scope, dict):
+            inner = record_or_scope.get("scope")
+            scope = inner if isinstance(inner, dict) else record_or_scope
+            maybe_diag = record_or_scope.get("diagnostics")
+            if isinstance(maybe_diag, dict):
+                record_diagnostics = maybe_diag
+        else:
+            scope = record_or_scope
+        if not isinstance(scope, dict):
+            outcome["reason"] = "no_scope"
+            return outcome
+        if _finish is None:
+            try:
+                from . import torch_compile_policy as _tcp_finish
+
+                _finish = _tcp_finish.finish_compile_sample
+            except Exception:
+                _finish = None
+        if _summarize is None:
+            try:
+                from . import torch_compile_policy as _tcp_summary
+
+                _summarize = _tcp_summary.summarize_compile_sample
+            except Exception:
+                _summarize = None
+        if _release is None:
+            try:
+                from . import torch_compile_policy as _tcp_release
+
+                _release = _tcp_release.release_compile_targets
+            except Exception:
+                _release = None
+        if _finish is not None:
+            try:
+                finished = _finish(scope, recompiles_observed=recompiles_observed)
+            except Exception as exc:
+                finished = {"recompiles_observed": 0, "over_budget": False,
+                            "error": type(exc).__name__}
+            if isinstance(finished, dict):
+                outcome["over_budget"] = bool(finished.get("over_budget"))
+            outcome["finished"] = True
+        if _summarize is not None:
+            try:
+                summary = _summarize(scope)
+            except Exception as exc:
+                summary = {"line": "", "error": type(exc).__name__}
+            if isinstance(summary, dict):
+                outcome["line"] = str(summary.get("line", "") or "")
+                details = summary.get("details")
+                if isinstance(details, dict):
+                    outcome["latch_state"] = str(details.get("latch_state", ""))
+        line = outcome.get("line", "")
+        # Off-by-default byte-identical logs: stay silent when the resolved
+        # mode is off, unless the legacy flag was explicitly set (its
+        # deprecate-not-OR diagnostics are the point).  Enabled modes always
+        # emit the aggregate line for validation.
+        try:
+            _pol = scope.get("policy")
+            _mode = str(getattr(_pol, "mode", "off") or "off")
+        except Exception:
+            _mode = "off"
+        try:
+            _reasons = record_diagnostics.get("reasons") or []
+            _legacy = any(
+                "legacy_compile_flag" in str(reason) for reason in _reasons
+            )
+        except Exception:
+            _legacy = False
+        if line and (_mode != "off" or _legacy):
+            try:
+                print(line, flush=True)
+                outcome["emitted"] = True
+            except Exception:
+                pass
+        if _release is not None:
+            try:
+                released = _release(scope)
+            except Exception as exc:
+                released = {"released": False, "error": type(exc).__name__}
+            if isinstance(released, dict):
+                outcome["released"] = bool(released.get("released"))
+                if "already" in released:
+                    outcome["already"] = bool(released.get("already"))
+        outcome["reason"] = "finalized" if outcome["released"] else "release_skipped"
+        return outcome
+    except Exception as exc:
+        outcome["reason"] = f"finalize_failed:{type(exc).__name__}"
+        return outcome
+
+
 def _critical_path_delta_ms(start_ns: Any, end_ns: Any) -> float | None:
     if not isinstance(start_ns, int) or not isinstance(end_ns, int):
         return None
@@ -10430,10 +11473,10 @@ class ModalRuntimeEntrypoint:
                 from .golden_model_transport import get_golden_model_transport
                 get_golden_model_transport().initialize_cuda()
             # Retry after CUDA initialization if restore-entry visibility was
-            # deferred by the runtime.
+            # deferred by the runtime (neutral coordinator; keeps the retry).
             try:
-                from . import ideogram_cuda_profile as _ideo_restore
-                _ideo_restore.repair_kitchen_gpu_backends_after_restore()
+                from . import gpu_restore as _gpu_restore_cuda_retry
+                _gpu_restore_cuda_retry.repair_gpu_capabilities_after_restore()
             except Exception:
                 pass
             if isinstance(value, tuple) and len(value) == 2:
@@ -12563,6 +13606,16 @@ class ModalRuntimeEntrypoint:
             self._golden_minimal_restore_logical_gpu_state()
             _mark("logical_gpu_repair_ms", _t)
 
+            # Part A4: complete pending GPU-capability repair now that logical
+            # GPU state is reattached (the attention-limit provider stays
+            # inert while model_management is still CPU-state).  Best-effort;
+            # never fails the minimal restore.
+            try:
+                from . import gpu_restore as _gpu_restore_minimal
+                _gpu_restore_minimal.repair_gpu_capabilities_after_restore()
+            except Exception:
+                pass
+
             # The experimental source-thread arm deliberately establishes its
             # one-time CUDA/arena/source-process/dispatcher resources during
             # restore.  The ordinary minimal-restore path remains CUDA-lazy;
@@ -12720,11 +13773,20 @@ class ModalRuntimeEntrypoint:
         restore_method_start_wall_ns: int = remote_python_resume_wall_ns
         restore_method_start_mono_ns: int = remote_python_resume_mono_ns
         _restore_perf_start = time.perf_counter()
-        # Repair snapshot-time CPU capability decisions before the Golden fast
-        # return or any model/inference path can observe stale kitchen state.
+        # Part A4: reset + repair GPU capabilities before the Golden fast
+        # return or any model/inference path can observe stale post-snapshot
+        # state.  Best-effort; never fails restore.
         try:
-            from . import ideogram_cuda_profile as _ideo_restore
-            _ideo_restore.repair_kitchen_gpu_backends_after_restore()
+            from . import gpu_restore as _gpu_restore_entry
+            _gpu_restore_entry.begin_gpu_restore()
+            _gpu_restore_entry.repair_gpu_capabilities_after_restore()
+        except Exception:
+            pass
+        # torch.compile wiring: bind the compiler cache at restore/process
+        # scope before first compile use (off by default: no-op, no I/O).
+        # Best-effort; never fails restore.
+        try:
+            ensure_compile_cache_bound()
         except Exception:
             pass
         if _golden_minimal_restore_enabled():
@@ -15028,6 +16090,20 @@ class ModalRuntimeEntrypoint:
     async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
         if getattr(self, "_golden_execution_active", False):
             raise RuntimeError("golden_prompt_executor_forbidden")
+        # Part A4: retry-once pending GPU-capability repair before any
+        # pre-execution early-return can bypass it.  Best-effort; never fails
+        # execution.
+        try:
+            from . import gpu_restore as _gpu_restore_pre_exec
+            _gpu_restore_pre_exec.ensure_gpu_capabilities_repaired_before_execution()
+        except Exception:
+            pass
+        # torch.compile wiring: process-scope cache bind before first compile
+        # use (off by default: no-op).  Best-effort; never fails execution.
+        try:
+            ensure_compile_cache_bound()
+        except Exception:
+            pass
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
         try:
@@ -16185,6 +17261,20 @@ class ModalRuntimeEntrypoint:
         """
         if getattr(self, "_golden_execution_active", False):
             raise RuntimeError("golden_prompt_executor_forbidden")
+        # Part A4: retry-once pending GPU-capability repair before any
+        # pre-execution early-return can bypass it.  Best-effort; never fails
+        # execution.
+        try:
+            from . import gpu_restore as _gpu_restore_pre_executor
+            _gpu_restore_pre_executor.ensure_gpu_capabilities_repaired_before_execution()
+        except Exception:
+            pass
+        # torch.compile wiring: process-scope cache bind before first compile
+        # use (off by default: no-op).  Best-effort; never fails execution.
+        try:
+            ensure_compile_cache_bound()
+        except Exception:
+            pass
         # Generated-output durability is request policy, not source-publication
         # policy. Resolve it here (same rationale as _run_plan_stream_impl):
         # the result-persistence section below reads it, and an invalid
@@ -17517,6 +18607,25 @@ class ModalRuntimeEntrypoint:
                     mark_production_cpu_snapshot_request(_watchdog_request_id)
                 except Exception:
                     pass
+            # torch.compile wiring: request-scope install (resolve -> install
+            # -> attach before wrapper merge -> readiness -> deferred
+            # ON_PRE_RUN prepare).  No live diffusion model is observable
+            # pre-execution, so an enabled install defers (latch stays
+            # UNTRIED) until the ON_PRE_RUN seam observes the effective
+            # post-load model; validation-supplied models still prepare
+            # inline.  Off by default: eager no-op.
+            # Best-effort; never fails execution.
+            try:
+                _compile_scope_record = _install_request_compile_scope(executor)
+            except Exception:
+                _compile_scope_record = None
+            try:
+                # Publish for the sampler-boundary ON_PRE_RUN refresh seam
+                # (runtime_executor reads modal_app._compile_scope_record).
+                # Single-request containers: cleared in the finally below.
+                globals()["_compile_scope_record"] = _compile_scope_record
+            except Exception:
+                pass
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
                     # ── Task-1 opt-signature memo identity stash ──
@@ -17541,6 +18650,17 @@ class ModalRuntimeEntrypoint:
                     else:
                         executor.execute(**execute_kwargs)
             finally:
+                # torch.compile wiring: ON_DETACH cleanup (finish ->
+                # [compile] line -> release).  Restores eager state in the
+                # request finally; never fails execution.
+                try:
+                    _finalize_request_compile_scope(_compile_scope_record)
+                except Exception:
+                    pass
+                try:
+                    globals()["_compile_scope_record"] = None
+                except Exception:
+                    pass
                 # Finish the watchdog on normal completion (also on error) so
                 # nothing keeps the event loop or a thread alive afterward.
                 # The watchdog is armed at the sampling_start boundary by
@@ -24459,6 +25579,14 @@ class ModalRuntimeEntrypoint:
             )
             if not callable(ensure_gpu_ready):
                 raise RuntimeError("golden_legacy_api_gpu_readiness_unavailable")
+            # Part A4: retry-once pending GPU-capability repair before the
+            # GPU-readiness gate; a readiness early-return must not bypass it.
+            # Best-effort; never fails the Golden request.
+            try:
+                from . import gpu_restore as _gpu_restore_golden_exec
+                _gpu_restore_golden_exec.ensure_gpu_capabilities_repaired_before_execution()
+            except Exception:
+                pass
             ensure_gpu_ready()
             if cpu_prefetch_ticket is not None:
                 cpu_prefetch_ticket.event(

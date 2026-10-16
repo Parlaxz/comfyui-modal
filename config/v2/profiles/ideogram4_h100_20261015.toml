@@ -107,9 +107,6 @@ COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND = "comfy_kitchen"
 # for exactly one profiled run, then revert to off + redeploy.
 # Validation runs stay unprofiled: honest s/it, no profiler perturbation.
 COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE = "off"
-COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_ITERATION = "3"
-COMFYMODAL_V2_IDEOGRAM_CUDA_PROFILE_BLOCK_RANGES = "0"
-# ── Kitchen Triton backend (INT8 fallback rescue) ──────────────────────
 # Comfy disables the kitchen Triton backend by default; the container ships
 # triton via the cu130 torch dependency and H100 satisfies the SM80+ INT8
 # constraint. Registry priority (cuda > triton > eager) keeps this a no-op
@@ -120,3 +117,12 @@ COMFYMODAL_V2_WORKFLOW_ID = "wf_81513286bb304e9f"
 COMFYMODAL_V2_WORKFLOW_VERSION_ID = "wv_f3baf54d8f784b64"
 # COMFYMODAL_V2_WORKFLOW_STEPS intentionally unset (= 0 = stored graph
 # default, 20 steps). The invariant run passes 16 explicitly per invocation.
+# ── torch.compile validation control (opt-in ONLY; default OFF) ─────────
+# Compile stays off unless explicitly enabled per run: regional/full
+# requires a deliberate COMFYMODAL_TORCH_COMPILE_MODE override (run-scoped,
+# no redeploy). These pinned OFF values keep validation runs byte-identical
+# to production unless the operator opts into compile explicitly.
+COMFYMODAL_TORCH_COMPILE_MODE = "off"
+COMFYMODAL_TORCH_COMPILE_DYNAMIC = "auto"
+COMFYMODAL_TORCH_COMPILE_DEBUG = "0"
+COMFYMODAL_TORCH_COMPILE_RECOMPILE_LIMIT = "8"

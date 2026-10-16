@@ -694,6 +694,50 @@ owner = "testing8-gds-instanttensor"
 description = "TESTING8-only installation gate for isolated InstantTensor transport probes; never used by Golden loaders."
 
 [[flag]]
+name = "COMFYMODAL_TORCH_COMPILE_DEBUG"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = true
+owner = "torch-compile"
+description = "Emit per-region compile diagnostics for the opt-in torch.compile policy (the aggregate [compile] line gains per-target detail). Default OFF. Inert unless COMFYMODAL_TORCH_COMPILE_MODE selects a non-off region policy."
+
+[[flag]]
+name = "COMFYMODAL_TORCH_COMPILE_DYNAMIC"
+type = "enum"
+default = "auto"
+enum_values = ["auto", "true", "false"]
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = true
+owner = "torch-compile"
+description = "Dynamic-shape tracing mode for the opt-in torch.compile policy (auto lets Inductor decide; true/false force the KJ wrapper dynamic flag). Default auto. Inert unless COMFYMODAL_TORCH_COMPILE_MODE selects a non-off region policy."
+
+[[flag]]
+name = "COMFYMODAL_TORCH_COMPILE_MODE"
+type = "enum"
+default = "off"
+enum_values = ["off", "regional", "full"]
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = true
+owner = "torch-compile"
+description = "Opt-in torch.compile region policy for diffusion sampling (default OFF = byte-identical eager execution). regional compiles structurally discovered transformer blocks via KJNodes' set_torch_compile_wrapper; full targets the whole diffusion module. Fixed codegen contract: Inductor backend, fullgraph off, no CUDA graphs, upstream guards retained. Validation-only; never enabled in production."
+
+[[flag]]
+name = "COMFYMODAL_TORCH_COMPILE_RECOMPILE_LIMIT"
+type = "int"
+default = "8"
+consumed_at = "request"
+change_requires = "run"
+runtime_exposed = true
+owner = "torch-compile"
+description = "Recompile budget for the opt-in torch.compile policy; exceeding it trips the scope latch terminally to eager. The runtime aliases this onto the policy resolver's recompile-budget input when COMFYMODAL_TORCH_COMPILE_RECOMPILE_BUDGET is unset. Default 8. Inert unless COMFYMODAL_TORCH_COMPILE_MODE selects a non-off region policy."
+min = 0
+max = 64
+
+[[flag]]
 name = "COMFYMODAL_V2CTL_PROFILE"
 type = "string"
 default = ""
