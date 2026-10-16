@@ -8,33 +8,51 @@ import StudioCard from "./StudioCard.vue";
 const history = useHistoryStore();
 const pair = computed(() => history.compareRecords);
 
-function urlOf(id: string | null, variant: "original" | "dataSaver"): string | null {
-  const record = history.records.find((item) => item.id === id);
-  const output = record?.featuredOutput;
+function recordFor(id: string | null) {
+  return history.records.find((item) => item.id === id) ?? null;
+}
+
+function urlOf(id: string | null): string | null {
+  const output = recordFor(id)?.featuredOutput;
   if (!output) return null;
-  return variant === "original" ? selectCompareAsset(output) : output.dataSaverUrl || output.thumbUrl;
+  return selectCompareAsset(output);
+}
+
+function captionFor(slot: "a" | "b"): string {
+  const id = slot === "a" ? history.compareA : history.compareB;
+  const record = recordFor(id);
+  if (!record) return `Slot ${slot.toUpperCase()} empty or deleted.`;
+  return `${slot.toUpperCase()} · ${record.workflow || record.id}`;
 }
 </script>
 
 <template>
   <StudioCard v-if="pair.a || pair.b" class="cmst:p-4" data-testid="vue-compare">
-    <div class="cmst:flex cmst:items-center cmst:justify-between">
-      <h3 class="cmst:text-sm cmst:font-semibold">Compare (transient — never persisted)</h3>
-      <div class="cmst:flex cmst:gap-2">
+    <div class="cmst:flex cmst:flex-wrap cmst:items-center cmst:justify-between cmst:gap-2">
+      <div class="cmst:min-w-0">
+        <h3 class="cmst-type-section">Compare</h3>
+        <p class="cmst-type-meta cmst:mt-0.5">transient — never persisted</p>
+      </div>
+      <div class="cmst:flex cmst:gap-1.5">
         <StudioButton variant="ghost" size="sm" data-testid="vue-compare-swap" @click="history.swapCompare()">Switch A/B</StudioButton>
         <StudioButton variant="ghost" size="sm" data-testid="vue-compare-clear" @click="history.clearCompare()">Clear</StudioButton>
       </div>
     </div>
-    <div class="cmst:mt-3 cmst:grid cmst:grid-cols-2 cmst:gap-3">
-      <figure v-for="slot in (['a', 'b'] as const)" :key="slot">
-        <img
-          v-if="urlOf(slot === 'a' ? history.compareA : history.compareB, 'original')"
-          :src="urlOf(slot === 'a' ? history.compareA : history.compareB, 'original')!"
-          :alt="`Compare ${slot.toUpperCase()}`"
-          class="cmst:w-full cmst:rounded cmst:object-contain"
-          :data-testid="`vue-compare-${slot}`"
-        />
-        <figcaption v-else class="cmst:text-xs cmst:opacity-60">Slot {{ slot.toUpperCase() }} empty or deleted.</figcaption>
+    <!-- Side-by-side wells on matte; images are never double-wrapped in
+      bordered boxes — the well is the only frame. -->
+    <div class="cmst:mt-3 cmst:grid cmst:grid-cols-1 cmst:gap-3 cmst:sm:grid-cols-2">
+      <figure v-for="slot in (['a', 'b'] as const)" :key="slot" class="cmst:min-w-0">
+        <div class="cmst-media-well cmst:flex cmst:aspect-[4/3] cmst:items-center cmst:justify-center">
+          <img
+            v-if="urlOf(slot === 'a' ? history.compareA : history.compareB)"
+            :src="urlOf(slot === 'a' ? history.compareA : history.compareB)!"
+            :alt="`Compare ${slot.toUpperCase()}`"
+            class="cmst:max-h-full cmst:max-w-full cmst:object-contain"
+            :data-testid="`vue-compare-${slot}`"
+          />
+          <span v-else class="cmst:px-3 cmst:text-center cmst:text-xs cmst:text-cmst-muted">Slot {{ slot.toUpperCase() }} empty or deleted.</span>
+        </div>
+        <figcaption class="cmst-type-meta cmst:mt-1 cmst:truncate">{{ captionFor(slot) }}</figcaption>
       </figure>
     </div>
   </StudioCard>
