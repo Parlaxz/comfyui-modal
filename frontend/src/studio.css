@@ -12,6 +12,12 @@
  *
  * The Vue UI imports ZERO old Studio CSS (no studio-styles.js,
  * no testing-styles.js, no copied selectors). Proven by test.
+ *
+ * Phase 4.5 visual language: semantic tokens below are the single source
+ * of truth. See docs/STUDIO_VISUAL_LANGUAGE.md for the laws. Rules:
+ * - Reference tokens (var(--cmst-*)) or cmst: utilities, never raw hex.
+ * - One raised container per region; hairlines, not nested cards.
+ * - No zinc/slate palettes here — only the custom dark tokens.
  */
 
 @layer cmst-theme, cmst-base, cmst-utilities;
@@ -19,38 +25,71 @@
 @import "tailwindcss/theme.css" layer(cmst-theme) prefix(cmst);
 @import "tailwindcss/utilities.css" layer(cmst-utilities) prefix(cmst);
 
-/* Studio palette as Tailwind theme colors so `cmst:bg-cmst-primary`-style
+/* Studio palette as Tailwind theme colors so `cmst:bg-cmst-raised`-style
  * utilities are generated (still prefixed, still layered, still no
  * preflight). The same values back the hand-written tokens below. */
 @theme {
-  --color-cmst-bg: #0f141b;
-  --color-cmst-surface: #171e27;
-  --color-cmst-fg: #e6ebf2;
-  --color-cmst-muted: #9aa6b5;
-  --color-cmst-border: #2b3542;
+  --color-cmst-bg: #090c11;
+  --color-cmst-surface: #0f141b;
+  --color-cmst-raised: #151b24;
+  --color-cmst-hover: #1a222d;
+  --color-cmst-matte: #07090d;
+  --color-cmst-border: rgba(178, 189, 203, 0.16);
+  --color-cmst-fg: #f3f6fa;
+  --color-cmst-secondary-text: #b2bdcb;
+  --color-cmst-muted: #7f8b9b;
   --color-cmst-primary: #4f7cff;
-  --color-cmst-primary-hover: #3d68e0;
+  --color-cmst-primary-hover: #638cff;
   --color-cmst-primary-fg: #ffffff;
-  --color-cmst-secondary: #222c38;
-  --color-cmst-secondary-hover: #2b3646;
-  --color-cmst-secondary-fg: #e6ebf2;
+  --color-cmst-secondary: #151b24;
+  --color-cmst-secondary-hover: #1a222d;
+  --color-cmst-secondary-fg: #f3f6fa;
+  --color-cmst-ok: #4ca98a;
+  --color-cmst-warn: #c99a4a;
+  --color-cmst-danger: #d96a5f;
 }
 
 /* Studio-scoped design tokens. */
 @layer cmst-base {
   [data-studio-app],
   [data-studio-portals] {
-    --cmst-bg: #0f141b;
-    --cmst-surface: #171e27;
-    --cmst-fg: #e6ebf2;
-    --cmst-muted: #9aa6b5;
-    --cmst-border: #2b3542;
+    --cmst-bg: #090c11;
+    --cmst-surface: #0f141b;
+    --cmst-raised: #151b24;
+    --cmst-hover: #1a222d;
+    --cmst-matte: #07090d;
+    --cmst-border: rgba(178, 189, 203, 0.16);
+    --cmst-fg: #f3f6fa;
+    --cmst-secondary-text: #b2bdcb;
+    --cmst-muted: #7f8b9b;
     --cmst-primary: #4f7cff;
-    --cmst-primary-hover: #3d68e0;
+    --cmst-primary-hover: #638cff;
     --cmst-primary-fg: #ffffff;
-    --cmst-secondary: #222c38;
-    --cmst-secondary-hover: #2b3646;
-    --cmst-secondary-fg: #e6ebf2;
+    --cmst-secondary: #151b24;
+    --cmst-secondary-hover: #1a222d;
+    --cmst-secondary-fg: #f3f6fa;
+    --cmst-ok: #4ca98a;
+    --cmst-warn: #c99a4a;
+    --cmst-danger: #d96a5f;
+
+    /* Type scale. */
+    --cmst-text-view: 20px;
+    --cmst-text-section: 15px;
+    --cmst-text-object: 14px;
+    --cmst-text-body: 13px;
+    --cmst-text-meta: 11px;
+
+    /* Radius roles: media 0–2 / controls 6 / containers 8. */
+    --cmst-radius-media: 2px;
+    --cmst-radius-control: 6px;
+    --cmst-radius-container: 8px;
+
+    /* Depth budget: flat + hairlines. Shadows reserved for overlays. */
+    --cmst-shadow-overlay: 0 12px 32px rgba(0, 0, 0, 0.45);
+
+    /* Motion: quiet, 120–180ms. */
+    --cmst-motion-fast: 120ms;
+    --cmst-motion-base: 160ms;
 
     color-scheme: dark;
     font-family:
@@ -75,5 +114,261 @@
 
   [data-studio-app] a {
     color: inherit;
+  }
+
+  /* Visible keyboard focus everywhere in Studio. */
+  [data-studio-app] :focus-visible {
+    outline: 2px solid var(--cmst-primary);
+    outline-offset: 2px;
+    border-radius: var(--cmst-radius-control);
+  }
+
+  /* ---- Scoped type helpers (no component library, just scale) ---- */
+  [data-studio-app] .cmst-type-view {
+    font-size: var(--cmst-text-view);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.3;
+  }
+  [data-studio-app] .cmst-type-section {
+    font-size: var(--cmst-text-section);
+    font-weight: 600;
+    line-height: 1.4;
+  }
+  [data-studio-app] .cmst-type-object {
+    font-size: var(--cmst-text-object);
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  [data-studio-app] .cmst-type-body {
+    font-size: var(--cmst-text-body);
+    line-height: 1.5;
+  }
+  [data-studio-app] .cmst-type-meta {
+    font-family:
+      ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: var(--cmst-text-meta);
+    letter-spacing: 0.02em;
+    color: var(--cmst-muted);
+  }
+
+  /* ---- Hairline separator: the only divider primitive ---- */
+  [data-studio-app] .cmst-hairline {
+    border: 0;
+    border-top: 1px solid var(--cmst-border);
+  }
+
+  /* ---- Native form controls on tokens (no invented primitives) ---- */
+  [data-studio-app] .cmst-field {
+    height: 34px;
+    border: 1px solid var(--cmst-border);
+    border-radius: var(--cmst-radius-control);
+    background: var(--cmst-bg);
+    color: var(--cmst-fg);
+    padding: 0 10px;
+    font-size: var(--cmst-text-body);
+  }
+  [data-studio-app] textarea.cmst-field {
+    height: auto;
+    padding: 8px 10px;
+    line-height: 1.5;
+  }
+  [data-studio-app] .cmst-field::placeholder {
+    color: var(--cmst-muted);
+  }
+  [data-studio-app] .cmst-field-label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: var(--cmst-text-body);
+    color: var(--cmst-secondary-text);
+  }
+
+  /* ---- Quiet tabs: text + underline, never bright fill ---- */
+  [data-studio-app] .cmst-quiet-tab {
+    position: relative;
+    padding: 8px 2px;
+    margin-right: 16px;
+    font-size: var(--cmst-text-body);
+    font-weight: 500;
+    color: var(--cmst-muted);
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+  }
+  [data-studio-app] .cmst-quiet-tab:hover {
+    color: var(--cmst-fg);
+  }
+  [data-studio-app] .cmst-quiet-tab[aria-selected="true"] {
+    color: var(--cmst-fg);
+  }
+  [data-studio-app] .cmst-quiet-tab[aria-selected="true"]::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -1px;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--cmst-primary);
+  }
+
+  /* ---- Object rows: hairline-separated, restrained selection ---- */
+  [data-studio-app] .cmst-object-row {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 0;
+    border-top: 1px solid var(--cmst-border);
+    padding: 8px 12px;
+    min-height: 34px;
+    cursor: pointer;
+  }
+  [data-studio-app] .cmst-object-row:first-child {
+    border-top: 0;
+  }
+  [data-studio-app] .cmst-object-row:hover {
+    background: var(--cmst-hover);
+  }
+  [data-studio-app] .cmst-object-row[aria-selected="true"] {
+    background: var(--cmst-raised);
+    box-shadow: inset 2px 0 0 var(--cmst-primary);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    [data-studio-app] *,
+    [data-studio-portals] * {
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+    }
+  }
+}
+
+/* Phase 4.5 lane-B helpers (append-only; lane-A tokens above untouched).
+ * Page-level primitives for the History media grid, Backend operations
+ * console, and Settings nav/pane. Everything references tokens; quiet
+ * 120–160ms background/color transitions only, never transition-all. */
+@layer cmst-base {
+  /* Matte media well: images sit on --cmst-matte at media radius, no border. */
+  [data-studio-app] .cmst-media-well {
+    background: var(--cmst-matte);
+    border-radius: var(--cmst-radius-media);
+    overflow: hidden;
+  }
+
+  /* Dense data row: hairline-separated, for models/nodes/settings lists.
+   * Lives inside a bordered container or a bare list — never both. */
+  [data-studio-app] .cmst-data-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 34px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--cmst-border);
+    font-size: var(--cmst-text-body);
+  }
+  [data-studio-app] .cmst-data-row:first-child {
+    border-top: 0;
+  }
+
+  /* Status dot: 6px, shape only — color comes from a cmst: text/bg utility
+   * (ok/warn/danger/muted) next to words, never a filled pill. */
+  [data-studio-app] .cmst-status-dot {
+    display: inline-block;
+    flex-shrink: 0;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+  }
+
+  /* Settings row: label + description left, control right; stacks < 640px. */
+  [data-studio-app] .cmst-setting-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 4px 12px;
+    padding: 10px 0;
+    border-top: 1px solid var(--cmst-border);
+  }
+  [data-studio-app] .cmst-setting-row:first-child {
+    border-top: 0;
+  }
+  @media (max-width: 639px) {
+    [data-studio-app] .cmst-setting-row {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  /* Compact ghost icon button (card overlays, row actions). */
+  [data-studio-app] .cmst-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px;
+    border: 0;
+    border-radius: var(--cmst-radius-control);
+    background: transparent;
+    color: var(--cmst-muted);
+    cursor: pointer;
+    transition:
+      background-color var(--cmst-motion-fast) ease-out,
+      color var(--cmst-motion-fast) ease-out;
+  }
+  [data-studio-app] .cmst-icon-btn:hover {
+    background: var(--cmst-hover);
+    color: var(--cmst-fg);
+  }
+  [data-studio-app] .cmst-icon-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  [data-studio-app] .cmst-icon-btn[aria-pressed="true"] {
+    color: var(--cmst-primary);
+  }
+
+  /* Card overlay actions: hidden until hover/focus, always shown when active. */
+  [data-studio-app] .cmst-hover-actions {
+    opacity: 0;
+    transition: opacity var(--cmst-motion-fast) ease-out;
+  }
+  [data-studio-app] .cmst-hover-actions.cmst-hover-actions-pinned,
+  [data-studio-app] :hover > .cmst-hover-actions,
+  [data-studio-app] .cmst-hover-actions:focus-within {
+    opacity: 1;
+  }
+
+  /* Thin restrained progress track for deployment status. */
+  [data-studio-app] .cmst-progress-track {
+    height: 3px;
+    border-radius: 2px;
+    background: var(--cmst-raised);
+    overflow: hidden;
+  }
+  [data-studio-app] .cmst-progress-fill {
+    height: 100%;
+    border-radius: inherit;
+    background: var(--cmst-primary);
+    transition: width var(--cmst-motion-base) ease-out;
+  }
+
+  /* Side nav: vertical quiet tabs on wide, wrapping row on narrow. */
+  [data-studio-app] .cmst-side-nav {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0;
+  }
+  @media (min-width: 1024px) {
+    [data-studio-app] .cmst-side-nav {
+      flex-direction: column;
+      align-items: stretch;
+    }
+    [data-studio-app] .cmst-side-nav .cmst-quiet-tab {
+      margin-right: 0;
+      padding: 8px 2px;
+      text-align: left;
+      text-transform: capitalize;
+    }
   }
 }

@@ -5,19 +5,16 @@ import {
   FlaskConical,
   History,
   Layers,
-  MonitorSmartphone,
   ServerCog,
   Settings,
+  X,
 } from "@lucide/vue";
-import { useMediaQuery } from "@vueuse/core";
 import { STUDIO_PAGES, STUDIO_PAGE_LABELS, type StudioPage } from "./router/studioRoute";
-import { useOperationsStore } from "../stores/operations";
 import { useSettingsStore } from "../stores/settings";
 import { useInfrastructureStore } from "../stores/infrastructure";
 import { cn } from "../components/cn";
 
 const route = useRoute();
-const operations = useOperationsStore();
 const settings = useSettingsStore();
 const infrastructure = useInfrastructureStore();
 
@@ -25,10 +22,6 @@ onMounted(() => {
   void settings.initialize();
   void infrastructure.initialize();
 });
-
-// VueUse where it removes manual plumbing: a media query with no
-// matchMedia listener lifecycle of our own.
-const isWide = useMediaQuery("(min-width: 768px)");
 
 const NAV_ICONS: Record<StudioPage, unknown> = {
   playground: FlaskConical,
@@ -43,11 +36,22 @@ const activePage = computed(() => String(route.name ?? "playground"));
 function navClass(page: StudioPage): string {
   const active = activePage.value === page;
   return cn(
-    "cmst:flex cmst:items-center cmst:gap-2 cmst:rounded-md cmst:px-3 cmst:py-2 cmst:text-sm cmst:font-medium cmst:no-underline cmst:border cmst:border-solid cmst:border-transparent",
+    "cmst:relative cmst:flex cmst:items-center cmst:gap-1.5 cmst:px-1 cmst:py-2 cmst:text-[13px] cmst:font-medium cmst:no-underline cmst:transition-colors",
     active
-      ? "cmst:bg-cmst-secondary cmst:text-cmst-fg"
-      : "cmst:text-cmst-muted cmst:hover:bg-cmst-secondary cmst:hover:text-cmst-fg",
+      ? "cmst:text-cmst-fg after:cmst:absolute after:cmst:inset-x-0 after:cmst:-bottom-px after:cmst:h-0.5 after:cmst:rounded-full after:cmst:bg-cmst-primary"
+      : "cmst:text-cmst-muted cmst:hover:text-cmst-fg",
   );
+}
+
+// Integrated close: the host owns overlay lifecycle (Escape + backdrop).
+// This affordance asks the host to close without touching its contract —
+// both paths are optional, so a standalone preview simply no-ops.
+function closeStudio(): void {
+  window.dispatchEvent(new CustomEvent("comfymodal:close-vue-studio"));
+  const host = window as unknown as {
+    __comfymodalCloseVueStudio?: () => void;
+  };
+  host.__comfymodalCloseVueStudio?.();
 }
 </script>
 
@@ -58,46 +62,41 @@ function navClass(page: StudioPage): string {
     descendant rules apply through the single host-owned root. -->
   <div
     data-testid="vue-studio-root"
-    class="cmst:flex cmst:min-h-[60vh] cmst:flex-col cmst:rounded-lg cmst:border cmst:border-solid cmst:border-cmst-border cmst:bg-cmst-bg cmst:text-cmst-fg"
+    class="cmst:flex cmst:min-h-[60vh] cmst:flex-col cmst:bg-cmst-bg cmst:text-cmst-fg"
   >
-    <header class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-2 cmst:border-b cmst:border-solid cmst:border-cmst-border cmst:p-3">
-      <span class="cmst:mr-2 cmst:text-sm cmst:font-semibold cmst:tracking-tight">
-        Modal Studio <span class="cmst:font-normal cmst:opacity-70">· Vue proof shell</span>
+    <!-- Right padding reserves room for the host-owned preview close
+      (`.comfymodal-vue-studio-close`, 32px at frame top-right): without it
+      the host button lands on top of the in-app close. -->
+    <header class="cmst:flex cmst:items-center cmst:gap-3 cmst:border-b cmst:border-solid cmst:border-cmst-border cmst:py-0 cmst:pl-4 cmst:pr-14">
+      <span class="cmst:shrink-0 cmst:py-2.5 cmst:text-[13px] cmst:font-semibold cmst:tracking-tight cmst:text-cmst-fg">
+        Modal Studio
       </span>
-      <nav aria-label="Studio pages" class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-1">
+      <nav aria-label="Studio pages" class="cmst:flex cmst:min-w-0 cmst:flex-1 cmst:flex-wrap cmst:items-center cmst:gap-x-4 cmst:gap-y-0">
         <RouterLink
           v-for="page in STUDIO_PAGES"
           :key="page"
           :to="{ name: page }"
           :class="navClass(page)"
           :data-testid="`vue-nav-${page}`"
+          :aria-current="activePage === page ? 'page' : undefined"
         >
           <component :is="NAV_ICONS[page]" class="cmst:size-4" aria-hidden="true" />
           {{ STUDIO_PAGE_LABELS[page] }}
         </RouterLink>
       </nav>
+      <button
+        type="button"
+        data-testid="vue-studio-close"
+        aria-label="Close Studio"
+        class="cmst:shrink-0 cmst:rounded-md cmst:p-1.5 cmst:text-cmst-muted cmst:hover:bg-cmst-hover cmst:hover:text-cmst-fg"
+        @click="closeStudio"
+      >
+        <X class="cmst:size-4" aria-hidden="true" />
+      </button>
     </header>
 
-    <main class="cmst:flex-1">
+    <main class="cmst:flex-1 cmst:min-w-0">
       <RouterView />
     </main>
-
-    <footer
-      class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-x-4 cmst:gap-y-1 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:px-4 cmst:py-2 cmst:text-xs cmst:opacity-90"
-      data-testid="vue-status-strip"
-    >
-      <span>route: <strong data-testid="vue-status-route">{{ activePage }}</strong></span>
-      <span>
-        operations: <strong data-testid="vue-status-ops">{{ operations.active.length }} active</strong>
-        / {{ operations.all.length }} total
-      </span>
-      <span>
-        density: <strong data-testid="vue-status-density">{{ settings.density }}</strong>
-      </span>
-      <span class="cmst:flex cmst:items-center cmst:gap-1">
-        <MonitorSmartphone class="cmst:size-3.5" aria-hidden="true" />
-        viewport: <strong>{{ isWide ? "wide" : "narrow" }}</strong> (VueUse media query)
-      </span>
-    </footer>
   </div>
 </template>
