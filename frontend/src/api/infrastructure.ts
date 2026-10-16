@@ -22,5 +22,35 @@ export async function listModels(params: { search?: string; type?: string; state
 export async function rescanModels(forceRehash = false) { return requestJson<InventoryEnvelope>("/studio/models/rescan", { method: "POST", body: { force_rehash: forceRehash } }); }
 export async function listCustomNodes() { return requestJson<InventoryEnvelope>("/studio/custom-nodes"); }
 export async function refreshCustomNodes() { return requestJson<InventoryEnvelope>("/studio/custom-nodes/refresh", { method: "POST" }); }
+export async function upsertWorkspace(payload: Record<string, unknown>) { return requestJson<WorkspaceEnvelope>("/workspaces", { method: "POST", body: payload }); }
 export async function requestWorkspaceSwap(payload: Record<string, unknown>) { return requestJson<Record<string, unknown>>("/workspaces/swap", { method: "POST", body: payload }); }
 export async function getWorkspaceSwapStatus(swapId: string) { return requestJson<Record<string, unknown>>(`/workspaces/swap/${encodeURIComponent(swapId)}`); }
+export function buildSwapConfirmPayload(workspaceId: string, selectedKeys: string[]) { return { workspace_id: workspaceId, confirm: true, selected_keys: selectedKeys.slice() }; }
+export function swapPhaseMessage(data: Record<string, unknown> | null | undefined): string {
+  const phase = String((data && data.phase) || "");
+  if (phase === "downloading_models") {
+    const msg = String((data && data.download_message) || "");
+    const done = Number((data && data.download_completed) || 0);
+    const total = Number((data && data.download_total) || 0) + Number((data && data.download_skipped) || 0);
+    return msg || `Preparing downloads… ${done}/${total}`;
+  }
+  if (phase === "syncing_custom_nodes") return String((data && data.sync_message) || "Syncing custom nodes to Modal…");
+  if (phase === "deploying") return String((data && data.deploy_message) || "Deploying workspace…");
+  return phase ? `Phase: ${phase.replace(/_/g, " ")}` : "";
+}
+export async function getCustomNodeSyncStatus() { return requestJson<Record<string, unknown>>("/studio/custom-nodes/sync-status"); }
+export async function triggerPushPlugins() { return requestJson<Record<string, unknown>>("/studio/custom-nodes/sync", { method: "POST" }); }
+export async function triggerRebuildDependencies() { return requestJson<Record<string, unknown>>("/studio/custom-nodes/sync/rebuild-dependencies", { method: "POST" }); }
+export async function getCustomNodeSyncOperationStatus(syncId: string) { return requestJson<Record<string, unknown>>(`/studio/custom-nodes/sync/status/${encodeURIComponent(syncId)}`); }
+export async function installSingleModel(item: Record<string, unknown>) { return requestJson<Record<string, unknown>>("/model/install", { method: "POST", body: item }); }
+export async function modelDownloadStatus(downloadId: string) { return requestJson<Record<string, unknown>>(`/download/status/${encodeURIComponent(downloadId || "")}`); }
+export async function requestModelInstall(body: Record<string, unknown>) { return requestJson<Record<string, unknown>>("/studio/models/install-request", { method: "POST", body }); }
+export async function requestCustomNodeInstall(body: Record<string, unknown>) { return requestJson<Record<string, unknown>>("/studio/custom-nodes/install-request", { method: "POST", body }); }
+export async function scanManifestIssues() { return requestJson<Record<string, unknown>>("/manifest/repair/scan", { method: "POST" }); }
+export async function applyManifestRepairs(updates: unknown) { return requestJson<Record<string, unknown>>("/manifest/repair/apply", { method: "POST", body: { updates } }); }
+export async function deleteManifestPlaceholder(folder: string, filename: string) { return requestJson<Record<string, unknown>>("/manifest/repair/delete-placeholder", { method: "POST", body: { folder, filename } }); }
+export async function getAuthStatus() { return requestJson<Record<string, unknown>>("/auth/status"); }
+export async function getCredentialStatus(kind: "hf" | "civitai") { return requestJson<Record<string, unknown>>(kind === "civitai" ? "/civitai-token" : "/hf-token"); }
+export async function saveCredentialToken(kind: "hf" | "civitai", token: string) { return requestJson<Record<string, unknown>>(kind === "civitai" ? "/civitai-token" : "/hf-token", { method: "POST", body: { token } }); }
+export function credentialConfigured(data: unknown): boolean { return !!(data && typeof data === "object" && typeof (data as Record<string, unknown>).token === "string" && (data as Record<string, unknown>).token !== ""); }
+export async function getRuntimeHealth() { return requestJson<Record<string, unknown>>("/health?mode=deploy"); }
