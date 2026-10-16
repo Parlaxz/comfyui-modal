@@ -81,10 +81,10 @@ test.describe("Studio wizard browser refresh", () => {
     await openVuePage(page, "workflows", workflowRoutes);
     await page.waitForSelector('[data-testid="vue-workflow-wf_refresh"]', { timeout: 60000 });
     await page.click('[data-testid="vue-workflow-wf_refresh"]');
-    await page.click("text=Setup wizard");
+    await page.getByRole("button", { name: "Setup workflow" }).click();
     await page.waitForSelector('[data-testid="vue-workflow-wizard"]', { timeout: 30000 });
-    await page.click("text=Next");
-    await page.waitForTimeout(300);
+    await page.locator('[data-testid="vue-workflow-wizard"] button', { hasText: "Next" }).click();
+    await expect.poll(async () => page.evaluate(() => sessionStorage.getItem("comfymodal.studio.wizard.draft.v1")), { timeout: 15000 }).not.toBeNull();
     const before = await page.evaluate(() => JSON.parse(sessionStorage.getItem("comfymodal.studio.wizard.draft.v1") || "null"));
     expect(before).toBeTruthy();
     expect(before.workflowId).toBe("wf_refresh");
@@ -98,12 +98,12 @@ test.describe("Studio wizard browser refresh", () => {
       return 1;
     });
     await page.waitForSelector('[data-testid="vue-workflow-wizard"]', { timeout: 60000 });
-    await expect(page.locator('[data-testid="vue-workflow-wizard"]')).toContainText("required-bindings");
+    await expect(page.locator('[data-testid="vue-workflow-wizard"]')).toContainText("Step 2 of 4 · Bindings");
     const after = await page.evaluate(() => JSON.parse(sessionStorage.getItem("comfymodal.studio.wizard.draft.v1") || "null"));
     expect(after.workflowId).toBe(before.workflowId);
     expect(after.step).toBe("required-bindings");
 
-    await page.locator('[data-testid="vue-workflow-wizard"]').getByRole("button", { name: "Close", exact: true }).click();
+    await page.locator('[data-testid="vue-workflow-wizard"]').getByRole("button", { name: "Close wizard" }).click();
     await expect(page.locator('[data-testid="vue-workflow-wizard"]')).toHaveCount(0, { timeout: 10000 });
     expect(await page.evaluate(() => sessionStorage.getItem("comfymodal.studio.wizard.draft.v1"))).toBeNull();
 

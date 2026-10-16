@@ -69,6 +69,7 @@ test("dependency summary renders after import and gates the run button", async (
     }],
   ]);
   await page.waitForSelector('[data-testid="vue-workflow-wf_dep"]', { timeout: 60000 });
+  await page.click('[data-testid="vue-workflow-import-toggle"]');
   await page.fill('[data-testid="vue-workflow-import-input"]', JSON.stringify({ name: "Dep Flow", static_graph: {} }));
   await page.click('[data-testid="vue-workflow-import"]');
   await page.waitForSelector('[data-testid="vue-workflow-wf_dep"]', { timeout: 30000 });
