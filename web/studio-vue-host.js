@@ -42,6 +42,7 @@ let _escListener = null;
 let _backdropListener = null;
 let _wizardListenersRegistered = false;
 let _closeBtn = null;
+let _graphCaptureCancel = null;
 
 // ── Future wizard seam ───────────────────────────────────────────────
 // Phase 1 does not port the workflow wizard. When it arrives, the wizard
@@ -227,9 +228,27 @@ function _nestedLayerOpen() {
   const portals = _root.querySelector("[data-studio-portals]");
   if (!portals) return false;
   return (
-    portals.querySelector('[data-state="open"]') !== null ||
-    portals.querySelector('[role="dialog"], [role="alertdialog"], [role="menu"]') !== null
+    _root.querySelector('[data-state="open"]') !== null ||
+    _root.querySelector('[role="dialog"], [role="alertdialog"], [role="menu"]') !== null
   );
+}
+
+/**
+ * Thin host seam for the existing graph-binding behavior engine. The Vue
+ * wizard owns the presentation and confirmation; studio-graph-binding.js
+ * owns actual ComfyUI/LiteGraph capture, candidate extraction, Escape
+ * cleanup, and highlight behavior. No generic event bus or new graph model.
+ */
+export async function beginStudioGraphBinding(options) {
+  const binding = await import("./studio-graph-binding.js");
+  _graphCaptureCancel = binding.beginGraphBindingCapture(options) || null;
+  return _graphCaptureCancel;
+}
+
+export async function cancelStudioGraphBinding() {
+  const binding = await import("./studio-graph-binding.js");
+  binding.cancelGraphBinding();
+  _graphCaptureCancel = null;
 }
 
 function _removeEscListener() {
@@ -278,11 +297,16 @@ export async function openStudioVue(page) {
   try {
     window.__comfymodalVueRouter = handle.router;
     window.__comfymodalSetGraphInteractionEnabled = setGraphInteractionEnabled;
+    window.__comfymodalBeginStudioGraphBinding = beginStudioGraphBinding;
+    window.__comfymodalCancelStudioGraphBinding = cancelStudioGraphBinding;
   } catch (_) {}
   return handle;
 }
 
 export function closeStudioVue() {
+  if (_graphCaptureCancel) {
+    void cancelStudioGraphBinding();
+  }
   if (_root && document.body.contains(_root)) {
     _root.style.display = "none";
   }

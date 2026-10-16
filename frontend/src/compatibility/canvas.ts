@@ -13,7 +13,13 @@
 export interface CanvasCompatibilitySnapshot {
   outputFormat: string;
   quality: number | null;
+  webpLosslessCompression: string;
   autoSaveLocal: boolean;
+  saveFolder: string;
+  saveMetadataSidecar: boolean;
+  dataSaverDefault: "off" | "on";
+  dataSaverCodec: string;
+  dataSaverQuality: number | null;
 }
 
 const OUTPUT_KEYS = {
@@ -28,15 +34,30 @@ export function projectCanvasCompatibility(settings: Record<string, unknown>): C
   const snapshot: CanvasCompatibilitySnapshot = {
     outputFormat: String(settings.output_format ?? "original"),
     quality: typeof settings.quality === "number" ? settings.quality : null,
+    webpLosslessCompression: String(settings.webp_lossless_compression ?? "balanced"),
     autoSaveLocal: settings.auto_save_local === true,
+    saveFolder: String(settings.save_folder ?? ""),
+    saveMetadataSidecar: settings.save_metadata_sidecar !== false,
+    dataSaverDefault: settings.data_saver_default === "on" ? "on" : "off",
+    dataSaverCodec: String(settings.data_saver_codec ?? settings.preview_codec ?? "webp"),
+    dataSaverQuality: typeof settings.data_saver_quality === "number"
+      ? settings.data_saver_quality
+      : typeof settings.preview_quality === "number" ? settings.preview_quality : null,
   };
   if (typeof window === "undefined") return snapshot;
   const options = {
     output_format: snapshot.outputFormat,
     quality: snapshot.quality ?? 75,
+    webp_lossless_compression: snapshot.webpLosslessCompression,
     auto_save_local: snapshot.autoSaveLocal,
-    save_folder: String(settings.save_folder ?? ""),
-    save_metadata_sidecar: settings.save_metadata_sidecar !== false,
+    save_folder: snapshot.saveFolder,
+    save_metadata_sidecar: snapshot.saveMetadataSidecar,
+    preview_default: snapshot.dataSaverDefault,
+    preview_codec: snapshot.dataSaverCodec,
+    preview_quality: snapshot.dataSaverQuality ?? 70,
+    data_saver_default: snapshot.dataSaverDefault,
+    data_saver_codec: snapshot.dataSaverCodec,
+    data_saver_quality: snapshot.dataSaverQuality ?? 70,
   };
   window._comfyModalOutputOptions = options;
   try {

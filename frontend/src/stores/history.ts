@@ -37,31 +37,41 @@ export const useHistoryStore = defineStore("studio-history", () => {
   async function loadFeed(append = false): Promise<void> {
     loading.value = true;
     error.value = null;
-    const result = await feedTask.run(async (signal) => {
-      const response = await getHistoryFeed({ search: query.value, sort: sort.value, favorite_only: favoriteOnly.value, cursor: append ? cursor.value ?? undefined : undefined });
-      if (signal.aborted) return null;
-      return response;
-    });
-    if (result.stale || !result.value) return;
-    const response = result.value;
-    const items = (response.items ?? response.records ?? []).map(normalizeHistoryRecord);
-    records.value = append ? records.value.concat(items) : items;
-    cursor.value = response.next_cursor ?? null;
-    hasMore.value = response.has_more === true || Boolean(cursor.value);
-    loading.value = false;
+    try {
+      const result = await feedTask.run(async (signal) => {
+        const response = await getHistoryFeed({ search: query.value, sort: sort.value, favorite_only: favoriteOnly.value, cursor: append ? cursor.value ?? undefined : undefined });
+        if (signal.aborted) return null;
+        return response;
+      });
+      if (result.stale || !result.value) return;
+      const response = result.value;
+      const items = (response.items ?? response.records ?? []).map(normalizeHistoryRecord);
+      records.value = append ? records.value.concat(items) : items;
+      cursor.value = response.next_cursor ?? null;
+      hasMore.value = response.has_more === true || Boolean(cursor.value);
+      if (selected.value) selected.value = records.value.find((item) => item.id === selected.value?.id) ?? selected.value;
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : "Could not load History V2";
+    } finally {
+      loading.value = false;
+    }
   }
 
   async function loadDetail(id: string, kind: HistoryRecord["kind"] = "generation"): Promise<void> {
-    const result = await detailTask.run(async (signal) => {
-      const raw = kind === "experiment" ? await getExperiment(id) : await getGeneration(id);
-      if (signal.aborted) return null;
-      return raw;
-    });
-    if (result.stale || !result.value) return;
-    const detail = normalizeHistoryRecord(result.value);
-    selected.value = detail;
-    const index = records.value.findIndex((item) => item.id === detail.id);
-    if (index >= 0) records.value[index] = detail;
+    try {
+      const result = await detailTask.run(async (signal) => {
+        const raw = kind === "experiment" ? await getExperiment(id) : await getGeneration(id);
+        if (signal.aborted) return null;
+        return raw;
+      });
+      if (result.stale || !result.value) return;
+      const detail = normalizeHistoryRecord(result.value);
+      selected.value = detail;
+      const index = records.value.findIndex((item) => item.id === detail.id);
+      if (index >= 0) records.value[index] = detail;
+    } catch (cause) {
+      error.value = cause instanceof Error ? cause.message : "Could not load History detail";
+    }
   }
 
   async function setFavorite(record: HistoryRecord, value: boolean): Promise<void> {

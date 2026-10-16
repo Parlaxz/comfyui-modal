@@ -27,6 +27,8 @@ export const useInfrastructureStore = defineStore("studio-infrastructure", () =>
   const loading = ref(false);
   const error = ref<string | null>(null);
   const inventoryTask = createLatestTask();
+  const deploymentAbort = ref<AbortController | null>(null);
+  const deploymentOperationId = ref<string | null>(null);
   let stopCrossTab: (() => void) | null = null;
 
   const activeWorkspace = computed(() => workspaces.value.find((item) => item.isActive) ?? null);
@@ -93,6 +95,7 @@ export const useInfrastructureStore = defineStore("studio-infrastructure", () =>
   }
 
   async function selectWorkspace(id: string): Promise<void> {
+    if (deploymentOperationId.value) throw new Error("Cannot change workspace while deployment is active");
     await activateWorkspace(id);
     await loadWorkspaces();
     publishCrossTabInvalidation("workspace");
@@ -100,12 +103,19 @@ export const useInfrastructureStore = defineStore("studio-infrastructure", () =>
 
   async function deploy(): Promise<string> {
     const operations = useOperationsStore();
+    if (deploymentOperationId.value) return deploymentOperationId.value;
+    const targetWorkspaceId = activeWorkspaceId.value ?? undefined;
     const operationId = operations.start({ kind: "deploy", label: "Deploy workspace" });
+    deploymentOperationId.value = operationId;
+    const controller = new AbortController();
+    deploymentAbort.value = controller;
+    const deadline = window.setTimeout(() => controller.abort(new DOMException("Deployment polling timed out", "TimeoutError")), 10 * 60 * 1000);
     try {
       await triggerDeploy();
       operations.patch(operationId, { status: "running", message: "Deployment started" });
       const final = await pollUntil({
         intervalMs: 3000,
+        signal: controller.signal,
         run: async () => {
           const status = await getDeployStatus();
           deployStatus.value = status;
@@ -117,11 +127,16 @@ export const useInfrastructureStore = defineStore("studio-infrastructure", () =>
         done: (status) => status.state === "ready" || status.state === "deployed_unwarmed" || (status.state !== "deploying" && status.state !== "starting" && status.state !== "unknown"),
       });
       if (!isDeployUsable(final.state)) throw new Error(final.message || `Deployment ended in ${final.state}`);
+      if (targetWorkspaceId && activeWorkspaceId.value !== targetWorkspaceId) throw new Error("Deployment target workspace changed");
       operations.finish(operationId, final.message || "Deployment completed");
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "Deployment failed";
       operations.fail(operationId, message);
       throw cause;
+    } finally {
+      window.clearTimeout(deadline);
+      deploymentAbort.value = null;
+      deploymentOperationId.value = null;
     }
     return operationId;
   }
@@ -151,7 +166,7 @@ export const useInfrastructureStore = defineStore("studio-infrastructure", () =>
 
   return {
     deployState, deployMessage, syncSummary, workspaces, activeWorkspaceId, activeWorkspace,
-    deployStatus, deployLog, models, customNodes, loading, error,
+    deployStatus, deployLog, models, customNodes, loading, error, deploymentOperationId,
     setDeploy, setSyncSummary, reset, load, initialize, loadWorkspaces, loadDeployment,
     loadInventory, selectWorkspace, deploy, refreshRemoteInventoryNow, rescanModelsNow,
     refreshCustomNodesNow, loadLog,

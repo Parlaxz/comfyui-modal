@@ -10,7 +10,7 @@ import {
   type WorkflowSummary, type WorkflowVersion,
 } from "../api/workflows";
 import { createLatestTask } from "../async/latest";
-import { publishCrossTabInvalidation } from "../compatibility/crossTab";
+import { createCrossTabInvalidation, publishCrossTabInvalidation } from "../compatibility/crossTab";
 
 const WIZARD_DRAFT_KEY = "comfymodal.studio.wizard.draft.v1";
 
@@ -32,6 +32,7 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
   const wizardOpen = ref(false);
   const wizardDraft = ref<WizardDraft | null>(null);
   const detailTask = createLatestTask();
+  let stopCrossTab: (() => void) | null = null;
 
   function select(id: string | null): void { selectedId.value = id; }
   function clear(): void { selectedId.value = null; selectedWorkflow.value = null; versions.value = []; selectedVersion.value = null; }
@@ -43,6 +44,15 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
       workflows.value = result.workflows ?? [];
     } catch (cause) { error.value = cause instanceof Error ? cause.message : "Could not load workflows"; throw cause; }
     finally { loading.value = false; }
+  }
+
+  async function initialize(): Promise<void> {
+    if (!stopCrossTab) {
+      stopCrossTab = createCrossTabInvalidation((kind) => {
+        if (kind === "workflows" && !loading.value) void loadList();
+      });
+    }
+    if (!workflows.value.length) await loadList();
   }
 
   async function selectWorkflow(id: string): Promise<void> {
@@ -115,7 +125,7 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
   return {
     workflows, selectedId, selectedWorkflow, versions, selectedVersion, mapping, mappingCandidates,
     dependencies, compatibility, portability, presets, query, loading, error, wizardOpen, wizardDraft,
-    select, clear, loadList, selectWorkflow, selectVersion, loadMappingCandidates, openWizard,
+    select, clear, loadList, initialize, selectWorkflow, selectVersion, loadMappingCandidates, openWizard,
     updateWizard, setWizardStep, closeWizard, updateMetadata,
   };
 });

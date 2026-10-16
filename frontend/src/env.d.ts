@@ -11,4 +11,12 @@ interface Window {
   __comfymodalOpenVueStudio?: (page?: string) => Promise<unknown>;
   __comfymodalCloseVueStudio?: () => void;
   __comfymodalSetGraphInteractionEnabled?: (enabled: boolean) => void;
+  __comfymodalBeginStudioGraphBinding?: (options: {
+    bindingKey: string;
+    label: string;
+    allowOutput?: boolean;
+    onCapture: (result: Record<string, unknown>) => void;
+    onCancel: (reason: string) => void;
+  }) => Promise<(() => void) | null>;
+  __comfymodalCancelStudioGraphBinding?: () => Promise<void>;
 }

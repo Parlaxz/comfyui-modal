@@ -5,11 +5,20 @@ export interface WorkflowVersion { workflow_version_id: string; workflow_id?: st
 export interface WorkflowEnvelope { status: string; workflows?: WorkflowSummary[]; workflow?: WorkflowSummary; versions?: WorkflowVersion[]; [key: string]: unknown; }
 export interface DependencyEnvelope { status: string; models?: unknown[]; custom_nodes?: unknown[]; summary?: unknown; [key: string]: unknown; }
 
+function unwrap<T>(payload: T): T {
+  if (!payload || typeof payload !== "object") return payload;
+  const value = payload as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(value, "workflow")) return value.workflow as T;
+  if (Object.prototype.hasOwnProperty.call(value, "version")) return value.version as T;
+  if (Object.prototype.hasOwnProperty.call(value, "mapping")) return value.mapping as T;
+  return payload;
+}
+
 export async function listWorkflows(params: { search?: string; tag?: string; folder?: string; favorite?: boolean } = {}) { const q = new URLSearchParams(); if (params.search) q.set("search", params.search); if (params.tag) q.set("tag", params.tag); if (params.folder) q.set("folder", params.folder); if (params.favorite) q.set("favorite", "1"); const suffix = q.toString() ? `?${q}` : ""; return requestJson<WorkflowEnvelope>(`/studio/workflows${suffix}`); }
-export async function getWorkflow(id: string) { return requestJson<WorkflowEnvelope>(`/studio/workflows/${encodeURIComponent(id)}`); }
+export async function getWorkflow(id: string) { return requestJson<WorkflowEnvelope>(`/studio/workflows/${encodeURIComponent(id)}`).then((payload) => ({ ...payload, workflow: unwrap(payload) as unknown as WorkflowSummary })); }
 export async function listVersions(id: string) { return requestJson<WorkflowEnvelope>(`/studio/workflows/${encodeURIComponent(id)}/versions`); }
-export async function getVersion(id: string) { return requestJson<WorkflowEnvelope>(`/studio/workflows/versions/${encodeURIComponent(id)}`); }
-export async function getMapping(id: string) { return requestJson<unknown>(`/studio/workflows/versions/${encodeURIComponent(id)}/mapping`); }
+export async function getVersion(id: string) { return requestJson<WorkflowEnvelope>(`/studio/workflows/versions/${encodeURIComponent(id)}`).then((payload) => unwrap(payload)); }
+export async function getMapping(id: string) { return requestJson<unknown>(`/studio/workflows/versions/${encodeURIComponent(id)}/mapping`).then((payload) => unwrap(payload)); }
 export async function getMappingCandidates(id: string) { return requestJson<unknown>(`/studio/workflows/versions/${encodeURIComponent(id)}/mapping/candidates`); }
 export async function getDependencies(id: string) { return requestJson<DependencyEnvelope>(`/studio/workflows/versions/${encodeURIComponent(id)}/dependencies`); }
 export async function getCompatibility(id: string) { return requestJson<unknown>(`/studio/workflows/versions/${encodeURIComponent(id)}/compatibility`); }

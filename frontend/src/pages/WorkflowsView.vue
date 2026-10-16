@@ -20,7 +20,7 @@ const wizardStepIndex = computed(() => Math.max(0, WIZARD_STEPS.indexOf(workflow
 const wizardStep = computed(() => WIZARD_STEPS[wizardStepIndex.value]);
 
 onMounted(async () => {
-  await Promise.all([workflows.loadList(), infrastructure.initialize()]);
+  await Promise.all([workflows.initialize(), infrastructure.initialize()]);
 });
 
 async function search() {
@@ -39,14 +39,30 @@ function openWizard() {
 }
 
 function closeWizard() {
+  void window.__comfymodalCancelStudioGraphBinding?.();
   workflows.closeWizard();
   window.__comfymodalSetGraphInteractionEnabled?.(false);
 }
 
-function captureBinding() {
+async function captureBinding() {
   if (!bindingInput.value.trim()) return;
-  workflows.updateWizard({ bindings: { ...(workflows.wizardDraft?.bindings ?? {}), prompt: { target: bindingInput.value.trim(), confirmed: true } } });
-  wizardMessage.value = `Confirmed graph target ${bindingInput.value.trim()}`;
+  const fallbackTarget = bindingInput.value.trim();
+  if (window.__comfymodalBeginStudioGraphBinding) {
+    wizardMessage.value = "Click a node in the ComfyUI graph…";
+    await window.__comfymodalBeginStudioGraphBinding({
+      bindingKey: "prompt",
+      label: "prompt",
+      allowOutput: false,
+      onCapture: (result) => {
+        workflows.updateWizard({ bindings: { ...(workflows.wizardDraft?.bindings ?? {}), prompt: { ...result, confirmed: true } } });
+        wizardMessage.value = `Confirmed ${String(result.nodeTitle ?? result.nodeId ?? "graph target")}`;
+      },
+      onCancel: (reason) => { wizardMessage.value = reason; },
+    });
+    return;
+  }
+  workflows.updateWizard({ bindings: { ...(workflows.wizardDraft?.bindings ?? {}), prompt: { target: fallbackTarget, confirmed: true } } });
+  wizardMessage.value = `Confirmed graph target ${fallbackTarget}`;
 }
 
 function nextWizardStep() {

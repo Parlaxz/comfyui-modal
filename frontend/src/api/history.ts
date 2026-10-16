@@ -43,6 +43,12 @@ export interface HistoryFeedResponse {
   [key: string]: unknown;
 }
 
+function unwrapItem(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object") return payload;
+  const value = payload as Record<string, unknown>;
+  return value.item ?? value.generation ?? value.experiment ?? payload;
+}
+
 function stringValue(record: Record<string, unknown>, ...keys: string[]): string {
   for (const key of keys) if (typeof record[key] === "string") return record[key] as string;
   return "";
@@ -51,15 +57,15 @@ function stringValue(record: Record<string, unknown>, ...keys: string[]): string
 function normalizeOutput(raw: unknown, index: number): HistoryOutput {
   const value = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const assetId = stringValue(value, "asset_id", "assetId");
-  const url = (variant: string) => `/comfymodal/history-v2/assets/${encodeURIComponent(assetId)}?variant=${variant}`;
+  const url = () => `/comfymodal/history-v2/assets/${encodeURIComponent(assetId)}`;
   return {
     index: typeof value.index === "number" ? value.index : index,
     outputId: stringValue(value, "output_id", "outputId"),
     assetId,
     logicalKey: stringValue(value, "logical_key", "logicalKey"),
-    thumbUrl: stringValue(value, "thumb_url", "thumbnail_url") || url("thumbnail"),
-    previewUrl: stringValue(value, "preview_url", "data_saver_url") || url("data_saver"),
-    originalUrl: stringValue(value, "original_url") || url("original"),
+    thumbUrl: stringValue(value, "thumb_url", "thumbnail_url") || url(),
+    previewUrl: stringValue(value, "preview_url", "data_saver_url") || url(),
+    originalUrl: stringValue(value, "original_url") || url(),
     originalAvailable: value.original_available !== false,
     width: typeof value.width === "number" ? value.width : null,
     height: typeof value.height === "number" ? value.height : null,
@@ -94,18 +100,27 @@ export function normalizeHistoryRecord(raw: unknown): HistoryRecord {
 
 export async function getHistoryFeed(params: Record<string, string | number | boolean | undefined> = {}) {
   const query = new URLSearchParams();
-  for (const [key, value] of Object.entries({ limit: 24, ...params })) {
+  const wireParams: Record<string, string | number | boolean | undefined> = { limit: 24, ...params };
+  if (wireParams.sort !== undefined) {
+    wireParams.order = wireParams.sort;
+    delete wireParams.sort;
+  }
+  if (wireParams.favorite_only !== undefined) {
+    wireParams.favorite = wireParams.favorite_only;
+    delete wireParams.favorite_only;
+  }
+  for (const [key, value] of Object.entries(wireParams)) {
     if (value !== undefined && String(value) !== "") query.set(key, String(value));
   }
   return requestJson<HistoryFeedResponse>(`/history-v2/feed?${query}`);
 }
 
 export async function getGeneration(id: string) {
-  return requestJson<unknown>(`/history-v2/generations/${encodeURIComponent(id)}`);
+  return requestJson<unknown>(`/history-v2/generations/${encodeURIComponent(id)}`).then(unwrapItem);
 }
 
 export async function getExperiment(id: string) {
-  return requestJson<unknown>(`/history-v2/experiments/${encodeURIComponent(id)}`);
+  return requestJson<unknown>(`/history-v2/experiments/${encodeURIComponent(id)}`).then(unwrapItem);
 }
 
 export async function setGenerationFavorite(id: string, favorite: boolean) {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { Settings, RefreshCw } from "@lucide/vue";
 import { useSettingsStore } from "../stores/settings";
 import StudioButton from "../components/StudioButton.vue";
@@ -13,6 +13,13 @@ const selectedProfile = ref("off");
 
 const config = computed(() => settings.config);
 const gpuOptions = computed(() => config.value?.available_gpus ?? []);
+
+watch(config, (value) => {
+  if (!value) return;
+  selectedQuality.value = value.quality;
+  selectedSaveFolder.value = value.save_folder;
+}, { immediate: true });
+watch(() => settings.profileLevel, (value) => { selectedProfile.value = value; }, { immediate: true });
 
 async function saveOutputSettings() {
   await settings.save({
