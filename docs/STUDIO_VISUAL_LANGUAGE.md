@@ -1,127 +1,81 @@
-# Studio Visual Language (Phase 4.5)
+# Studio Visual Language (Phase 4.5 Fresh — Accepted)
 
-Single authority for how Studio Vue looks. Tokens live in
-`frontend/src/studio.css`; these are the laws behind them.
+Derived from Mix Studio (spatial/interaction grammar, measured live),
+Stimma Atelier v3 (discipline laws), and Mooshie (clarity). Full provenance:
+`reports/studio-phase4_5-fresh/reference-extraction.md`.
 
-## Philosophy
+## Foundation: true neutrals, blue as action-only
 
-Quiet workspace, not a showcase. Studio is embedded inside ComfyUI: chrome
-recedes, content leads. Structure comes from type and whitespace separated
-by hairlines — never from stacked panels, fills, or glow.
-
-References: Mix Studio `2705793` (ADOPT 70% — workspace-first control/result
-split, persistent rail, gallery as surface), Stimma `46f178b`
-`frontend/DESIGN.md` (ADOPT — one raised container per region, hairline
-discipline, matte media, radius roles), Mooshie `v2.3.20` (ADAPT 20% —
-guided setup steps, presets as image-free configs). Neon/gradient
-heroes and card soup are rejected outright.
-
-## Palette
+Environmental surfaces are neutral near-blacks with NO blue/zinc tint.
+Blue (`#4f7cff` family — never stock Tailwind `#3b82f6`) appears only on
+primary actions, focus/selection accents, and status. ~70% base / ~20%
+elevation / ~10% accent-status.
 
 | Token | Value | Use |
 |---|---|---|
-| `--cmst-bg` | `#090C11` | App background |
-| `--cmst-surface` | `#0F141B` | Region container |
-| `--cmst-raised` | `#151B24` | Selected / popped content |
-| `--cmst-hover` | `#1A222D` | Hover wash only |
-| `--cmst-border` | `rgba(178,189,203,.16)` | Hairlines, control borders |
-| `--cmst-fg` | `#F3F6FA` | Primary text |
-| `--cmst-secondary-text` | `#B2BDCB` | Secondary text |
-| `--cmst-muted` | `#7F8B9B` | Meta, placeholders, quiet icons |
-| `--cmst-primary` / hover | `#4F7CFF` / `#638CFF` | Accent: active underline, primary action, focus |
-| `--cmst-matte` | `#07090D` | Media wells only |
-| `--cmst-ok / -warn / -danger` | `#4CA98A / #C99A4A / #D96A5F` | Status dots and badges, desaturated |
+| `--cmst-bg` | `#0b0b0c` | app base |
+| `--cmst-surface` | `#131314` | rails, wells, drawer, inspector |
+| `--cmst-raised` | `#1b1b1d` | cards, popovers, selected wash |
+| `--cmst-hover` | `#222224` | hover fill |
+| `--cmst-matte` | `#060607` | media matte (darker than page) |
+| `--cmst-fg` / `-secondary-text` / `-muted` | `#f2f2f3` / `#c6c6c9` / `#8f8f96` | text ramp |
+| `--cmst-border` | `rgba(255,255,255,.08)` | hairlines (neutral, never blue) |
+| `--cmst-primary` / `-hover` | `#4f7cff` / `#6a90ff` | action accent only |
+| `--cmst-ok` / `-warn` / `-danger` | `#34c98e` / `#d9a13b` / `#e0655a` | status |
 
-No zinc/slate, no raw hex in templates — tokens or `cmst:` utilities only.
+Radii (role-disciplined): media 4px / controls 8px / containers 12px / pills full.
+Type: 20px/600 view titles · 14–15px/600 sentence-case sections · 14px/500 object
+names · 13px body · 12px dense · mono tabular facts. Micro-labels
+(11px/700/uppercase/tracked) are SPARING eyebrows only — never default headings.
 
-## Type
+## Binding laws
 
-View title 20 semibold (one per page) · section 14–15 semibold · object 14
-medium · body 13 · meta 11–12 mono muted. Scoped helpers: `cmst-type-view`,
-`cmst-type-section`, `cmst-type-object`, `cmst-type-body`, `cmst-type-meta`.
+1. **Separator law** — a hairline exists only BETWEEN two peers. No leading/
+   trailing rules; children indent, never fenced; rule OR box OR gutter.
+2. **Depth budget** — base + ONE raised step per region; hairlines + whitespace
+   inside, never nested boxes; shadows on overlays only; hairline OR fill.
+3. **Selection ≠ action** — selected = neutral wash + bright text (rows, nav,
+   rail, segmented); accent ring only on media tiles. No blue edge/bar as a
+   selection signal. Focus ring blue, `:focus-visible` only.
+4. **One primary per surface.** The full-width gradient-border hero pill is
+   reserved for the ONE true run CTA (Playground Generate, as a split button
+   with queue/experiment dropdown). Continue/Save/Install/Import stay compact.
+5. **Sentence-case hierarchy.** Uppercase tracked labels only for tiny eyebrows.
+6. **Default border = none.** Controls, floating surfaces, dense-row hairlines,
+   and focus/selection states earn their lines; sections/groups/headings never
+   get boxes. Native button chrome is reset at the base.
+7. **Task-relevant information only.** No ids/hashes, no "No folder", no raw
+   JSON dumps, no store/server prose on default surfaces. Technical detail
+   lives one disclosure down (raw toggles, inspectors, debug layers).
+8. **Spacing rhythm** — 4/8/12/16/20/24/32 scale; group gaps visibly larger
+   than in-group gaps; page 24–32px, wizard body 16px, settings rows 14px.
 
-## Spacing
+## Compositions
 
-Page padding 20–24 (`studioPageClass`) · section gaps 8–12 · object rows
-30–34 min-height · buttons 34–36 height (`.cmst-field` is 34).
+- **Shell** — 56px topbar (brand button, view title, ops); NO top tabs.
+  Navigation lives in a 330px drawer: Playground + History primary, then a
+  STUDIO group (Workflows, Manage Modal, Settings) with hint rows. Route
+  changes and Escape close it; opening moves focus inside.
+- **Workflows** — library rail (300px: search, segmented filter, human rows)
+  + detail editor (spacing-separated sections, mapping summary, quiet dep
+  rows). No generation stage, no run bar, no ids in the default surface.
+- **Wizard = graph mode (task-mode transition).** Opening Setup Workflow hides
+  the Workflows editor (slim setup strip + Exit remains); the ComfyUI graph
+  becomes primary with the 360px inspector docked right. Feature → Bindings →
+  Controls → Review order frozen. Never a modal: no backdrop, graph visible +
+  interactive. Body-teleported above ComfyUI chrome (z-2000) with an in-root
+  `data-state=open` marker preserving the host Esc protocol; top offset clears
+  ComfyUI's floating cluster.
+- **History** — media-first matte grid (2px gutters, no tile borders, human
+  titles), inline tile-size slider, accent-ring selection, viewer = large
+  media + compact inspector.
+- **Manage Modal** — ops console: segmented tabs, dense status-dot rows
+  (spacing-separated), mono facts, verb buttons.
+- **Settings** — left rail (wash selection, no accent bar) + flat hairline
+  setting rows (label+desc left, ONE control right, 14px rhythm), max-width
+  pane. Close controls everywhere use the shared quiet 32px icon button.
 
-## Depth
+## References (read before restyling)
 
-Flat + hairlines. One raised container per region; inside it, sections split
-with 1px `cmst-border` dividers (`.cmst-hairline`). The single elevation
-token (`--cmst-shadow-overlay`) belongs to overlays (dialogs, menus) only.
-`StudioCard` carries no shadow.
-
-## Separators
-
-Hairlines never double: a bordered container holds borderless rows divided
-by top-hairlines; sibling sections divide with a top border. No bordered
-chips inside bordered boxes.
-
-## Radius
-
-Media 0–2 (`--cmst-radius-media`) · controls 6 (`--cmst-radius-control`,
-fields, buttons, badges) · containers 8 (`--cmst-radius-container`, cards,
-dialogs). No pills.
-
-## Action hierarchy
-
-One primary per region. Shell: none (nav is quiet text + 2px accent
-underline; close is a ghost icon). The shell header reserves right-side room
-(`pr-14`) for the host-owned preview close, which floats at the frame
-top-right — the in-app close must never sit under it. Workflows detail: Setup workflow.
-Wizard: Next on steps 1–3, Save mapping on Review. Everything else is
-secondary / outline / ghost, descending with consequence (Delete is outline
-inside overflow, ghost in rows).
-
-## Media
-
-Thumbnails and viewer wells sit on `--cmst-matte` with radius ≤ 2. Media
-never floats on accent, gradient, or glow. History cards carry media to the
-edge on a matte well (`.cmst-media-well`); title + mono meta + compact
-actions sit below, contextual actions (favorite, select) hover-overlay the
-well. Compare A/B is two matte wells side by side with mono captions —
-never bordered boxes around the images.
-
-## Status
-
-State is a dot + words, never a filled pill: ok/warn/danger dots for
-runnable and dependency states; Bound (ok tint) / Pending (warn tint) text
-badges for wizard bindings — e.g. binding the Steps control on a KSampler
-reads back as a green-dot "Bound" row.
-
- ## Motion
-
-120ms micro (hover/fade), 160ms standard (dialogs, tabs). Underline and
-background transitions only; nothing slides. `prefers-reduced-motion`
-collapses all durations. Focus is always visible: 2px accent outline.
-
-Opening the setup wizard hands graph interaction back to ComfyUI (Studio
-modal drops `aria-modal`, background leaves `inert`); EVERY wizard exit —
-explicit close AND successful save — restores the inert modal. The save path
-closes inside the store, so the page re-applies the restore after
-`saveWizardMapping` resolves.
-
-## Responsive
-
-Shell header wraps; Workflows list/detail is one column under `lg`, rail +
-surface at `280px + 1fr` above. Settings is category nav + pane
-(`180px + 1fr` above `lg`, stacked below). History grid honors the
-Interface column preference with `minmax(0,1fr)` columns so it never
-overflows. Overlay dialogs cap at `42rem / 94vw`.
-
-## Operations + settings rows
-
-Backend workspaces are object rows (dot + name + mono state line, active
-obvious); deployment readiness is dot + words with a thin progress track,
-logs secondary on matte. Models/nodes are dense hairline rows
-(`.cmst-data-row`), never bulleted pills. Settings rows align
-label/description left with the control right (`.cmst-setting-row`,
-stacked under 640px); resets are ghost/outline, destructive-tinted only
-for reset-all.
-
-## Anti-patterns
-
-Gradient or neon heroes · card-in-card nesting · bright-fill active tabs ·
-prototype copy or debug footers in chrome · invented control libraries (style
-native inputs with `.cmst-field`) · status pills · shadows on static panels.
+- `reports/studio-phase4_5-fresh/reference-extraction.md` (ADOPT/ADAPT/REJECT)
+- `reports/studio-phase4_5-fresh/review/` (verdict + product screenshots)
