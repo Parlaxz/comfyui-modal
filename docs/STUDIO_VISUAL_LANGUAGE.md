@@ -52,20 +52,25 @@ names · 13px body · 12px dense · mono tabular facts. Micro-labels
 
 ## Compositions
 
-- **Shell** — 56px topbar (brand button, view title, ops); NO top tabs.
-  Navigation lives in a 330px drawer: Playground + History primary, then a
-  STUDIO group (Workflows, Manage Modal, Settings) with hint rows. Route
-  changes and Escape close it; opening moves focus inside.
+- **Shell — fullscreen application.** Normal Studio owns the viewport:
+  host canvas/chrome/toasts/badges parked via reversible CSS
+  (`body[data-cmv-own]`), overlay opaque, frame full-bleed. 56px topbar
+  (brand button, view title, ops); NO top tabs. Navigation in a 330px drawer:
+  Playground + History primary, STUDIO group with hints. Route changes and
+  Escape close it; opening moves focus inside.
 - **Workflows** — library rail (300px: search, segmented filter, human rows)
   + detail editor (spacing-separated sections, mapping summary, quiet dep
   rows). No generation stage, no run bar, no ids in the default surface.
-- **Wizard = graph mode (task-mode transition).** Opening Setup Workflow hides
-  the Workflows editor (slim setup strip + Exit remains); the ComfyUI graph
-  becomes primary with the 360px inspector docked right. Feature → Bindings →
-  Controls → Review order frozen. Never a modal: no backdrop, graph visible +
-  interactive. Body-teleported above ComfyUI chrome (z-2000) with an in-root
-  `data-state=open` marker preserving the host Esc protocol; top offset clears
-  ComfyUI's floating cluster.
+- **Wizard = graph mode (task-mode transition).** Opening Setup Workflow parks
+  the Workflows editor entirely (no setup slab); the ComfyUI graph becomes
+  primary (canvas/nodes/wires only — chrome, toasts, badges stay parked) with
+  the 360px inspector docked right. Feature → Bindings → Controls → Review
+  order frozen. Never a modal: no backdrop, graph visible + interactive.
+  Body-teleported above ComfyUI chrome (z-2000) with an in-root
+  `data-state=open` marker preserving the host Esc protocol (plus a
+  document-level Escape while the wizard owns the session, since binding moves
+  focus to the graph); top offset clears ComfyUI's floating cluster. Closing
+  restores fullscreen Studio; closing Studio restores all host chrome.
 - **History** — media-first matte grid (2px gutters, no tile borders, human
   titles), inline tile-size slider, accent-ring selection, viewer = large
   media + compact inspector.

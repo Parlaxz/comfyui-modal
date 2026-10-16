@@ -115,7 +115,7 @@ async function resetAll() {
 
     <!-- Category nav (left on wide) + single main pane. -->
     <div class="cmst:grid cmst:grid-cols-1 cmst:gap-6 cmst:lg:grid-cols-[180px_minmax(0,1fr)]">
-      <nav aria-label="Settings sections" class="cmst-side-nav cmst:min-w-0 cmst:lg:border-r cmst:lg:border-solid cmst:lg:border-cmst-border cmst:lg:pr-4">
+      <nav aria-label="Settings sections" class="cmst-side-nav cmst:min-w-0 cmst:lg:pr-2">
         <button
           v-for="section in SETTINGS_SECTIONS"
           :key="section"

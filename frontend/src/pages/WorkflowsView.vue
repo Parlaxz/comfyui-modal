@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Database, Import, Layers, RefreshCw, Search, Star, WandSparkles, X } from "@lucide/vue";
 import { useWorkflowsStore } from "../stores/workflows";
 import { useInfrastructureStore } from "../stores/infrastructure";
@@ -120,6 +120,30 @@ function closeWizard() {
   workflows.closeWizard();
   window.__comfymodalSetGraphInteractionEnabled?.(false);
 }
+
+// The inspector is body-teleported, so its own @keydown.esc only fires with
+// focus inside it — but binding requires clicking the graph (focus leaves).
+// While the wizard owns the session, a document-level Escape closes it from
+// anywhere; portalled controls that already handled the key (defaultPrevented)
+// win. The host capture listener defers to us via the data-state marker.
+function onDocumentKeydown(event: KeyboardEvent) {
+  if (event.key !== "Escape" || event.defaultPrevented) return;
+  if (!workflows.wizardOpen) return;
+  event.stopPropagation();
+  closeWizard();
+}
+
+watch(
+  () => workflows.wizardOpen,
+  (open) => {
+    if (open) document.addEventListener("keydown", onDocumentKeydown);
+    else document.removeEventListener("keydown", onDocumentKeydown);
+  },
+);
+
+onUnmounted(() => {
+  document.removeEventListener("keydown", onDocumentKeydown);
+});
 
 async function captureBinding() {
   if (!bindingInput.value.trim()) return;
@@ -260,7 +284,9 @@ const dependencyModelRows = computed<DependencyRow[]>(() => {
         message: workflows.dependencyInstallMessage[key] ?? "",
         raw: item,
       };
-    });
+    })
+    // Problems first: missing rows above the quiet installed bulk.
+    .sort((a, b) => (a.state === "missing" ? 0 : 1) - (b.state === "missing" ? 0 : 1));
 });
 
 const dependencyNodeRows = computed<DependencyNodeRow[]>(() => {
@@ -337,19 +363,11 @@ async function installDependencyNode(row: DependencyNodeRow) {
 
 <template>
   <section :class="studioPageClass()" data-testid="vue-page-workflows">
-    <!-- SETUP MODE: the Workflows editor gets out of the way — the ComfyUI
-      graph is primary, the teleported inspector (below) is its panel. A slim
-      bar keeps context + the exit path; closing restores normal Studio. -->
-    <div v-if="workflows.wizardOpen" class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-3">
-      <div class="cmst:min-w-0 cmst:flex-1">
-        <h1 class="cmst-type-view cmst:truncate">Setting up {{ workflows.selectedWorkflow?.name || "workflow" }}</h1>
-        <p class="cmst:mt-0.5 cmst:text-[13px] cmst:text-cmst-muted">
-          Click nodes in the ComfyUI graph to map controls. The graph stays interactive.
-        </p>
-      </div>
-      <StudioButton size="sm" variant="secondary" @click="closeWizard">Exit setup</StudioButton>
-    </div>
-    <template v-else>
+    <!-- SETUP MODE: the Workflows editor is parked (v-else below) while the
+      wizard owns the session — the ComfyUI graph is primary, the teleported
+      inspector is its panel. Exit via the inspector close or Escape, which
+      restore normal Studio through the existing closeWizard path. -->
+    <template v-if="!workflows.wizardOpen">
     <!-- Page toolbar: title + search + filters + import. Flush on the page
       background — no hero band, no card. -->
     <div class="cmst:flex cmst:flex-wrap cmst:items-end cmst:justify-between cmst:gap-3">
@@ -521,14 +539,16 @@ async function installDependencyNode(row: DependencyNodeRow) {
             </div>
           </div>
 
-          <div class="cmst:mt-3 cmst:grid cmst:grid-cols-1 cmst:gap-2 cmst:sm:grid-cols-2">
-            <label class="cmst-field-label">Name<input v-model="editName" class="cmst-field" /></label>
-            <label class="cmst-field-label">Folder<input v-model="editFolder" class="cmst-field" /></label>
-          </div>
-          <div class="cmst:mt-2">
-            <StudioButton size="sm" variant="secondary" data-testid="vue-workflow-save-meta" @click="saveMetadata">
-              Save metadata
-            </StudioButton>
+          <div class="cmst:mt-3 cmst:rounded-xl cmst:bg-cmst-surface cmst:p-4">
+            <div class="cmst:grid cmst:grid-cols-1 cmst:gap-3 cmst:sm:grid-cols-2">
+              <label class="cmst-field-label">Name<input v-model="editName" class="cmst-field" /></label>
+              <label class="cmst-field-label">Folder<input v-model="editFolder" class="cmst-field" /></label>
+            </div>
+            <div class="cmst:mt-3">
+              <StudioButton size="sm" variant="secondary" data-testid="vue-workflow-save-meta" @click="saveMetadata">
+                Save metadata
+              </StudioButton>
+            </div>
           </div>
 
           <section aria-label="Mapping" class="cmst:mt-6">
@@ -564,9 +584,9 @@ async function installDependencyNode(row: DependencyNodeRow) {
                 />
                 <span class="cmst:min-w-0 cmst:flex-1">{{ row.filename }} <span class="cmst:text-cmst-muted">({{ row.folder }})</span></span>
                 <span class="cmst-type-meta" data-testid="dependency-model-state">{{ row.state }}</span>
-                <label class="cmst:flex cmst:items-center cmst:gap-1 cmst:text-xs cmst:text-cmst-muted">
+                <label class="cmst:flex cmst:items-center cmst:gap-1 cmst:text-xs cmst:text-cmst-muted" title="Optional: skip this file when checking or installing requirements">
                   <input type="checkbox" :checked="row.nonessential" @change="toggleNonessential(row.key, ($event.target as HTMLInputElement).checked)" />
-                  nonessential
+                  Optional
                 </label>
                 <StudioButton v-if="row.state === 'missing' && row.hasSource" size="sm" variant="ghost" data-testid="dependency-model-install-now" @click="installDependencyModel(row)">Install now</StudioButton>
                 <span v-if="row.message" class="cmst:w-full cmst:text-xs cmst:text-cmst-muted" data-testid="dependency-model-install-note">{{ row.message }}</span>

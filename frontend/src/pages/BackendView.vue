@@ -158,7 +158,6 @@ async function installFromUrl() {
     <div class="cmst:flex cmst:flex-wrap cmst:items-end cmst:justify-between cmst:gap-3">
       <div>
         <h1 class="cmst-type-view">Manage Modal</h1>
-        <p class="cmst-type-meta cmst:mt-0.5">workspaces · deployment · models · nodes</p>
       </div>
       <StudioButton variant="ghost" size="icon" aria-label="Reload infrastructure" :disabled="infrastructure.loading" @click="infrastructure.load()">
         <RefreshCw class="cmst:size-4" :class="infrastructure.loading ? 'cmst:animate-spin' : ''" aria-hidden="true" />

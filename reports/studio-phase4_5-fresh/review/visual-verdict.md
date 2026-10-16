@@ -1,44 +1,49 @@
-# Visual Verdict — Phase 4.5 Final Correction Pass (PASS)
+# Visual Verdict — Phase 4.5 Host Ownership + Fidelity Correction (PASS)
 
-Judged from `review/*.png` (10-shot acceptance set + narrow check), all
-captured on the final build in live ComfyUI at 1440×900 unless noted.
+Supersedes the earlier premature PASS. Judged from the 10-shot acceptance set
+below, all captured on the final build in live ComfyUI at 1440×900 (plus one
+~1075px narrow check). The prior verdict's "fullscreen / graph primary"
+claims were aspirational; the shots below demonstrate them literally.
 
-## Acceptance set
+## Acceptance set (all current)
 
-- `nav-drawer.png` — in-frame drawer, wash selection (no blue edge), quiet
-  close, STUDIO group spaced. PASS.
-- `workflows.png` — rail + detail, human rows (no ids), truthful mapping
-  summary, borderless sections. PASS.
-- `workflow-detail.png` — detail finish close-up: no boxes, no hairline walls,
-  quiet dep rows. PASS.
-- `wizard-graph-mode.png` — GRAPH PRIMARY: real nodes/connections across the
-  viewport, slim setup strip, docked inspector. No editor behind. PASS.
-- `wizard-graph-mode-narrow.png` (~1075px) — composition holds, inspector
-  readable, no clipping/overflow. PASS.
-- `wizard-binding.png` — live binding: instruction + target + host banner +
-  graph. Esc restores (DOM-verified). PASS.
-- `history.png` — matte gallery, no tile outlines, human titles, quiet meta,
-  inline tile slider. PASS.
-- `history-selected.png` — accent ring + bulk bar; rest state unselected. PASS.
-- `manage-workspaces.png` / `manage-models.png` — segmented ops tabs, dense
-  status-dot rows, no ledger walls. PASS.
-- `settings.png` — integrated rail (wash selection), flat hairline rows,
-  14px rhythm, no arch copy. PASS.
+- `normal-studio-history-fullscreen.png` — zero ComfyUI chrome: no tabs, rail,
+  toolbars, toasts, badges, zoom controls. Standalone gallery app. PASS.
+- `normal-studio-workflows-fullscreen.png` — same ownership; human rows,
+  surfaced metadata editor, truthful mapping summary. PASS.
+- `nav-drawer-fullscreen.png` — in-frame drawer, wash selection, quiet X. PASS.
+- `settings-in-studio.png` — Studio context behind; integrated rail (no cage),
+  flat 14px rows, no arch copy. PASS.
+- `manage-workspaces-fullscreen.png` — selected wash + Active signal, no
+  ledger walls, quiet seg. PASS.
+- `manage-models-fullscreen.png` — dense rows keep faint peer hairlines only;
+  calm ledger, no cards. PASS.
+- `wizard-graph-clean.png` (`wizard-graph-mode.png`) — GRAPH PRIMARY: real
+  nodes/wires across the viewport, no Studio editor, no setup slab, docked
+  inspector. PASS.
+- `wizard-binding-clean.png` (`wizard-binding.png`) — live binding state +
+  host banner + graph; Esc restores (DOM-verified). PASS.
+- `wizard-graph-narrow-clean.png` (`wizard-graph-mode-narrow.png`, ~1075px) —
+  no clipping; inspector readable; graph usable. PASS (with noted host-chrome
+  overlap at narrow widths, which is ComfyUI's own chrome, not ours).
+- `studio-closed-host-restored.png` — attribute removed, canvas/toasts/badges
+  back, scroll lock off. PASS.
 
-## Audit results (per-line/per-pixel review)
+## Audit results
 
-- Borders: every remaining line names two peers (control edges, dense-row
-  hairlines, inspector/drawer separation edges). Tile outlines, section boxes,
-  band rules, row walls all deleted. Native button border reset at base.
-- Padding: 24/32 page gutters, 16–20 drawer inset, 16px wizard body, 12–16px
-  footers, 14px settings rows, 20–24px section gaps. Nothing glued to an edge;
-  no compensating dead zones.
-- Information: workflow/version/gen ids, "No folder", raw mapping JSON, and
-  store/server prose removed from default surfaces (kept in raw-mapping
-  toggle, testids, inspector layers).
-- Selection: wash + bright text everywhere (drawer, rows, rail, seg); accent
-  ring only on media tiles. Understandable with blue removed.
-- Reference check: Mix (workspace modes are real modes, content over chrome,
+- Host: every non-Studio element in prior shots classified; normal mode parks
+  canvas+chrome+toasts+badges via reversible CSS; graph mode returns canvas
+  only. Esc layer fixed (frame no longer self-blocks). Cycles verified.
+- Borders: each remaining line names two peers (control edges, dense-row
+  hairlines, drawer/inspector separation, rail-free settings).
+- Padding: 24/32 gutters, 16px wizard body, 14px settings rows, 12px manage
+  rows, 20–24px section gaps; semantic gaps exceed internal gaps.
+- Information: ids/hashes/"No folder"/raw JSON/arch prose gone from defaults
+  (raw mapping toggle, testids, inspector layers retain them); deps
+  missing-first; "Optional" replaces "nonessential".
+- Selection: wash + bright text throughout; accent ring on media only;
+  understandable with blue removed.
+- Reference check: Mix (workspace modes are real modes; content over chrome;
   few permanent borders) ✓ · Stimma (separator law, one elevation step,
-  hairline-or-fill, selection≠action) ✓ · Mooshie (task concepts only,
-  obvious next action, wiring hidden) ✓.
+  hairline-or-fill, selection≠action) ✓ · Mooshie (task concepts, obvious
+  next action, wiring hidden) ✓.

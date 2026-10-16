@@ -433,15 +433,16 @@
     color: var(--cmst-muted);
   }
 
-  /* Segmented control: one pill track, options share it (Mix M3). */
+  /* Segmented control: quiet options on the surface, selected option takes
+   * the neutral fill. No capsule container — spacing does the grouping. */
   [data-studio-app] .cmst-seg {
     display: inline-flex;
     align-items: center;
     gap: 2px;
-    padding: 3px;
+    padding: 2px;
     border-radius: 999px;
-    background: var(--cmst-surface);
-    border: 1px solid var(--cmst-border);
+    background: transparent;
+    border: 0;
   }
   [data-studio-app] .cmst-seg-btn {
     display: inline-flex;

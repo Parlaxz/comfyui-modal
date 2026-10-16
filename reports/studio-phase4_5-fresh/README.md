@@ -15,11 +15,14 @@ Phase 4.5 attempt (`reports/studio-phase4_5-visual/`, quarantined) was never ope
 - `review/comparison.md` — zoomed core-part renders vs references + doc-gap log.
 - `review/visual-verdict.md` — the screenshot gate verdict (same folder).
 - `review/*.png` — product-review artifacts, all captured on the final build:
-  `shell.png` + `nav-drawer.png` (drawer nav), `workflows.png` (library/detail),
-  `workflow-detail.png` (detail finish), `wizard-sidebar.png` (Setup inspector),
-  `wizard-graph-mode.png` (+ `-narrow` at ~1075px) and `wizard-binding.png`
-  (live graph binding), `history.png` + `history-selected.png`,
-  `manage-workspaces.png` + `manage-models.png`, `settings.png`.
+  `normal-studio-history-fullscreen.png`, `normal-studio-workflows-fullscreen.png`,
+  `nav-drawer-fullscreen.png` (+ `nav-drawer.png`, `shell.png` pre-fullscreen),
+  `settings-in-studio.png` (+ `settings.png`), `manage-workspaces-fullscreen.png`
+  + `manage-models-fullscreen.png`, `wizard-graph-clean.png`
+  (`wizard-graph-mode.png`, + `-narrow` at ~1075px) and `wizard-binding-clean.png`
+  (`wizard-binding.png`), `wizard-sidebar.png`, `workflows.png`,
+  `workflow-detail.png`, `history.png` + `history-selected.png`,
+  `studio-closed-host-restored.png`.
 
 ## What changed (presentation only; architecture frozen)
 

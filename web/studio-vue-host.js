@@ -59,11 +59,37 @@ let _parkedLegacyOverlay = null;
 // modal-testing.js without coupling to it.
 export function setGraphInteractionEnabled(enabled) {
   _inertBackground(!enabled);
+  _setOwnership(enabled ? "graph" : "studio");
   if (!_root) return;
   const modal = _root.querySelector("[data-comfymodal-studio-modal]");
   if (!modal) return;
   if (enabled) modal.removeAttribute("aria-modal");
   else modal.setAttribute("aria-modal", "true");
+}
+
+// ── Viewport ownership ─────────────────────────────────────────────
+// While Vue Studio is open it owns the viewport; ComfyUI host chrome is
+// parked with pure CSS (body[data-cmv-own]) so closing restores everything
+// automatically — no DOM removal, no state to leak, no restore bookkeeping.
+//
+//   "studio" → fullscreen app: host canvas + chrome + toasts + badges all
+//              parked; overlay goes opaque and the frame goes full-bleed.
+//   "graph"  → setup mode: the graph canvas (nodes/wires/widgets) returns,
+//              chrome/toasts/badges stay parked; overlay goes transparent.
+//   null     → attribute removed: every host rule stops applying at once.
+//
+// The selector list is pinned to the ComfyUI frontend structure observed
+// live (ids first, then stable classes); see _ensureHostStyle. Anything not
+// listed keeps working — parking is deny-by-default for chrome, never for
+// content the graph needs (canvas, node tooltips, dom-widgets).
+function _setOwnership(mode) {
+  try {
+    if (mode === "studio" || mode === "graph") {
+      document.body.setAttribute("data-cmv-own", mode);
+    } else {
+      document.body.removeAttribute("data-cmv-own");
+    }
+  } catch (_) {}
 }
 
 function _inertBackground(inert) {
@@ -127,6 +153,10 @@ function _ensureHostStyle() {
   style.id = HOST_STYLE_ID;
   // Host frame only. Scoped `.cmv-` classes; no old Studio selectors, no
   // global resets. The Vue app's own design layer arrives via studio.css.
+  // Viewport-ownership rules below are keyed off body[data-cmv-own] (see
+  // _setOwnership): "studio" parks ALL host chrome for fullscreen Studio,
+  // "graph" returns only the graph canvas for Setup Workflow. Removing the
+  // attribute restores every rule at once — nothing is deleted or mutated.
   style.textContent = [
     ".comfymodal-vue-studio-host{display:contents;}",
     "." + OVERLAY_CLASS + "{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;background:rgba(4,8,14,.72);padding:24px;box-sizing:border-box;}",
@@ -134,6 +164,40 @@ function _ensureHostStyle() {
     ".comfymodal-vue-studio-close{position:absolute;top:10px;right:10px;z-index:5;width:32px;height:32px;border-radius:8px;border:1px solid #2b3542;background:#171e27;color:#e6ebf2;font-size:15px;line-height:1;cursor:pointer;}",
     ".comfymodal-vue-studio-close:hover{background:#222c38;}",
     "body.comfymodal-vue-scroll-lock{overflow:hidden;}",
+    // ── Normal Studio owns the viewport ──
+    'body[data-cmv-own="studio"] .comfymodal-vue-studio-overlay{background:#0b0b0c;padding:0;}',
+    'body[data-cmv-own="studio"] .comfymodal-vue-studio-frame{width:100%;max-height:none;height:100%;border-radius:0;overflow:hidden;display:flex;flex-direction:column;}',
+    'body[data-cmv-own="studio"] .comfymodal-vue-studio-frame>[data-comfymodal-studio]{flex:1;min-height:0;display:flex;flex-direction:column;}',
+    'body[data-cmv-own="studio"] .comfymodal-vue-studio-frame>[data-comfymodal-studio]>[data-studio-app]{flex:1;min-height:0;}',
+    'body[data-cmv-own="studio"] .comfymodal-vue-studio-frame [data-testid="vue-studio-root"]{height:100%;}',
+    'body[data-cmv-own="studio"] .comfymodal-vue-studio-frame [data-testid="vue-studio-root"]>main{flex:1;min-width:0;min-height:0;overflow:auto;}',
+    // Park ALL host chrome (canvas, rails, toolbars, feeds) + floating
+    // surfaces (toasts, badges, masks, lightboxes, third-party widgets).
+    'body[data-cmv-own="studio"]>div#vue-app,',
+    'body[data-cmv-own="studio"]>div.p-toast,',
+    'body[data-cmv-own="studio"]>div.comfyui-easyuse-toast,',
+    'body[data-cmv-own="studio"]>div.p-blockui-mask,',
+    'body[data-cmv-own="studio"]>button#donut-civitai-btn,',
+    'body[data-cmv-own="studio"]>div.ue-floating,',
+    'body[data-cmv-own="studio"]>div.pysssss-lightbox,',
+    'body[data-cmv-own="studio"]>div.photopea-editor,',
+    'body[data-cmv-own="studio"]>div.comfy-modal{display:none !important;}',
+    // ── Graph mode: canvas returns, chrome stays parked ──
+    'body[data-cmv-own="graph"] .comfymodal-vue-studio-overlay{background:transparent;}',
+    'body[data-cmv-own="graph"]>div.p-toast,',
+    'body[data-cmv-own="graph"]>div.comfyui-easyuse-toast,',
+    'body[data-cmv-own="graph"]>div.p-blockui-mask,',
+    'body[data-cmv-own="graph"]>button#donut-civitai-btn,',
+    'body[data-cmv-own="graph"]>div.ue-floating,',
+    'body[data-cmv-own="graph"]>div.pysssss-lightbox,',
+    'body[data-cmv-own="graph"]>div.photopea-editor,',
+    'body[data-cmv-own="graph"]>div.comfy-modal,',
+    'body[data-cmv-own="graph"] #comfyui-body-top,',
+    'body[data-cmv-own="graph"] #comfyui-body-bottom,',
+    'body[data-cmv-own="graph"] #comfyui-body-left,',
+    'body[data-cmv-own="graph"] #comfyui-body-right,',
+    'body[data-cmv-own="graph"] #graph-canvas-container>.comfy-menu,',
+    'body[data-cmv-own="graph"] #graph-canvas-container>.pointer-events-none.absolute{display:none !important;}',
   ].join("\n");
   document.head.appendChild(style);
 }
@@ -248,15 +312,21 @@ function _addEscListener() {
 }
 
 // True while a portalled Studio control (Reka dialog/popover/select…,
-// all of which expose data-state="open" / dialog roles) is open.
+// all of which expose data-state="open" / dialog roles) is open. The Studio
+// frame itself carries role="dialog" but never counts as a nested layer,
+// otherwise Escape could never close Studio.
 function _nestedLayerOpen() {
   if (!_root || !document.body.contains(_root)) return false;
   const portals = _root.querySelector("[data-studio-portals]");
   if (!portals) return false;
-  return (
-    _root.querySelector('[data-state="open"]') !== null ||
-    _root.querySelector('[role="dialog"], [role="alertdialog"], [role="menu"]') !== null
+  const layers = _root.querySelectorAll(
+    '[data-state="open"], [role="dialog"], [role="alertdialog"], [role="menu"]',
   );
+  for (const el of layers) {
+    if (el.hasAttribute && el.hasAttribute("data-comfymodal-studio-modal")) continue;
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -290,6 +360,7 @@ export async function openStudioVue(page) {
   _triggerEl = document.activeElement;
   document.body.classList.add("comfymodal-vue-scroll-lock");
   _inertBackground(true);
+  _setOwnership("studio");
   _parkLegacyOverlay();
   _root.style.display = "flex";
   _isOpen = true;
@@ -340,6 +411,7 @@ export function closeStudioVue() {
   _removeEscListener();
   _isOpen = false;
   _inertBackground(false);
+  _setOwnership(null);
   _restoreLegacyOverlay();
   document.body.classList.remove("comfymodal-vue-scroll-lock");
   if (_triggerEl && typeof _triggerEl.focus === "function") {
