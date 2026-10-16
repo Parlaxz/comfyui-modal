@@ -1,11 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { Check, Database, Import, Layers, RefreshCw, Search, Star, WandSparkles, X } from "@lucide/vue";
+import { Database, Import, Layers, RefreshCw, Search, Star, WandSparkles, X } from "@lucide/vue";
 import { useWorkflowsStore } from "../stores/workflows";
 import { useInfrastructureStore } from "../stores/infrastructure";
 import { WIZARD_STEPS } from "../api/workflows";
 import StudioButton from "../components/StudioButton.vue";
-import StudioCard from "../components/StudioCard.vue";
 import { studioPageClass } from "../components/studioPanels";
 
 const workflows = useWorkflowsStore();
@@ -27,6 +26,44 @@ const mappingText = ref("");
 
 const wizardStepIndex = computed(() => Math.max(0, WIZARD_STEPS.indexOf(workflows.wizardDraft?.step ?? "feature-type")));
 const wizardStep = computed(() => WIZARD_STEPS[wizardStepIndex.value]);
+
+// Display-only row secondary: folder, else first tag. Internal ids and
+// "No folder" placeholders never surface in the library.
+function workflowSecondary(workflow: { folder?: string; tags?: string[] }): string {
+  if (workflow.folder) return workflow.folder;
+  const tag = (workflow.tags ?? []).find((entry) => !!entry);
+  return tag ?? "";
+}
+
+// Human version label for the detail header. Raw version hashes stay out of
+// the default presentation (version switching lives in More actions).
+const selectedVersionLabel = computed(() => {
+  const version = workflows.selectedVersion as unknown as Record<string, unknown> | null;
+  const numeric = version?.version;
+  return typeof numeric === "number" ? `Version ${numeric}` : "";
+});
+
+// Human mapping summary for the detail surface. Reads the mapping defensively:
+// newer drafts nest under .bindings, persisted legacy mappings are flat
+// ({ prompt: {...} }) — both count as bindings except known meta keys.
+// Raw JSON stays behind the Edit toggle and never dumps into the workspace.
+const MAPPING_META_KEYS = new Set(["output", "outputBinding", "controls", "featureType", "step", "version"]);
+const mappingSummary = computed(() => {
+  const mapping = workflows.mapping as unknown as Record<string, unknown> | null;
+  if (!mapping) return { configured: false, bindings: 0, controls: 0 };
+  const nested = mapping.bindings;
+  const bindings = nested && typeof nested === "object"
+    ? Object.keys(nested).length
+    : Object.keys(mapping).filter((key) => !MAPPING_META_KEYS.has(key)).length;
+  const controls = mapping.controls;
+  return {
+    configured: true,
+    bindings,
+    controls: Array.isArray(controls) ? controls.length : 0,
+  };
+});
+
+const showMappingEditor = ref(false);
 
 // Display labels for the four engine steps. The WIZARD_STEPS values are the
 // persisted engine contract (draft resume, graph binding) and never change;
@@ -300,26 +337,29 @@ async function installDependencyNode(row: DependencyNodeRow) {
 
 <template>
   <section :class="studioPageClass()" data-testid="vue-page-workflows">
+    <!-- SETUP MODE: the Workflows editor gets out of the way — the ComfyUI
+      graph is primary, the teleported inspector (below) is its panel. A slim
+      bar keeps context + the exit path; closing restores normal Studio. -->
+    <div v-if="workflows.wizardOpen" class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-3">
+      <div class="cmst:min-w-0 cmst:flex-1">
+        <h1 class="cmst-type-view cmst:truncate">Setting up {{ workflows.selectedWorkflow?.name || "workflow" }}</h1>
+        <p class="cmst:mt-0.5 cmst:text-[13px] cmst:text-cmst-muted">
+          Click nodes in the ComfyUI graph to map controls. The graph stays interactive.
+        </p>
+      </div>
+      <StudioButton size="sm" variant="secondary" @click="closeWizard">Exit setup</StudioButton>
+    </div>
+    <template v-else>
     <!-- Page toolbar: title + search + filters + import. Flush on the page
       background — no hero band, no card. -->
     <div class="cmst:flex cmst:flex-wrap cmst:items-end cmst:justify-between cmst:gap-3">
       <div>
         <h1 class="cmst-type-view">Workflows</h1>
         <p class="cmst:mt-0.5 cmst:text-[13px] cmst:text-cmst-muted">
-          {{ workflows.workflows.length }} workflows · versions and shared model inventory stay separate
+          {{ workflows.workflows.length }} workflows
         </p>
       </div>
       <div class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-2">
-        <div class="cmst:relative">
-          <Search class="cmst:pointer-events-none cmst:absolute cmst:left-2.5 cmst:top-1/2 cmst:size-4 cmst:-translate-y-1/2 cmst:text-cmst-muted" aria-hidden="true" />
-          <input
-            v-model="query"
-            class="cmst-field cmst:w-52 cmst:pl-8"
-            placeholder="Search workflows"
-            aria-label="Search workflows"
-            @keyup.enter="search"
-          />
-        </div>
         <select
           v-model="workflows.tagFilter"
           class="cmst-field"
@@ -332,10 +372,6 @@ async function installDependencyNode(row: DependencyNodeRow) {
           <input v-model="workflows.favoritesOnly" type="checkbox" @change="workflows.loadList()" />
           Favorites
         </label>
-        <StudioButton size="sm" variant="secondary" @click="search">Search</StudioButton>
-        <StudioButton size="sm" variant="ghost" aria-label="Refresh workflows" @click="workflows.loadList()">
-          <RefreshCw class="cmst:size-4" aria-hidden="true" />
-        </StudioButton>
         <StudioButton size="sm" variant="outline" data-testid="vue-workflow-import-toggle" @click="showImport = !showImport">
           <Import class="cmst:size-4" aria-hidden="true" />Import
         </StudioButton>
@@ -356,20 +392,33 @@ async function installDependencyNode(row: DependencyNodeRow) {
       <div><StudioButton size="sm" data-testid="vue-workflow-import" @click="doImport">Import</StudioButton></div>
     </div>
 
-    <!-- Quiet view tabs: text + underline, never bright fill. -->
-    <div role="tablist" aria-label="Workflows or shared inventory" class="cmst:flex cmst:border-b cmst:border-solid cmst:border-cmst-border">
-      <button type="button" role="tab" class="cmst-quiet-tab" :aria-selected="tab === 'workflows'" @click="tab = 'workflows'">
-        <span class="cmst:inline-flex cmst:items-center cmst:gap-1.5"><Layers class="cmst:size-4" aria-hidden="true" />Workflows</span>
-      </button>
-      <button type="button" role="tab" class="cmst-quiet-tab" :aria-selected="tab === 'models'" @click="tab = 'models'">
-        <span class="cmst:inline-flex cmst:items-center cmst:gap-1.5"><Database class="cmst:size-4" aria-hidden="true" />Models / Nodes</span>
-      </button>
-    </div>
-
-    <template v-if="tab === 'workflows'">
-      <div class="cmst:grid cmst:grid-cols-1 cmst:gap-6 cmst:lg:grid-cols-[280px_minmax(0,1fr)]">
-        <!-- Object list: hairline rows, restrained selection. -->
-        <div role="listbox" aria-label="Workflows" class="cmst:min-w-0">
+    <div class="cmst:grid cmst:grid-cols-1 cmst:gap-6 cmst:lg:grid-cols-[300px_minmax(0,1fr)]">
+        <!-- Library rail: search + filter + dense rows. -->
+        <div class="cmst:min-w-0">
+          <div class="cmst:relative">
+            <Search class="cmst:pointer-events-none cmst:absolute cmst:left-2.5 cmst:top-1/2 cmst:size-4 cmst:-translate-y-1/2 cmst:text-cmst-muted" aria-hidden="true" />
+            <input
+              v-model="query"
+              class="cmst-field cmst:w-full cmst:pl-8"
+              placeholder="Search workflows"
+              aria-label="Search workflows"
+              @keyup.enter="search"
+            />
+          </div>
+          <div class="cmst:mt-2 cmst:flex cmst:items-center cmst:justify-between cmst:gap-2">
+            <div class="cmst-seg" role="tablist" aria-label="Workflows or shared inventory">
+              <button type="button" role="tab" class="cmst-seg-btn" :data-active="tab === 'workflows'" :aria-selected="tab === 'workflows'" @click="tab = 'workflows'">
+                <Layers class="cmst:size-4" aria-hidden="true" />Workflows
+              </button>
+              <button type="button" role="tab" class="cmst-seg-btn" :data-active="tab === 'models'" :aria-selected="tab === 'models'" @click="tab = 'models'">
+                <Database class="cmst:size-4" aria-hidden="true" />Models / Nodes
+              </button>
+            </div>
+            <StudioButton size="sm" variant="ghost" aria-label="Refresh workflows" @click="workflows.loadList()">
+              <RefreshCw class="cmst:size-4" aria-hidden="true" />
+            </StudioButton>
+          </div>
+          <div v-if="tab === 'workflows'" role="listbox" aria-label="Workflows" class="cmst:mt-2 cmst:min-w-0">
           <button
             v-for="workflow in workflows.workflows"
             :key="workflow.workflow_id"
@@ -386,24 +435,26 @@ async function installDependencyNode(row: DependencyNodeRow) {
                 class="cmst:size-3.5 cmst:shrink-0 cmst:fill-cmst-primary cmst:text-cmst-primary"
                 aria-label="Favorite"
               />
-              <strong class="cmst-type-object cmst:truncate">{{ workflow.name || workflow.workflow_id }}</strong>
+              <strong class="cmst-type-object cmst:truncate">{{ workflow.name || "Untitled workflow" }}</strong>
             </span>
-            <span class="cmst-type-meta cmst:mt-0.5 cmst:block cmst:truncate">
-              {{ workflow.folder || "No folder" }} · {{ workflow.latest_version_id || "No version" }}
+            <span v-if="workflowSecondary(workflow)" class="cmst-type-meta cmst:mt-0.5 cmst:block cmst:truncate">
+              {{ workflowSecondary(workflow) }}
             </span>
           </button>
           <p v-if="!workflows.workflows.length" class="cmst:py-4 cmst:text-[13px] cmst:text-cmst-muted">
             No workflows returned by the server.
           </p>
+          </div>
         </div>
 
+      <template v-if="tab === 'workflows'">
         <!-- Detail surface: flat sections on hairlines, not nested cards. -->
         <div v-if="workflows.selectedWorkflow" class="cmst:min-w-0">
           <div class="cmst:flex cmst:flex-wrap cmst:items-start cmst:justify-between cmst:gap-3">
             <div class="cmst:min-w-0">
-              <h2 class="cmst-type-section cmst:truncate">{{ workflows.selectedWorkflow.name }}</h2>
-              <p class="cmst-type-meta cmst:mt-0.5">
-                Version {{ workflows.selectedVersion?.version ?? workflows.selectedVersion?.workflow_version_id }}
+              <h2 class="cmst-type-view cmst:truncate">{{ workflows.selectedWorkflow.name }}</h2>
+              <p v-if="selectedVersionLabel" class="cmst-type-meta cmst:mt-0.5">
+                {{ selectedVersionLabel }}
               </p>
               <p
                 v-if="runnableText"
@@ -480,23 +531,30 @@ async function installDependencyNode(row: DependencyNodeRow) {
             </StudioButton>
           </div>
 
-          <section aria-label="Mapping" class="cmst:mt-5 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:pt-4">
+          <section aria-label="Mapping" class="cmst:mt-6">
             <h3 class="cmst-type-section">Mapping</h3>
-            <p class="cmst-type-meta cmst:mt-0.5">{{ workflows.mapping ? "configured" : "not configured" }}</p>
-            <div class="cmst:mt-2"><StudioButton size="sm" variant="ghost" @click="workflows.loadMappingCandidates()">Load candidates</StudioButton></div>
-            <pre v-if="workflows.mappingCandidates" class="cmst:mt-2 cmst:max-h-32 cmst:overflow-auto cmst:rounded cmst:bg-cmst-matte cmst:p-2 cmst:font-mono cmst:text-xs cmst:text-cmst-secondary-text">{{ JSON.stringify(workflows.mappingCandidates, null, 1).slice(0, 800) }}</pre>
-            <textarea v-model="mappingText" rows="3" class="cmst-field cmst:mt-2 cmst:w-full cmst:font-mono cmst:text-xs" placeholder='{"bindings": {...}}' />
-            <div class="cmst:mt-1.5"><StudioButton size="sm" variant="secondary" data-testid="vue-mapping-save" @click="saveMappingEdit">Save mapping</StudioButton></div>
+            <p class="cmst-type-meta cmst:mt-0.5">
+              {{ mappingSummary.configured ? `${mappingSummary.bindings} bindings · ${mappingSummary.controls} controls` : "not configured" }}
+            </p>
+            <div class="cmst:mt-2 cmst:flex cmst:gap-1.5">
+              <StudioButton size="sm" variant="ghost" @click="workflows.loadMappingCandidates()">Load candidates</StudioButton>
+              <StudioButton size="sm" variant="ghost" @click="showMappingEditor = !showMappingEditor">{{ showMappingEditor ? "Hide raw mapping" : "Edit raw mapping" }}</StudioButton>
+            </div>
+            <div v-if="showMappingEditor" class="cmst:mt-2">
+              <pre v-if="workflows.mappingCandidates" class="cmst:mt-2 cmst:max-h-32 cmst:overflow-auto cmst:rounded cmst:bg-cmst-matte cmst:p-2 cmst:font-mono cmst:text-xs cmst:text-cmst-secondary-text">{{ JSON.stringify(workflows.mappingCandidates, null, 1).slice(0, 800) }}</pre>
+              <textarea v-model="mappingText" rows="3" class="cmst-field cmst:mt-2 cmst:w-full cmst:font-mono cmst:text-xs" placeholder='{"bindings": {...}}' />
+              <div class="cmst:mt-1.5"><StudioButton size="sm" variant="secondary" data-testid="vue-mapping-save" @click="saveMappingEdit">Save mapping</StudioButton></div>
+            </div>
           </section>
 
-          <section aria-label="Dependencies" class="cmst:mt-5 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:pt-4" data-testid="vue-dependencies">
+          <section aria-label="Dependencies" class="cmst:mt-6" data-testid="vue-dependencies">
             <h3 class="cmst-type-section">Dependencies</h3>
             <p class="cmst-type-meta cmst:mt-0.5">{{ dependencySummaryLine }}</p>
-            <ul class="cmst:mt-1 cmst:flex cmst:max-h-56 cmst:flex-col cmst:overflow-auto">
+            <ul class="cmst:mt-2 cmst:flex cmst:max-h-56 cmst:flex-col cmst:gap-1 cmst:overflow-auto">
               <li
                 v-for="row in dependencyModelRows"
                 :key="`model-${row.key}`"
-                class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-x-2 cmst:gap-y-1 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:py-2 cmst:text-[13px] first:cmst:border-t-0"
+                class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-x-2 cmst:gap-y-1 cmst:rounded-md cmst:px-2 cmst:py-2 cmst:text-[13px] cmst:hover:bg-cmst-hover"
                 data-testid="dependency-model-row"
               >
                 <span
@@ -516,7 +574,7 @@ async function installDependencyNode(row: DependencyNodeRow) {
               <li
                 v-for="row in dependencyNodeRows"
                 :key="`node-${row.key}`"
-                class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-x-2 cmst:gap-y-1 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:py-2 cmst:text-[13px]"
+                class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-x-2 cmst:gap-y-1 cmst:rounded-md cmst:px-2 cmst:py-2 cmst:text-[13px] cmst:hover:bg-cmst-hover"
                 data-testid="dependency-node-row"
               >
                 <span
@@ -531,7 +589,7 @@ async function installDependencyNode(row: DependencyNodeRow) {
             </ul>
           </section>
 
-          <section aria-label="Portability" class="cmst:mt-5 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:pt-4">
+          <section aria-label="Portability" class="cmst:mt-6">
             <h3 class="cmst-type-section">Portability</h3>
             <p class="cmst-type-meta cmst:mt-0.5">{{ workflows.portability ? "analyzed" : "not analyzed" }}</p>
             <div class="cmst:mt-2 cmst:flex cmst:gap-1.5">
@@ -540,7 +598,7 @@ async function installDependencyNode(row: DependencyNodeRow) {
             </div>
           </section>
 
-          <section aria-label="Presets" class="cmst:mt-5 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:pt-4">
+          <section aria-label="Presets" class="cmst:mt-6">
             <h3 class="cmst-type-section">Presets</h3>
             <p class="cmst-type-meta cmst:mt-0.5">image-free configuration only</p>
             <div class="cmst:mt-2 cmst:flex cmst:gap-2">
@@ -551,7 +609,7 @@ async function installDependencyNode(row: DependencyNodeRow) {
               <li
                 v-for="(preset, index) in workflows.presets"
                 :key="index"
-                class="cmst:flex cmst:items-center cmst:justify-between cmst:gap-2 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:py-1.5 cmst:text-[13px] first:cmst:border-t-0"
+                class="cmst:flex cmst:items-center cmst:justify-between cmst:gap-2 cmst:rounded-md cmst:px-2 cmst:py-1.5 cmst:text-[13px] cmst:hover:bg-cmst-hover"
               >
                 <span class="cmst:truncate">{{ String((preset as Record<string, unknown>).name || `preset ${index}`) }}</span>
                 <StudioButton size="sm" variant="ghost" @click="workflows.removePreset(String((preset as Record<string, unknown>).preset_id || (preset as Record<string, unknown>).id || ''))">Delete</StudioButton>
@@ -559,7 +617,7 @@ async function installDependencyNode(row: DependencyNodeRow) {
             </ul>
           </section>
 
-          <section aria-label="Guidance mapping" class="cmst:mt-5 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:pt-4">
+          <section aria-label="Guidance mapping" class="cmst:mt-6">
             <h3 class="cmst-type-section">Guidance mapping</h3>
             <div class="cmst:mt-2 cmst:flex cmst:flex-wrap cmst:gap-2">
               <input v-model="guidanceSha" class="cmst-field cmst:flex-1" placeholder="model sha256" aria-label="Model sha256" />
@@ -574,65 +632,65 @@ async function installDependencyNode(row: DependencyNodeRow) {
         <p v-else class="cmst:py-8 cmst:text-[13px] cmst:text-cmst-muted">
           Select a workflow to inspect its versions, mapping, and dependencies.
         </p>
-      </div>
-    </template>
+      </template>
 
-    <template v-else>
-      <StudioCard class="cmst:p-4">
-        <h3 class="cmst-type-section">Shared model inventory</h3>
-        <p class="cmst:mt-1 cmst:text-[13px] cmst:text-cmst-muted">Owned by infrastructureStore; workflow dependencies reference this state.</p>
-        <div class="cmst:mt-3 cmst:text-[13px]">Models: {{ infrastructure.models.length }} · Custom nodes: {{ infrastructure.customNodes.length }}</div>
-        <div class="cmst:mt-3 cmst:flex cmst:gap-2">
-          <StudioButton size="sm" variant="outline" @click="infrastructure.rescanModelsNow(true)">Rescan models</StudioButton>
-          <StudioButton size="sm" variant="outline" @click="infrastructure.refreshCustomNodesNow()">Refresh nodes</StudioButton>
+      <template v-else>
+        <div class="cmst:min-w-0">
+          <h2 class="cmst-type-view">Shared models &amp; nodes</h2>
+          <p class="cmst:mt-0.5 cmst:text-[13px] cmst:text-cmst-muted">Models: {{ infrastructure.models.length }} · Custom nodes: {{ infrastructure.customNodes.length }}</p>
+          <div class="cmst:mt-3 cmst:flex cmst:gap-2">
+            <StudioButton size="sm" variant="outline" @click="infrastructure.rescanModelsNow(true)">Rescan models</StudioButton>
+            <StudioButton size="sm" variant="outline" @click="infrastructure.refreshCustomNodesNow()">Refresh nodes</StudioButton>
+          </div>
         </div>
-      </StudioCard>
+      </template>
+    </div>
     </template>
 
     <!-- Setup wizard: 1 Feature / 2 Bindings / 3 Controls / 4 Review.
       Step values are the persisted engine contract; labels are display only.
-      Graph-binding engine (begin/cancel/capture callbacks) untouched. -->
-    <div
-      v-if="workflows.wizardOpen"
-      class="cmst:fixed cmst:inset-0 cmst:z-[70] cmst:flex cmst:items-center cmst:justify-center cmst:bg-black/60 cmst:p-6"
+      Graph-binding engine (begin/cancel/capture callbacks) untouched.
+      The wizard is a docked right inspector, NOT a modal: no backdrop, the
+      ComfyUI graph stays visible and interactive while mapping controls.
+      Teleported to <body> inside its own [data-studio-app] scope so the
+      inspector escapes the host overlay's z-60 stacking context (ComfyUI
+      canvas chrome paints at z-999/1200 and would cover it). The marker div
+      below stays in the Vue root while the wizard is open so the host's
+      nested-layer protocol keeps treating Escape as wizard-owned. -->
+    <div v-if="workflows.wizardOpen" data-state="open" aria-hidden="true" style="display: none" />
+    <Teleport to="body">
+      <div data-studio-app>
+        <aside
+          v-if="workflows.wizardOpen"
+          class="cmst-inspector"
       data-state="open"
       data-testid="vue-workflow-wizard"
+      role="complementary"
+      aria-label="Setup workflow"
       tabindex="-1"
       @keydown.esc.stop="closeWizard"
     >
-      <StudioCard class="cmst:max-h-[90vh] cmst:w-[min(42rem,94vw)] cmst:overflow-auto cmst:p-5">
+      <div class="cmst-inspector-head">
         <div class="cmst:flex cmst:items-start cmst:justify-between cmst:gap-3">
-          <div>
-            <h2 class="cmst-type-section">Setup workflow</h2>
+          <div class="cmst:min-w-0">
+            <h2 class="cmst-type-section cmst:truncate">Setup workflow</h2>
             <p class="cmst-type-meta cmst:mt-0.5">Step {{ wizardStepIndex + 1 }} of {{ WIZARD_STEPS.length }} · {{ wizardStepLabel }}</p>
           </div>
           <button
             type="button"
             aria-label="Close wizard"
-            class="cmst:rounded-md cmst:p-1.5 cmst:text-cmst-muted cmst:hover:bg-cmst-hover cmst:hover:text-cmst-fg"
+            class="cmst-close-btn"
             @click="closeWizard"
           >
             <X class="cmst:size-4" aria-hidden="true" />
           </button>
         </div>
+        <div class="cmst-progress-thin cmst:mt-2" aria-hidden="true">
+          <span :style="{ width: `${Math.round(((wizardStepIndex + 1) / WIZARD_STEPS.length) * 100)}%` }" />
+        </div>
+      </div>
 
-        <ol class="cmst:mt-3 cmst:flex cmst:items-center cmst:gap-1" aria-label="Setup progress">
-          <li v-for="(step, index) in WIZARD_STEPS" :key="step" class="cmst:flex cmst:flex-1 cmst:items-center cmst:gap-1.5">
-            <span
-              class="cmst:flex cmst:size-5 cmst:shrink-0 cmst:items-center cmst:justify-center cmst:rounded-full cmst:text-[11px] cmst:font-semibold"
-              :class="index < wizardStepIndex ? 'cmst:bg-cmst-ok cmst:text-white' : index === wizardStepIndex ? 'cmst:bg-cmst-primary cmst:text-white' : 'cmst:bg-cmst-raised cmst:text-cmst-muted'"
-              :aria-current="index === wizardStepIndex ? 'step' : undefined"
-            >
-              <Check v-if="index < wizardStepIndex" class="cmst:size-3" aria-hidden="true" />
-              <span v-else>{{ index + 1 }}</span>
-            </span>
-            <span class="cmst:truncate cmst:text-xs" :class="index === wizardStepIndex ? 'cmst:font-medium cmst:text-cmst-fg' : 'cmst:text-cmst-muted'">
-              {{ WIZARD_STEP_LABELS[step] ?? step }}
-            </span>
-          </li>
-        </ol>
-
-        <div class="cmst:mt-4 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:pt-4">
+      <div class="cmst-inspector-body">
           <template v-if="wizardStep === 'feature-type'">
             <h3 class="cmst-type-object">1 · Feature</h3>
             <p class="cmst:mt-1 cmst:text-[13px] cmst:text-cmst-muted">Choose what this workflow does. This decides which bindings and controls the next steps ask for.</p>
@@ -728,7 +786,7 @@ async function installDependencyNode(row: DependencyNodeRow) {
           </template>
         </div>
 
-        <div class="cmst:mt-4 cmst:flex cmst:items-center cmst:justify-between cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:pt-3">
+      <div class="cmst-inspector-foot">
           <StudioButton variant="ghost" size="sm" :disabled="wizardStepIndex === 0" @click="previousWizardStep">Back</StudioButton>
           <!-- One primary per region: the Review step owns Save mapping in
             the body above, so the footer only advances on steps 1–3. -->
@@ -738,8 +796,9 @@ async function installDependencyNode(row: DependencyNodeRow) {
             @click="nextWizardStep"
           >Next</StudioButton>
           <span v-else class="cmst-type-meta">Review → Save mapping</span>
-        </div>
-      </StudioCard>
-    </div>
+      </div>
+        </aside>
+      </div>
+    </Teleport>
   </section>
 </template>

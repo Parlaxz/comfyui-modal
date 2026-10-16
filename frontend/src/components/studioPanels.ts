@@ -1,11 +1,10 @@
-// Studio page shell — the one shared page-layout helper for the Phase-1
-// proof views (vertical stack with breathing room). Card panels render
-// through the canonical `./StudioCard.vue` SFC, not through class helpers.
+// Studio page shell — fullscreen workspace gutter: 24px page inset (32px on
+// wide), so content never glues to the frame edge and dead zones stay small.
 import { cn } from "./cn";
 
 export function studioPageClass(extra?: string): string {
   return cn(
-    "cmst:flex cmst:flex-col cmst:gap-4 cmst:p-4 cmst:sm:p-6",
+    "cmst:flex cmst:flex-col cmst:gap-4 cmst:p-6 cmst:sm:p-8",
     extra,
   );
 }

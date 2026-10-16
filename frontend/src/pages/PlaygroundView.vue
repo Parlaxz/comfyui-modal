@@ -54,7 +54,7 @@ function runSyntheticOperation() {
       </h2>
       <p class="cmst:text-sm cmst:opacity-80">
         Product functionality is intentionally not ported yet. This view proves
-        store ownership and the operation registry.
+        the playground slice and a harmless local demo operation.
       </p>
       <label class="cmst:flex cmst:items-center cmst:gap-2 cmst:text-sm cmst:mt-3">
         <input

@@ -4,7 +4,6 @@ import { ImageOff, Star, Check } from "@lucide/vue";
 import type { HistoryRecord } from "../api/history";
 import { selectFeedAsset } from "../api/history";
 import { useHistoryStore } from "../stores/history";
-import StudioCard from "./StudioCard.vue";
 
 const props = defineProps<{ record: HistoryRecord }>();
 const emit = defineEmits<{ select: [record: HistoryRecord] }>();
@@ -13,17 +12,36 @@ const history = useHistoryStore();
 const selectionKey = computed(() => `${props.record.kind}:${props.record.id}`);
 const selected = computed(() => history.selection.includes(selectionKey.value));
 
-function formatDuration(ms: number | null): string | null {
-  if (typeof ms !== "number" || ms < 0) return null;
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-}
-
 const dimensions = computed(() => {
   const output = props.record.featuredOutput;
   if (!output || typeof output.width !== "number" || typeof output.height !== "number") return null;
   return `${output.width}×${output.height}`;
 });
+
+// Human gallery title: prompt first (unless it is a serialized JSON blob),
+// then workflow, then a kind label. Raw ids/JSON never headline the tile.
+const displayTitle = computed(() => {
+  const prompt = props.record.prompt?.trim();
+  if (prompt && !/^[{[]/.test(prompt)) return prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt;
+  if (props.record.workflow) return props.record.workflow;
+  return props.record.kind === "experiment" ? "Experiment" : "Generation";
+});
+
+function relativeTime(iso: string | null): string | null {
+  if (!iso) return null;
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return null;
+  const minutes = Math.max(0, Math.round((Date.now() - then) / 60000));
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return new Date(then).toLocaleDateString();
+}
+
+const timeAgo = computed(() => relativeTime(props.record.completedAt ?? props.record.startedAt));
 
 async function toggleFavorite(event: Event) {
   event.stopPropagation();
@@ -37,8 +55,12 @@ function toggleSelect(event: Event) {
 </script>
 
 <template>
-  <StudioCard class="cmst:group cmst:overflow-hidden">
-    <!-- Media to the edge on matte; footer below holds title + meta only. -->
+  <!-- Media-first tile: artwork on matte at media radius, no card chrome.
+    Selected = accent ring (selection treatment); hover reveals actions. -->
+  <div
+    class="cmst:group cmst:overflow-hidden cmst:rounded cmst:bg-cmst-matte"
+    :class="selected ? 'cmst:ring-2 cmst:ring-cmst-primary cmst:ring-inset' : ''"
+  >
     <div class="cmst-media-well cmst:relative">
       <button
         type="button"
@@ -93,8 +115,8 @@ function toggleSelect(event: Event) {
       :aria-label="`Open ${record.workflow || record.id}`"
       @click="emit('select', record)"
     >
-      <span class="cmst-type-object cmst:block cmst:truncate">{{ record.workflow || record.id }}</span>
-      <span class="cmst-type-meta cmst:mt-0.5 cmst:block cmst:truncate">{{ record.status }} · {{ record.kind }}<template v-if="dimensions"> · {{ dimensions }}</template><template v-if="formatDuration(record.durationMs)"> · {{ formatDuration(record.durationMs) }}</template></span>
+      <span class="cmst-type-object cmst:block cmst:truncate">{{ displayTitle }}</span>
+      <span class="cmst-type-meta cmst:mt-0.5 cmst:block cmst:truncate">{{ record.status }}<template v-if="dimensions"> · {{ dimensions }}</template><template v-if="timeAgo"> · {{ timeAgo }}</template></span>
     </button>
-  </StudioCard>
+  </div>
 </template>

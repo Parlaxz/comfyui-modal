@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { RefreshCw, Search } from "@lucide/vue";
 import { useRoute, useRouter } from "vue-router";
 import { useHistoryStore } from "../stores/history";
+import { useSettingsStore } from "../stores/settings";
 import type { HistoryRecord } from "../api/history";
 import StudioButton from "../components/StudioButton.vue";
 import ImageGrid from "../components/ImageGrid.vue";
@@ -12,10 +13,21 @@ import CompareViewer from "../components/CompareViewer.vue";
 import { studioPageClass } from "../components/studioPanels";
 
 const history = useHistoryStore();
+const settings = useSettingsStore();
 const route = useRoute();
 const router = useRouter();
 const search = ref(history.query);
 const pickerOpen = ref(false);
+
+// Thumbnail density slider (Mix gallery pattern): writes the persisted
+// Interface > history-columns preference through the existing store action.
+const thumbColumns = computed({
+  get: () => {
+    const parsed = Number.parseInt(String(settings.columnsPreference ?? "4"), 10);
+    return Number.isNaN(parsed) ? 4 : Math.min(8, Math.max(2, parsed));
+  },
+  set: (value: number) => settings.setHistoryColumns(String(value)),
+});
 
 function routeFocus(): string | null {
   const focus = route.query.focus;
@@ -80,6 +92,20 @@ function clearFilters() {
         </p>
       </div>
       <div class="cmst:flex cmst:items-center cmst:gap-1.5">
+        <label class="cmst:flex cmst:items-center cmst:gap-2 cmst:text-xs cmst:text-cmst-muted">
+          <span aria-hidden="true">Tiles</span>
+          <input
+            v-model.number="thumbColumns"
+            type="range"
+            min="2"
+            max="8"
+            step="1"
+            aria-label="Thumbnail columns"
+            data-testid="vue-history-thumb-size"
+            class="cmst:accent-cmst-primary"
+          />
+          <span class="cmst-type-meta" aria-hidden="true">{{ thumbColumns }}</span>
+        </label>
         <StudioButton variant="secondary" size="sm" data-testid="vue-history-picker-open" @click="pickerOpen = true">Pick generation</StudioButton>
         <StudioButton variant="ghost" size="icon" aria-label="Refresh history" :disabled="history.loading" @click="history.loadFeed()">
           <RefreshCw class="cmst:size-4" :class="history.loading ? 'cmst:animate-spin' : ''" aria-hidden="true" />
@@ -87,8 +113,8 @@ function clearFilters() {
       </div>
     </div>
 
-    <!-- Compact filter toolbar on a hairline band. -->
-    <div class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-2 cmst:border-y cmst:border-solid cmst:border-cmst-border cmst:py-2.5">
+    <!-- Compact filter row: controls separated by spacing, no band box. -->
+    <div class="cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-2">
       <div class="cmst:relative">
         <Search class="cmst:pointer-events-none cmst:absolute cmst:left-2.5 cmst:top-1/2 cmst:size-4 cmst:-translate-y-1/2 cmst:text-cmst-muted" aria-hidden="true" />
         <input v-model="search" class="cmst-field cmst:w-52 cmst:pl-8" placeholder="Search history" aria-label="Search history" data-testid="vue-history-search" />

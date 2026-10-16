@@ -27,50 +27,54 @@
 
 /* Studio palette as Tailwind theme colors so `cmst:bg-cmst-raised`-style
  * utilities are generated (still prefixed, still layered, still no
- * preflight). The same values back the hand-written tokens below. */
+ * preflight). The same values back the hand-written tokens below.
+ *
+ * Phase 4.5 fresh: TRUE-NEUTRAL environmental surfaces (no blue/zinc tint).
+ * Blue (#4f7cff family) is an action accent only. ~70% page / ~20% elevation
+ * / ~10% accent-status. */
 @theme {
-  --color-cmst-bg: #090c11;
-  --color-cmst-surface: #0f141b;
-  --color-cmst-raised: #151b24;
-  --color-cmst-hover: #1a222d;
-  --color-cmst-matte: #07090d;
-  --color-cmst-border: rgba(178, 189, 203, 0.16);
-  --color-cmst-fg: #f3f6fa;
-  --color-cmst-secondary-text: #b2bdcb;
-  --color-cmst-muted: #7f8b9b;
+  --color-cmst-bg: #0b0b0c;
+  --color-cmst-surface: #131314;
+  --color-cmst-raised: #1b1b1d;
+  --color-cmst-hover: #222224;
+  --color-cmst-matte: #060607;
+  --color-cmst-border: rgba(255, 255, 255, 0.08);
+  --color-cmst-fg: #f2f2f3;
+  --color-cmst-secondary-text: #c6c6c9;
+  --color-cmst-muted: #8f8f96;
   --color-cmst-primary: #4f7cff;
-  --color-cmst-primary-hover: #638cff;
+  --color-cmst-primary-hover: #6a90ff;
   --color-cmst-primary-fg: #ffffff;
-  --color-cmst-secondary: #151b24;
-  --color-cmst-secondary-hover: #1a222d;
-  --color-cmst-secondary-fg: #f3f6fa;
-  --color-cmst-ok: #4ca98a;
-  --color-cmst-warn: #c99a4a;
-  --color-cmst-danger: #d96a5f;
+  --color-cmst-secondary: #1b1b1d;
+  --color-cmst-secondary-hover: #222224;
+  --color-cmst-secondary-fg: #f2f2f3;
+  --color-cmst-ok: #34c98e;
+  --color-cmst-warn: #d9a13b;
+  --color-cmst-danger: #e0655a;
 }
 
 /* Studio-scoped design tokens. */
 @layer cmst-base {
   [data-studio-app],
   [data-studio-portals] {
-    --cmst-bg: #090c11;
-    --cmst-surface: #0f141b;
-    --cmst-raised: #151b24;
-    --cmst-hover: #1a222d;
-    --cmst-matte: #07090d;
-    --cmst-border: rgba(178, 189, 203, 0.16);
-    --cmst-fg: #f3f6fa;
-    --cmst-secondary-text: #b2bdcb;
-    --cmst-muted: #7f8b9b;
+    --cmst-bg: #0b0b0c;
+    --cmst-surface: #131314;
+    --cmst-raised: #1b1b1d;
+    --cmst-hover: #222224;
+    --cmst-matte: #060607;
+    --cmst-border: rgba(255, 255, 255, 0.08);
+    --cmst-fg: #f2f2f3;
+    --cmst-secondary-text: #c6c6c9;
+    --cmst-muted: #8f8f96;
     --cmst-primary: #4f7cff;
-    --cmst-primary-hover: #638cff;
+    --cmst-primary-hover: #6a90ff;
     --cmst-primary-fg: #ffffff;
-    --cmst-secondary: #151b24;
-    --cmst-secondary-hover: #1a222d;
-    --cmst-secondary-fg: #f3f6fa;
-    --cmst-ok: #4ca98a;
-    --cmst-warn: #c99a4a;
-    --cmst-danger: #d96a5f;
+    --cmst-secondary: #1b1b1d;
+    --cmst-secondary-hover: #222224;
+    --cmst-secondary-fg: #f2f2f3;
+    --cmst-ok: #34c98e;
+    --cmst-warn: #d9a13b;
+    --cmst-danger: #e0655a;
 
     /* Type scale. */
     --cmst-text-view: 20px;
@@ -110,6 +114,9 @@
 
   [data-studio-app] button {
     font: inherit;
+    border: 0;
+    background: transparent;
+    padding: 0;
   }
 
   [data-studio-app] a {
@@ -213,27 +220,25 @@
     background: var(--cmst-primary);
   }
 
-  /* ---- Object rows: hairline-separated, restrained selection ---- */
+  /* ---- Object rows: spacing-separated, wash selection. No hairlines:
+   * two-line rows identify through spacing + hover wash; selection is wash +
+   * bright text (understandable with accent removed). ---- */
   [data-studio-app] .cmst-object-row {
     display: block;
     width: 100%;
     text-align: left;
     background: transparent;
     border: 0;
-    border-top: 1px solid var(--cmst-border);
-    padding: 8px 12px;
+    border-radius: 8px;
+    padding: 10px 12px;
     min-height: 34px;
     cursor: pointer;
-  }
-  [data-studio-app] .cmst-object-row:first-child {
-    border-top: 0;
   }
   [data-studio-app] .cmst-object-row:hover {
     background: var(--cmst-hover);
   }
   [data-studio-app] .cmst-object-row[aria-selected="true"] {
     background: var(--cmst-raised);
-    box-shadow: inset 2px 0 0 var(--cmst-primary);
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -257,14 +262,15 @@
     overflow: hidden;
   }
 
-  /* Dense data row: hairline-separated, for models/nodes/settings lists.
-   * Lives inside a bordered container or a bare list — never both. */
+  /* Dense data row (models/nodes/dependency lists): genuinely dense
+   * single-line rows keep one faint peer hairline; two-line content must use
+   * .cmst-object-row (spacing) instead. */
   [data-studio-app] .cmst-data-row {
     display: flex;
     align-items: center;
     gap: 8px;
-    min-height: 34px;
-    padding: 8px 12px;
+    min-height: 40px;
+    padding: 10px 12px;
     border-top: 1px solid var(--cmst-border);
     font-size: var(--cmst-text-body);
   }
@@ -282,13 +288,14 @@
     border-radius: 9999px;
   }
 
-  /* Settings row: label + description left, control right; stacks < 640px. */
+  /* Settings row: label + description left, control right; stacks < 640px.
+   * 14px vertical breathing room; hairlines only between peers. */
   [data-studio-app] .cmst-setting-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 4px 12px;
-    padding: 10px 0;
+    padding: 14px 0;
     border-top: 1px solid var(--cmst-border);
   }
   [data-studio-app] .cmst-setting-row:first-child {
@@ -338,6 +345,37 @@
     opacity: 1;
   }
 
+  /* Shared quiet close/icon-dismiss control: transparent 32px box, no
+   * permanent border or slab; hover/pressed fills; accent focus ring. */
+  [data-studio-app] .cmst-close-btn {
+    display: inline-flex;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--cmst-muted);
+    cursor: pointer;
+    transition:
+      background-color var(--cmst-motion-fast) ease-out,
+      color var(--cmst-motion-fast) ease-out;
+  }
+  [data-studio-app] .cmst-close-btn:hover {
+    background: var(--cmst-hover);
+    color: var(--cmst-fg);
+  }
+  [data-studio-app] .cmst-close-btn:active {
+    background: var(--cmst-raised);
+    color: var(--cmst-fg);
+  }
+  [data-studio-app] .cmst-close-btn svg {
+    width: 16px;
+    height: 16px;
+  }
+
   /* Thin restrained progress track for deployment status. */
   [data-studio-app] .cmst-progress-track {
     height: 3px;
@@ -370,5 +408,237 @@
       text-align: left;
       text-transform: capitalize;
     }
+    /* Rail active state (Mix Prefs grammar): neutral wash + bright text,
+     * not the underline used by in-page quiet tabs. */
+    [data-studio-app] .cmst-side-nav .cmst-quiet-tab[aria-selected="true"] {
+      background: var(--cmst-raised);
+      border-radius: 8px;
+    }
+    [data-studio-app] .cmst-side-nav .cmst-quiet-tab[aria-selected="true"]::after {
+      content: none;
+    }
+  }
+}
+
+/* Phase 4.5 fresh structural primitives (measured from Mix Studio, disciplined
+ * by Stimma laws). Micro-labels are SPARING (tiny eyebrows only); default
+ * section headings stay sentence-case via .cmst-type-section. */
+@layer cmst-base {
+  /* Tiny eyebrow micro-label: rails, drawer groups. Never a default heading. */
+  [data-studio-app] .cmst-micro {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--cmst-muted);
+  }
+
+  /* Segmented control: one pill track, options share it (Mix M3). */
+  [data-studio-app] .cmst-seg {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 3px;
+    border-radius: 999px;
+    background: var(--cmst-surface);
+    border: 1px solid var(--cmst-border);
+  }
+  [data-studio-app] .cmst-seg-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 28px;
+    padding: 4px 12px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--cmst-muted);
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  [data-studio-app] .cmst-seg-btn:hover {
+    color: var(--cmst-fg);
+  }
+  [data-studio-app] .cmst-seg-btn[data-active="true"] {
+    background: var(--cmst-raised);
+    color: var(--cmst-fg);
+    box-shadow: inset 0 0 0 1px var(--cmst-border);
+  }
+
+  /* Nav drawer (Mix M9): slide-over panel + backdrop. The panel docks to the
+   * Studio surface's left edge (absolute) so it reads as one product with the
+   * workspace and never slides under ComfyUI's own chrome; the backdrop stays
+   * viewport-fixed to quiet the whole screen while navigating. */
+  [data-studio-app] .cmst-drawer-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    background: rgba(0, 0, 0, 0.6);
+    border: 0;
+    padding: 0;
+    cursor: default;
+  }
+  [data-studio-app] .cmst-drawer {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 61;
+    width: min(330px, 90vw);
+    display: flex;
+    flex-direction: column;
+    padding: 8px 8px 16px;
+    background: var(--cmst-surface);
+    border-right: 1px solid var(--cmst-border);
+    box-shadow: var(--cmst-shadow-overlay);
+  }
+  [data-studio-app] .cmst-drawer-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    min-height: 48px;
+    padding: 8px 12px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--cmst-secondary-text);
+    font-size: 14px;
+    font-weight: 500;
+    text-align: left;
+    text-decoration: none;
+    cursor: pointer;
+  }
+  [data-studio-app] .cmst-drawer-row:hover {
+    background: var(--cmst-hover);
+    color: var(--cmst-fg);
+  }
+  /* Nav drawer row: wash + bright text selection (no accent bar). */
+  [data-studio-app] .cmst-drawer-row[data-active="true"] {
+    background: var(--cmst-raised);
+    color: var(--cmst-fg);
+  }
+  [data-studio-app] .cmst-drawer-hint {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--cmst-muted);
+    white-space: nowrap;
+  }
+
+  /* Right inspector (wizard home): header + scroll body + footer bar.
+   * Teleported to <body> (see WorkflowsView) so it escapes the host overlay's
+   * z-60 stacking context: ComfyUI's own canvas chrome paints at z-999/1200
+   * and would otherwise cover the inspector and steal its clicks. z-2000 sits
+   * above ComfyUI chrome but below the legacy Studio overlay (9999).
+   * Fixed against the viewport, docked to the host frame's right edge
+   * (frame is min(1200px,96vw) centered, 92vh tall): no backdrop, so the host
+   * graph stays visible and interactive around the frame during binding.
+   * Stays put while the frame content scrolls beneath it.
+   * top: ComfyUI's own floating top-right cluster paints above the host
+   * overlay (measured bottom edge ~95px at 1920w), so the inspector starts
+   * below it — otherwise the header/close is covered. */
+  [data-studio-app] .cmst-inspector {
+    position: fixed;
+    top: 104px;
+    bottom: 4vh;
+    right: max(0px, calc((100vw - 1200px) / 2));
+    z-index: 2000;
+    width: 360px;
+    max-width: 94vw;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    background: var(--cmst-surface);
+    border-left: 1px solid var(--cmst-border);
+    box-shadow: var(--cmst-shadow-overlay);
+  }
+  [data-studio-app] .cmst-inspector-head {
+    flex-shrink: 0;
+    padding: 14px 16px 12px;
+    border-bottom: 1px solid var(--cmst-border);
+  }
+  [data-studio-app] .cmst-inspector-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 14px 16px;
+  }
+  [data-studio-app] .cmst-inspector-foot {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--cmst-border);
+    background: var(--cmst-surface);
+  }
+  [data-studio-app] .cmst-progress-thin {
+    height: 2px;
+    border-radius: 1px;
+    background: var(--cmst-raised);
+    overflow: hidden;
+  }
+  [data-studio-app] .cmst-progress-thin > span {
+    display: block;
+    height: 100%;
+    background: var(--cmst-primary);
+    border-radius: inherit;
+    transition: width var(--cmst-motion-base) ease-out;
+  }
+
+  /* Value-first summary row (completed wizard steps, facts): label left,
+   * mono value right, hairline between peers only. */
+  [data-studio-app] .cmst-value-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 0;
+    border-top: 1px solid var(--cmst-border);
+    font-size: 13px;
+  }
+  [data-studio-app] .cmst-value-row:first-child {
+    border-top: 0;
+  }
+  [data-studio-app] .cmst-value-row > :first-child {
+    color: var(--cmst-secondary-text);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  [data-studio-app] .cmst-value-row > :last-child {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--cmst-muted);
+    text-align: right;
+  }
+  [data-studio-app] .cmst-value-row[data-modified="true"] > :last-child {
+    color: var(--cmst-primary-hover);
+  }
+
+  /* Graph-target chip: dashed empty (awaiting) vs confirmed bound target. */
+  [data-studio-app] .cmst-target-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  [data-studio-app] .cmst-target-chip[data-state="empty"] {
+    border: 1px dashed var(--cmst-muted);
+    color: var(--cmst-muted);
+  }
+  [data-studio-app] .cmst-target-chip[data-state="bound"] {
+    border: 1px solid var(--cmst-border);
+    background: var(--cmst-raised);
+    color: var(--cmst-fg);
   }
 }

@@ -20,7 +20,7 @@ const columns = computed(() => {
 
 <template>
   <div
-    class="cmst:grid cmst:gap-3"
+    class="cmst:grid cmst:gap-0.5"
     :style="{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }"
     data-testid="vue-history-grid"
   >
