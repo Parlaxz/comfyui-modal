@@ -47,3 +47,17 @@ Starting point: 293-row v1 oracle (10/6/1 legacy smoke; PASS/FAIL/UNKNOWN/NOT_AP
 ## Remaining UNKNOWNs
 
 See `coverage.md` (BROWSER / RACE / REAL_BACKEND / INTEGRATION lists). Each row states exactly what evidence resolves it.
+
+---
+
+# Final cleanup freeze (2026-10-17, commit `test(studio): finalize Vue parity oracle contracts`)
+
+- POLL-OWNER merged into POLL-ABORT (kept stable ID); contradiction removed. Correct invariant: one domain owner, no duplication, navigation never auto-kills, terminal/dispose stops, domain owns semantics.
+- SK2-SURFACE rewritten from selector/wording freeze to behavioral surface requirement; reuse invariant kept.
+- POST2-PIPELINE deleted as product_behavior (Canvas 2D internals not parity-scored); reuse invariant governs.
+- POST2-PERSIST rewritten as durable-data compatibility (existing keys or bounded migration read), not key identity.
+- Added SKETCH-ENGINE-REUSE + POST-ENGINE-REUSE family contracts (migration_architecture, PASS/STATIC as recorded binding directives). Existing SK2/POST2 granularity kept: acceptance surfaces, not rebuild tasks.
+- Stale-contract sweep: two historical Vue-Router-restraint mentions reworded; no other live remnants (SET-SKIP exact-key, POLL-TERMINAL done/abort, correction-history notes all valid).
+- Settled decisions untouched: Model Library in Manage Modal, Sketch/Post reuse, Upscale parked, Vue Router + operationStore approved, run-controller reuse, canvas separation, History V2, no Comparison revival.
+- Guards added to builder: contradictory nav-poll policy (negation-aware), reused-engine DOM/copy freeze, post mechanism freeze; validator now also owns duplicate-ID detection.
+- Docs: README distinguishes editable row sources vs generated compiled oracle; coverage overlap explained in README + coverage header; AUDIT_REPORT.md bannered as historical record.

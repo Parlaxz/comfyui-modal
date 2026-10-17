@@ -58,3 +58,33 @@ def test_parity_manifest_valid_and_honest():
     assert "Needs BROWSER" in coverage and "Needs RACE" in coverage
     assert manifest["static_checks"]["no-provider-branch"]["ok"] is True
     assert manifest["static_checks"]["no-old-css"]["ok"] is True
+
+
+def _row(rid, **kw):
+    base = {"id": rid, "contract_type": "product_behavior", "area": "async",
+            "behavior": "placeholder", "authorities": [{"kind": "legacy_impl", "ref": "x"}],
+            "required_evidence": ["STATIC"], "current_evidence": ["STATIC"],
+            "status": "UNKNOWN", "reason": "test", "legacy_evidence": "",
+            "vue_evidence": "", "tests_or_traces": [], "implementation_invariant": "",
+            "notes": ""}
+    base.update(kw)
+    return base
+
+
+@pytest.mark.fast_unit
+def test_contract_guards_reject_known_mistakes():
+    sys.path.insert(0, str(REPO / "tools" / "parity_oracle"))
+    import build_manifest as bm
+    poll_rows = [
+        _row("T-POLL-A", behavior="Abort polls on navigation to another page"),
+        _row("T-POLL-B", behavior="Route navigation does NOT kill running polls"),
+    ]
+    assert any("contradictory" in p for p in bm.contract_guards(poll_rows))
+    dom_rows = [_row("T-SKETCH", area="generate/sketch",
+                     behavior="Sketch preserves exact selectors and save wording")]
+    assert any("DOM/copy" in p for p in bm.contract_guards(dom_rows))
+    mech_rows = [_row("T-POST", area="post",
+                      behavior="Post requires the single-threaded Canvas 2D pipeline")]
+    assert any("mechanism" in p for p in bm.contract_guards(mech_rows))
+    clean = [_row("T-OK", behavior="Polls have one owner; navigation does NOT kill them")]
+    assert bm.contract_guards(clean) == []

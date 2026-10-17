@@ -75,12 +75,53 @@ def load_rows() -> list[dict]:
     return rows
 
 
+NAV_KILL = re.compile(r"abort.{0,40}navigat|kill.{0,30}navigat|navigat.{0,30}kill", re.I)
+NAV_CONTINUE = re.compile(r"navigat.{0,60}does\s+not.{0,60}(kill|abort|stop|cancel)|continu.{0,40}across.{0,20}(navigat|page)|must\s+not\s+die", re.I)
+DOM_FREEZE = re.compile(r"exact\s+(old\s+)?(selector|test-?id|wording|class|dom)|legacy\s+(class|dom|selector)|wording\s+preserv|selectors?\s+preserv", re.I)
+MECH_FREEZE = re.compile(
+    r"canvas\s*2d.{0,40}(required|requires|must|needs)|"
+    r"single-threaded.{0,40}(required|requires|must|needs)|"
+    r"(requires|must|needs).{0,40}canvas\s*2d|"
+    r"(requires|must|needs).{0,40}single-threaded", re.I)
+
+
+def contract_guards(rows: list[dict]) -> list[str]:
+    """Targeted guards against recurring oracle mistakes (cheap keyword rules)."""
+    problems = []
+    nav_rows = [r for r in rows
+                if "poll" in r["id"].lower() or "poll" in r.get("area", "").lower()
+                or "long-running" in r.get("behavior", "").lower()]
+    def _affirmative_kill(text: str) -> bool:
+        # A kill/abort requirement counts only when neither the match nor its
+        # surroundings negate it ("does NOT kill", "never aborts"). Negated
+        # mentions are the corrected policy, not the contradiction.
+        for m in NAV_KILL.finditer(text):
+            window = (text[max(0, m.start() - 24):m.start()] + " " + m.group(0)).lower()
+            if re.search(r"\b(not|never|without|no|isn't)\b", window):
+                continue
+            return True
+        return False
+    if any(_affirmative_kill(r.get("behavior", "") or "") for r in nav_rows) and \
+       any(NAV_CONTINUE.search(r.get("behavior", "") or "") for r in nav_rows):
+        problems.append("contradictory navigation-poll policy: rows both require and forbid abort/kill on navigation")
+    for r in rows:
+        blob = " ".join(str(r.get(k, "") or "") for k in ("behavior", "reason", "notes"))
+        exempt = bool(re.search(r"\bNOT\b.{0,80}(migration\s+)?requirements?", blob))
+        is_engine_row = "sketch" in r["id"].lower() or r["id"].startswith(("POST", "SK"))
+        if not exempt and is_engine_row and DOM_FREEZE.search(blob):
+            problems.append(f"{r['id']}: reused-engine row freezes old DOM/copy (selectors/test-ids/wording/classes)")
+        if (r["id"].startswith("POST") or r["area"] == "post") and MECH_FREEZE.search(blob):
+            problems.append(f"{r['id']}: post row freezes implementation mechanism (Canvas 2D / single-threaded)")
+    return problems
+
+
 def validate(rows: list[dict], checks: dict) -> list[str]:
     problems = []
     ids = [r.get("id") or "" for r in rows]
     dupes = sorted({i for i in ids if i and ids.count(i) > 1})
     if dupes:
         problems.append(f"duplicate row ids: {dupes}")
+    problems.extend(contract_guards(rows))
     for r in rows:
         missing = REQUIRED_KEYS - set(r)
         if missing:
@@ -211,7 +252,9 @@ def write_report(manifest: dict) -> None:
 def write_coverage(manifest: dict) -> None:
     rows = manifest["rows"]
     L = ["# Parity coverage gaps", "",
-         "Unresolved rows grouped by the evidence still required.", ""]
+         "Unresolved rows grouped by the evidence still required.",
+         "These groups OVERLAP by design: evidence is a set, so one row appears under every",
+         "level it still needs. Do not sum groups; manifest counts are the row totals.", ""]
     for level in ["BROWSER", "RACE", "REAL_BACKEND", "INTEGRATION", "UNIT", "STATIC"]:
         need = [r for r in rows if r["status"] in ("UNKNOWN", "FAIL")
                 and level in r["required_evidence"] and level not in r["current_evidence"]]

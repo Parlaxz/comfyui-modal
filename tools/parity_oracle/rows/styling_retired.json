@@ -326,11 +326,11 @@
     ],
     "status": "PASS",
     "reason": "Revised blueprint approves Vue Router with the frozen hash contract; source proves createRouter over a custom #comfymodal history. Behavioral URL compatibility stays on route rows.",
-    "legacy_evidence": "blueprint 1.2/2.1: do not add Vue Router unless contract undemonstrably maintainable",
+    "legacy_evidence": "superseded Phase-0 restraint (revised docs/VUE_MIGRATION_BLUEPRINT.md sections 4, 7 approve Vue Router)",
     "vue_evidence": "app/router/index.ts:44 createRouter; studioHistory.ts custom history; vue-router in package.json deps",
     "tests_or_traces": [],
     "implementation_invariant": "",
-    "notes": "Corrected: was UNKNOWN/alleged drift; no owner ruling needed."
+    "notes": "Superseded restraint; Vue Router is approved, no ruling needed."
   },
   {
     "id": "ARCH-API-LAYER",

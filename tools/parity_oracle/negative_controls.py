@@ -148,6 +148,36 @@ def main() -> int:
         ("NC-DUPLICATE-ID", _metadata_control(
             "NC-DUPLICATE-ID",
             lambda rows: rows.append(dict(rows[0])))),
+        # Contradictory navigation-poll policy reintroduced.
+        ("NC-GUARD-POLL", _metadata_control(
+            "NC-GUARD-POLL",
+            lambda rows: rows.append({"id": "NC-POLL-BAD", "contract_type": "product_behavior",
+                                      "area": "async", "behavior": "Abort polls on navigation to another page",
+                                      "authorities": [{"kind": "legacy_impl", "ref": "x"}],
+                                      "required_evidence": ["RACE"], "current_evidence": ["STATIC"],
+                                      "status": "UNKNOWN", "reason": "bogus",
+                                      "legacy_evidence": "", "vue_evidence": "",
+                                      "tests_or_traces": [], "implementation_invariant": "", "notes": ""}))),
+        # Old DOM/copy freeze reintroduced on a sketch row.
+        ("NC-GUARD-DOM", _metadata_control(
+            "NC-GUARD-DOM",
+            lambda rows: rows.append({"id": "NC-SKETCH-BAD", "contract_type": "product_behavior",
+                                      "area": "generate/sketch", "behavior": "Sketch preserves exact selectors and save wording",
+                                      "authorities": [{"kind": "legacy_impl", "ref": "x"}],
+                                      "required_evidence": ["BROWSER"], "current_evidence": ["STATIC"],
+                                      "status": "UNKNOWN", "reason": "bogus",
+                                      "legacy_evidence": "", "vue_evidence": "",
+                                      "tests_or_traces": [], "implementation_invariant": "", "notes": ""}))),
+        # Canvas 2D mechanism freeze reintroduced on a post row.
+        ("NC-GUARD-MECH", _metadata_control(
+            "NC-GUARD-MECH",
+            lambda rows: rows.append({"id": "NC-POST-BAD", "contract_type": "product_behavior",
+                                      "area": "post", "behavior": "Post requires the single-threaded Canvas 2D pipeline",
+                                      "authorities": [{"kind": "legacy_impl", "ref": "x"}],
+                                      "required_evidence": ["BROWSER"], "current_evidence": ["STATIC"],
+                                      "status": "UNKNOWN", "reason": "bogus",
+                                      "legacy_evidence": "", "vue_evidence": "",
+                                      "tests_or_traces": [], "implementation_invariant": "", "notes": ""}))),
     ]
 
     # Smoke contamination: atomic totals must be independent of smoke labels.

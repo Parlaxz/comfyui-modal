@@ -127,39 +127,14 @@
     "notes": "Corrected: specialized tokens are not automatically redundant."
   },
   {
-    "id": "POLL-OWNER",
-    "contract_type": "product_behavior",
-    "area": "async",
-    "behavior": "Long polls have one owner; abort on navigation/terminal; domain keeps backend semantics",
-    "authorities": [
-      {
-        "kind": "migration_contract",
-        "ref": "blueprint 5 deploy rule"
-      }
-    ],
-    "required_evidence": [
-      "RACE"
-    ],
-    "current_evidence": [
-      "STATIC"
-    ],
-    "status": "UNKNOWN",
-    "reason": "Utility is single-purpose but several domain call sites exist; ownership unproven.",
-    "legacy_evidence": "legacy bounded deploy polls",
-    "vue_evidence": "async/polling.ts:1-22; infrastructure call sites",
-    "tests_or_traces": [],
-    "implementation_invariant": "",
-    "notes": ""
-  },
-  {
     "id": "POLL-ABORT",
     "contract_type": "product_behavior",
     "area": "async",
-    "behavior": "Long polls: one owner; navigation/rerender never duplicates polling; operation continues when domain requires; terminal/dispose/replacement stops it; no zombie timers",
+    "behavior": "Long-running operations (deploy, model install/download, node publication/rebuild, inventory/status): one domain owner; no duplicate poll loops; route navigation does NOT automatically kill the operation; rerender/reopen never creates a second owner; terminal/dispose/replacement stops the poll when appropriate; no zombie timers/listeners; domain owns success/failure semantics",
     "authorities": [
       {
         "kind": "migration_contract",
-        "ref": "blueprint 5"
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md section 8; binding ownership rule"
       }
     ],
     "required_evidence": [
@@ -169,7 +144,7 @@
       "STATIC"
     ],
     "status": "UNKNOWN",
-    "reason": "Old row wrongly required abort-on-navigate. Real invariant unproven: duplication/ownership/zombies need race evidence. A download must NOT die because the user opens History.",
+    "reason": "Real invariant unproven: single ownership, no duplication across navigation/rerender, continuation when domain requires, terminal/dispose stops, no zombies. A download must NOT die because the user opens History. (Absorbed POLL-OWNER; the old contradictory clause is removed.)",
     "legacy_evidence": "legacy lifecycle cleanup",
     "vue_evidence": "async/polling.ts:24-77; stores/infrastructure.ts:300-520 without abort owner",
     "tests_or_traces": [],

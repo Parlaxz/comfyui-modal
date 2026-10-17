@@ -1,18 +1,18 @@
 {
-  "generated_at": "2026-10-17T16:34:50.159154+00:00",
-  "repo_sha": "86d9d1b765b6d075f726794013d7c0f0c7b666fd",
+  "generated_at": "2026-10-17T16:54:37.258809+00:00",
+  "repo_sha": "0827f43ab35ce3ebfd6a8ac2fd962681502cea35",
   "oracle": "parity/ORACLE_FREEZE.json",
   "migration_contract": "docs/VUE_MIGRATION_BLUEPRINT.md (revised; binding for architecture)",
   "verdict_rule": "PASS only when required_evidence \u2286 current_evidence. FAIL provable by code absence with current ['STATIC']. No hand-typed PASS; no LIKELY PARITY.",
   "counts": {
     "by_type": {
       "product_behavior": {
-        "UNKNOWN": 232,
+        "UNKNOWN": 231,
         "PASS": 25,
-        "FAIL": 120
+        "FAIL": 119
       },
       "migration_architecture": {
-        "PASS": 5,
+        "PASS": 7,
         "UNKNOWN": 1,
         "INTENTIONAL_CHANGE": 2
       },
@@ -21,9 +21,9 @@
       }
     },
     "total": {
-      "UNKNOWN": 233,
-      "PASS": 30,
-      "FAIL": 120,
+      "UNKNOWN": 232,
+      "PASS": 32,
+      "FAIL": 119,
       "INTENTIONAL_CHANGE": 2,
       "NA": 9
     },
@@ -431,40 +431,14 @@
       "_source_file": "async_ops.json"
     },
     {
-      "id": "POLL-OWNER",
-      "contract_type": "product_behavior",
-      "area": "async",
-      "behavior": "Long polls have one owner; abort on navigation/terminal; domain keeps backend semantics",
-      "authorities": [
-        {
-          "kind": "migration_contract",
-          "ref": "blueprint 5 deploy rule"
-        }
-      ],
-      "required_evidence": [
-        "RACE"
-      ],
-      "current_evidence": [
-        "STATIC"
-      ],
-      "status": "UNKNOWN",
-      "reason": "Utility is single-purpose but several domain call sites exist; ownership unproven.",
-      "legacy_evidence": "legacy bounded deploy polls",
-      "vue_evidence": "async/polling.ts:1-22; infrastructure call sites",
-      "tests_or_traces": [],
-      "implementation_invariant": "",
-      "notes": "",
-      "_source_file": "async_ops.json"
-    },
-    {
       "id": "POLL-ABORT",
       "contract_type": "product_behavior",
       "area": "async",
-      "behavior": "Long polls: one owner; navigation/rerender never duplicates polling; operation continues when domain requires; terminal/dispose/replacement stops it; no zombie timers",
+      "behavior": "Long-running operations (deploy, model install/download, node publication/rebuild, inventory/status): one domain owner; no duplicate poll loops; route navigation does NOT automatically kill the operation; rerender/reopen never creates a second owner; terminal/dispose/replacement stops the poll when appropriate; no zombie timers/listeners; domain owns success/failure semantics",
       "authorities": [
         {
           "kind": "migration_contract",
-          "ref": "blueprint 5"
+          "ref": "docs/VUE_MIGRATION_BLUEPRINT.md section 8; binding ownership rule"
         }
       ],
       "required_evidence": [
@@ -474,7 +448,7 @@
         "STATIC"
       ],
       "status": "UNKNOWN",
-      "reason": "Old row wrongly required abort-on-navigate. Real invariant unproven: duplication/ownership/zombies need race evidence. A download must NOT die because the user opens History.",
+      "reason": "Real invariant unproven: single ownership, no duplication across navigation/rerender, continuation when domain requires, terminal/dispose stops, no zombies. A download must NOT die because the user opens History. (Absorbed POLL-OWNER; the old contradictory clause is removed.)",
       "legacy_evidence": "legacy lifecycle cleanup",
       "vue_evidence": "async/polling.ts:24-77; stores/infrastructure.ts:300-520 without abort owner",
       "tests_or_traces": [],
@@ -6292,19 +6266,19 @@
       "authorities": [
         {
           "kind": "legacy_impl",
-          "ref": "web/studio-postprocess.js:11-12"
+          "ref": "web/studio-postprocess.js:17-19 (LS_RECIPE/LS_PRESETS/LS_LUTFAV)"
         }
       ],
-      "behavior": "Single-threaded Canvas 2D pipeline; native deviations marked APPROX",
+      "behavior": "Accepted Post user state that is intentionally durable (recipe/current settings, saved Looks/presets, LUT favorites) remains available after migration, via existing keys or a bounded compatibility read/migration into the new persistence mechanism",
       "contract_type": "product_behavior",
       "current_evidence": [
         "STATIC"
       ],
-      "id": "POST2-PIPELINE",
+      "id": "POST2-PERSIST",
       "implementation_invariant": "reuse_existing_upstream_derived_engine",
-      "legacy_evidence": "web/studio-postprocess.js:11-12",
-      "notes": "",
-      "reason": "Accepted engine character; no Vue engine.",
+      "legacy_evidence": "web/studio-postprocess.js:17-19",
+      "notes": "Corrected: was exact-key preservation.",
+      "reason": "Durable-data compatibility is the requirement, not exact storage-key identity \u2014 unless a remaining non-Vue consumer needs the exact key. If existing user data under comfymodal.studio.postprocess.* must survive, the port must read/migrate those keys. No Vue implementation exists.",
       "required_evidence": [
         "BROWSER"
       ],
@@ -6314,29 +6288,33 @@
       "_source_file": "post_engine.json"
     },
     {
+      "id": "POST-ENGINE-REUSE",
+      "contract_type": "migration_architecture",
       "area": "post",
+      "behavior": "Post migration reuses/ports the existing TinyLuma-derived engine/editor via a thin Vue host/adaptation with fresh presentation. The processing engine is NEVER rebuilt feature-by-feature; Canvas 2D internals are not parity-scored.",
       "authorities": [
         {
+          "kind": "owner_decision",
+          "ref": "Binding: Post is an integration/port, not a reimplementation"
+        },
+        {
           "kind": "legacy_impl",
-          "ref": "web/studio-postprocess.js:17-19 (LS_RECIPE/LS_PRESETS/LS_LUTFAV)"
+          "ref": "web/studio-postprocess.js:1-13 (TinyLuma-based; commit 9b333d08)"
         }
       ],
-      "behavior": "Recipe, presets, LUT favorites persist under designated localStorage keys",
-      "contract_type": "product_behavior",
+      "required_evidence": [
+        "STATIC"
+      ],
       "current_evidence": [
         "STATIC"
       ],
-      "id": "POST2-PERSIST",
-      "implementation_invariant": "reuse_existing_upstream_derived_engine",
-      "legacy_evidence": "web/studio-postprocess.js:17-19",
-      "notes": "",
-      "reason": "Accepted persistence keys; no Vue implementation.",
-      "required_evidence": [
-        "UNIT"
-      ],
-      "status": "FAIL",
+      "status": "PASS",
+      "reason": "Contract recorded and binding; POST2-* acceptance rows inherit it via implementation_invariant. Compliance is verified when the port lands.",
+      "legacy_evidence": "web/studio-postprocess.js (engine :224-674; shell :720-1905)",
+      "vue_evidence": "Directive for future migration (thin host/adapter acceptable)",
       "tests_or_traces": [],
-      "vue_evidence": "MISSING (searched frontend/src)",
+      "implementation_invariant": "reuse_existing_upstream_derived_engine",
+      "notes": "Family contract: POST2-* rows are acceptance surfaces of this engine, not rebuild tasks.",
       "_source_file": "post_engine.json"
     },
     {
@@ -8965,7 +8943,7 @@
           "ref": "tests/studio_phase6_sketch_contract.mjs:177-192"
         }
       ],
-      "behavior": "Sketch surface preserves canvas/undo/save/mask-preview selectors and save wording",
+      "behavior": "Sketch surface exposes the required canvas interaction, undo/redo, save/commit and mask-preview behavior through the Vue UI",
       "contract_type": "product_behavior",
       "current_evidence": [
         "STATIC"
@@ -8973,14 +8951,44 @@
       "id": "SK2-SURFACE",
       "implementation_invariant": "reuse_existing_upstream_derived_engine",
       "legacy_evidence": "tests/studio_phase6_sketch_contract.mjs:177-192",
-      "notes": "",
-      "reason": "Selector/wording preservation statically accepted; no Vue surface.",
+      "notes": "Corrected: was a selector/wording freeze; behavioral rewrite.",
+      "reason": "Legacy selectors, test IDs, DOM shape, and exact wording are explicitly NOT migration requirements (fresh DOM/CSS/components allowed). Only product-meaningful behavior must survive. No Vue sketch surface exists.",
       "required_evidence": [
         "BROWSER"
       ],
       "status": "FAIL",
       "tests_or_traces": [],
       "vue_evidence": "MISSING (searched frontend/src)",
+      "_source_file": "sketch_engine.json"
+    },
+    {
+      "id": "SKETCH-ENGINE-REUSE",
+      "contract_type": "migration_architecture",
+      "area": "generate/sketch",
+      "behavior": "Sketch migration reuses/ports the existing ComfySketch-derived engine (engine, layers, composite, history, zoom/pan, flatten); only host/state seams are adapted, presentation is fresh. The drawing/layer engine is NEVER rewritten from scratch while it exists.",
+      "authorities": [
+        {
+          "kind": "owner_decision",
+          "ref": "Binding: Sketch is an integration/port, not a reimplementation"
+        },
+        {
+          "kind": "legacy_impl",
+          "ref": "web/studio-sketch-engine.js:1-19 (MIT comfyui-comfysketch, Mexes1978)"
+        }
+      ],
+      "required_evidence": [
+        "STATIC"
+      ],
+      "current_evidence": [
+        "STATIC"
+      ],
+      "status": "PASS",
+      "reason": "Contract recorded and binding; SK2-* acceptance rows inherit it via implementation_invariant. Compliance is verified when the port lands.",
+      "legacy_evidence": "web/studio-sketch-{engine,layers,panels,shell}.js",
+      "vue_evidence": "Directive for future migration (no engine rewrite)",
+      "tests_or_traces": [],
+      "implementation_invariant": "reuse_existing_upstream_derived_engine",
+      "notes": "Family contract: SK2-* rows are acceptance surfaces of this engine, not rebuild tasks.",
       "_source_file": "sketch_engine.json"
     },
     {
@@ -10166,11 +10174,11 @@
       ],
       "status": "PASS",
       "reason": "Revised blueprint approves Vue Router with the frozen hash contract; source proves createRouter over a custom #comfymodal history. Behavioral URL compatibility stays on route rows.",
-      "legacy_evidence": "blueprint 1.2/2.1: do not add Vue Router unless contract undemonstrably maintainable",
+      "legacy_evidence": "superseded Phase-0 restraint (revised docs/VUE_MIGRATION_BLUEPRINT.md sections 4, 7 approve Vue Router)",
       "vue_evidence": "app/router/index.ts:44 createRouter; studioHistory.ts custom history; vue-router in package.json deps",
       "tests_or_traces": [],
       "implementation_invariant": "",
-      "notes": "Corrected: was UNKNOWN/alleged drift; no owner ruling needed.",
+      "notes": "Superseded restraint; Vue Router is approved, no ruling needed.",
       "_source_file": "styling_retired.json"
     },
     {

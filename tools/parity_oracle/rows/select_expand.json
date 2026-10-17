@@ -1,19 +1,455 @@
 [
-  {"area": "edit/select", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:6798-6805"}, {"kind": "accepted_test", "ref": "tests/browser/fake/studio-fake-inpaint-tools.spec.mjs"}], "behavior": "Select offers Brush, Lasso, Rectangle, Object, Detect tools", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "SEL2-TOOLS", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:6798-6805", "notes": "", "reason": "Accepted tool set; no Vue Select editor.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": ["tests/browser/fake/studio-fake-inpaint-tools.spec.mjs"], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/select", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:6835-6837"}], "behavior": "Mask ops Add, Subtract, Replace", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "SEL2-ADD-SUB", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:6835-6837", "notes": "", "reason": "Accepted ops; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": ["tests/browser/fake/studio-fake-inpaint-tools.spec.mjs"], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/select", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:6835-6837"}], "behavior": "Mask ops Grow, Shrink, Feather (radius-based)", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "SEL2-GROW", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:6835-6837", "notes": "", "reason": "Accepted ops; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": ["tests/browser/fake/studio-fake-inpaint-tools.spec.mjs"], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/select", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:7463-7465"}], "behavior": "Mask ops Invert, Fill Holes, Clear; mask Undo/Redo round trip", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "SEL2-INVERT-HISTORY", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:7463-7465; inpaint spec :114-161", "notes": "", "reason": "Accepted ops/history; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": ["tests/browser/fake/studio-fake-inpaint-tools.spec.mjs:114-161"], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/select", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:6798-6805"}], "behavior": "Erase is Brush + Subtract, not its own subsystem", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "SEL2-ERASE-EQ", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:6798-6805", "notes": "Architecture constraint for future implementation: do not build a separate erase subsystem.", "reason": "Equivalence unproven; no Vue editor to verify against.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/select", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:6077-6171"}], "behavior": "Select source via Upload, Current, History, drag-drop, paste", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "SEL2-SOURCE-PATHS", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:6077-6171", "notes": "", "reason": "Five accepted paths; no Vue Select source acquisition.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": ["tests/browser/fake/studio-fake-inpaint-tools.spec.mjs"], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/select", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:6171-6314"}, {"kind": "accepted_test", "ref": "tests/browser/fake/studio-fake-inpaint-tools.spec.mjs:268-328"}], "behavior": "Select source Replace/Clear; clear invalidates paint history (Undo cannot resurrect)", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "SEL2-SOURCE-CLEAR", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:6171-6314; inpaint spec :318-328", "notes": "", "reason": "Accepted clear/invalidation; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": ["tests/browser/fake/studio-fake-inpaint-tools.spec.mjs:268-328"], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/select", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:6171"}], "behavior": "Base change clears stale overlay strokes and mask state", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "SEL2-BASE-CLEAR", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:6171", "notes": "", "reason": "Accepted reconciliation; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/select", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:6865-6891"}], "behavior": "Mask save carries mask into execution state", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "SEL2-MASK-SAVE", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:6865-6891", "notes": "", "reason": "Accepted save path; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/select", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:2143-2158"}], "behavior": "Select keeps legacy dedicated-inpaint compatibility alongside ordinary I2I", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "SEL2-COMPAT", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:2143-2158", "notes": "", "reason": "Accepted dual-path routing; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": ["tests/studio_phase6_sketch_contract.mjs:162"], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/expand", "authorities": [{"kind": "accepted_test", "ref": "tests/studio_phase3_methods_unit.mjs:43-48"}], "behavior": "Expand exposes independent Top/Right/Bottom/Left values", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "EXP2-SIDES", "implementation_invariant": "", "legacy_evidence": "tests/studio_phase3_methods_unit.mjs:43-48", "notes": "", "reason": "Accepted side values; no Vue Expand UI.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": ["tests/studio_phase3_methods_unit.mjs:43-48"], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/expand", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:1134-1137"}], "behavior": "Expand direct-manipulation preview alongside numeric controls", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "EXP2-DRAG", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:1134-1137", "notes": "", "reason": "Accepted direct manipulation; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/expand", "authorities": [{"kind": "accepted_test", "ref": "tests/studio_phase3_methods_unit.mjs:43-48,71-115"}], "behavior": "Expand methods Pad Canvas, Pad+Preserve, Dedicated Workflow", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "EXP2-METHODS", "implementation_invariant": "", "legacy_evidence": "tests/studio_phase3_methods_unit.mjs:43-48", "notes": "", "reason": "Accepted methods; no Vue method selector.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": ["tests/studio_phase3_methods_unit.mjs:71-115"], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/expand", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:2143-2158"}], "behavior": "Expand offers no Auto method", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "EXP2-NO-AUTO", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:2143-2158", "notes": "Future constraint: do not invent Auto when building Expand.", "reason": "No Expand UI exists to violate this yet; constraint recorded for implementation.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": "MISSING Expand entirely (searched frontend/src)"},
-  {"area": "edit/expand", "authorities": [{"kind": "accepted_test", "ref": "tests/studio_phase3_methods_unit.mjs:71-78,204"}], "behavior": "Expand remembers method per workflow; stored workflow stays immutable", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "EXP2-MEMORY", "implementation_invariant": "", "legacy_evidence": "tests/studio_phase3_methods_unit.mjs:71-78,204", "notes": "", "reason": "Accepted memory/immutability; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": ["tests/studio_phase3_methods_unit.mjs:204"], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/expand", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:1969-1977"}], "behavior": "Stale workflow responses cannot overwrite current Expand state", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "EXP2-RACE", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:1969-1977", "notes": "", "reason": "Accepted ownership boundary; no Vue implementation.", "required_evidence": ["RACE"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "edit/expand", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-playground.js:2143-2158"}], "behavior": "Expand supports normal I2I workflows", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "EXP2-I2I", "implementation_invariant": "", "legacy_evidence": "web/studio-playground.js:2143-2158", "notes": "", "reason": "Accepted I2I support; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"}
+  {
+    "area": "edit/select",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:6798-6805"
+      },
+      {
+        "kind": "accepted_test",
+        "ref": "tests/browser/fake/studio-fake-inpaint-tools.spec.mjs"
+      }
+    ],
+    "behavior": "Select offers Brush, Lasso, Rectangle, Object, Detect tools",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "SEL2-TOOLS",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:6798-6805",
+    "notes": "",
+    "reason": "Accepted tool set; no Vue Select editor.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [
+      "tests/browser/fake/studio-fake-inpaint-tools.spec.mjs"
+    ],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/select",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:6835-6837"
+      }
+    ],
+    "behavior": "Mask ops Add, Subtract, Replace",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "SEL2-ADD-SUB",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:6835-6837",
+    "notes": "",
+    "reason": "Accepted ops; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [
+      "tests/browser/fake/studio-fake-inpaint-tools.spec.mjs"
+    ],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/select",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:6835-6837"
+      }
+    ],
+    "behavior": "Mask ops Grow, Shrink, Feather (radius-based)",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "SEL2-GROW",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:6835-6837",
+    "notes": "",
+    "reason": "Accepted ops; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [
+      "tests/browser/fake/studio-fake-inpaint-tools.spec.mjs"
+    ],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/select",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:7463-7465"
+      }
+    ],
+    "behavior": "Mask ops Invert, Fill Holes, Clear; mask Undo/Redo round trip",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "SEL2-INVERT-HISTORY",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:7463-7465; inpaint spec :114-161",
+    "notes": "",
+    "reason": "Accepted ops/history; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [
+      "tests/browser/fake/studio-fake-inpaint-tools.spec.mjs:114-161"
+    ],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/select",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:6798-6805"
+      }
+    ],
+    "behavior": "Erase is Brush + Subtract, not its own subsystem",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "SEL2-ERASE-EQ",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:6798-6805",
+    "notes": "Architecture constraint for future implementation: do not build a separate erase subsystem.",
+    "reason": "Equivalence unproven; no Vue editor to verify against.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/select",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:6077-6171"
+      }
+    ],
+    "behavior": "Select source via Upload, Current, History, drag-drop, paste",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "SEL2-SOURCE-PATHS",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:6077-6171",
+    "notes": "",
+    "reason": "Five accepted paths; no Vue Select source acquisition.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [
+      "tests/browser/fake/studio-fake-inpaint-tools.spec.mjs"
+    ],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/select",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:6171-6314"
+      },
+      {
+        "kind": "accepted_test",
+        "ref": "tests/browser/fake/studio-fake-inpaint-tools.spec.mjs:268-328"
+      }
+    ],
+    "behavior": "Select source Replace/Clear; clear invalidates paint history (Undo cannot resurrect)",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "SEL2-SOURCE-CLEAR",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:6171-6314; inpaint spec :318-328",
+    "notes": "",
+    "reason": "Accepted clear/invalidation; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [
+      "tests/browser/fake/studio-fake-inpaint-tools.spec.mjs:268-328"
+    ],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/select",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:6171"
+      }
+    ],
+    "behavior": "Base change clears stale overlay strokes and mask state",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "SEL2-BASE-CLEAR",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:6171",
+    "notes": "",
+    "reason": "Accepted reconciliation; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/select",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:6865-6891"
+      }
+    ],
+    "behavior": "Mask save carries mask into execution state",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "SEL2-MASK-SAVE",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:6865-6891",
+    "notes": "",
+    "reason": "Accepted save path; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/select",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:2143-2158"
+      }
+    ],
+    "behavior": "Select keeps legacy dedicated-inpaint compatibility alongside ordinary I2I",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "SEL2-COMPAT",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:2143-2158",
+    "notes": "",
+    "reason": "Accepted dual-path routing; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [
+      "tests/studio_phase6_sketch_contract.mjs:162"
+    ],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/expand",
+    "authorities": [
+      {
+        "kind": "accepted_test",
+        "ref": "tests/studio_phase3_methods_unit.mjs:43-48"
+      }
+    ],
+    "behavior": "Expand exposes independent Top/Right/Bottom/Left values",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "EXP2-SIDES",
+    "implementation_invariant": "",
+    "legacy_evidence": "tests/studio_phase3_methods_unit.mjs:43-48",
+    "notes": "",
+    "reason": "Accepted side values; no Vue Expand UI.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [
+      "tests/studio_phase3_methods_unit.mjs:43-48"
+    ],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/expand",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:1134-1137"
+      }
+    ],
+    "behavior": "Expand direct-manipulation preview alongside numeric controls",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "EXP2-DRAG",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:1134-1137",
+    "notes": "",
+    "reason": "Accepted direct manipulation; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/expand",
+    "authorities": [
+      {
+        "kind": "accepted_test",
+        "ref": "tests/studio_phase3_methods_unit.mjs:43-48,71-115"
+      }
+    ],
+    "behavior": "Expand methods Pad Canvas, Pad+Preserve, Dedicated Workflow",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "EXP2-METHODS",
+    "implementation_invariant": "",
+    "legacy_evidence": "tests/studio_phase3_methods_unit.mjs:43-48",
+    "notes": "",
+    "reason": "Accepted methods; no Vue method selector.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [
+      "tests/studio_phase3_methods_unit.mjs:71-115"
+    ],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/expand",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:2143-2158"
+      }
+    ],
+    "behavior": "Expand offers no Auto method",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "EXP2-NO-AUTO",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:2143-2158",
+    "notes": "Future constraint: do not invent Auto when building Expand.",
+    "reason": "No Expand UI exists to violate this yet; constraint recorded for implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING Expand entirely (searched frontend/src)"
+  },
+  {
+    "area": "edit/expand",
+    "authorities": [
+      {
+        "kind": "accepted_test",
+        "ref": "tests/studio_phase3_methods_unit.mjs:71-78,204"
+      }
+    ],
+    "behavior": "Expand remembers method per workflow; stored workflow stays immutable",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "EXP2-MEMORY",
+    "implementation_invariant": "",
+    "legacy_evidence": "tests/studio_phase3_methods_unit.mjs:71-78,204",
+    "notes": "",
+    "reason": "Accepted memory/immutability; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [
+      "tests/studio_phase3_methods_unit.mjs:204"
+    ],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/expand",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:1969-1977"
+      }
+    ],
+    "behavior": "Stale workflow responses cannot overwrite current Expand state",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "EXP2-RACE",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:1969-1977",
+    "notes": "",
+    "reason": "Accepted ownership boundary; no Vue implementation.",
+    "required_evidence": [
+      "RACE"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "edit/expand",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground.js:2143-2158"
+      }
+    ],
+    "behavior": "Expand supports normal I2I workflows",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "EXP2-I2I",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-playground.js:2143-2158",
+    "notes": "",
+    "reason": "Accepted I2I support; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  }
 ]

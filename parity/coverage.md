@@ -1,6 +1,8 @@
 # Parity coverage gaps
 
 Unresolved rows grouped by the evidence still required.
+These groups OVERLAP by design: evidence is a set, so one row appears under every
+level it still needs. Do not sum groups; manifest counts are the row totals.
 
 ## Needs BROWSER (259)
 
@@ -166,7 +168,7 @@ Unresolved rows grouped by the evidence still required.
 - POST2-WORKFLOW [FAIL/product_behavior] post: Post supports presets, filmstrip, batch apply, undo-redo, before/after, export
 - POST2-ORDER [FAIL/product_behavior] post: Processing order heal -> color/curves/LUT -> dehaze -> spatial -> orient/straighten/crop
 - POST2-RES [FAIL/product_behavior] post: Preview capped at 1200px long side; export renders full resolution
-- POST2-PIPELINE [FAIL/product_behavior] post: Single-threaded Canvas 2D pipeline; native deviations marked APPROX
+- POST2-PERSIST [FAIL/product_behavior] post: Accepted Post user state that is intentionally durable (recipe/current settings, saved Looks/presets, LUT favorites) remains available after migration, via existing keys or a bounded compatibility read/migration into the new persistence mechanism
 - EXP-NO-RETRY-ALL [UNKNOWN/product_behavior] experiment: Per-cell retry only; no automatic retry-all
 - REF2-METHODS [UNKNOWN/product_behavior] generate/references: Accepted methods: Multi-image Conditioning Slots, Reference Latent Chain, Dedicated Workflow
 - REF2-NO-AUTO [UNKNOWN/product_behavior] generate/references: Method selection explicit; no Auto mode offered or implied
@@ -216,7 +218,7 @@ Unresolved rows grouped by the evidence still required.
 - SK2-LAYERS [FAIL/product_behavior] generate/sketch: Layers: add, delete, rename, visibility, opacity, reorder, duplicate, merge-down, flatten
 - SK2-BASE-LOCK [FAIL/product_behavior] generate/sketch: Base layer index-zero, locked, protected from deletion/movement
 - SK2-ROUTING [FAIL/product_behavior] generate/sketch: Sketch routes to sketch editor; legacy inpaint/Select keep paint editor
-- SK2-SURFACE [FAIL/product_behavior] generate/sketch: Sketch surface preserves canvas/undo/save/mask-preview selectors and save wording
+- SK2-SURFACE [FAIL/product_behavior] generate/sketch: Sketch surface exposes the required canvas interaction, undo/redo, save/commit and mask-preview behavior through the Vue UI
 - SK-OPEN [UNKNOWN/product_behavior] generate/sketch: Sketch editor opens with base image selection
 - SK-STROKES [FAIL/product_behavior] generate/sketch: Stroke creation, eraser, clear, undo/redo
 - SK-FLATTEN-UPLOAD [FAIL/product_behavior] generate/sketch: Sketch flattens and uploads with sketch identity as source
@@ -264,13 +266,12 @@ Unresolved rows grouped by the evidence still required.
 - PRESET-CLEAR-EDITORS [UNKNOWN/product_behavior] presets: Stale editor/direct-manip state cleared on preset apply
 - PRESET-LOOKS-SEPARATE [UNKNOWN/product_behavior] presets: Post Looks remain distinct from workflow presets
 
-## Needs RACE (32)
+## Needs RACE (31)
 
 - LATEST-READS [UNKNOWN/product_behavior] async: Workflow/version/detail reads use latest-wins primitive
 - LATEST-HISTORY [UNKNOWN/product_behavior] async: History feed/detail reads use latest-wins; entity may update cache but never steal focus
 - LATEST-REFRESH [UNKNOWN/product_behavior] async: Inventory/settings refresh reads use latest-wins
-- POLL-OWNER [UNKNOWN/product_behavior] async: Long polls have one owner; abort on navigation/terminal; domain keeps backend semantics
-- POLL-ABORT [UNKNOWN/product_behavior] async: Long polls: one owner; navigation/rerender never duplicates polling; operation continues when domain requires; terminal/dispose/replacement stops it; no zombie timers
+- POLL-ABORT [UNKNOWN/product_behavior] async: Long-running operations (deploy, model install/download, node publication/rebuild, inventory/status): one domain owner; no duplicate poll loops; route navigation does NOT automatically kill the operation; rerender/reopen never creates a second owner; terminal/dispose/replacement stops the poll when appropriate; no zombie timers/listeners; domain owns success/failure semantics
 - WS-MIDOP [UNKNOWN/product_behavior] operations: Workspace switch mid-operation cannot retarget submitted request
 - WS-GUARD [UNKNOWN/product_behavior] operations: Accepted operation stays bound to its accepted workspace; switching active workspace changes future operations only; current operation never retargeted
 - WF-STALE-READ [UNKNOWN/product_behavior] workflows: Stale workflow/version reads cannot commit over newer selection
@@ -358,9 +359,8 @@ Unresolved rows grouped by the evidence still required.
 - GUI-PAYLOAD [FAIL/product_behavior] generate/guidance: Guidance mutates request and persists per version
 - PRESET-NO-SETTINGS [UNKNOWN/product_behavior] presets: Preset output overrides never mutate global Settings
 
-## Needs UNIT (7)
+## Needs UNIT (6)
 
-- POST2-PERSIST [FAIL/product_behavior] post: Recipe, presets, LUT favorites persist under designated localStorage keys
 - QUEUE-EXTRAS-FROZEN [FAIL/product_behavior] queue: Methods/references/layout/guidance frozen at enqueue
 - QUEUE-ORDER [UNKNOWN/product_behavior] queue: FIFO order preserved across drain
 - QUEUE-REMOVE-CLEAR [UNKNOWN/product_behavior] queue: Remove and clear queue semantics

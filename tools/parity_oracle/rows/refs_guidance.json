@@ -1,17 +1,377 @@
 [
-  {"area": "generate/references", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-bindable-inputs.js reference methods; wizard reference sections"}], "behavior": "Accepted methods: Multi-image Conditioning Slots, Reference Latent Chain, Dedicated Workflow", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "REF2-METHODS", "implementation_invariant": "", "legacy_evidence": "web/studio-bindable-inputs.js method taxonomy", "notes": "", "reason": "Method taxonomy accepted; Vue method surface unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/references", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-bindable-inputs.js explicit method"}], "behavior": "Method selection explicit; no Auto mode offered or implied", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "REF2-NO-AUTO", "implementation_invariant": "", "legacy_evidence": "web/studio-bindable-inputs.js manual method", "notes": "", "reason": "No-Auto rule accepted; Vue method UI unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/references", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-bindable-inputs.js per-workflow method"}], "behavior": "Selected method remembered per workflow", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "REF2-MEMORY", "implementation_invariant": "", "legacy_evidence": "web/studio-bindable-inputs.js remembered method", "notes": "", "reason": "Per-workflow memory accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/references", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-bindable-inputs.js graph-derived capacity"}], "behavior": "Reference capacity derived from workflow graph (not a fixed count)", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "REF2-CAPACITY", "implementation_invariant": "", "legacy_evidence": "web/studio-bindable-inputs.js capacity derivation", "notes": "", "reason": "Graph-derived capacity accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/references", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-bindable-inputs.js reference sources"}], "behavior": "Reference slots fill from Upload, Current, History sources", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "REF2-SOURCES", "implementation_invariant": "", "legacy_evidence": "web/studio-bindable-inputs.js Upload/Current/History", "notes": "", "reason": "Three sources accepted; Vue slot sourcing unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/references", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-bindable-inputs.js stable identity"}], "behavior": "Reference entries keep stable identity across slot operations", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "REF2-IDENTITY", "implementation_invariant": "", "legacy_evidence": "web/studio-bindable-inputs.js identity", "notes": "", "reason": "Stable identity accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/references", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-bindable-inputs.js thumbnails; wizard sections"}], "behavior": "Entries show thumbnails; source image stays semantically distinct from references", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "REF2-THUMBS", "implementation_invariant": "", "legacy_evidence": "web/studio-bindable-inputs.js thumbnails + distinction", "notes": "", "reason": "Thumbnails/distinction accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/guidance", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-guidance.js model identity"}], "behavior": "Guidance resolves against exact loaded model identity (not display label)", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "GUI2-IDENTITY", "implementation_invariant": "", "legacy_evidence": "web/studio-guidance.js identity resolution", "notes": "", "reason": "Identity resolution accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/guidance", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-guidance.js hash precedence"}], "behavior": "Hash/manifest identity outranks ambiguous names", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "GUI2-HASH", "implementation_invariant": "", "legacy_evidence": "web/studio-guidance.js precedence", "notes": "", "reason": "Precedence accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/guidance", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-guidance.js proposals"}], "behavior": "Recommendations proposed, never silently applied; Confirm and Change exposed", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "GUI2-PROPOSE", "implementation_invariant": "", "legacy_evidence": "web/studio-guidance.js propose/Confirm/Change", "notes": "", "reason": "Propose-not-trust accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/guidance", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-guidance.js reuse mappings"}], "behavior": "Confirmed mapping reused across workflows sharing model identity; never silently replaced", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "GUI2-REUSE", "implementation_invariant": "", "legacy_evidence": "web/studio-guidance.js reuse + no-replace", "notes": "", "reason": "Reuse/no-replace accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/guidance", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-guidance.js provenance"}], "behavior": "Provenance, controller/provider, weight filename and hash recorded", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "GUI2-PROVENANCE", "implementation_invariant": "", "legacy_evidence": "web/studio-guidance.js metadata", "notes": "", "reason": "Metadata accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/guidance", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-guidance.js preprocessor"}], "behavior": "Required preprocessor explicit and preserved per mapping", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "GUI2-PREPROCESSOR", "implementation_invariant": "", "legacy_evidence": "web/studio-guidance.js preprocessor", "notes": "Narrowed from modes+preprocessor (modes covered by GUI-MODES).", "reason": "Preprocessor requirement accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/guidance", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-guidance.js manual fallback"}], "behavior": "Manual fallback available when no trusted mapping exists", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "GUI2-FALLBACK", "implementation_invariant": "", "legacy_evidence": "web/studio-guidance.js fallback", "notes": "", "reason": "Fallback accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "generate/guidance", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-guidance.js execution"}], "behavior": "Backend receives guidance config; soft reference stays distinct from structural guidance", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "GUI2-EXEC", "implementation_invariant": "", "legacy_evidence": "web/studio-guidance.js backend path", "notes": "", "reason": "Payload/backend distinction accepted; Vue behavior unverified.", "required_evidence": ["INTEGRATION"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""}
+  {
+    "area": "generate/references",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-bindable-inputs.js reference methods; wizard reference sections"
+      }
+    ],
+    "behavior": "Accepted methods: Multi-image Conditioning Slots, Reference Latent Chain, Dedicated Workflow",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "REF2-METHODS",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-bindable-inputs.js method taxonomy",
+    "notes": "",
+    "reason": "Method taxonomy accepted; Vue method surface unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/references",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-bindable-inputs.js explicit method"
+      }
+    ],
+    "behavior": "Method selection explicit; no Auto mode offered or implied",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "REF2-NO-AUTO",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-bindable-inputs.js manual method",
+    "notes": "",
+    "reason": "No-Auto rule accepted; Vue method UI unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/references",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-bindable-inputs.js per-workflow method"
+      }
+    ],
+    "behavior": "Selected method remembered per workflow",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "REF2-MEMORY",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-bindable-inputs.js remembered method",
+    "notes": "",
+    "reason": "Per-workflow memory accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/references",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-bindable-inputs.js graph-derived capacity"
+      }
+    ],
+    "behavior": "Reference capacity derived from workflow graph (not a fixed count)",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "REF2-CAPACITY",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-bindable-inputs.js capacity derivation",
+    "notes": "",
+    "reason": "Graph-derived capacity accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/references",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-bindable-inputs.js reference sources"
+      }
+    ],
+    "behavior": "Reference slots fill from Upload, Current, History sources",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "REF2-SOURCES",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-bindable-inputs.js Upload/Current/History",
+    "notes": "",
+    "reason": "Three sources accepted; Vue slot sourcing unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/references",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-bindable-inputs.js stable identity"
+      }
+    ],
+    "behavior": "Reference entries keep stable identity across slot operations",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "REF2-IDENTITY",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-bindable-inputs.js identity",
+    "notes": "",
+    "reason": "Stable identity accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/references",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-bindable-inputs.js thumbnails; wizard sections"
+      }
+    ],
+    "behavior": "Entries show thumbnails; source image stays semantically distinct from references",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "REF2-THUMBS",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-bindable-inputs.js thumbnails + distinction",
+    "notes": "",
+    "reason": "Thumbnails/distinction accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/guidance",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-guidance.js model identity"
+      }
+    ],
+    "behavior": "Guidance resolves against exact loaded model identity (not display label)",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "GUI2-IDENTITY",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-guidance.js identity resolution",
+    "notes": "",
+    "reason": "Identity resolution accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/guidance",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-guidance.js hash precedence"
+      }
+    ],
+    "behavior": "Hash/manifest identity outranks ambiguous names",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "GUI2-HASH",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-guidance.js precedence",
+    "notes": "",
+    "reason": "Precedence accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/guidance",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-guidance.js proposals"
+      }
+    ],
+    "behavior": "Recommendations proposed, never silently applied; Confirm and Change exposed",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "GUI2-PROPOSE",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-guidance.js propose/Confirm/Change",
+    "notes": "",
+    "reason": "Propose-not-trust accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/guidance",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-guidance.js reuse mappings"
+      }
+    ],
+    "behavior": "Confirmed mapping reused across workflows sharing model identity; never silently replaced",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "GUI2-REUSE",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-guidance.js reuse + no-replace",
+    "notes": "",
+    "reason": "Reuse/no-replace accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/guidance",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-guidance.js provenance"
+      }
+    ],
+    "behavior": "Provenance, controller/provider, weight filename and hash recorded",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "GUI2-PROVENANCE",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-guidance.js metadata",
+    "notes": "",
+    "reason": "Metadata accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/guidance",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-guidance.js preprocessor"
+      }
+    ],
+    "behavior": "Required preprocessor explicit and preserved per mapping",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "GUI2-PREPROCESSOR",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-guidance.js preprocessor",
+    "notes": "Narrowed from modes+preprocessor (modes covered by GUI-MODES).",
+    "reason": "Preprocessor requirement accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/guidance",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-guidance.js manual fallback"
+      }
+    ],
+    "behavior": "Manual fallback available when no trusted mapping exists",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "GUI2-FALLBACK",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-guidance.js fallback",
+    "notes": "",
+    "reason": "Fallback accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "generate/guidance",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-guidance.js execution"
+      }
+    ],
+    "behavior": "Backend receives guidance config; soft reference stays distinct from structural guidance",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "GUI2-EXEC",
+    "implementation_invariant": "",
+    "legacy_evidence": "web/studio-guidance.js backend path",
+    "notes": "",
+    "reason": "Payload/backend distinction accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  }
 ]

@@ -1,15 +1,331 @@
 [
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:1-13 (TinyLuma-based; full control parity statement)"}], "behavior": "Post provides Light controls (exposure/contrast/whites/blacks/shadows/highlights/brightness)", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-LIGHT", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:4,24-30", "notes": "Upstream: TinyLuma-derived engine (source-attributed). Thin Vue host/adapter acceptable; no new processing architecture.", "reason": "Accepted control parity; no Vue post workspace.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:4"}], "behavior": "Post provides Color controls (temp/tint/vibrance/saturation/hue)", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-COLOR", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:4", "notes": "", "reason": "Accepted control parity; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:4"}], "behavior": "Post provides Curves controls", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-CURVES", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:4", "notes": "", "reason": "Accepted control parity; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:4"}], "behavior": "Post provides Mixer and Grading controls", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-MIXER", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:4", "notes": "", "reason": "Accepted control parity; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:5"}], "behavior": "Post provides Detail (texture/clarity/dehaze/sharpen/structure) and Effects controls", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-DETAIL-FX", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:5", "notes": "", "reason": "Accepted control parity; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:5"}], "behavior": "Post provides LUT library with import/use/favorites", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-LUT", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:5,19 (LS_LUTFAV)", "notes": "", "reason": "Accepted LUT behavior; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:5"}], "behavior": "Post provides Crop and Straighten controls", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-CROP", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:5", "notes": "", "reason": "Accepted control parity; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:5"}], "behavior": "Post provides Spot heal and white-balance picker tools", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-HEAL-WB", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:5", "notes": "", "reason": "Accepted tool parity; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:6"}], "behavior": "Post supports presets, filmstrip, batch apply, undo-redo, before/after, export", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-WORKFLOW", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:6,720-1905 shell", "notes": "", "reason": "Accepted workspace behavior; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:8-10"}], "behavior": "Processing order heal -> color/curves/LUT -> dehaze -> spatial -> orient/straighten/crop", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-ORDER", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:8-10 (mirrors TinyLuma render_full_image)", "notes": "", "reason": "Accepted order; no Vue engine to verify.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:10"}], "behavior": "Preview capped at 1200px long side; export renders full resolution", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-RES", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:10", "notes": "", "reason": "Accepted resolution paths; no Vue implementation.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:11-12"}], "behavior": "Single-threaded Canvas 2D pipeline; native deviations marked APPROX", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-PIPELINE", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:11-12", "notes": "", "reason": "Accepted engine character; no Vue engine.", "required_evidence": ["BROWSER"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"},
-  {"area": "post", "authorities": [{"kind": "legacy_impl", "ref": "web/studio-postprocess.js:17-19 (LS_RECIPE/LS_PRESETS/LS_LUTFAV)"}], "behavior": "Recipe, presets, LUT favorites persist under designated localStorage keys", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "POST2-PERSIST", "implementation_invariant": "reuse_existing_upstream_derived_engine", "legacy_evidence": "web/studio-postprocess.js:17-19", "notes": "", "reason": "Accepted persistence keys; no Vue implementation.", "required_evidence": ["UNIT"], "status": "FAIL", "tests_or_traces": [], "vue_evidence": "MISSING (searched frontend/src)"}
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:1-13 (TinyLuma-based; full control parity statement)"
+      }
+    ],
+    "behavior": "Post provides Light controls (exposure/contrast/whites/blacks/shadows/highlights/brightness)",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-LIGHT",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:4,24-30",
+    "notes": "Upstream: TinyLuma-derived engine (source-attributed). Thin Vue host/adapter acceptable; no new processing architecture.",
+    "reason": "Accepted control parity; no Vue post workspace.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:4"
+      }
+    ],
+    "behavior": "Post provides Color controls (temp/tint/vibrance/saturation/hue)",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-COLOR",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:4",
+    "notes": "",
+    "reason": "Accepted control parity; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:4"
+      }
+    ],
+    "behavior": "Post provides Curves controls",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-CURVES",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:4",
+    "notes": "",
+    "reason": "Accepted control parity; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:4"
+      }
+    ],
+    "behavior": "Post provides Mixer and Grading controls",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-MIXER",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:4",
+    "notes": "",
+    "reason": "Accepted control parity; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:5"
+      }
+    ],
+    "behavior": "Post provides Detail (texture/clarity/dehaze/sharpen/structure) and Effects controls",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-DETAIL-FX",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:5",
+    "notes": "",
+    "reason": "Accepted control parity; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:5"
+      }
+    ],
+    "behavior": "Post provides LUT library with import/use/favorites",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-LUT",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:5,19 (LS_LUTFAV)",
+    "notes": "",
+    "reason": "Accepted LUT behavior; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:5"
+      }
+    ],
+    "behavior": "Post provides Crop and Straighten controls",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-CROP",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:5",
+    "notes": "",
+    "reason": "Accepted control parity; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:5"
+      }
+    ],
+    "behavior": "Post provides Spot heal and white-balance picker tools",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-HEAL-WB",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:5",
+    "notes": "",
+    "reason": "Accepted tool parity; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:6"
+      }
+    ],
+    "behavior": "Post supports presets, filmstrip, batch apply, undo-redo, before/after, export",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-WORKFLOW",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:6,720-1905 shell",
+    "notes": "",
+    "reason": "Accepted workspace behavior; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:8-10"
+      }
+    ],
+    "behavior": "Processing order heal -> color/curves/LUT -> dehaze -> spatial -> orient/straighten/crop",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-ORDER",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:8-10 (mirrors TinyLuma render_full_image)",
+    "notes": "",
+    "reason": "Accepted order; no Vue engine to verify.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:10"
+      }
+    ],
+    "behavior": "Preview capped at 1200px long side; export renders full resolution",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-RES",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:10",
+    "notes": "",
+    "reason": "Accepted resolution paths; no Vue implementation.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "area": "post",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:17-19 (LS_RECIPE/LS_PRESETS/LS_LUTFAV)"
+      }
+    ],
+    "behavior": "Accepted Post user state that is intentionally durable (recipe/current settings, saved Looks/presets, LUT favorites) remains available after migration, via existing keys or a bounded compatibility read/migration into the new persistence mechanism",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "POST2-PERSIST",
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "legacy_evidence": "web/studio-postprocess.js:17-19",
+    "notes": "Corrected: was exact-key preservation.",
+    "reason": "Durable-data compatibility is the requirement, not exact storage-key identity \u2014 unless a remaining non-Vue consumer needs the exact key. If existing user data under comfymodal.studio.postprocess.* must survive, the port must read/migrate those keys. No Vue implementation exists.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "FAIL",
+    "tests_or_traces": [],
+    "vue_evidence": "MISSING (searched frontend/src)"
+  },
+  {
+    "id": "POST-ENGINE-REUSE",
+    "contract_type": "migration_architecture",
+    "area": "post",
+    "behavior": "Post migration reuses/ports the existing TinyLuma-derived engine/editor via a thin Vue host/adaptation with fresh presentation. The processing engine is NEVER rebuilt feature-by-feature; Canvas 2D internals are not parity-scored.",
+    "authorities": [
+      {
+        "kind": "owner_decision",
+        "ref": "Binding: Post is an integration/port, not a reimplementation"
+      },
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-postprocess.js:1-13 (TinyLuma-based; commit 9b333d08)"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "Contract recorded and binding; POST2-* acceptance rows inherit it via implementation_invariant. Compliance is verified when the port lands.",
+    "legacy_evidence": "web/studio-postprocess.js (engine :224-674; shell :720-1905)",
+    "vue_evidence": "Directive for future migration (thin host/adapter acceptable)",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Family contract: POST2-* rows are acceptance surfaces of this engine, not rebuild tasks."
+  }
 ]

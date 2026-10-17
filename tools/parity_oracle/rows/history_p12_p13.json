@@ -1,23 +1,561 @@
 [
-  {"area": "history", "authorities": [{"kind": "accepted_phase", "ref": "History iterative actions (phase evidence)"}], "behavior": "History item hands off as current image", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "HIST2-USE-CURRENT", "implementation_invariant": "", "legacy_evidence": "Use as Current accepted", "notes": "", "reason": "Handoff accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "history", "authorities": [{"kind": "accepted_phase", "ref": "History iterative actions (phase evidence)"}], "behavior": "History item hands off to Edit and to Use as Reference", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "HIST2-EDIT-REF", "implementation_invariant": "", "legacy_evidence": "Edit + Use as Reference accepted", "notes": "", "reason": "Handoffs accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "history", "authorities": [{"kind": "accepted_phase", "ref": "History iterative actions (phase evidence)"}], "behavior": "History item hands off to Post Process with identity/metadata intact", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "HIST2-POST-HANDOFF", "implementation_invariant": "", "legacy_evidence": "Post Process handoff accepted", "notes": "Narrowed: Favorite/notes covered by HIST-FAVORITE/HIST-NOTE; Download/Export by HIST-DOWNLOAD-EXPORT.", "reason": "Handoff accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "history", "authorities": [{"kind": "accepted_phase", "ref": "History iterative actions (phase evidence)"}], "behavior": "Deleted history target yields clear unavailable state, never stale data, on handoff", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "HIST2-DELETED", "implementation_invariant": "", "legacy_evidence": "Deleted handling accepted", "notes": "Narrowed to history handoff (compare slots covered by CMP-DELETED).", "reason": "Deleted-state accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "compare", "authorities": [{"kind": "accepted_phase", "ref": "History/Compare iterative actions (phase evidence)"}], "behavior": "Compare divider drags; pan/zoom affect viewport without corrupting selection", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "CMP2-INTERACT", "implementation_invariant": "", "legacy_evidence": "Divider/pan/zoom accepted", "notes": "", "reason": "Interactions accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "compare", "authorities": [{"kind": "accepted_phase", "ref": "History/Compare iterative actions (phase evidence)"}], "behavior": "Compare offers Fit and 1:1 viewport scales", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "CMP2-FIT", "implementation_invariant": "", "legacy_evidence": "Fit/1:1 accepted", "notes": "", "reason": "View modes accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "compare", "authorities": [{"kind": "accepted_phase", "ref": "History/Compare iterative actions (phase evidence)"}], "behavior": "Transient compare inputs never become persistent history entries", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "CMP2-TRANSIENT-IO", "implementation_invariant": "", "legacy_evidence": "Transient lifecycle accepted", "notes": "", "reason": "Transient lifecycle accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": [], "vue_evidence": ""},
-  {"area": "compare", "authorities": [{"kind": "migration_contract", "ref": "docs/VUE_MIGRATION_BLUEPRINT.md section 12 RETIRED; binding retirement guards"}], "behavior": "Comparison Profiles/Runner stay retired (no revival)", "contract_type": "retirement", "current_evidence": ["STATIC"], "id": "CMP2-NO-REVIVAL", "implementation_invariant": "", "legacy_evidence": "Retired by migration contract", "notes": "", "reason": "Retirement binding; absence holds in current Vue surface.", "required_evidence": ["STATIC"], "status": "NA", "tests_or_traces": [], "vue_evidence": "Absent (good); guard against future revival"},
-  {"area": "presets", "authorities": [{"kind": "accepted_test", "ref": "tests/test_studio_workflow_presets.py"}, {"kind": "legacy_impl", "ref": "web/studio-presets.js"}], "behavior": "Saved workflow keeps workflow identity, version identity, and saved-workflow identity vocabulary", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P12-IDENTITY", "implementation_invariant": "", "legacy_evidence": "tests/test_studio_workflow_presets.py identity", "notes": "Uses user-facing saved-workflow vocabulary.", "reason": "Identity accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["tests/test_studio_workflow_presets.py"], "vue_evidence": ""},
-  {"area": "presets", "authorities": [{"kind": "accepted_test", "ref": "tests/test_studio_workflow_presets.py"}], "behavior": "Reopen restores mode, subtool, and saved sidebar values semantically", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P12-REOPEN", "implementation_invariant": "", "legacy_evidence": "tests/test_studio_workflow_presets.py reopen", "notes": "", "reason": "Reopen accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["tests/test_studio_workflow_presets.py"], "vue_evidence": ""},
-  {"area": "presets", "authorities": [{"kind": "accepted_test", "ref": "tests/test_studio_workflow_presets.py"}], "behavior": "Display-label overrides and relabeling never alter semantic identity", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P12-LABELS", "implementation_invariant": "", "legacy_evidence": "tests/test_studio_workflow_presets.py labels", "notes": "", "reason": "Label/identity split accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["tests/test_studio_workflow_presets.py"], "vue_evidence": ""},
-  {"area": "presets", "authorities": [{"kind": "accepted_test", "ref": "tests/test_studio_workflow_presets.py"}], "behavior": "Hidden task prompt, visible default prompt, preset-only/user-only/combined cases compose deterministically", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P12-PROMPT", "implementation_invariant": "", "legacy_evidence": "tests/test_studio_workflow_presets.py prompt cases", "notes": "", "reason": "Composition accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["tests/test_studio_workflow_presets.py"], "vue_evidence": ""},
-  {"area": "presets", "authorities": [{"kind": "accepted_test", "ref": "tests/test_studio_workflow_presets.py"}], "behavior": "Saved workflow keeps selected execution method identity where task-owned", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P12-METHOD", "implementation_invariant": "", "legacy_evidence": "tests/test_studio_workflow_presets.py methods", "notes": "", "reason": "Method identity accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["tests/test_studio_workflow_presets.py"], "vue_evidence": ""},
-  {"area": "presets", "authorities": [{"kind": "accepted_test", "ref": "tests/test_studio_workflow_presets.py"}], "behavior": "Source/reference/mask images reopen empty; no stale image state restored", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P12-EMPTY-IMAGES", "implementation_invariant": "", "legacy_evidence": "tests/test_studio_workflow_presets.py images-empty", "notes": "", "reason": "Empty-reopen accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["tests/test_studio_workflow_presets.py"], "vue_evidence": ""},
-  {"area": "presets", "authorities": [{"kind": "accepted_test", "ref": "tests/test_studio_workflow_presets.py"}], "behavior": "Run-local overrides and replay provenance stay separate from saved identity; final submitted prompt traceable", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P12-PROVENANCE", "implementation_invariant": "", "legacy_evidence": "tests/test_studio_workflow_presets.py overrides/provenance", "notes": "Narrowed: Looks-vs-presets covered by PRESET-LOOKS-SEPARATE.", "reason": "Separation accepted; Vue behavior unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["tests/test_studio_workflow_presets.py"], "vue_evidence": ""},
-  {"area": "integration", "authorities": [{"kind": "accepted_phase", "ref": "PHASE13_FINAL_UI_REPORT.md"}, {"kind": "accepted_test", "ref": "reports/i11-exhaustive-e2e/"}], "behavior": "Current-image chaining works; explicit source replacement supersedes lineage", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P13-CHAIN", "implementation_invariant": "", "legacy_evidence": "PHASE13 chaining + replacement", "notes": "", "reason": "Integration flow accepted; Vue end-to-end unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["reports/i11-exhaustive-e2e/"], "vue_evidence": ""},
-  {"area": "integration", "authorities": [{"kind": "accepted_phase", "ref": "PHASE13_FINAL_UI_REPORT.md"}], "behavior": "Source/mode/subtool switches clear stale masks, overlays, and controls", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P13-STALE", "implementation_invariant": "", "legacy_evidence": "PHASE13 stale prevention + switch clearing", "notes": "Integration-level; unit rows (SEL-STALE-MASK, CANVAS-SWITCH) cover slices.", "reason": "Cleanup accepted; Vue end-to-end unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["reports/i11-exhaustive-e2e/"], "vue_evidence": ""},
-  {"area": "integration", "authorities": [{"kind": "accepted_phase", "ref": "PHASE13_FINAL_UI_REPORT.md"}], "behavior": "T2I/I2I families separated; legacy specialized workflows stay compatible", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P13-FAMILIES", "implementation_invariant": "", "legacy_evidence": "PHASE13 families + legacy compat", "notes": "", "reason": "Family separation accepted; Vue cross-family unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["reports/i11-exhaustive-e2e/"], "vue_evidence": ""},
-  {"area": "integration", "authorities": [{"kind": "accepted_phase", "ref": "PHASE13_FINAL_UI_REPORT.md"}], "behavior": "Honest placeholders with gate reasons; truthful async status; actionable dependency failures", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P13-HONEST", "implementation_invariant": "", "legacy_evidence": "PHASE13 placeholders + status + failures", "notes": "", "reason": "Honesty contract accepted; Vue runtime paths unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["reports/i11-exhaustive-e2e/"], "vue_evidence": ""},
-  {"area": "integration", "authorities": [{"kind": "accepted_phase", "ref": "PHASE13_FINAL_UI_REPORT.md"}], "behavior": "Queue and Experiment identity stable across submission and reload", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P13-IDENTITY", "implementation_invariant": "", "legacy_evidence": "PHASE13 identity + reload", "notes": "", "reason": "Identity accepted; Vue queue/reload unverified.", "required_evidence": ["BROWSER"], "status": "UNKNOWN", "tests_or_traces": ["reports/i11-exhaustive-e2e/"], "vue_evidence": ""},
-  {"area": "integration", "authorities": [{"kind": "accepted_phase", "ref": "PHASE13_FINAL_UI_REPORT.md"}], "behavior": "Queue snapshot carries subtool, methods, references, style, guidance, workflow/version, controls, request state", "contract_type": "product_behavior", "current_evidence": ["STATIC"], "id": "P13-SNAPSHOT", "implementation_invariant": "", "legacy_evidence": "PHASE13 explicit snapshot field list", "notes": "Network-payload angle; QUEUE-EXTRAS-FROZEN covers structural absence.", "reason": "Full snapshot accepted; Vue payload unverified.", "required_evidence": ["INTEGRATION"], "status": "UNKNOWN", "tests_or_traces": ["reports/i11-exhaustive-e2e/"], "vue_evidence": ""}
+  {
+    "area": "history",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "History iterative actions (phase evidence)"
+      }
+    ],
+    "behavior": "History item hands off as current image",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "HIST2-USE-CURRENT",
+    "implementation_invariant": "",
+    "legacy_evidence": "Use as Current accepted",
+    "notes": "",
+    "reason": "Handoff accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "history",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "History iterative actions (phase evidence)"
+      }
+    ],
+    "behavior": "History item hands off to Edit and to Use as Reference",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "HIST2-EDIT-REF",
+    "implementation_invariant": "",
+    "legacy_evidence": "Edit + Use as Reference accepted",
+    "notes": "",
+    "reason": "Handoffs accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "history",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "History iterative actions (phase evidence)"
+      }
+    ],
+    "behavior": "History item hands off to Post Process with identity/metadata intact",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "HIST2-POST-HANDOFF",
+    "implementation_invariant": "",
+    "legacy_evidence": "Post Process handoff accepted",
+    "notes": "Narrowed: Favorite/notes covered by HIST-FAVORITE/HIST-NOTE; Download/Export by HIST-DOWNLOAD-EXPORT.",
+    "reason": "Handoff accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "history",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "History iterative actions (phase evidence)"
+      }
+    ],
+    "behavior": "Deleted history target yields clear unavailable state, never stale data, on handoff",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "HIST2-DELETED",
+    "implementation_invariant": "",
+    "legacy_evidence": "Deleted handling accepted",
+    "notes": "Narrowed to history handoff (compare slots covered by CMP-DELETED).",
+    "reason": "Deleted-state accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "compare",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "History/Compare iterative actions (phase evidence)"
+      }
+    ],
+    "behavior": "Compare divider drags; pan/zoom affect viewport without corrupting selection",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "CMP2-INTERACT",
+    "implementation_invariant": "",
+    "legacy_evidence": "Divider/pan/zoom accepted",
+    "notes": "",
+    "reason": "Interactions accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "compare",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "History/Compare iterative actions (phase evidence)"
+      }
+    ],
+    "behavior": "Compare offers Fit and 1:1 viewport scales",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "CMP2-FIT",
+    "implementation_invariant": "",
+    "legacy_evidence": "Fit/1:1 accepted",
+    "notes": "",
+    "reason": "View modes accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "compare",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "History/Compare iterative actions (phase evidence)"
+      }
+    ],
+    "behavior": "Transient compare inputs never become persistent history entries",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "CMP2-TRANSIENT-IO",
+    "implementation_invariant": "",
+    "legacy_evidence": "Transient lifecycle accepted",
+    "notes": "",
+    "reason": "Transient lifecycle accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [],
+    "vue_evidence": ""
+  },
+  {
+    "area": "compare",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md section 12 RETIRED; binding retirement guards"
+      }
+    ],
+    "behavior": "Comparison Profiles/Runner stay retired (no revival)",
+    "contract_type": "retirement",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "CMP2-NO-REVIVAL",
+    "implementation_invariant": "",
+    "legacy_evidence": "Retired by migration contract",
+    "notes": "",
+    "reason": "Retirement binding; absence holds in current Vue surface.",
+    "required_evidence": [
+      "STATIC"
+    ],
+    "status": "NA",
+    "tests_or_traces": [],
+    "vue_evidence": "Absent (good); guard against future revival"
+  },
+  {
+    "area": "presets",
+    "authorities": [
+      {
+        "kind": "accepted_test",
+        "ref": "tests/test_studio_workflow_presets.py"
+      },
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-presets.js"
+      }
+    ],
+    "behavior": "Saved workflow keeps workflow identity, version identity, and saved-workflow identity vocabulary",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P12-IDENTITY",
+    "implementation_invariant": "",
+    "legacy_evidence": "tests/test_studio_workflow_presets.py identity",
+    "notes": "Uses user-facing saved-workflow vocabulary.",
+    "reason": "Identity accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "tests/test_studio_workflow_presets.py"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "presets",
+    "authorities": [
+      {
+        "kind": "accepted_test",
+        "ref": "tests/test_studio_workflow_presets.py"
+      }
+    ],
+    "behavior": "Reopen restores mode, subtool, and saved sidebar values semantically",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P12-REOPEN",
+    "implementation_invariant": "",
+    "legacy_evidence": "tests/test_studio_workflow_presets.py reopen",
+    "notes": "",
+    "reason": "Reopen accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "tests/test_studio_workflow_presets.py"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "presets",
+    "authorities": [
+      {
+        "kind": "accepted_test",
+        "ref": "tests/test_studio_workflow_presets.py"
+      }
+    ],
+    "behavior": "Display-label overrides and relabeling never alter semantic identity",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P12-LABELS",
+    "implementation_invariant": "",
+    "legacy_evidence": "tests/test_studio_workflow_presets.py labels",
+    "notes": "",
+    "reason": "Label/identity split accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "tests/test_studio_workflow_presets.py"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "presets",
+    "authorities": [
+      {
+        "kind": "accepted_test",
+        "ref": "tests/test_studio_workflow_presets.py"
+      }
+    ],
+    "behavior": "Hidden task prompt, visible default prompt, preset-only/user-only/combined cases compose deterministically",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P12-PROMPT",
+    "implementation_invariant": "",
+    "legacy_evidence": "tests/test_studio_workflow_presets.py prompt cases",
+    "notes": "",
+    "reason": "Composition accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "tests/test_studio_workflow_presets.py"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "presets",
+    "authorities": [
+      {
+        "kind": "accepted_test",
+        "ref": "tests/test_studio_workflow_presets.py"
+      }
+    ],
+    "behavior": "Saved workflow keeps selected execution method identity where task-owned",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P12-METHOD",
+    "implementation_invariant": "",
+    "legacy_evidence": "tests/test_studio_workflow_presets.py methods",
+    "notes": "",
+    "reason": "Method identity accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "tests/test_studio_workflow_presets.py"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "presets",
+    "authorities": [
+      {
+        "kind": "accepted_test",
+        "ref": "tests/test_studio_workflow_presets.py"
+      }
+    ],
+    "behavior": "Source/reference/mask images reopen empty; no stale image state restored",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P12-EMPTY-IMAGES",
+    "implementation_invariant": "",
+    "legacy_evidence": "tests/test_studio_workflow_presets.py images-empty",
+    "notes": "",
+    "reason": "Empty-reopen accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "tests/test_studio_workflow_presets.py"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "presets",
+    "authorities": [
+      {
+        "kind": "accepted_test",
+        "ref": "tests/test_studio_workflow_presets.py"
+      }
+    ],
+    "behavior": "Run-local overrides and replay provenance stay separate from saved identity; final submitted prompt traceable",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P12-PROVENANCE",
+    "implementation_invariant": "",
+    "legacy_evidence": "tests/test_studio_workflow_presets.py overrides/provenance",
+    "notes": "Narrowed: Looks-vs-presets covered by PRESET-LOOKS-SEPARATE.",
+    "reason": "Separation accepted; Vue behavior unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "tests/test_studio_workflow_presets.py"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "integration",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "PHASE13_FINAL_UI_REPORT.md"
+      },
+      {
+        "kind": "accepted_test",
+        "ref": "reports/i11-exhaustive-e2e/"
+      }
+    ],
+    "behavior": "Current-image chaining works; explicit source replacement supersedes lineage",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P13-CHAIN",
+    "implementation_invariant": "",
+    "legacy_evidence": "PHASE13 chaining + replacement",
+    "notes": "",
+    "reason": "Integration flow accepted; Vue end-to-end unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "reports/i11-exhaustive-e2e/"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "integration",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "PHASE13_FINAL_UI_REPORT.md"
+      }
+    ],
+    "behavior": "Source/mode/subtool switches clear stale masks, overlays, and controls",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P13-STALE",
+    "implementation_invariant": "",
+    "legacy_evidence": "PHASE13 stale prevention + switch clearing",
+    "notes": "Integration-level; unit rows (SEL-STALE-MASK, CANVAS-SWITCH) cover slices.",
+    "reason": "Cleanup accepted; Vue end-to-end unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "reports/i11-exhaustive-e2e/"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "integration",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "PHASE13_FINAL_UI_REPORT.md"
+      }
+    ],
+    "behavior": "T2I/I2I families separated; legacy specialized workflows stay compatible",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P13-FAMILIES",
+    "implementation_invariant": "",
+    "legacy_evidence": "PHASE13 families + legacy compat",
+    "notes": "",
+    "reason": "Family separation accepted; Vue cross-family unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "reports/i11-exhaustive-e2e/"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "integration",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "PHASE13_FINAL_UI_REPORT.md"
+      }
+    ],
+    "behavior": "Honest placeholders with gate reasons; truthful async status; actionable dependency failures",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P13-HONEST",
+    "implementation_invariant": "",
+    "legacy_evidence": "PHASE13 placeholders + status + failures",
+    "notes": "",
+    "reason": "Honesty contract accepted; Vue runtime paths unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "reports/i11-exhaustive-e2e/"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "integration",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "PHASE13_FINAL_UI_REPORT.md"
+      }
+    ],
+    "behavior": "Queue and Experiment identity stable across submission and reload",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P13-IDENTITY",
+    "implementation_invariant": "",
+    "legacy_evidence": "PHASE13 identity + reload",
+    "notes": "",
+    "reason": "Identity accepted; Vue queue/reload unverified.",
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "reports/i11-exhaustive-e2e/"
+    ],
+    "vue_evidence": ""
+  },
+  {
+    "area": "integration",
+    "authorities": [
+      {
+        "kind": "accepted_phase",
+        "ref": "PHASE13_FINAL_UI_REPORT.md"
+      }
+    ],
+    "behavior": "Queue snapshot carries subtool, methods, references, style, guidance, workflow/version, controls, request state",
+    "contract_type": "product_behavior",
+    "current_evidence": [
+      "STATIC"
+    ],
+    "id": "P13-SNAPSHOT",
+    "implementation_invariant": "",
+    "legacy_evidence": "PHASE13 explicit snapshot field list",
+    "notes": "Network-payload angle; QUEUE-EXTRAS-FROZEN covers structural absence.",
+    "reason": "Full snapshot accepted; Vue payload unverified.",
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "status": "UNKNOWN",
+    "tests_or_traces": [
+      "reports/i11-exhaustive-e2e/"
+    ],
+    "vue_evidence": ""
+  }
 ]

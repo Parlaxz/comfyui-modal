@@ -1,6 +1,6 @@
 # Legacy-vs-Vue Parity Report
 
-Generated from `parity/manifest.json` at 2026-10-17T16:34:50.159154+00:00 (sha 86d9d1b765b6d075f726794013d7c0f0c7b666fd).
+Generated from `parity/manifest.json` at 2026-10-17T16:54:37.258809+00:00 (sha 0827f43ab35ce3ebfd6a8ac2fd962681502cea35).
 The atomic manifest below is authoritative. The legacy smoke section at the end is
 LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 
@@ -8,10 +8,10 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 
 | scope | PASS | FAIL | UNKNOWN | NA | INTENTIONAL_CHANGE |
 |---|---|---|---|---|---|
-| product_behavior | 25 | 120 | 232 | 0 | 0 |
-| migration_architecture | 5 | 0 | 1 | 0 | 2 |
+| product_behavior | 25 | 119 | 231 | 0 | 0 |
+| migration_architecture | 7 | 0 | 1 | 0 | 2 |
 | retirement | 0 | 0 | 0 | 9 | 0 |
-| Total | 30 | 120 | 233 | 9 | 2 |
+| Total | 32 | 119 | 232 | 9 | 2 |
 
 ## Atomic matrix
 
@@ -22,8 +22,7 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 | LATEST-REFRESH | product_behavior | async | Inventory/settings refresh reads use latest-wins | UNKNOWN | RACE / STATIC | Wiring exists; no store race tests. |
 | LATEST-MUTATIONS | product_behavior | async | Mutations (favorite/note/delete/save) complete; navigation never cancels server write | UNKNOWN | INTEGRATION / STATIC | Primitive documents policy; mutation call sites not exhaustively verified. |
 | LATEST-SHARED | product_behavior | async | Reads use shared latest.ts where newest-read-commit semantics match; specialized ownership tokens (owner identity, upload token, overlay invalidation) are legitimate where semantics differ | UNKNOWN | STATIC / STATIC | Per-site appropriateness unverified: sourceToken may be legitimate specialization, latest.ts gaps may exist. Needs review, not a rewrite mandate. |
-| POLL-OWNER | product_behavior | async | Long polls have one owner; abort on navigation/terminal; domain keeps backend semantics | UNKNOWN | RACE / STATIC | Utility is single-purpose but several domain call sites exist; ownership unproven. |
-| POLL-ABORT | product_behavior | async | Long polls: one owner; navigation/rerender never duplicates polling; operation continues when domain requires; terminal/dispose/replacement stops it; no zombie timers | UNKNOWN | RACE / STATIC | Old row wrongly required abort-on-navigate. Real invariant unproven: duplication/ownership/zombies need race evidence. A download must NOT die because the user opens History. |
+| POLL-ABORT | product_behavior | async | Long-running operations (deploy, model install/download, node publication/rebuild, inventory/status): one domain owner; no duplicate poll loops; route navigation does NOT automatically kill the operation; rerender/reopen never creates a second owner; terminal/dispose/replacement stops the poll when appropriate; no zombie timers/listeners; domain owns success/failure semantics | UNKNOWN | RACE / STATIC | Real invariant unproven: single ownership, no duplication across navigation/rerender, continuation when domain requires, terminal/dispose stops, no zombies. A download must NOT die because the user opens History. (Absorbed POLL-OWNER; the old contradictory clause is removed.) |
 | POLL-TERMINAL | product_behavior | async | Polling terminates on done/abort (no runaway loop after rerender) | PASS | UNIT / UNIT | done()/abort termination directly tested. |
 | POLL-RUN | product_behavior | async | Run progress/status integrated with run-controller identity and terminal semantics (controller owns semantics, not the generic poller) | FAIL | INTEGRATION / STATIC | No Vue run polling/controller integration exists; controller owns semantics, generic polling only mechanics. |
 | OPS-DUP-BUSY | product_behavior | operations | No second generic operation registry and no conflicting busy authority beside operationStore (domain runState/isBusy as semantic truth is allowed) | UNKNOWN | INTEGRATION / STATIC | Approved split is registry=visible summary vs domain=semantic truth. Whether runState and the registry ever conflict as authority is unproven. |
@@ -244,8 +243,8 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 | POST2-WORKFLOW | product_behavior | post | Post supports presets, filmstrip, batch apply, undo-redo, before/after, export | FAIL | BROWSER / STATIC | Accepted workspace behavior; no Vue implementation. |
 | POST2-ORDER | product_behavior | post | Processing order heal -> color/curves/LUT -> dehaze -> spatial -> orient/straighten/crop | FAIL | BROWSER / STATIC | Accepted order; no Vue engine to verify. |
 | POST2-RES | product_behavior | post | Preview capped at 1200px long side; export renders full resolution | FAIL | BROWSER / STATIC | Accepted resolution paths; no Vue implementation. |
-| POST2-PIPELINE | product_behavior | post | Single-threaded Canvas 2D pipeline; native deviations marked APPROX | FAIL | BROWSER / STATIC | Accepted engine character; no Vue engine. |
-| POST2-PERSIST | product_behavior | post | Recipe, presets, LUT favorites persist under designated localStorage keys | FAIL | UNIT / STATIC | Accepted persistence keys; no Vue implementation. |
+| POST2-PERSIST | product_behavior | post | Accepted Post user state that is intentionally durable (recipe/current settings, saved Looks/presets, LUT favorites) remains available after migration, via existing keys or a bounded compatibility read/migration into the new persistence mechanism | FAIL | BROWSER / STATIC | Durable-data compatibility is the requirement, not exact storage-key identity — unless a remaining non-Vue consumer needs the exact key. If existing user data under comfymodal.studio.postprocess.* must survive, the port must read/migrate those keys. No Vue implementation exists. |
+| POST-ENGINE-REUSE | migration_architecture | post | Post migration reuses/ports the existing TinyLuma-derived engine/editor via a thin Vue host/adaptation with fresh presentation. The processing engine is NEVER rebuilt feature-by-feature; Canvas 2D internals are not parity-scored. | PASS | STATIC / STATIC | Contract recorded and binding; POST2-* acceptance rows inherit it via implementation_invariant. Compliance is verified when the port lands. |
 | QUEUE-IDS-FROZEN | product_behavior | queue | Workflow/version IDs frozen at enqueue | PASS | UNIT / UNIT | QueueItem stores both IDs; frozen-variants test green. |
 | QUEUE-CONTROLS-FROZEN | product_behavior | queue | Controls deep-frozen at enqueue (later edits cannot leak) | PASS | UNIT / UNIT | freezeIntent deep-copy directly unit-tested. |
 | QUEUE-EXTRAS-FROZEN | product_behavior | queue | Methods/references/layout/guidance frozen at enqueue | FAIL | UNIT / STATIC | QueueItem stores controls only; no methods/references/layout/guidance snapshot. |
@@ -344,7 +343,8 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 | SK2-BASE-LOCK | product_behavior | generate/sketch | Base layer index-zero, locked, protected from deletion/movement | FAIL | BROWSER / STATIC | Base protection statically accepted; no Vue implementation. |
 | SK2-COMMIT | product_behavior | generate/sketch | Flattened sketch uploads as uniquely named source image with source commit hook | FAIL | INTEGRATION / STATIC | Upload/commit statically accepted; no Vue integration. |
 | SK2-ROUTING | product_behavior | generate/sketch | Sketch routes to sketch editor; legacy inpaint/Select keep paint editor | FAIL | BROWSER / STATIC | Routing pins exist for legacy; Vue routing parity unproven and no editor exists. |
-| SK2-SURFACE | product_behavior | generate/sketch | Sketch surface preserves canvas/undo/save/mask-preview selectors and save wording | FAIL | BROWSER / STATIC | Selector/wording preservation statically accepted; no Vue surface. |
+| SK2-SURFACE | product_behavior | generate/sketch | Sketch surface exposes the required canvas interaction, undo/redo, save/commit and mask-preview behavior through the Vue UI | FAIL | BROWSER / STATIC | Legacy selectors, test IDs, DOM shape, and exact wording are explicitly NOT migration requirements (fresh DOM/CSS/components allowed). Only product-meaningful behavior must survive. No Vue sketch surface exists. |
+| SKETCH-ENGINE-REUSE | migration_architecture | generate/sketch | Sketch migration reuses/ports the existing ComfySketch-derived engine (engine, layers, composite, history, zoom/pan, flatten); only host/state seams are adapted, presentation is fresh. The drawing/layer engine is NEVER rewritten from scratch while it exists. | PASS | STATIC / STATIC | Contract recorded and binding; SK2-* acceptance rows inherit it via implementation_invariant. Compliance is verified when the port lands. |
 | SK-OPEN | product_behavior | generate/sketch | Sketch editor opens with base image selection | UNKNOWN | BROWSER / STATIC | Base selection shell exists; no drawing surface, behavior unproven. |
 | SK-STROKES | product_behavior | generate/sketch | Stroke creation, eraser, clear, undo/redo | FAIL | BROWSER / STATIC | Only a local stroke-count array; no editor operations. |
 | SK-FLATTEN-UPLOAD | product_behavior | generate/sketch | Sketch flattens and uploads with sketch identity as source | FAIL | BROWSER / STATIC | No flatten path (no toBlob/toDataURL/uploadSketch); strokes local-only. |
@@ -416,7 +416,7 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 
 - broken core behavior: SEL-BRUSH, SEL-ERASE, SEL-LASSO, SEL-RECT, SEL-MASK-OPS, SEL-UNDO, SEL-SAM3, SEL-DETECT, SEL-CROPSTITCH, SEL-COND-CROP, SEL-DEDICATED, POST-ADJUST, POST-COLOR, POST-DETAIL, POST-EFFECTS, POST-CROP, POST-HEAL, LAY-OPEN, LAY-GEOMETRY, LAY-TEMPLATES, LAY-PAYLOAD, PG-PICKER-FILTERS, PG-MODEL-UNET, PG-MODEL-CLIP, PG-MODEL-VAE, PG-MODEL-OPTIONS, PG-ADV-DISCLOSURE, PG-ADV-PERSIST, PG-CONTROL-ORDER, PG-ORDER-PERSIST, PG-METHOD-SELECT, SEL2-TOOLS, SEL2-ADD-SUB, SEL2-GROW, SEL2-INVERT-HISTORY, SEL2-SOURCE-PATHS, SEL2-SOURCE-CLEAR, SEL2-BASE-CLEAR, SEL2-MASK-SAVE, SEL2-COMPAT, SK2-TOOLS, SK2-SETTINGS, SK2-COMPOSITE, SK2-ZOOM, SK2-LAYERS, SK2-BASE-LOCK, SK2-COMMIT, SK2-ROUTING, SK2-SURFACE, SK-STROKES, SK-FLATTEN-UPLOAD, GUI-LOOKUP, GUI-KEY, GUI-MODES, GUI-PAYLOAD, WZ-SUG-UNET, WZ-SUG-CLIP, WZ-SUG-VAE
 - safety/race failure: QUEUE-EXTRAS-FROZEN, QUEUE-IDENTITY-CHECK, EXP-CELL-IDS, RUN-CANCEL, RUN-CONTROLLER-INTEGRATION, EXP2-RACE
-- missing feature: POLL-RUN, SRC-FROM-HISTORY, SRC-DRAGDROP, SRC-PASTE, EXPAND-GEOMETRY, EXPAND-PAD, EXPAND-PRESERVE, EXPAND-PAYLOAD, REF-REPLACE, REF-WEIGHTS, REF-DRAFT-PERSIST, HOST-AUTOREOPEN, DEPS-STATES, POST2-LIGHT, POST2-COLOR, POST2-CURVES, POST2-MIXER, POST2-DETAIL-FX, POST2-LUT, POST2-CROP, POST2-HEAL-WB, POST2-WORKFLOW, POST2-RES, POST2-PIPELINE, POST2-PERSIST, ROUTE-SETTINGS-FOCUS, EXP2-SIDES, EXP2-DRAG, EXP2-METHODS, EXP2-MEMORY, EXP2-I2I, STY-CONTEXT, STY-SHELL, STY-SEARCH, STY-CATEGORY, STY-SELECT, STY-NONE, STY-PERSIST, STY-FAVORITE, LAY2-SHELL, LAY2-CREATE, LAY2-TYPE-TEXT, LAY2-JSON-PREVIEW, LAY2-BBOX, LAY2-DIMS, LAY2-SEND, LAY2-DRAFT, WZ-CENTER, WZ-HIGHLIGHT, WZ-GRAPH-MODE
+- missing feature: POLL-RUN, SRC-FROM-HISTORY, SRC-DRAGDROP, SRC-PASTE, EXPAND-GEOMETRY, EXPAND-PAD, EXPAND-PRESERVE, EXPAND-PAYLOAD, REF-REPLACE, REF-WEIGHTS, REF-DRAFT-PERSIST, HOST-AUTOREOPEN, DEPS-STATES, POST2-LIGHT, POST2-COLOR, POST2-CURVES, POST2-MIXER, POST2-DETAIL-FX, POST2-LUT, POST2-CROP, POST2-HEAL-WB, POST2-WORKFLOW, POST2-RES, POST2-PERSIST, ROUTE-SETTINGS-FOCUS, EXP2-SIDES, EXP2-DRAG, EXP2-METHODS, EXP2-MEMORY, EXP2-I2I, STY-CONTEXT, STY-SHELL, STY-SEARCH, STY-CATEGORY, STY-SELECT, STY-NONE, STY-PERSIST, STY-FAVORITE, LAY2-SHELL, LAY2-CREATE, LAY2-TYPE-TEXT, LAY2-JSON-PREVIEW, LAY2-BBOX, LAY2-DIMS, LAY2-SEND, LAY2-DRAFT, WZ-CENTER, WZ-HIGHLIGHT, WZ-GRAPH-MODE
 - missing QoL: POST2-ORDER, LAY2-LIFECYCLE
 - presentation difference: CANVAS-SELECT, CANVAS-EXPAND, CANVAS-SKETCH, WZ-PORTAL
 
@@ -427,8 +427,7 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 - LATEST-REFRESH needs RACE (has STATIC): Wiring exists; no store race tests.
 - LATEST-MUTATIONS needs INTEGRATION (has STATIC): Primitive documents policy; mutation call sites not exhaustively verified.
 - LATEST-SHARED needs STATIC (has STATIC): Per-site appropriateness unverified: sourceToken may be legitimate specialization, latest.ts gaps may exist. Needs review, not a rewrite mandate.
-- POLL-OWNER needs RACE (has STATIC): Utility is single-purpose but several domain call sites exist; ownership unproven.
-- POLL-ABORT needs RACE (has STATIC): Old row wrongly required abort-on-navigate. Real invariant unproven: duplication/ownership/zombies need race evidence. A download must NOT die because the user opens History.
+- POLL-ABORT needs RACE (has STATIC): Real invariant unproven: single ownership, no duplication across navigation/rerender, continuation when domain requires, terminal/dispose stops, no zombies. A download must NOT die because the user opens History. (Absorbed POLL-OWNER; the old contradictory clause is removed.)
 - OPS-DUP-BUSY needs INTEGRATION (has STATIC): Approved split is registry=visible summary vs domain=semantic truth. Whether runState and the registry ever conflict as authority is unproven.
 - OPS-IDS needs BROWSER (has STATIC): Unique generation exists; lifecycle/remount behavior unproven.
 - WS-MIDOP needs RACE,REAL_BACKEND (has STATIC): Browser payload lacks workspaceId, but historical architecture had server workspace authority. Current proof cannot determine the real dispatch seam.
