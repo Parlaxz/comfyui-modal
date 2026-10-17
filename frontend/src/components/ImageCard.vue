@@ -77,8 +77,9 @@ function toggleSelect(event: Event) {
           class="cmst:block cmst:aspect-square cmst:w-full cmst:object-cover"
           loading="lazy"
         />
-        <span v-else class="cmst:flex cmst:aspect-square cmst:w-full cmst:items-center cmst:justify-center cmst:text-cmst-muted" aria-hidden="true">
+        <span v-else class="cmst:flex cmst:aspect-square cmst:w-full cmst:flex-col cmst:items-center cmst:justify-center cmst:gap-1.5 cmst:text-cmst-muted" aria-hidden="true">
           <ImageOff class="cmst:size-[18px]" />
+          <span class="cmst:text-xs">{{ record.status === "failed" ? "Failed" : "No preview" }}</span>
         </span>
       </button>
       <!-- Contextual hover actions: favorite + bulk select. Pinned visible

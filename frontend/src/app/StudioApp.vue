@@ -22,10 +22,19 @@ const infrastructure = useInfrastructureStore();
 const workflows = useWorkflowsStore();
 const drawerOpen = ref(false);
 const drawerPanel = ref<HTMLElement | null>(null);
+const closeBtn = ref<HTMLElement | null>(null);
 
 onMounted(() => {
   void settings.initialize();
   void infrastructure.initialize();
+  // The bundle mounted: the Vue topbar owns the single Studio-close
+  // affordance, so the host parks its fallback close button (see host CSS).
+  // Focus starts on it, matching the previous host-button focus behavior.
+  try {
+    document.body.setAttribute("data-cmv-vue-ready", "1");
+  } catch { /* non-DOM test host */
+  }
+  closeBtn.value?.focus();
 });
 
 const NAV_ICONS: Record<StudioPage, unknown> = {
@@ -119,6 +128,7 @@ function closeStudio(): void {
         {{ activeLabel }}
       </span>
       <button
+        ref="closeBtn"
         type="button"
         data-testid="vue-studio-close"
         aria-label="Close Studio"

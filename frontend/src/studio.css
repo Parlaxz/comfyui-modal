@@ -376,6 +376,56 @@
     height: 16px;
   }
 
+  /* Preferences sheet (Settings route): dimmed Studio behind, one centered
+   * surface with its own header, rail, and pane. Route + store unchanged. */
+  [data-studio-app] .cmst-settings-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    background: rgba(0, 0, 0, 0.65);
+  }
+  [data-studio-app] .cmst-settings-sheet {
+    position: fixed;
+    z-index: 50;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(960px, 94vw);
+    max-height: min(860px, 92vh);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--cmst-surface);
+    border: 1px solid var(--cmst-border);
+    border-radius: 12px;
+    box-shadow: var(--cmst-shadow-overlay);
+  }
+  [data-studio-app] .cmst-settings-head {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 20px 12px;
+    border-bottom: 1px solid var(--cmst-border);
+  }
+  [data-studio-app] .cmst-settings-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 20px;
+    padding: 16px 20px 20px;
+  }
+  @media (min-width: 1024px) {
+    [data-studio-app] .cmst-settings-body {
+      grid-template-columns: 200px minmax(0, 1fr);
+      gap: 24px;
+      padding: 20px 24px 24px;
+    }
+  }
+
   /* Thin restrained progress track for deployment status. */
   [data-studio-app] .cmst-progress-track {
     height: 3px;

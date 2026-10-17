@@ -149,7 +149,7 @@ async function installFromUrl() {
 </script>
 
 <template>
-  <section :class="studioPageClass()" data-testid="vue-page-backend">
+  <section :class="studioPageClass('cmst:mx-auto cmst:w-full cmst:max-w-6xl')" data-testid="vue-page-backend">
     <div v-if="infrastructure.error" class="cmst:text-[13px] cmst:text-cmst-danger" role="alert">
       {{ infrastructure.error }}
     </div>

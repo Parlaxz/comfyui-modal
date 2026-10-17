@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { RefreshCw, Star } from "@lucide/vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import { RefreshCw, Star, X } from "@lucide/vue";
+import { useRouter } from "vue-router";
 import { useSettingsStore, SETTINGS_SECTIONS, type SettingsSection } from "../stores/settings";
 import StudioButton from "../components/StudioButton.vue";
-import { studioPageClass } from "../components/studioPanels";
 
 const settings = useSettingsStore();
+const router = useRouter();
 const quality = ref(75);
 const saveFolder = ref("");
 const outputFormat = ref("original");
@@ -21,6 +22,22 @@ const confirmResetAll = ref(false);
 
 const config = computed(() => settings.config);
 const gpuOptions = computed(() => config.value?.available_gpus ?? []);
+const closeBtn = ref<HTMLElement | null>(null);
+
+// Closing the Preferences layer returns to a deterministic Studio home.
+// push (not back): the route stays canonical and Back reopens Settings,
+// matching page-change history semantics.
+function closeSettings(): void {
+  void router.push({ name: "playground" });
+}
+
+// Escape closes this layer only; the host defers via the dialog role, and
+// portalled controls that already handled the key (defaultPrevented) win.
+function onDocumentKeydown(event: KeyboardEvent) {
+  if (event.key !== "Escape" || event.defaultPrevented) return;
+  event.stopPropagation();
+  closeSettings();
+}
 
 function hydrateDrafts() {
   const c = config.value;
@@ -42,6 +59,12 @@ onMounted(async () => {
   await settings.initialize().catch(() => undefined);
   await settings.loadGolden().catch(() => undefined);
   hydrateDrafts();
+  closeBtn.value?.focus();
+  document.addEventListener("keydown", onDocumentKeydown);
+});
+
+onUnmounted(() => {
+  document.removeEventListener("keydown", onDocumentKeydown);
 });
 
 async function saveOutputs() {
@@ -98,23 +121,50 @@ async function resetAll() {
 </script>
 
 <template>
-  <section :class="studioPageClass()" data-testid="vue-page-settings">
-    <div v-if="settings.error" class="cmst:text-[13px] cmst:text-cmst-danger" role="alert">
-      {{ settings.error }}
-    </div>
-
-    <!-- Page toolbar flush on the page background. -->
-    <div class="cmst:flex cmst:flex-wrap cmst:items-end cmst:justify-between cmst:gap-3">
-      <div>
+  <!-- Settings presents as a Preferences sheet layered over Studio: the
+    route stays canonical (#comfymodal=settings, Settings store owns state),
+    only the presentation is modal. Close returns to Playground; Escape
+    closes this layer (host defers via the dialog role), never Studio. -->
+  <section class="cmst:block cmst:min-h-[60vh]" data-testid="vue-page-settings">
+    <div class="cmst-settings-backdrop" aria-hidden="true" />
+    <div
+      class="cmst-settings-sheet"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Settings"
+      tabindex="-1"
+    >
+      <div class="cmst-settings-head">
         <h1 class="cmst-type-view">Settings</h1>
+        <div class="cmst:flex cmst:items-center cmst:gap-1">
+          <button
+            type="button"
+            class="cmst-icon-btn"
+            aria-label="Reload settings"
+            :disabled="settings.loading"
+            data-testid="vue-settings-reload"
+            @click="settings.load().then(hydrateDrafts).catch(() => undefined)"
+          >
+            <RefreshCw class="cmst:size-4" :class="settings.loading ? 'cmst:animate-spin' : ''" aria-hidden="true" />
+          </button>
+          <button
+            ref="closeBtn"
+            type="button"
+            class="cmst-close-btn"
+            aria-label="Close settings"
+            data-testid="vue-settings-close"
+            @click="closeSettings"
+          >
+            <X class="cmst:size-4" aria-hidden="true" />
+          </button>
+        </div>
       </div>
-      <StudioButton variant="ghost" size="icon" aria-label="Reload settings" :disabled="settings.loading" @click="settings.load().then(hydrateDrafts).catch(() => undefined)">
-        <RefreshCw class="cmst:size-4" :class="settings.loading ? 'cmst:animate-spin' : ''" aria-hidden="true" />
-      </StudioButton>
-    </div>
+      <div v-if="settings.error" class="cmst:px-5 cmst:pt-2 cmst:text-[13px] cmst:text-cmst-danger" role="alert">
+        {{ settings.error }}
+      </div>
 
-    <!-- Category nav (left on wide) + single main pane. -->
-    <div class="cmst:grid cmst:grid-cols-1 cmst:gap-6 cmst:lg:grid-cols-[180px_minmax(0,1fr)]">
+      <!-- Category nav + single main pane. -->
+      <div class="cmst-settings-body">
       <nav aria-label="Settings sections" class="cmst-side-nav cmst:min-w-0 cmst:lg:pr-2">
         <button
           v-for="section in SETTINGS_SECTIONS"
@@ -343,6 +393,7 @@ async function resetAll() {
             <p class="cmst:mt-1 cmst:text-xs cmst:text-cmst-muted">Resets only Settings-owned keys. Credentials and user data are not affected.</p>
           </div>
         </template>
+      </div>
       </div>
     </div>
   </section>

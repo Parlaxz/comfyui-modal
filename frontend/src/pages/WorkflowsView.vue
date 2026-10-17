@@ -467,7 +467,7 @@ async function installDependencyNode(row: DependencyNodeRow) {
 
       <template v-if="tab === 'workflows'">
         <!-- Detail surface: flat sections on hairlines, not nested cards. -->
-        <div v-if="workflows.selectedWorkflow" class="cmst:min-w-0">
+        <div v-if="workflows.selectedWorkflow" class="cmst:w-full cmst:min-w-0 cmst:max-w-4xl">
           <div class="cmst:flex cmst:flex-wrap cmst:items-start cmst:justify-between cmst:gap-3">
             <div class="cmst:min-w-0">
               <h2 class="cmst-type-view cmst:truncate">{{ workflows.selectedWorkflow.name }}</h2>

@@ -163,6 +163,11 @@ function _ensureHostStyle() {
     ".comfymodal-vue-studio-frame{position:relative;width:min(1200px,96vw);max-height:92vh;overflow:auto;border-radius:12px;box-sizing:border-box;}",
     ".comfymodal-vue-studio-close{position:absolute;top:10px;right:10px;z-index:5;width:32px;height:32px;border-radius:8px;border:1px solid #2b3542;background:#171e27;color:#e6ebf2;font-size:15px;line-height:1;cursor:pointer;}",
     ".comfymodal-vue-studio-close:hover{background:#222c38;}",
+    // Single Studio-close affordance: once the Vue bundle has mounted it sets
+    // body[data-cmv-vue-ready] and the Vue topbar owns the quiet close button
+    // (focus-managed, test-covered). The host button stays as the fallback
+    // when the bundle never loads, so Studio can always be dismissed.
+    "body[data-cmv-vue-ready] .comfymodal-vue-studio-close{display:none;}",
     "body.comfymodal-vue-scroll-lock{overflow:hidden;}",
     // ── Normal Studio owns the viewport ──
     'body[data-cmv-own="studio"] .comfymodal-vue-studio-overlay{background:#0b0b0c;padding:0;}',
