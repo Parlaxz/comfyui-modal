@@ -36,7 +36,11 @@ function choose(record: HistoryRecord) {
 </script>
 
 <template>
-  <Teleport :to="portalTarget ?? undefined">
+  <!-- The portal target resolves in onMounted (after first render), so the
+    Teleport mounts only once a real target exists. Mounting it with a
+    nullish target leaves unmounted component vnodes behind that crash the
+    next patch (shouldUpdateComponent reads .component of null). -->
+  <Teleport v-if="portalTarget" :to="portalTarget">
     <div class="cmst:fixed cmst:inset-0 cmst:z-[70] cmst:flex cmst:items-center cmst:justify-center cmst:bg-black/60 cmst:p-6" data-state="open" data-testid="vue-history-picker" role="dialog" aria-modal="true" aria-label="Pick a History generation" tabindex="-1" @keydown.esc.stop="emit('cancel')">
       <StudioCard class="cmst:w-[min(48rem,94vw)] cmst:max-h-[86vh] cmst:overflow-auto cmst:p-4">
         <div class="cmst:flex cmst:items-center cmst:justify-between cmst:gap-2">
