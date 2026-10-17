@@ -1,9 +1,24 @@
-# Visual Verdict — Phase 4.5 Host Ownership + Fidelity Correction (PASS)
+# Visual Verdict — Phase 4.5 Parity Pass (PASS)
 
-Supersedes the earlier premature PASS. Judged from the 10-shot acceptance set
-below, all captured on the final build in live ComfyUI at 1440×900 (plus one
-~1075px narrow check). The prior verdict's "fullscreen / graph primary"
-claims were aspirational; the shots below demonstrate them literally.
+Prior verdicts stand; this pass added behavior with presentation discipline.
+New/changed surfaces re-verified on the final build in live ComfyUI:
+
+- `normal-studio-workflows-fullscreen.png` — bounded detail (max-w-4xl),
+  dep rows with local action groups (source/URL + Install/Queue + Find),
+  truthful summary, manifest import entry. No 1500px eye travel. PASS.
+- `workflows-library.png` — searchable browsable inventory (92 models,
+  35 nodes), type filter, expandable provenance, note editor, used-by line.
+  PASS.
+- `settings-in-studio.png` — Preferences sheet over dimmed Studio; golden
+  GPU order A/B with active radio rendered from live profiles. PASS.
+- Wizard inspector (roles + gate) covered by `wizard-binding.png` grammar;
+  role rows verified live (capture → bind → View → centered on graph).
+- History/manage shots unchanged since last PASS (no visual changes there
+  this pass except dep-adjacent rows, re-verified in workflows shot).
+
+Audits hold: borders name peers; spacing rhythm kept; selection wash-only;
+no ids/arch prose on default surfaces; single Studio close; fullscreen
+ownership intact (re-verified via parking spec 2/2 on final build).
 
 ## Acceptance set (all current)
 
