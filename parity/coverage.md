@@ -1,0 +1,372 @@
+# Parity coverage gaps
+
+Unresolved rows grouped by the evidence still required.
+
+## Needs BROWSER (259)
+
+- OPS-IDS [UNKNOWN/product_behavior] operations: Operation IDs unique; cleanup on terminal/remount
+- CANVAS-POST-CLOSE [UNKNOWN/product_behavior] canvas compatibility: Studio close leaves canvas submission behavior unchanged
+- PERSIST-RELOAD [UNKNOWN/product_behavior] persistence: Browser-only UI preferences restore on reload
+- XTAB-KINDS [UNKNOWN/product_behavior] cross-tab: Settings/workspace/history/workflows broadcast kind-only invalidation
+- XTAB-NO-ENTITIES [UNKNOWN/product_behavior] cross-tab: Messages carry invalidation only, never entity state
+- XTAB-REFETCH [UNKNOWN/product_behavior] cross-tab: Receiving tab refetches server truth (no full-entity broadcast)
+- XTAB-CLEANUP [UNKNOWN/product_behavior] cross-tab: Listeners cleaned up on dispose; same-tab Pinia never relies on BroadcastChannel
+- CMP-SELECT [UNKNOWN/product_behavior] compare: Select A and B images
+- CMP-SWAP [UNKNOWN/product_behavior] compare: Replace/swap A/B
+- CMP-VIEWER [UNKNOWN/product_behavior] compare: Side-by-side viewer with divider control
+- CMP-EXIT [UNKNOWN/product_behavior] compare: Exit compare clears transient state
+- CMP-DELETED [UNKNOWN/product_behavior] compare: Deleted record in compare slot renders explicit state
+- CMP-TRANSIENT [UNKNOWN/product_behavior] compare: Compare A/B never durably persists (transient two slots)
+- CMP-HANDOFF [UNKNOWN/product_behavior] compare: History/picker-to-compare handoff end to end
+- WF-LIBRARY [UNKNOWN/product_behavior] workflows: Workflow library list + select + detail
+- WF-FILTERS [UNKNOWN/product_behavior] workflows: Search/folder/tag filters
+- WF-CRUD [UNKNOWN/product_behavior] workflows: Workflow create/update/delete
+- WF-VERSIONS [UNKNOWN/product_behavior] workflows: Version list, select, capture
+- WF-MAPPING [UNKNOWN/product_behavior] workflows: Mapping save vs revision distinction + confirmation
+- WF-DEPS [UNKNOWN/product_behavior] workflows: Dependency data loaded into manager context
+- WF-COMPAT [UNKNOWN/product_behavior] workflows: Compatibility + portability reports visible per version
+- WF-MANIFEST [UNKNOWN/product_behavior] workflows: Manifest import/export round trip
+- WF-SHARED-SELECT [UNKNOWN/product_behavior] workflows: Selected version shared between Workflows and Playground
+- WF-FOLDERS [UNKNOWN/product_behavior] workflows: Folder create + tag inventory persist
+- SRC-UPLOAD [UNKNOWN/product_behavior] edit/source: Source upload binds real filename into controls
+- SRC-FAIL-OWNER [UNKNOWN/product_behavior] edit/source: Upload failure surfaces only on current owner
+- SRC-FROM-HISTORY [FAIL/product_behavior] edit/source: Source from History/previous generation binds real file
+- SRC-DRAGDROP [FAIL/product_behavior] edit/source: Drag/drop ingests source image
+- SRC-PASTE [FAIL/product_behavior] edit/source: Paste ingests source image
+- SRC-CLEAR-MASK [UNKNOWN/product_behavior] edit/source: Clear source also clears dependent mask/selection state
+- SRC-SHARED-IDENTITY [UNKNOWN/product_behavior] edit/source: Source identity shared correctly across Edit subtools
+- SEL-BRUSH [FAIL/product_behavior] edit/select: Brush selection paints mask
+- SEL-ERASE [FAIL/product_behavior] edit/select: Erase selection
+- SEL-LASSO [FAIL/product_behavior] edit/select: Lasso selection
+- SEL-RECT [FAIL/product_behavior] edit/select: Rectangle selection
+- SEL-MASK-OPS [FAIL/product_behavior] edit/select: Combine/add, grow, feather, invert mask ops
+- SEL-UNDO [FAIL/product_behavior] edit/select: Selection undo/redo/clear
+- SEL-SAM3 [FAIL/product_behavior] edit/select: SAM3 object selection (points/boxes)
+- SEL-DETECT [FAIL/product_behavior] edit/select: SAM3 text/detect selection
+- SEL-MASK-GATE [UNKNOWN/product_behavior] edit/select: Mask-required run gating blocks maskless inpaint submit
+- SEL-STALE-MASK [UNKNOWN/product_behavior] edit/select: Source replacement clears stale mask/SAM result
+- EXPAND-GEOMETRY [FAIL/product_behavior] edit/expand: Expand padding controls and geometry
+- EXPAND-PREVIEW [UNKNOWN/product_behavior] edit/expand: Expand preview reflects padding/geometry before run
+- POST-ADJUST [FAIL/product_behavior] post: Adjust tool controls + engine behavior + ownership
+- POST-COLOR [FAIL/product_behavior] post: Color tool controls + engine behavior + ownership
+- POST-DETAIL [FAIL/product_behavior] post: Detail tool controls + engine behavior + ownership
+- POST-EFFECTS [FAIL/product_behavior] post: Effects tool controls + engine behavior + ownership
+- POST-CROP [FAIL/product_behavior] post: Crop tool controls + engine behavior + ownership
+- POST-HEAL [FAIL/product_behavior] post: Heal tool controls + engine behavior + ownership
+- POST-LOOKS [UNKNOWN/product_behavior] post: Saved Looks owned separately from workflow presets
+- POST-UPSCALE-PARKED [UNKNOWN/product_behavior] post: Upscale stays a placeholder; no invented execution
+- CANVAS-BASE [UNKNOWN/product_behavior] canvas rule: Central stage holds image/content only in base state
+- CANVAS-SELECT [FAIL/product_behavior] canvas rule: Select overlays render inside central stage, aligned to image
+- CANVAS-EXPAND [FAIL/product_behavior] canvas rule: Expand direct-manipulation overlays render inside stage
+- CANVAS-SKETCH [FAIL/product_behavior] canvas rule: Sketch overlays are stage-local direct manipulation
+- CANVAS-NO-CONTROLS [UNKNOWN/product_behavior] canvas rule: Post/inspector controls never persist inside central stage
+- CANVAS-SWITCH [UNKNOWN/product_behavior] canvas rule: Tool switching preserves image identity without stale overlays
+- TXT-PROMPT [UNKNOWN/product_behavior] generate/text: Prompt + negative prompt entry and display
+- TXT-RESULT [UNKNOWN/product_behavior] generate/text: Generated result displays; recent History converges
+- REF-ADD-REMOVE [UNKNOWN/product_behavior] generate/references: Add and remove references (ordered cards)
+- REF-REPLACE [FAIL/product_behavior] generate/references: Replace a reference in place
+- REF-ORDER [UNKNOWN/product_behavior] generate/references: Multiple references keep order into payload
+- REF-WEIGHTS [FAIL/product_behavior] generate/references: Reference strength/weight settings exist exactly for real Reference Methods that support them (no universal slider)
+- REF-DRAFT-PERSIST [FAIL/product_behavior] generate/references: Reference draft metadata persists across reload
+- LAY-OPEN [FAIL/product_behavior] generate/layout: Layout editor opens with boxes/captions/geometry
+- LAY-GEOMETRY [FAIL/product_behavior] generate/layout: Layout geometry/coordinate conversion/resize
+- LAY-TEMPLATES [FAIL/product_behavior] generate/layout: Layout templates, drafts, clear/reset persist
+- HIST-FEED [UNKNOWN/product_behavior] history: History V2 feed loads generations and experiments
+- HIST-PAGINATION [UNKNOWN/product_behavior] history: Cursor pagination / load-more
+- HIST-QUERY [UNKNOWN/product_behavior] history: Search, filter, sort wired to feed
+- HIST-VIEWSTATE [UNKNOWN/product_behavior] history: Filter/sort state persists across reload
+- HIST-FOCUS [UNKNOWN/product_behavior] history: Record focus state + focus route loads detail on demand
+- HIST-FAVORITE [UNKNOWN/product_behavior] history: Favorite toggle with optimistic update + rollback + persistence
+- HIST-NOTE [UNKNOWN/product_behavior] history: Note save on generation and experiment
+- HIST-DELETE [UNKNOWN/product_behavior] history: Single delete with confirm + feed update
+- HIST-BULK-DELETE [UNKNOWN/product_behavior] history: Bulk delete with selection
+- HIST-ORIGINAL [UNKNOWN/product_behavior] history: Generate Original and Retry Original are distinct actions/endpoints
+- HIST-RESUME [UNKNOWN/product_behavior] history: Single Resume resumes generation (not an Original action)
+- HIST-CELL-RETRY [UNKNOWN/product_behavior] history: Experiment cell retry from History
+- HIST-EXP-CANCEL-RESUME [UNKNOWN/product_behavior] history: Experiment cancel/resume from History
+- HIST-DOWNLOAD-EXPORT [UNKNOWN/product_behavior] history: Browser Download (single asset, blob) vs configured-folder Export
+- HIST-GEN-DETAIL [UNKNOWN/product_behavior] history: Generation detail renders full record
+- HIST-EXP-DETAIL [UNKNOWN/product_behavior] history: Experiment detail renders cells/counts
+- HIST-COLUMNS [UNKNOWN/product_behavior] history: Column/density preferences respected + persisted
+- HIST-PICKER [UNKNOWN/product_behavior] history: History picker filters, paginates, focuses, hands selection
+- HIST2-USE-CURRENT [UNKNOWN/product_behavior] history: History item hands off as current image
+- HIST2-EDIT-REF [UNKNOWN/product_behavior] history: History item hands off to Edit and to Use as Reference
+- HIST2-POST-HANDOFF [UNKNOWN/product_behavior] history: History item hands off to Post Process with identity/metadata intact
+- HIST2-DELETED [UNKNOWN/product_behavior] history: Deleted history target yields clear unavailable state, never stale data, on handoff
+- CMP2-INTERACT [UNKNOWN/product_behavior] compare: Compare divider drags; pan/zoom affect viewport without corrupting selection
+- CMP2-FIT [UNKNOWN/product_behavior] compare: Compare offers Fit and 1:1 viewport scales
+- CMP2-TRANSIENT-IO [UNKNOWN/product_behavior] compare: Transient compare inputs never become persistent history entries
+- P12-IDENTITY [UNKNOWN/product_behavior] presets: Saved workflow keeps workflow identity, version identity, and saved-workflow identity vocabulary
+- P12-REOPEN [UNKNOWN/product_behavior] presets: Reopen restores mode, subtool, and saved sidebar values semantically
+- P12-LABELS [UNKNOWN/product_behavior] presets: Display-label overrides and relabeling never alter semantic identity
+- P12-PROMPT [UNKNOWN/product_behavior] presets: Hidden task prompt, visible default prompt, preset-only/user-only/combined cases compose deterministically
+- P12-METHOD [UNKNOWN/product_behavior] presets: Saved workflow keeps selected execution method identity where task-owned
+- P12-EMPTY-IMAGES [UNKNOWN/product_behavior] presets: Source/reference/mask images reopen empty; no stale image state restored
+- P12-PROVENANCE [UNKNOWN/product_behavior] presets: Run-local overrides and replay provenance stay separate from saved identity; final submitted prompt traceable
+- P13-CHAIN [UNKNOWN/product_behavior] integration: Current-image chaining works; explicit source replacement supersedes lineage
+- P13-STALE [UNKNOWN/product_behavior] integration: Source/mode/subtool switches clear stale masks, overlays, and controls
+- P13-FAMILIES [UNKNOWN/product_behavior] integration: T2I/I2I families separated; legacy specialized workflows stay compatible
+- P13-HONEST [UNKNOWN/product_behavior] integration: Honest placeholders with gate reasons; truthful async status; actionable dependency failures
+- P13-IDENTITY [UNKNOWN/product_behavior] integration: Queue and Experiment identity stable across submission and reload
+- HOST-LAUNCHER [UNKNOWN/product_behavior] host/modal: Sidebar launcher opens Studio
+- HOST-FALLBACK [UNKNOWN/product_behavior] host/modal: Fallback launcher when sidebar registration unavailable
+- HOST-WINDOW-API [UNKNOWN/product_behavior] host/modal: window.open_testing_modal / window.close_testing_modal entrypoints preserved
+- HOST-SINGLE-MOUNT [UNKNOWN/product_behavior] host/modal: Vue app mounts once, reused across opens
+- HOST-FOCUS-CAPTURE [UNKNOWN/product_behavior] host/modal: Open captures trigger element
+- HOST-FOCUS-RESTORE [UNKNOWN/product_behavior] host/modal: Close restores focus to opener
+- HOST-SCROLL-LOCK [UNKNOWN/product_behavior] host/modal: Body scroll locked while open, released on close
+- HOST-INERT [UNKNOWN/product_behavior] host/modal: Background inert + aria-hidden applied and restored (incl. pre-existing attrs)
+- HOST-ARIA-MODAL [UNKNOWN/product_behavior] host/modal: aria-modal=true represents normal modal ownership
+- HOST-ESCAPE [UNKNOWN/product_behavior] host/modal: Escape closes topmost layer; nested portalled layers own Escape first
+- HOST-BACKDROP [UNKNOWN/product_behavior] host/modal: Backdrop click closes main modal
+- HOST-CLOSE-SUPPRESS [UNKNOWN/product_behavior] host/modal: Explicit close suppresses refresh auto-reopen
+- HOST-AUTOREOPEN [FAIL/product_behavior] host/modal: Same-tab refresh auto-reopens Studio on last page (explicit close suppresses)
+- HOST-EXPLICIT-OPENER [UNKNOWN/product_behavior] host/modal: Reopen honors hash unless explicit opener supplies page
+- HOST-WIZARD-MODE [UNKNOWN/product_behavior] host/modal: Wizard graph mode releases inert + aria-modal; close restores containment
+- HOST-CLOSE-BUTTON [UNKNOWN/product_behavior] host/modal: Single Studio close affordance; host fallback hidden after bundle ready
+- HOST-LEGACY-RESTORE [UNKNOWN/product_behavior] host/modal: Close restores parked legacy overlay and host chrome
+- HOST-WIZARD-REOPEN [UNKNOWN/product_behavior] host/modal: Pending wizard draft forces reload back to Workflows so the draft can resume
+- INFRA-WORKSPACES [UNKNOWN/product_behavior] manage modal: Workspace list + active workspace normalized
+- INFRA-SWITCH [UNKNOWN/product_behavior] manage modal: Workspace switch activates with rollback on failure
+- INFRA-MODELS [UNKNOWN/product_behavior] manage modal: Model list renders presence states distinctly
+- INFRA-INSTALL [UNKNOWN/product_behavior] manage modal: Model install/download full status lifecycle in view
+- INFRA-CREDS [UNKNOWN/product_behavior] manage modal: Credentials save + status/failure visibility
+- INFRA-OPVIS [UNKNOWN/product_behavior] manage modal: Long operations visible once with IDs/progress/failure (no duplicate busy)
+- DEPS-STATES [FAIL/product_behavior] dependencies: Dependency presence contract is exhaustive and distinct: local-present, Modal-workspace-present, missing, installing, unknown/unverified (each rendered distinctly, none double-counted)
+- DEPS-MODEL-GATE [UNKNOWN/product_behavior] dependencies: Missing-model blocks execution attempt (gate, not badge)
+- DEPS-NODE-GATE [UNKNOWN/product_behavior] dependencies: Missing-node gate honors skip_plan_validation interaction
+- PG-WORKFLOW-SELECT [UNKNOWN/product_behavior] playground: Workflow selection loads run context
+- PG-PICKER-FILTERS [FAIL/product_behavior] playground: Workflow picker offers search/folders (not bare select)
+- PG-VERSION-PICK [UNKNOWN/product_behavior] playground: Version picker lists versions; latest resolved on workflow change
+- PG-SELECTION-PERSIST [UNKNOWN/product_behavior] playground: Workflow/version selection persists across reload
+- PG-MODEL-UNET [FAIL/product_behavior] playground: UNET control is a model picker with populated choices
+- PG-MODEL-CLIP [FAIL/product_behavior] playground: CLIP control is a model picker with populated choices
+- PG-MODEL-VAE [FAIL/product_behavior] playground: VAE control is a model picker with populated choices
+- PG-SEED-RANDOMIZE [UNKNOWN/product_behavior] playground: Seed randomize action produces a fresh draw (-1 = random semantics kept)
+- PG-SELECT [UNKNOWN/product_behavior] playground: Select controls render options and coerce values
+- PG-BOOLEAN [UNKNOWN/product_behavior] playground: Boolean/toggle controls emit booleans into payload
+- PG-TEXT [UNKNOWN/product_behavior] playground: Prompt/multiline text entry into payload
+- PG-ADV-DISCLOSURE [FAIL/product_behavior] playground: Advanced is a collapsible disclosure (not a static group)
+- PG-ADV-PERSIST [FAIL/product_behavior] playground: Advanced open/closed state persists
+- PG-CONTROL-ORDER [FAIL/product_behavior] playground: Controls follow user-defined order/rows
+- PG-ORDER-PERSIST [FAIL/product_behavior] playground: Control order/rows persist across reload
+- PG-METHOD-SELECT [FAIL/product_behavior] playground: Method selectors choose execution method and enter payload
+- PG-DIRTY [UNKNOWN/product_behavior] playground: Dirty-state semantics: preset dirty vs run-state reset
+- PG-RUN-GATE [UNKNOWN/product_behavior] playground: Run enable/disable gate matrix (loading/error/runnable/required/busy/placeholder)
+- PG-NUM-STEP [UNKNOWN/product_behavior] playground: Numeric step behavior (stepper increments, e.g. step 8 for dimensions)
+- PG-SEED-RANGE [UNKNOWN/product_behavior] playground: Seed-specific range semantics (accepted min/max, -1 random) excluding the randomize action
+- POST2-LIGHT [FAIL/product_behavior] post: Post provides Light controls (exposure/contrast/whites/blacks/shadows/highlights/brightness)
+- POST2-COLOR [FAIL/product_behavior] post: Post provides Color controls (temp/tint/vibrance/saturation/hue)
+- POST2-CURVES [FAIL/product_behavior] post: Post provides Curves controls
+- POST2-MIXER [FAIL/product_behavior] post: Post provides Mixer and Grading controls
+- POST2-DETAIL-FX [FAIL/product_behavior] post: Post provides Detail (texture/clarity/dehaze/sharpen/structure) and Effects controls
+- POST2-LUT [FAIL/product_behavior] post: Post provides LUT library with import/use/favorites
+- POST2-CROP [FAIL/product_behavior] post: Post provides Crop and Straighten controls
+- POST2-HEAL-WB [FAIL/product_behavior] post: Post provides Spot heal and white-balance picker tools
+- POST2-WORKFLOW [FAIL/product_behavior] post: Post supports presets, filmstrip, batch apply, undo-redo, before/after, export
+- POST2-ORDER [FAIL/product_behavior] post: Processing order heal -> color/curves/LUT -> dehaze -> spatial -> orient/straighten/crop
+- POST2-RES [FAIL/product_behavior] post: Preview capped at 1200px long side; export renders full resolution
+- POST2-PIPELINE [FAIL/product_behavior] post: Single-threaded Canvas 2D pipeline; native deviations marked APPROX
+- EXP-NO-RETRY-ALL [UNKNOWN/product_behavior] experiment: Per-cell retry only; no automatic retry-all
+- REF2-METHODS [UNKNOWN/product_behavior] generate/references: Accepted methods: Multi-image Conditioning Slots, Reference Latent Chain, Dedicated Workflow
+- REF2-NO-AUTO [UNKNOWN/product_behavior] generate/references: Method selection explicit; no Auto mode offered or implied
+- REF2-MEMORY [UNKNOWN/product_behavior] generate/references: Selected method remembered per workflow
+- REF2-CAPACITY [UNKNOWN/product_behavior] generate/references: Reference capacity derived from workflow graph (not a fixed count)
+- REF2-SOURCES [UNKNOWN/product_behavior] generate/references: Reference slots fill from Upload, Current, History sources
+- REF2-IDENTITY [UNKNOWN/product_behavior] generate/references: Reference entries keep stable identity across slot operations
+- REF2-THUMBS [UNKNOWN/product_behavior] generate/references: Entries show thumbnails; source image stays semantically distinct from references
+- GUI2-IDENTITY [UNKNOWN/product_behavior] generate/guidance: Guidance resolves against exact loaded model identity (not display label)
+- GUI2-HASH [UNKNOWN/product_behavior] generate/guidance: Hash/manifest identity outranks ambiguous names
+- GUI2-PROPOSE [UNKNOWN/product_behavior] generate/guidance: Recommendations proposed, never silently applied; Confirm and Change exposed
+- GUI2-REUSE [UNKNOWN/product_behavior] generate/guidance: Confirmed mapping reused across workflows sharing model identity; never silently replaced
+- GUI2-PROVENANCE [UNKNOWN/product_behavior] generate/guidance: Provenance, controller/provider, weight filename and hash recorded
+- GUI2-PREPROCESSOR [UNKNOWN/product_behavior] generate/guidance: Required preprocessor explicit and preserved per mapping
+- GUI2-FALLBACK [UNKNOWN/product_behavior] generate/guidance: Manual fallback available when no trusted mapping exists
+- ROUTE-BACK [UNKNOWN/product_behavior] routing: Back/Forward restores Studio page and focus
+- ROUTE-OPENER-WINS [UNKNOWN/product_behavior] routing: Explicit programmatic opener beats stale hash for that invocation
+- ROUTE-NO-REOPEN [UNKNOWN/product_behavior] routing: Close-then-hash does not auto-reopen Studio
+- ROUTE-SETTINGS-FOCUS [FAIL/product_behavior] routing: Settings focus selects the requested section (focus=outputs defect fixed, not removed)
+- SEL2-TOOLS [FAIL/product_behavior] edit/select: Select offers Brush, Lasso, Rectangle, Object, Detect tools
+- SEL2-ADD-SUB [FAIL/product_behavior] edit/select: Mask ops Add, Subtract, Replace
+- SEL2-GROW [FAIL/product_behavior] edit/select: Mask ops Grow, Shrink, Feather (radius-based)
+- SEL2-INVERT-HISTORY [FAIL/product_behavior] edit/select: Mask ops Invert, Fill Holes, Clear; mask Undo/Redo round trip
+- SEL2-ERASE-EQ [UNKNOWN/product_behavior] edit/select: Erase is Brush + Subtract, not its own subsystem
+- SEL2-SOURCE-PATHS [FAIL/product_behavior] edit/select: Select source via Upload, Current, History, drag-drop, paste
+- SEL2-SOURCE-CLEAR [FAIL/product_behavior] edit/select: Select source Replace/Clear; clear invalidates paint history (Undo cannot resurrect)
+- SEL2-BASE-CLEAR [FAIL/product_behavior] edit/select: Base change clears stale overlay strokes and mask state
+- SEL2-MASK-SAVE [FAIL/product_behavior] edit/select: Mask save carries mask into execution state
+- SEL2-COMPAT [FAIL/product_behavior] edit/select: Select keeps legacy dedicated-inpaint compatibility alongside ordinary I2I
+- EXP2-SIDES [FAIL/product_behavior] edit/expand: Expand exposes independent Top/Right/Bottom/Left values
+- EXP2-DRAG [FAIL/product_behavior] edit/expand: Expand direct-manipulation preview alongside numeric controls
+- EXP2-METHODS [FAIL/product_behavior] edit/expand: Expand methods Pad Canvas, Pad+Preserve, Dedicated Workflow
+- EXP2-NO-AUTO [UNKNOWN/product_behavior] edit/expand: Expand offers no Auto method
+- EXP2-MEMORY [FAIL/product_behavior] edit/expand: Expand remembers method per workflow; stored workflow stays immutable
+- EXP2-I2I [FAIL/product_behavior] edit/expand: Expand supports normal I2I workflows
+- SET-DATASAVER [UNKNOWN/product_behavior] settings: Data Saver semantics preserved end to end
+- SET-MODEL-BLOCK [UNKNOWN/product_behavior] settings: Model-missing stays a blocker when skip_plan_validation is on
+- SET-NODE-RELAX [UNKNOWN/product_behavior] settings: skip flag relaxes custom-node validation only
+- SET-CROSSTAB [UNKNOWN/product_behavior] settings: Cross-tab settings change invalidates and refetches (kind-only message)
+- SET-BROWSER-PREFS [UNKNOWN/product_behavior] settings: Browser-only prefs persist; excluded from /config
+- SET-TRACING [UNKNOWN/product_behavior] settings: Tracing/profile selected vs effective level; failure rolls back
+- GOLDEN-CATALOG [UNKNOWN/product_behavior] settings: Golden catalog + server selection with fallback
+- SK2-TOOLS [FAIL/product_behavior] generate/sketch: Sketch tools: brush, pencil, eraser, line, rectangle, circle, fill, eyedropper
+- SK2-SETTINGS [FAIL/product_behavior] generate/sketch: Sketch settings: size, opacity, hardness, color, background, fill tolerance (pressure only if accepted)
+- SK2-COMPOSITE [FAIL/product_behavior] generate/sketch: Layer-composited rendering with bounded undo/redo history (cap 30)
+- SK2-ZOOM [FAIL/product_behavior] generate/sketch: Zoom in/out, Fit, wheel zoom, space/middle-mouse pan
+- SK2-LAYERS [FAIL/product_behavior] generate/sketch: Layers: add, delete, rename, visibility, opacity, reorder, duplicate, merge-down, flatten
+- SK2-BASE-LOCK [FAIL/product_behavior] generate/sketch: Base layer index-zero, locked, protected from deletion/movement
+- SK2-ROUTING [FAIL/product_behavior] generate/sketch: Sketch routes to sketch editor; legacy inpaint/Select keep paint editor
+- SK2-SURFACE [FAIL/product_behavior] generate/sketch: Sketch surface preserves canvas/undo/save/mask-preview selectors and save wording
+- SK-OPEN [UNKNOWN/product_behavior] generate/sketch: Sketch editor opens with base image selection
+- SK-STROKES [FAIL/product_behavior] generate/sketch: Stroke creation, eraser, clear, undo/redo
+- SK-FLATTEN-UPLOAD [FAIL/product_behavior] generate/sketch: Sketch flattens and uploads with sketch identity as source
+- SK-BASE-SWITCH [UNKNOWN/product_behavior] generate/sketch: Base switch clears strokes/layers, preserves tool settings
+- GUI-LOOKUP [FAIL/product_behavior] generate/guidance: Guidance mapping lookup for workflow/version
+- GUI-MODES [FAIL/product_behavior] generate/guidance: Guidance modes, unsupported states, and selection UI
+- STY-CONTEXT [FAIL/product_behavior] generate/style: Style browser visible only in Generate Text context, absent in Edit mode
+- STY-SHELL [FAIL/product_behavior] generate/style: Style browser renders collapsed accordion with search, categories, grid, twelve catalog cards
+- STY-SEARCH [FAIL/product_behavior] generate/style: Style search filters cards; clearing restores full catalog
+- STY-CATEGORY [FAIL/product_behavior] generate/style: Category filter shows member cards; All restores catalog
+- STY-SELECT [FAIL/product_behavior] generate/style: Style selection marks card pressed, exposes identity, composes prompt fragment
+- STY-NONE [FAIL/product_behavior] generate/style: None clears identity, effective prompt, pressed state, persisted selection
+- STY-PERSIST [FAIL/product_behavior] generate/style: Style selection and favorites persist in localStorage style store
+- STY-FAVORITE [FAIL/product_behavior] generate/style: Favorite toggle updates visual state and persisted favorites membership
+- STY-WORKFLOW-KEPT [UNKNOWN/product_behavior] generate/style: Selected workflow unchanged while style selection updates prompt
+- LAY2-SHELL [FAIL/product_behavior] generate/layout: Layout editor shell mounts with canvas, dimensions, palette, region list, inspector, JSON preview
+- LAY2-CREATE [FAIL/product_behavior] generate/layout: Canvas drag-create makes regions, including forced creation over existing region
+- LAY2-TRANSFORM [UNKNOWN/product_behavior] generate/layout: Region select, move, resize via canvas handles
+- LAY2-TYPE-TEXT [FAIL/product_behavior] generate/layout: Region switches Object/Text type; text regions keep exact entered text
+- LAY2-JSON-PREVIEW [FAIL/product_behavior] generate/layout: Descriptions and palette edits appear in structured layout JSON preview
+- LAY2-BBOX [FAIL/product_behavior] generate/layout: Bboxes serialize as Ideogram y-min,x-min,y-max,x-max on a 0-1000 grid
+- LAY2-LIFECYCLE [FAIL/product_behavior] generate/layout: Regions duplicate, reorder, delete, clear with serialized order preserved
+- LAY2-OVERLAP [UNKNOWN/product_behavior] generate/layout: Alt-click cycles selection among overlapping regions
+- LAY2-DIMS [FAIL/product_behavior] generate/layout: Canvas dimensions and global/background descriptions update draft and JSON caption
+- LAY2-SEND [FAIL/product_behavior] generate/layout: Send to Prompt serializes layout and returns shell to Text with workflow unchanged
+- LAY2-DRAFT [FAIL/product_behavior] generate/layout: Layout draft survives supported reload/remount path
+- STYLE-PORTAL [UNKNOWN/product_behavior] styling: Portalled controls render into Studio-owned portal target
+- STYLE-ZINDEX [UNKNOWN/product_behavior] styling: Modal / in-app / portal z-index ordered; focus correct; responsive
+- STYLE-HOST-SAFE [UNKNOWN/product_behavior] styling: Opening Vue Studio never alters external ComfyUI layout/styles
+- WZ-OPEN-CLOSE [UNKNOWN/product_behavior] wizard: Wizard opens and closes/cancels with cleanup
+- WZ-SUG-UNET [FAIL/product_behavior] wizard: Auto-suggest discovers UNET candidates in graph order
+- WZ-SUG-CLIP [FAIL/product_behavior] wizard: Auto-suggest discovers CLIP candidates in graph order
+- WZ-SUG-VAE [FAIL/product_behavior] wizard: Auto-suggest discovers VAE candidates in graph order
+- WZ-PROPOSE [UNKNOWN/product_behavior] wizard: Auto-suggest discovers text candidates; suggestions stay proposals until explicit confirm
+- WZ-ROLES [UNKNOWN/product_behavior] wizard: Required/optional role catalogs enforced at save
+- WZ-CENTER [FAIL/product_behavior] wizard: View centers graph on bound node
+- WZ-HIGHLIGHT [FAIL/product_behavior] wizard: View highlights node ~3s, cleared on re-render/close
+- WZ-GRAPH-MODE [FAIL/product_behavior] wizard: Graph interactive while wizard open; inert + aria-modal released, restored after
+- WZ-FOCUS [UNKNOWN/product_behavior] wizard: Wizard focus capture + aria-modal semantics
+- WZ-DRAFT [UNKNOWN/product_behavior] wizard: Mapping persists; draft survives reload scoped to version; reopen resumes step
+- PRESET-CRUD [UNKNOWN/product_behavior] presets: Preset create/apply/update/delete end to end
+- PRESET-IDENTITY [UNKNOWN/product_behavior] presets: Active preset identity + dirty state tracked
+- PRESET-VERSION [UNKNOWN/product_behavior] presets: Preset owned by workflow version; cross-version behavior correct
+- PRESET-APPLY [UNKNOWN/product_behavior] presets: Applying preset restores controls + output overrides
+- PRESET-CLEAR-EDITORS [UNKNOWN/product_behavior] presets: Stale editor/direct-manip state cleared on preset apply
+- PRESET-LOOKS-SEPARATE [UNKNOWN/product_behavior] presets: Post Looks remain distinct from workflow presets
+
+## Needs RACE (32)
+
+- LATEST-READS [UNKNOWN/product_behavior] async: Workflow/version/detail reads use latest-wins primitive
+- LATEST-HISTORY [UNKNOWN/product_behavior] async: History feed/detail reads use latest-wins; entity may update cache but never steal focus
+- LATEST-REFRESH [UNKNOWN/product_behavior] async: Inventory/settings refresh reads use latest-wins
+- POLL-OWNER [UNKNOWN/product_behavior] async: Long polls have one owner; abort on navigation/terminal; domain keeps backend semantics
+- POLL-ABORT [UNKNOWN/product_behavior] async: Long polls: one owner; navigation/rerender never duplicates polling; operation continues when domain requires; terminal/dispose/replacement stops it; no zombie timers
+- WS-MIDOP [UNKNOWN/product_behavior] operations: Workspace switch mid-operation cannot retarget submitted request
+- WS-GUARD [UNKNOWN/product_behavior] operations: Accepted operation stays bound to its accepted workspace; switching active workspace changes future operations only; current operation never retargeted
+- WF-STALE-READ [UNKNOWN/product_behavior] workflows: Stale workflow/version reads cannot commit over newer selection
+- SRC-LATEST-WINS [UNKNOWN/product_behavior] edit/source: Latest upload wins; token+owner guard discards stale completions
+- SRC-OWNER-SWITCH [UNKNOWN/product_behavior] edit/source: Owner change (workflow/tool switch) invalidates pending upload
+- REF-UPLOAD-RACE [UNKNOWN/product_behavior] generate/references: Reference upload ownership; stale reference upload discarded
+- HIST-STALE-FOCUS [UNKNOWN/product_behavior] history: Stale detail/query responses cannot steal focus
+- HOST-NO-DUP-ESC [UNKNOWN/product_behavior] host/modal: Repeated open/close does not duplicate Escape listeners
+- HOST-NO-DUP-WIZ [UNKNOWN/product_behavior] host/modal: Repeated mount does not duplicate wizard listeners
+- INFRA-FROZEN-TARGET [UNKNOWN/product_behavior] manage modal: In-flight infra operation records frozen workspace target
+- INFRA-REFRESH [UNKNOWN/product_behavior] manage modal: Inventory refresh with latest-wins; explicit UI refresh semantics
+- DEPS-STALE-REFRESH [UNKNOWN/product_behavior] dependencies: Stale inventory refresh never overwrites newer snapshot
+- QUEUE-WORKSPACE-FROZEN [UNKNOWN/product_behavior] queue: Accepted queued execution target cannot be retargeted by a later active-workspace switch (server dispatch owns authority boundary)
+- QUEUE-MUTATION-RACE [UNKNOWN/product_behavior] queue: Later UI edits cannot mutate already-queued request (adversarial A-then-B)
+- QUEUE-IDENTITY-CHECK [FAIL/product_behavior] queue: Queued item executes with its own frozen workflow identity, version, and intent; same-workflow/different-version variants never merge; batch grouping never combines incompatible immutable identity
+- EXP-CELL-IDS [FAIL/product_behavior] experiment: Experiment + cell IDs own status lifecycle in UI state
+- EXP-LATE-EVENT [UNKNOWN/product_behavior] experiment: Late events cannot claim a different experiment
+- RUN-FRESH-ID [UNKNOWN/product_behavior] run lifecycle: Fresh frontend run identity per Run click
+- RUN-PROMPT-ID [UNKNOWN/product_behavior] run lifecycle: Prompt ID captured; foreign prompt terminal events rejected
+- RUN-EVENT-ORDER [UNKNOWN/product_behavior] run lifecycle: Progress before execution-start rejected; foreign experiment progress rejected
+- RUN-TERMINAL-LOCK [UNKNOWN/product_behavior] run lifecycle: Terminal state cannot regress; duplicate terminals deduplicated
+- RUN-SNAPSHOT-DEDUP [UNKNOWN/product_behavior] run lifecycle: Snapshot/journal duplicate polls deduplicated
+- RUN-CANCEL [FAIL/product_behavior] run lifecycle: Cancel is authoritative and race-safe (cancel-then-success cannot resurrect)
+- RUN-LATE-EVENT [UNKNOWN/product_behavior] run lifecycle: Late prior-run events cannot hijack new run
+- RUN-MIDRUN-SWITCH [UNKNOWN/product_behavior] run lifecycle: Navigation / workflow switch mid-run cannot mutate active run
+- EXP2-RACE [FAIL/product_behavior] edit/expand: Stale workflow responses cannot overwrite current Expand state
+- SK-SETTINGS-GUARD [UNKNOWN/product_behavior] generate/sketch: Sketch tool settings preserved; stale completion guarded
+
+## Needs REAL_BACKEND (13)
+
+- WS-MIDOP [UNKNOWN/product_behavior] operations: Workspace switch mid-operation cannot retarget submitted request
+- CANVAS-PROMPT [UNKNOWN/product_behavior] canvas compatibility: /prompt interception preserved for canvas path
+- CANVAS-PASSTHROUGH [UNKNOWN/product_behavior] canvas compatibility: Cloud/Local pass-through + enable/disable preserved
+- CANVAS-MARKERS [UNKNOWN/product_behavior] canvas compatibility: Production graph markers/bypass preserved
+- CANVAS-CURRENT-SETTINGS [UNKNOWN/product_behavior] canvas compatibility: Canvas submission uses current Settings after projection
+- SEL-OWNERSHIP [UNKNOWN/product_behavior] edit/select: Mask + source share widget identity in request
+- REF-BINDING [UNKNOWN/product_behavior] generate/references: Reference candidate/method/binding structure matches mapping
+- INFRA-DEPLOY [UNKNOWN/product_behavior] manage modal: Deploy/redeploy triggers; readiness/status/logs/failure-retry surface
+- INFRA-NODES [UNKNOWN/product_behavior] manage modal: Custom-node presence, publication, rebuild wired
+- PG-MODEL-AUTOFILL [UNKNOWN/product_behavior] playground: UNET/CLIP/VAE autofill from captured workflow values
+- GOLDEN-AB-NEXT-RUN [UNKNOWN/product_behavior] settings: Active A/B order applies to next run without redeploy
+- GOLDEN-DEPLOY [UNKNOWN/product_behavior] settings: Golden deploy operation + status polling owned by Settings/infrastructure
+- WZ-CAPTURE [UNKNOWN/product_behavior] wizard: Actual node/widget capture binds exact graph target
+
+## Needs INTEGRATION (40)
+
+- LATEST-MUTATIONS [UNKNOWN/product_behavior] async: Mutations (favorite/note/delete/save) complete; navigation never cancels server write
+- POLL-RUN [FAIL/product_behavior] async: Run progress/status integrated with run-controller identity and terminal semantics (controller owns semantics, not the generic poller)
+- OPS-DUP-BUSY [UNKNOWN/product_behavior] operations: No second generic operation registry and no conflicting busy authority beside operationStore (domain runState/isBusy as semantic truth is allowed)
+- CANVAS-PROJECTION [UNKNOWN/product_behavior] canvas compatibility: Output options projected server -> legacy mirror one-way (never read back)
+- CANVAS-FALLBACK [UNKNOWN/product_behavior] canvas compatibility: localStorage fallback keys keep working during transition
+- SEL-CROPSTITCH [FAIL/product_behavior] edit/select: Crop+Stitch execution method
+- SEL-COND-CROP [FAIL/product_behavior] edit/select: Conditioning + Crop-Stitch method
+- SEL-DEDICATED [FAIL/product_behavior] edit/select: Dedicated override method + method switching preserves mask/source
+- SEL-PAYLOAD [UNKNOWN/product_behavior] edit/select: Inpaint request serializes source, mask, method exactly
+- EXPAND-PAD [FAIL/product_behavior] edit/expand: Pad Canvas method
+- EXPAND-PRESERVE [FAIL/product_behavior] edit/expand: Pad+Preserve method and Dedicated override
+- EXPAND-PAYLOAD [FAIL/product_behavior] edit/expand: Expand geometry serializes into request; replacement invalidates stale state
+- TXT-PAYLOAD [UNKNOWN/product_behavior] generate/text: Text serialized into request with workflow/version ownership
+- REF-SOURCE-SEPARATION [UNKNOWN/product_behavior] generate/references: Source image kept distinct from references in payload
+- LAY-PAYLOAD [FAIL/product_behavior] generate/layout: Layout serializes into request with image/base ownership
+- HIST-RECENT [UNKNOWN/product_behavior] history: Recent runs converge with History (Playground strip)
+- HIST-IMMUTABLE-REPLAY [UNKNOWN/product_behavior] history: Replay uses immutable execution params (browser never resends)
+- P13-SNAPSHOT [UNKNOWN/product_behavior] integration: Queue snapshot carries subtool, methods, references, style, guidance, workflow/version, controls, request state
+- PG-MODEL-OPTIONS [FAIL/product_behavior] playground: Model dropdown choices populate from graph + backend inventory
+- PG-MODEL-ROLES [UNKNOWN/product_behavior] playground: Model roles registered in control catalog and drive controls
+- PG-PAYLOAD [UNKNOWN/product_behavior] playground: Run request payload shape: workflow/version/controls identity to POST /studio/run
+- EXP-CANCEL-RESUME [UNKNOWN/product_behavior] experiment: Experiment cancel/resume with correct ownership
+- EXP-HISTORY-EXPOSURE [UNKNOWN/product_behavior] experiment: Experiment visible in History with results
+- GUI2-EXEC [UNKNOWN/product_behavior] generate/guidance: Backend receives guidance config; soft reference stays distinct from structural guidance
+- RUN-POST-AUTHORITY [UNKNOWN/product_behavior] run lifecycle: POST/result path is terminal authority (not websocket/progress)
+- RUN-GOLDEN-PRESENT [UNKNOWN/product_behavior] run lifecycle: Golden stage progress is presentation-only, never decides completion
+- RUN-FAILURE-PATH [UNKNOWN/product_behavior] run lifecycle: Failure path preserves run identity and details
+- RUN-RESULT-ATTACH [UNKNOWN/product_behavior] run lifecycle: Result attaches to submitted run; recent History converges
+- RUN-CONTROLLER-INTEGRATION [FAIL/product_behavior] run lifecycle: Vue run path integrates/ports the accepted run-controller machinery (fresh run identity, event-source attach/detach, execution-start locking, stale/foreign rejection, prompt/Experiment filtering, journal dedupe, terminal freeze, authoritative result integration, Golden-presentation semantics)
+- SET-CONFIG-AUTH [UNKNOWN/product_behavior] settings: /config is durable server authority; UI reflects acknowledged state
+- SET-GPU [UNKNOWN/product_behavior] settings: Selected GPU persists through /config
+- SET-OUTPUTS [UNKNOWN/product_behavior] settings: Output settings save + project to canvas mirror one-way
+- SET-SKIP-SEMANTICS [UNKNOWN/product_behavior] settings: skip_plan_validation exact key/value semantics (local 1/0 + server boolean)
+- SET-ROLLBACK [UNKNOWN/product_behavior] settings: Failed saves roll back to acknowledged server/browser state
+- SET-ACK [UNKNOWN/product_behavior] settings: Successful mutation applies only after server acknowledgement (reread)
+- GOLDEN-SEPARATION [UNKNOWN/product_behavior] settings: Normal GPU, Golden profile, deploy config, active A/B kept distinct
+- SK2-COMMIT [FAIL/product_behavior] generate/sketch: Flattened sketch uploads as uniquely named source image with source commit hook
+- GUI-KEY [FAIL/product_behavior] generate/guidance: Guidance keyed by exact (model_sha256, mode)
+- GUI-PAYLOAD [FAIL/product_behavior] generate/guidance: Guidance mutates request and persists per version
+- PRESET-NO-SETTINGS [UNKNOWN/product_behavior] presets: Preset output overrides never mutate global Settings
+
+## Needs UNIT (7)
+
+- POST2-PERSIST [FAIL/product_behavior] post: Recipe, presets, LUT favorites persist under designated localStorage keys
+- QUEUE-EXTRAS-FROZEN [FAIL/product_behavior] queue: Methods/references/layout/guidance frozen at enqueue
+- QUEUE-ORDER [UNKNOWN/product_behavior] queue: FIFO order preserved across drain
+- QUEUE-REMOVE-CLEAR [UNKNOWN/product_behavior] queue: Remove and clear queue semantics
+- EXP-AXIS-ORDER [UNKNOWN/product_behavior] experiment: Axis value ordering deterministic
+- EXP-DEFINITION-FROZEN [UNKNOWN/product_behavior] experiment: Submitted experiment definition immutable post-submit
+- ROUTE-FOCUS-SAFE [UNKNOWN/product_behavior] routing: Focus values never become executable markup
+
+## Needs STATIC (0)
+

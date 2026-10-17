@@ -1,0 +1,477 @@
+[
+  {
+    "id": "EXPAND-GEOMETRY",
+    "contract_type": "product_behavior",
+    "area": "edit/expand",
+    "behavior": "Expand padding controls and geometry",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2 Expand"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue Expand editor.",
+    "legacy_evidence": "web/studio-playground.js Expand editor",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "EXPAND-PAD",
+    "contract_type": "product_behavior",
+    "area": "edit/expand",
+    "behavior": "Pad Canvas method",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue method.",
+    "legacy_evidence": "web/studio-playground.js Pad Canvas",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "EXPAND-PRESERVE",
+    "contract_type": "product_behavior",
+    "area": "edit/expand",
+    "behavior": "Pad+Preserve method and Dedicated override",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue methods.",
+    "legacy_evidence": "web/studio-playground.js Pad+Preserve + override",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "EXPAND-PAYLOAD",
+    "contract_type": "product_behavior",
+    "area": "edit/expand",
+    "behavior": "Expand geometry serializes into request; replacement invalidates stale state",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7.3"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue serialization or state implementation.",
+    "legacy_evidence": "web/studio-playground.js Expand payload + invalidation",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "EXPAND-PREVIEW",
+    "contract_type": "product_behavior",
+    "area": "edit/expand",
+    "behavior": "Expand preview reflects padding/geometry before run",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Central stage has image/status only; no Expand preview.",
+    "legacy_evidence": "web/studio-playground.js Expand preview",
+    "vue_evidence": "PlaygroundView.vue:371-468 stage without Expand overlay",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "POST-ADJUST",
+    "contract_type": "product_behavior",
+    "area": "post",
+    "behavior": "Adjust tool controls + engine behavior + ownership",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2 Post"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No specialized Adjust panel; generic controls only.",
+    "legacy_evidence": "web/studio-postprocess.js Adjust implementation",
+    "vue_evidence": "MISSING (generic PlaygroundControls.vue only)",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: TinyLuma-based per web/studio-postprocess.js:1-13 (control parity statement, render_full_image order); introduced in commit 9b333d08. Engine: studio-postprocess.js:224-674 (Canvas 2D pixel pipeline); shell/UI: :720-1905; integration: studio-playground.js."
+  },
+  {
+    "id": "POST-COLOR",
+    "contract_type": "product_behavior",
+    "area": "post",
+    "behavior": "Color tool controls + engine behavior + ownership",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue evidence.",
+    "legacy_evidence": "web/studio-postprocess.js Color implementation",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: TinyLuma-based per web/studio-postprocess.js:1-13 (control parity statement, render_full_image order); introduced in commit 9b333d08. Engine: studio-postprocess.js:224-674 (Canvas 2D pixel pipeline); shell/UI: :720-1905; integration: studio-playground.js."
+  },
+  {
+    "id": "POST-DETAIL",
+    "contract_type": "product_behavior",
+    "area": "post",
+    "behavior": "Detail tool controls + engine behavior + ownership",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue evidence.",
+    "legacy_evidence": "web/studio-postprocess.js Detail implementation",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: TinyLuma-based per web/studio-postprocess.js:1-13 (control parity statement, render_full_image order); introduced in commit 9b333d08. Engine: studio-postprocess.js:224-674 (Canvas 2D pixel pipeline); shell/UI: :720-1905; integration: studio-playground.js."
+  },
+  {
+    "id": "POST-EFFECTS",
+    "contract_type": "product_behavior",
+    "area": "post",
+    "behavior": "Effects tool controls + engine behavior + ownership",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue evidence.",
+    "legacy_evidence": "web/studio-postprocess.js Effects implementation",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: TinyLuma-based per web/studio-postprocess.js:1-13 (control parity statement, render_full_image order); introduced in commit 9b333d08. Engine: studio-postprocess.js:224-674 (Canvas 2D pixel pipeline); shell/UI: :720-1905; integration: studio-playground.js."
+  },
+  {
+    "id": "POST-CROP",
+    "contract_type": "product_behavior",
+    "area": "post",
+    "behavior": "Crop tool controls + engine behavior + ownership",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue evidence.",
+    "legacy_evidence": "web/studio-postprocess.js Crop implementation",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: TinyLuma-based per web/studio-postprocess.js:1-13 (control parity statement, render_full_image order); introduced in commit 9b333d08. Engine: studio-postprocess.js:224-674 (Canvas 2D pixel pipeline); shell/UI: :720-1905; integration: studio-playground.js."
+  },
+  {
+    "id": "POST-HEAL",
+    "contract_type": "product_behavior",
+    "area": "post",
+    "behavior": "Heal tool controls + engine behavior + ownership",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue evidence.",
+    "legacy_evidence": "web/studio-postprocess.js Heal implementation",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: TinyLuma-based per web/studio-postprocess.js:1-13 (control parity statement, render_full_image order); introduced in commit 9b333d08. Engine: studio-postprocess.js:224-674 (Canvas 2D pixel pipeline); shell/UI: :720-1905; integration: studio-playground.js."
+  },
+  {
+    "id": "POST-LOOKS",
+    "contract_type": "product_behavior",
+    "area": "post",
+    "behavior": "Saved Looks owned separately from workflow presets",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.9"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Design contract exists; Vue Looks implementation absent.",
+    "legacy_evidence": "web/studio-postprocess.js Looks; blueprint 2.9 Looks vs presets",
+    "vue_evidence": "MISSING implementation (blueprint :261,415 contract only)",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: TinyLuma-based per web/studio-postprocess.js:1-13 (control parity statement, render_full_image order); introduced in commit 9b333d08. Engine: studio-postprocess.js:224-674 (Canvas 2D pixel pipeline); shell/UI: :720-1905; integration: studio-playground.js."
+  },
+  {
+    "id": "POST-UPSCALE-PARKED",
+    "contract_type": "product_behavior",
+    "area": "post",
+    "behavior": "Upscale stays a placeholder; no invented execution",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.10; 15 MAY NOT"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Placeholder explicitly represented; disabled-state needs browser check.",
+    "legacy_evidence": "web/studio-postprocess.js parked Upscale; blueprint 2.10",
+    "vue_evidence": "stores/playground.ts:37-41; PlaygroundView.vue:360-363 placeholder",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: TinyLuma-based per web/studio-postprocess.js:1-13 (control parity statement, render_full_image order); introduced in commit 9b333d08. Engine: studio-postprocess.js:224-674 (Canvas 2D pixel pipeline); shell/UI: :720-1905; integration: studio-playground.js."
+  },
+  {
+    "id": "CANVAS-BASE",
+    "contract_type": "product_behavior",
+    "area": "canvas rule",
+    "behavior": "Central stage holds image/content only in base state",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Source shows image/status branches; live DOM unproven.",
+    "legacy_evidence": "Phase13 central-stage contract",
+    "vue_evidence": "PlaygroundView.vue:371-460 stage branches",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CANVAS-SELECT",
+    "contract_type": "product_behavior",
+    "area": "canvas rule",
+    "behavior": "Select overlays render inside central stage, aligned to image",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue Select overlay exists.",
+    "legacy_evidence": "web/studio-playground.js Select overlays",
+    "vue_evidence": "MISSING (PlaygroundView.vue:371-468 no overlay)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CANVAS-EXPAND",
+    "contract_type": "product_behavior",
+    "area": "canvas rule",
+    "behavior": "Expand direct-manipulation overlays render inside stage",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue Expand overlay.",
+    "legacy_evidence": "web/studio-playground.js Expand overlays",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CANVAS-SKETCH",
+    "contract_type": "product_behavior",
+    "area": "canvas rule",
+    "behavior": "Sketch overlays are stage-local direct manipulation",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Comment/state mention is not overlay evidence.",
+    "legacy_evidence": "web/studio-playground.js Sketch overlays",
+    "vue_evidence": "MISSING overlay markup (PlaygroundView.vue:532 mention only)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CANVAS-NO-CONTROLS",
+    "contract_type": "product_behavior",
+    "area": "canvas rule",
+    "behavior": "Post/inspector controls never persist inside central stage",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Placement structurally suggested (controls at :607); browser DOM unproven.",
+    "legacy_evidence": "web/studio-postprocess.js; Phase13 rule",
+    "vue_evidence": "PlaygroundView.vue:371-468 stage vs :607 controls",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CANVAS-SWITCH",
+    "contract_type": "product_behavior",
+    "area": "canvas rule",
+    "behavior": "Tool switching preserves image identity without stale overlays",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Clear semantics exist; overlay lifecycle absent so transition unproven.",
+    "legacy_evidence": "legacy playground ownership transitions",
+    "vue_evidence": "stores/playground.ts:333-354 clear semantics only",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  }
+]

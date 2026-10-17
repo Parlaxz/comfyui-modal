@@ -1,0 +1,452 @@
+[
+  {
+    "id": "CMP-SELECT",
+    "contract_type": "product_behavior",
+    "area": "compare",
+    "behavior": "Select A and B images",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.3 CompareViewer"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Slots store-backed; selection behavior unproven.",
+    "legacy_evidence": "web/studio-image-compare.js A/B slots",
+    "vue_evidence": "stores/history.ts:283-290; CompareViewer.vue:20-25",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CMP-SWAP",
+    "contract_type": "product_behavior",
+    "area": "compare",
+    "behavior": "Replace/swap A/B",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Switch control visible in source; behavior unproven.",
+    "legacy_evidence": "web/studio-image-compare.js swap",
+    "vue_evidence": "CompareViewer.vue:39; stores/history.ts:287-290",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CMP-VIEWER",
+    "contract_type": "product_behavior",
+    "area": "compare",
+    "behavior": "Side-by-side viewer with divider control",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Wells rendered in source; viewer interaction unproven.",
+    "legacy_evidence": "web/studio-image-compare.js viewer + divider",
+    "vue_evidence": "CompareViewer.vue:32-58",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CMP-EXIT",
+    "contract_type": "product_behavior",
+    "area": "compare",
+    "behavior": "Exit compare clears transient state",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Clear path exists; behavior unproven.",
+    "legacy_evidence": "web/studio-image-compare.js exit/clear",
+    "vue_evidence": "CompareViewer.vue:40; stores/history.ts:293-300",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CMP-DELETED",
+    "contract_type": "product_behavior",
+    "area": "compare",
+    "behavior": "Deleted record in compare slot renders explicit state",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Explicit state rendered in source; behavior unproven.",
+    "legacy_evidence": "web/studio-image-compare.js deleted handling",
+    "vue_evidence": "CompareViewer.vue:23-24,54; stores/history.ts:114-119",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CMP-TRANSIENT",
+    "contract_type": "product_behavior",
+    "area": "compare",
+    "behavior": "Compare A/B never durably persists (transient two slots)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No persistence mechanism found, but reload behavior unproven.",
+    "legacy_evidence": "web/studio-image-compare.js no backend/persistence writes",
+    "vue_evidence": "CompareViewer.vue:36; store refs stores/history.ts:55",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Source declares transient; reload test required."
+  },
+  {
+    "id": "CMP-HANDOFF",
+    "contract_type": "product_behavior",
+    "area": "compare",
+    "behavior": "History/picker-to-compare handoff end to end",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Components exist separately; complete handoff undemonstrated.",
+    "legacy_evidence": "web/studio-history-picker.js:127-159 handoff",
+    "vue_evidence": "HistoryPicker.vue; CompareViewer.vue (separate)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-LIBRARY",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Workflow library list + select + detail",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Wired in source; library behavior unproven.",
+    "legacy_evidence": "web/studio-workflows.js:602-652 library/select",
+    "vue_evidence": "stores/workflows.ts:76,103-118; WorkflowsView.vue",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-FILTERS",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Search/folder/tag filters",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Filters + inventories present; behavior unproven.",
+    "legacy_evidence": "web/studio-workflows.js:120,745-750 filters",
+    "vue_evidence": "stores/workflows.ts:82-89; api/workflows.ts:17,26-27",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-CRUD",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Workflow create/update/delete",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Paths wired; behavior + persistence unproven.",
+    "legacy_evidence": "web/studio-workflows.js CRUD paths",
+    "vue_evidence": "api/workflows.ts:29-34; stores/workflows.ts:215-257",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-VERSIONS",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Version list, select, capture",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Version paths exist; behavior unproven.",
+    "legacy_evidence": "web/studio-workflows.js:84-86,669-673 versions",
+    "vue_evidence": "api/workflows.ts:19-20,34; stores/workflows.ts:103-118",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-MAPPING",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Mapping save vs revision distinction + confirmation",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Store/API distinction found; confirmation UI incomplete.",
+    "legacy_evidence": "web/studio-workflows.js:51-53,686-707 mapping/revision",
+    "vue_evidence": "api/workflows.ts:21-22,36-37; stores/workflows.ts:269+",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-DEPS",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Dependency data loaded into manager context",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Data loaded; visible detail behavior unproven.",
+    "legacy_evidence": "web/studio-workflows.js dependency panel",
+    "vue_evidence": "api/workflows.ts:23; stores/workflows.ts:120-140",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-COMPAT",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Compatibility + portability reports visible per version",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Reports loaded into state; visible UI + runtime unproven.",
+    "legacy_evidence": "web/studio-workflows.js:95-109,711-714 reports",
+    "vue_evidence": "api/workflows.ts:24-25; stores/workflows.ts:120-133",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-MANIFEST",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Manifest import/export round trip",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "API functions exist; visible workflow unconfirmed.",
+    "legacy_evidence": "legacy manifest import/export",
+    "vue_evidence": "api/workflows.ts:50-60; WorkflowsView.vue",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-SHARED-SELECT",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Selected version shared between Workflows and Playground",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Shared selection visible; cross-page behavior unproven.",
+    "legacy_evidence": "legacy shared selection paths",
+    "vue_evidence": "PlaygroundView.vue:100-126,299-332; stores/workflows.ts",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-STALE-READ",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Stale workflow/version reads cannot commit over newer selection",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5 workflow rule"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Latest-task guards explicit; race behavior unproven.",
+    "legacy_evidence": "web/studio-workflows.js:590-602 stale guards",
+    "vue_evidence": "stores/workflows.ts:65,106-126 + cross-tab invalidation",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WF-FOLDERS",
+    "contract_type": "product_behavior",
+    "area": "workflows",
+    "behavior": "Folder create + tag inventory persist",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Inventories exist; behavior unproven.",
+    "legacy_evidence": "web/studio-workflows.js:399-415 folders/tags",
+    "vue_evidence": "api/workflows.ts:26-27,33; stores/workflows.ts:257-260",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  }
+]

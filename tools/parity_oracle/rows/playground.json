@@ -1,0 +1,728 @@
+[
+  {
+    "id": "PG-WORKFLOW-SELECT",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Workflow selection loads run context",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Selection + context load exist; no browser proof.",
+    "legacy_evidence": "web/studio-playground.js:2800-2879 selection + context load",
+    "vue_evidence": "PlaygroundView.vue:281-297; stores/playground.ts:430-482 selectWorkflow",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-PICKER-FILTERS",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Workflow picker offers search/folders (not bare select)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2 WorkflowPicker"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Vue Playground uses a plain select; no search/folder picker.",
+    "legacy_evidence": "web/studio-workflow-picker.js:111-247 search/folders/filter",
+    "vue_evidence": "MISSING (PlaygroundView.vue:281-297 plain select)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Workflows library page has filters; this row is the Playground picker."
+  },
+  {
+    "id": "PG-VERSION-PICK",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Version picker lists versions; latest resolved on workflow change",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "List + latest-resolution exist; behavior unproven in browser.",
+    "legacy_evidence": "web/studio-playground.js:2821-2879 version list + latest",
+    "vue_evidence": "PlaygroundView.vue:298-316; stores/workflows.ts:105-146",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-VERSION-SWITCH",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Workflow/version switch reloads values; incompatible values dropped",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.4"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Unit tests prove defaults resolution + incompatible-value drop on switch.",
+    "legacy_evidence": "web/studio-playground.js:2879-3038 switch reload",
+    "vue_evidence": "stores/playground.ts:430-506 selectWorkflow clears + reloads",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.test.ts:85,95"
+    ],
+    "implementation_invariant": "",
+    "notes": "Supersedes original PG-VERSION-SWITCH PASS: switch-drop proven at UNIT; full cross-version value correctness still needs INTEGRATION."
+  },
+  {
+    "id": "PG-SELECTION-PERSIST",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Workflow/version selection persists across reload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Persisted identity exists; reload-restore unproven.",
+    "legacy_evidence": "web/studio-playground-state.js:648-729 persisted selection",
+    "vue_evidence": "stores/playground.ts:184-193,285-287 persistSelection",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-DEFAULTS",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Control defaults resolve from graph/schema",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Schema-default resolution directly unit-tested.",
+    "legacy_evidence": "web/studio-playground.js:2648-2710 graph defaults",
+    "vue_evidence": "stores/playground.ts:121-139 defaultValuesFromSchema; :490-495 merge",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.test.ts:85"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-MODEL-AUTOFILL",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "UNET/CLIP/VAE autofill from captured workflow values",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST (workflow/version/mapping)"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Frontend schema-default path unproven for captured model values; backend run-context evidence required.",
+    "legacy_evidence": "web/studio-playground.js:1788-1980 captured values; wizard UNETLoader/VAELoader/CLIPLoader patterns",
+    "vue_evidence": "UNPROVEN: defaultValuesFromSchema+draft override; no inventory lookup/autofill path (PlaygroundControls.vue:43-46,385-395)",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::PG-MODEL-AUTOFILL"
+    ],
+    "implementation_invariant": "",
+    "notes": "Supersedes original PG-MODEL-AUTOFILL UNKNOWN (unchanged): schema-default path exists, captured carry-through unproven. Needs captured workflow + both UIs + backend request comparison."
+  },
+  {
+    "id": "PG-MODEL-UNET",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "UNET control is a model picker with populated choices",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST (models)"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Vue renders model roles as text inputs / select-only-with-options; no picker.",
+    "legacy_evidence": "web/studio-field-blocks.js:112-124 renderModelPickerBlock; bindable model_unet",
+    "vue_evidence": "PlaygroundControls.vue:385-395 text inputs; kindOf model fallback :56-70",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::PG-MODEL-TYPE"
+    ],
+    "implementation_invariant": "",
+    "notes": "Split from original PG-MODEL-TYPE FAIL."
+  },
+  {
+    "id": "PG-MODEL-CLIP",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "CLIP control is a model picker with populated choices",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST (models)"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Same picker gap as UNET.",
+    "legacy_evidence": "web/studio-field-blocks.js:112-124; bindable clip",
+    "vue_evidence": "PlaygroundControls.vue:385-395 text inputs",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::PG-MODEL-TYPE"
+    ],
+    "implementation_invariant": "",
+    "notes": "Split from original PG-MODEL-TYPE FAIL."
+  },
+  {
+    "id": "PG-MODEL-VAE",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "VAE control is a model picker with populated choices",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST (models)"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Same picker gap as UNET.",
+    "legacy_evidence": "web/studio-field-blocks.js:112-124; bindable vae",
+    "vue_evidence": "PlaygroundControls.vue:385-395 text inputs",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::PG-MODEL-TYPE"
+    ],
+    "implementation_invariant": "",
+    "notes": "Split from original PG-MODEL-TYPE FAIL."
+  },
+  {
+    "id": "PG-MODEL-OPTIONS",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Model dropdown choices populate from graph + backend inventory",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST (models)"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Only schema enum options populate selects; model roles have no inventory-backed options.",
+    "legacy_evidence": "web/studio-feature-registry.js:147-165 dynamic options; model inventory paths",
+    "vue_evidence": "PlaygroundControls.vue:52-69 hasOptions gate; no model inventory lookup",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-MODEL-ROLES",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Model roles registered in control catalog and drive controls",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Roles exist in Vue API catalog; that they drive controls with correct values is unproven.",
+    "legacy_evidence": "web/studio-bindable-inputs.js:31-168 catalog roles",
+    "vue_evidence": "frontend/src/api/workflows.ts:90-103 roles present",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::PG-MODEL-ROLES"
+    ],
+    "implementation_invariant": "",
+    "notes": "Supersedes original PG-MODEL-ROLES PASS: role presence is surface, not wiring proof. Downgraded."
+  },
+  {
+    "id": "PG-SEED-RANDOMIZE",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Seed randomize action produces a fresh draw (-1 = random semantics kept)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Randomize button exists; bounds/rules differ (Vue random range) and fresh-draw behavior needs browser proof.",
+    "legacy_evidence": "web/studio-feature-registry.js:135-145 seed -1 random; field rules",
+    "vue_evidence": "PlaygroundControls.vue:207 randomizeSeed; :348-365 button",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::PG-SEED"
+    ],
+    "implementation_invariant": "",
+    "notes": "Supersedes original PG-SEED PASS: button exists, fresh-draw behavior unproven. Downgraded."
+  },
+  {
+    "id": "PG-SELECT",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Select controls render options and coerce values",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Enum selects render; coercion/selection behavior unproven.",
+    "legacy_evidence": "web/studio-field-blocks.js:81-110 dropdown renderer",
+    "vue_evidence": "PlaygroundControls.vue:335-346",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-BOOLEAN",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Boolean/toggle controls emit booleans into payload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Toggle renders; payload emission unproven.",
+    "legacy_evidence": "web/studio-field-blocks.js:386-425 boolean block",
+    "vue_evidence": "PlaygroundControls.vue:323-334",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-TEXT",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Prompt/multiline text entry into payload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Textareas render; entry-to-payload behavior unproven in browser.",
+    "legacy_evidence": "web/studio-field-blocks.js:37-46 multiline block",
+    "vue_evidence": "PlaygroundControls.vue:222-234,397-405",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-ADV-DISCLOSURE",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Advanced is a collapsible disclosure (not a static group)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Advanced renders as an always-open group; no collapse affordance.",
+    "legacy_evidence": "web/studio-playground.js:2558-2616 Advanced disclosure",
+    "vue_evidence": "PlaygroundControls.vue:117-143 static group",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::PG-ADVANCED"
+    ],
+    "implementation_invariant": "",
+    "notes": "Split from original PG-ADVANCED FAIL."
+  },
+  {
+    "id": "PG-ADV-PERSIST",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Advanced open/closed state persists",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No disclosure state exists to persist.",
+    "legacy_evidence": "web/studio-playground-state.js:438-480 advanced in shelf layout",
+    "vue_evidence": "MISSING (no disclosure state in controls/store)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from original PG-ADVANCED FAIL."
+  },
+  {
+    "id": "PG-CONTROL-ORDER",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Controls follow user-defined order/rows",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Vue has deterministic group order only; no user layout order.",
+    "legacy_evidence": "web/studio-playground-state.js:438-480 order/rows; layout editor",
+    "vue_evidence": "PlaygroundControls.vue:72-143 rank/group order",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::PG-REORDER"
+    ],
+    "implementation_invariant": "",
+    "notes": "Split from original PG-REORDER FAIL."
+  },
+  {
+    "id": "PG-ORDER-PERSIST",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Control order/rows persist across reload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Vue persists values only; no order/row layout state.",
+    "legacy_evidence": "web/studio-playground-state.js:380-480 shelf.layout.v1",
+    "vue_evidence": "MISSING (stores/playground.ts:184-188 values only)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from original PG-REORDER FAIL."
+  },
+  {
+    "id": "PG-METHOD-SELECT",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Method selectors choose execution method and enter payload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2 Edit panels"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Store holds workflowMethods but no selector UI or mutation path found.",
+    "legacy_evidence": "web/studio-bindable-inputs.js:276-391 methods; playground :1889-1946",
+    "vue_evidence": "MISSING UI (PlaygroundView.vue:498-545; stores/playground.ts:232-234,530-544)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-DIRTY",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Dirty-state semantics: preset dirty vs run-state reset",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Preset dirty present; broader legacy dirty/run-state reset semantics not evidenced.",
+    "legacy_evidence": "web/studio-playground.js:1478-1500,3073-3211 dirty/run reset",
+    "vue_evidence": "PlaygroundView.vue:335-337; stores/playground.ts:317-320,393-405",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-RUN-GATE",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Run enable/disable gate matrix (loading/error/runnable/required/busy/placeholder)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 8; 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Gate conditions exist; matrix behavior (incl. missing-model block) unproven.",
+    "legacy_evidence": "web/studio-playground.js:1848-1946,3073-3211 run gating",
+    "vue_evidence": "stores/playground.ts:264-279,546-560; PlaygroundGenerateBar.vue:52-68",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-PAYLOAD",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Run request payload shape: workflow/version/controls identity to POST /studio/run",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7.3"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Payload built and frozen; backend-accepted shape unproven without integration capture.",
+    "legacy_evidence": "web/studio-playground.js:3322-3410 payload build",
+    "vue_evidence": "api/playground.ts:44-59,85-87; stores/playground.ts:509-527 buildPayload",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.test.ts:109 (freeze only)"
+    ],
+    "implementation_invariant": "",
+    "notes": "Freeze proven (UNIT); exact shape/endpoint contract needs INTEGRATION capture."
+  },
+  {
+    "id": "PG-FREEZE",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Submitted request frozen before async submission",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.6"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Freeze-before-network directly unit-tested.",
+    "legacy_evidence": "web/studio-playground-run.js:132-339 freeze before submit",
+    "vue_evidence": "stores/playground.ts:559-571 freezeIntent; api/playground.ts:145-153",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.test.ts:109"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PG-NUM-MINMAX",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Numeric controls enforce min/max (HTML bounds + store validation + draft validation)",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-field-blocks.js:47-80"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Bounds enforced in template, store validation, and draft validation; directly tested.",
+    "legacy_evidence": "web/studio-field-blocks.js:47-80",
+    "vue_evidence": "PlaygroundControls.vue:273-288; stores/playground.ts:141-181",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.test.ts:75"
+    ],
+    "implementation_invariant": "",
+    "notes": "Split from PG-NUMERIC-BOUNDS."
+  },
+  {
+    "id": "PG-NUM-STEP",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Numeric step behavior (stepper increments, e.g. step 8 for dimensions)",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-field-blocks.js:47-80 step rules"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Step attributes may render; stepper behavior unproven.",
+    "legacy_evidence": "web/studio-field-blocks.js step rules",
+    "vue_evidence": "PlaygroundControls numeric inputs (step behavior unverified)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from PG-NUMERIC-BOUNDS."
+  },
+  {
+    "id": "PG-SEED-RANGE",
+    "contract_type": "product_behavior",
+    "area": "playground",
+    "behavior": "Seed-specific range semantics (accepted min/max, -1 random) excluding the randomize action",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-feature-registry.js seed rules; INTEGER_RULES.seed"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Seed bounds/rules differ (Vue random range); range behavior unproven. Randomize action is PG-SEED-RANDOMIZE.",
+    "legacy_evidence": "web/studio-feature-registry.js seed rules",
+    "vue_evidence": "PlaygroundControls seed input (bounds unverified)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from PG-NUMERIC-BOUNDS and PG-SEED."
+  }
+]

@@ -1,0 +1,463 @@
+[
+  {
+    "id": "LATEST-READS",
+    "contract_type": "product_behavior",
+    "area": "async",
+    "behavior": "Workflow/version/detail reads use latest-wins primitive",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5 read rule"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Primitive + wiring unit-tested; actual late-completion ordering unproven.",
+    "legacy_evidence": "legacy selection guards web/studio-workflows.js:590-602",
+    "vue_evidence": "async/latest.ts:1-31,94-155; stores/playground.ts:260,448-455; stores/workflows.ts:18,65",
+    "tests_or_traces": [
+      "frontend/src/async/latest.test.ts"
+    ],
+    "implementation_invariant": "",
+    "notes": "latest.test.ts green; race behavior still unproven."
+  },
+  {
+    "id": "LATEST-HISTORY",
+    "contract_type": "product_behavior",
+    "area": "async",
+    "behavior": "History feed/detail reads use latest-wins; entity may update cache but never steal focus",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5 history rule"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Primitive wired; no History-specific race test.",
+    "legacy_evidence": "legacy history guards",
+    "vue_evidence": "stores/history.ts:36,60-61 latest wiring",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "LATEST-REFRESH",
+    "contract_type": "product_behavior",
+    "area": "async",
+    "behavior": "Inventory/settings refresh reads use latest-wins",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5 refresh rule"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Wiring exists; no store race tests.",
+    "legacy_evidence": "legacy refresh guards",
+    "vue_evidence": "stores/infrastructure.ts:47,83; stores/settings.ts:26,406",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "LATEST-MUTATIONS",
+    "contract_type": "product_behavior",
+    "area": "async",
+    "behavior": "Mutations (favorite/note/delete/save) complete; navigation never cancels server write",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Primitive documents policy; mutation call sites not exhaustively verified.",
+    "legacy_evidence": "blueprint 5 mutation rule",
+    "vue_evidence": "async/latest.ts:36-41 policy note",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Requires per-mutation call-site verification."
+  },
+  {
+    "id": "LATEST-SHARED",
+    "contract_type": "product_behavior",
+    "area": "async",
+    "behavior": "Reads use shared latest.ts where newest-read-commit semantics match; specialized ownership tokens (owner identity, upload token, overlay invalidation) are legitimate where semantics differ",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Per-site appropriateness unverified: sourceToken may be legitimate specialization, latest.ts gaps may exist. Needs review, not a rewrite mandate.",
+    "legacy_evidence": "blueprint 5 (no generic cancellation service; per-rule primitives)",
+    "vue_evidence": "async/latest.ts vs sourceToken in stores/playground.ts:360-391",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Corrected: specialized tokens are not automatically redundant."
+  },
+  {
+    "id": "POLL-OWNER",
+    "contract_type": "product_behavior",
+    "area": "async",
+    "behavior": "Long polls have one owner; abort on navigation/terminal; domain keeps backend semantics",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5 deploy rule"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Utility is single-purpose but several domain call sites exist; ownership unproven.",
+    "legacy_evidence": "legacy bounded deploy polls",
+    "vue_evidence": "async/polling.ts:1-22; infrastructure call sites",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "POLL-ABORT",
+    "contract_type": "product_behavior",
+    "area": "async",
+    "behavior": "Long polls: one owner; navigation/rerender never duplicates polling; operation continues when domain requires; terminal/dispose/replacement stops it; no zombie timers",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Old row wrongly required abort-on-navigate. Real invariant unproven: duplication/ownership/zombies need race evidence. A download must NOT die because the user opens History.",
+    "legacy_evidence": "legacy lifecycle cleanup",
+    "vue_evidence": "async/polling.ts:24-77; stores/infrastructure.ts:300-520 without abort owner",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Corrected invariant per binding decision."
+  },
+  {
+    "id": "POLL-TERMINAL",
+    "contract_type": "product_behavior",
+    "area": "async",
+    "behavior": "Polling terminates on done/abort (no runaway loop after rerender)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "done()/abort termination directly tested.",
+    "legacy_evidence": "legacy bounded polls",
+    "vue_evidence": "async/polling.ts:61-77 done() immediate return",
+    "tests_or_traces": [
+      "frontend/src/async/polling.test.ts:10-61"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "POLL-RUN",
+    "contract_type": "product_behavior",
+    "area": "async",
+    "behavior": "Run progress/status integrated with run-controller identity and terminal semantics (controller owns semantics, not the generic poller)",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground-run.js:458-497"
+      },
+      {
+        "kind": "migration_contract",
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md section 6 (operationStore never wraps run controller)"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue run polling/controller integration exists; controller owns semantics, generic polling only mechanics.",
+    "legacy_evidence": "web/studio-playground-run.js:458-497 run polling",
+    "vue_evidence": "MISSING (searched frontend/src)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Corrected: no longer claims the controller must own the loop."
+  },
+  {
+    "id": "OPS-DUP-BUSY",
+    "contract_type": "product_behavior",
+    "area": "operations",
+    "behavior": "No second generic operation registry and no conflicting busy authority beside operationStore (domain runState/isBusy as semantic truth is allowed)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Approved split is registry=visible summary vs domain=semantic truth. Whether runState and the registry ever conflict as authority is unproven.",
+    "legacy_evidence": "blueprint 3: domain owns semantics; extract shared record only when needed",
+    "vue_evidence": "stores/playground.ts:279,573-580 runState vs stores/operations.ts:128-155",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Corrected: domain lifecycle state is not a failure."
+  },
+  {
+    "id": "OPS-TERMINAL",
+    "contract_type": "product_behavior",
+    "area": "operations",
+    "behavior": "Terminal operation states freeze (first-wins, no regression)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Terminal freeze explicitly tested.",
+    "legacy_evidence": "legacy run model terminal lock",
+    "vue_evidence": "stores/operations.ts:174-197 terminal freeze",
+    "tests_or_traces": [
+      "frontend/src/stores/operations.test.ts:96-123"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "OPS-IDS",
+    "contract_type": "product_behavior",
+    "area": "operations",
+    "behavior": "Operation IDs unique; cleanup on terminal/remount",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Unique generation exists; lifecycle/remount behavior unproven.",
+    "legacy_evidence": "legacy operation tracker",
+    "vue_evidence": "stores/operations.ts:115-155,26-27",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WS-MIDOP",
+    "contract_type": "product_behavior",
+    "area": "operations",
+    "behavior": "Workspace switch mid-operation cannot retarget submitted request",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 9.1"
+      }
+    ],
+    "required_evidence": [
+      "RACE",
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Browser payload lacks workspaceId, but historical architecture had server workspace authority. Current proof cannot determine the real dispatch seam.",
+    "legacy_evidence": "blueprint 9.1 subsequent ops follow new workspace; submitted keep target",
+    "vue_evidence": "stores/playground.ts:509-527 payload without workspace",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Corrected: was FAIL on payload shape alone."
+  },
+  {
+    "id": "WS-GUARD",
+    "contract_type": "product_behavior",
+    "area": "operations",
+    "behavior": "Accepted operation stays bound to its accepted workspace; switching active workspace changes future operations only; current operation never retargeted",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 9.1"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No blocking guard required. Bound-target behavior needs adversarial race proof (start in A, switch to B, complete).",
+    "legacy_evidence": "legacy workspace guard",
+    "vue_evidence": "stores/infrastructure.ts:187-190 guard",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Corrected invariant per binding decision."
+  },
+  {
+    "id": "OPS-ONE-ROOT",
+    "contract_type": "migration_architecture",
+    "area": "operations",
+    "behavior": "Exactly one Vue app root is mounted (no per-page apps)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md section 6"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "Single host mount + single StudioApp root in source; structural.",
+    "legacy_evidence": "",
+    "vue_evidence": "web/studio-vue-host.js single mount; StudioApp.vue root",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from OPS-REGISTRY per binding decision."
+  },
+  {
+    "id": "OPS-ONE-PINIA",
+    "contract_type": "migration_architecture",
+    "area": "operations",
+    "behavior": "Exactly one Pinia instance in production source",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md section 6"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "One createPinia in production source (studio.ts:33); test files use isolated instances, which is correct.",
+    "legacy_evidence": "",
+    "vue_evidence": "frontend/src/studio.ts:33 (test files excluded)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from OPS-REGISTRY per binding decision."
+  },
+  {
+    "id": "OPS-ONE-REGISTRY",
+    "contract_type": "migration_architecture",
+    "area": "operations",
+    "behavior": "Exactly one generic operation registry exists",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md section 6"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "operations.ts is the registry; whether infrastructure operation lists duplicate it as a second registry is unreviewed.",
+    "legacy_evidence": "",
+    "vue_evidence": "stores/operations.ts vs stores/infrastructure.ts:210-275",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from OPS-REGISTRY per binding decision."
+  },
+  {
+    "id": "OPS-NO-EXEC-AUTH",
+    "contract_type": "migration_architecture",
+    "area": "operations",
+    "behavior": "Operation registry never decides execution semantics (terminal, identity, status meaning, retry)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md section 6"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "Module contract explicitly disclaims every execution decision; structural source proof adequate.",
+    "legacy_evidence": "",
+    "vue_evidence": "stores/operations.ts:6,21-22,208-219 disclaimer list",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from OPS-REGISTRY per binding decision."
+  }
+]

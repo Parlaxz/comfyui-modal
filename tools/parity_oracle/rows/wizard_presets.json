@@ -1,0 +1,568 @@
+[
+  {
+    "id": "WZ-OPEN-CLOSE",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Wizard opens and closes/cancels with cleanup",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4 wizard"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Store owns lifecycle; rendered modal behavior unproven.",
+    "legacy_evidence": "web/studio-workflow-setup-wizard.js:647-689 open; :711-727 close",
+    "vue_evidence": "stores/workflows.ts:150-211; WorkflowsView.vue",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WZ-SUG-UNET",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Auto-suggest discovers UNET candidates in graph order",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4; 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Legacy deterministic discovery vs Vue explicit Suggest button; autofill semantics differ.",
+    "legacy_evidence": "web/studio-workflow-setup-wizard.js:178-180 UNETLoader.unet_name; :332-384 scan",
+    "vue_evidence": "WorkflowsView.vue:246,1228-1237 Suggest targets button",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::WZ-SUGGEST"
+    ],
+    "implementation_invariant": "",
+    "notes": "Split from original WZ-SUGGEST FAIL."
+  },
+  {
+    "id": "WZ-SUG-CLIP",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Auto-suggest discovers CLIP candidates in graph order",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Same suggest-semantics gap as UNET.",
+    "legacy_evidence": "web/studio-workflow-setup-wizard.js:186-188 CLIPLoader.clip_name",
+    "vue_evidence": "Explicit-button suggest only",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::WZ-SUGGEST"
+    ],
+    "implementation_invariant": "",
+    "notes": "Split from original WZ-SUGGEST FAIL."
+  },
+  {
+    "id": "WZ-SUG-VAE",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Auto-suggest discovers VAE candidates in graph order",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Same suggest-semantics gap as UNET.",
+    "legacy_evidence": "web/studio-workflow-setup-wizard.js:182-184 VAELoader.vae_name",
+    "vue_evidence": "Explicit-button suggest only",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::WZ-SUGGEST"
+    ],
+    "implementation_invariant": "",
+    "notes": "Split from original WZ-SUGGEST FAIL."
+  },
+  {
+    "id": "WZ-PROPOSE",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Auto-suggest discovers text candidates; suggestions stay proposals until explicit confirm",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4 explicit binding"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Proposals-only contract documented; explicit-confirm click path unverified.",
+    "legacy_evidence": "web/studio-workflow-setup-wizard.js:163-167,404-426 proposals-only + confirm",
+    "vue_evidence": "api/workflows.ts:126-128; WorkflowsView.vue suggest UI",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::WZ-SAVE-GATE"
+    ],
+    "implementation_invariant": "",
+    "notes": "Supersedes original WZ-SAVE-GATE PASS: confirm path exists but click-to-bind gate unproven. Downgraded."
+  },
+  {
+    "id": "WZ-ROLES",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Required/optional role catalogs enforced at save",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Catalogs exist; save-gate enforcement unproven.",
+    "legacy_evidence": "web/studio-workflow-setup-wizard.js:159-167 required roles + save gate",
+    "vue_evidence": "api/workflows.ts:98-123 required/optional catalogs",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Catalog existence is structural (PASS-able); enforcement needs interaction proof."
+  },
+  {
+    "id": "WZ-CENTER",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "View centers graph on bound node",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue center-graph implementation wired.",
+    "legacy_evidence": "web/studio-graph-binding.js centerOnNode + offset fallback",
+    "vue_evidence": "MISSING caller (seam in web/studio-vue-host.js unwired)",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::WZ-GRAPH-OPS"
+    ],
+    "implementation_invariant": "",
+    "notes": "Split from original WZ-GRAPH-OPS FAIL. Host seam exists (beginStudioGraphBinding/viewStudioGraphNode) but no Vue caller found."
+  },
+  {
+    "id": "WZ-HIGHLIGHT",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "View highlights node ~3s, cleared on re-render/close",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue highlight implementation.",
+    "legacy_evidence": "web/studio-graph-binding.js:482-520 magenta border 3s; :587-595 clear",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from original WZ-GRAPH-OPS FAIL."
+  },
+  {
+    "id": "WZ-GRAPH-MODE",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Graph interactive while wizard open; inert + aria-modal released, restored after",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Positive absence: host seam (setGraphInteractionEnabled/viewStudioGraphNode) exists but has no Vue wizard caller; no capture/cancel wiring found. Graph cannot be driven from the Vue wizard.",
+    "legacy_evidence": "web/studio-workflow-setup-wizard.js:699-704; modal-testing invariant",
+    "vue_evidence": "MISSING (WorkflowsView.vue; studio-vue-host.js seam only)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Corrected wording: FAIL rests on unwired seam, not on 'not evidenced'."
+  },
+  {
+    "id": "WZ-FOCUS",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Wizard focus capture + aria-modal semantics",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No confirmed wizard aria-modal/focus-trap evidence.",
+    "legacy_evidence": "legacy wizard overlay focus/modal semantics",
+    "vue_evidence": "MISSING (searched WorkflowsView.vue)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Note: WorkflowsView wizard teleports to body (WZ-PORTAL), compounding this."
+  },
+  {
+    "id": "WZ-CAPTURE",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Actual node/widget capture binds exact graph target",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "APIs/store exist; graph capture and visible save flow incomplete.",
+    "legacy_evidence": "web/studio-graph-binding.js:249-322 capture + exact-one auto-select",
+    "vue_evidence": "api/workflows.ts:34,36-37; stores/workflows.ts:263-279 (no capture)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WZ-DRAFT",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Mapping persists; draft survives reload scoped to version; reopen resumes step",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Session draft version-scoped; reload/reopen behavior unproven.",
+    "legacy_evidence": "web/studio-workflow-setup-wizard.js:653-661 draft + URL marker; mapping POST",
+    "vue_evidence": "stores/workflows.ts:36,152-203 draft + resume",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "WZ-PORTAL",
+    "contract_type": "product_behavior",
+    "area": "wizard",
+    "behavior": "Wizard UI renders inside Studio portal target, not document.body",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 10.3"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Wizard teleports to body, violating portal containment contract.",
+    "legacy_evidence": "portal isolation intent: web/studio-vue-host.js portal target comment (never into document.body)",
+    "vue_evidence": "WorkflowsView.vue:1129-1349 Teleport to=body",
+    "tests_or_traces": [
+      "STATIC-CHECK: grep Teleport to=body frontend/src -> WorkflowsView.vue:1135"
+    ],
+    "implementation_invariant": "",
+    "notes": "Verified by grep: WorkflowsView.vue:1135 Teleport to=body. Conflicts with blueprint 10.3 dedicated portal target."
+  },
+  {
+    "id": "PRESET-CRUD",
+    "contract_type": "product_behavior",
+    "area": "presets",
+    "behavior": "Preset create/apply/update/delete end to end",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST (Phase-12 presets)"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "API/store actions exist; full Vue preset UI CRUD unconfirmed.",
+    "legacy_evidence": "web/studio-presets.js CRUD + REST contract",
+    "vue_evidence": "api/workflows.ts:41-46; stores/playground.ts preset actions",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PRESET-IDENTITY",
+    "contract_type": "product_behavior",
+    "area": "presets",
+    "behavior": "Active preset identity + dirty state tracked",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "ID + dirty explicit in source; behavior unproven.",
+    "legacy_evidence": "web/studio-presets.js identity/dirty",
+    "vue_evidence": "stores/playground.ts:240-241,319-328,423-426",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PRESET-VERSION",
+    "contract_type": "product_behavior",
+    "area": "presets",
+    "behavior": "Preset owned by workflow version; cross-version behavior correct",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.9"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Context key includes version; cross-version behavior unproven.",
+    "legacy_evidence": "web/studio-presets.js version ownership",
+    "vue_evidence": "stores/playground.ts:262,423-437 context key",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PRESET-APPLY",
+    "contract_type": "product_behavior",
+    "area": "presets",
+    "behavior": "Applying preset restores controls + output overrides",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.9"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Apply path exists; restore behavior unproven.",
+    "legacy_evidence": "web/studio-presets.js apply path",
+    "vue_evidence": "stores/playground.ts:423-425; PlaygroundView.vue:122-126",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PRESET-NO-SETTINGS",
+    "contract_type": "product_behavior",
+    "area": "presets",
+    "behavior": "Preset output overrides never mutate global Settings",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.9"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Override is run intent in source; isolation unproven by test.",
+    "legacy_evidence": "blueprint 2.9 output overrides are Playground-scoped",
+    "vue_evidence": "stores/playground.ts:236,408; SettingsView.vue:99-129 separate",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PRESET-IMAGEFREE",
+    "contract_type": "product_behavior",
+    "area": "presets",
+    "behavior": "Image pixels excluded per field (source/mask/references/sketch/outputs/compare/URLs)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.9"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Image-like keys stripped; exclusion directly unit-tested.",
+    "legacy_evidence": "web/studio-presets.js image exclusion; blueprint 2.9",
+    "vue_evidence": "stores/playground.ts:43-112 stripImageKeys + PRESET_IMAGE_KEYS",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.test.ts:64,151-160"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PRESET-CLEAR-STALE",
+    "contract_type": "product_behavior",
+    "area": "presets",
+    "behavior": "Preset apply clears stale output + source/reference ownership",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.9"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Apply-clears-ownership directly unit-tested.",
+    "legacy_evidence": "web/studio-presets.js apply lifecycle transition (blueprint 2.9)",
+    "vue_evidence": "stores/playground.ts:408-425 clearSourceOwnership on apply",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.test.ts:151-160"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PRESET-CLEAR-EDITORS",
+    "contract_type": "product_behavior",
+    "area": "presets",
+    "behavior": "Stale editor/direct-manip state cleared on preset apply",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.9"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Source ownership clears; whole editor clearing unproven.",
+    "legacy_evidence": "blueprint 2.9 lifecycle transition",
+    "vue_evidence": "stores/playground.ts:423-437",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PRESET-LOOKS-SEPARATE",
+    "contract_type": "product_behavior",
+    "area": "presets",
+    "behavior": "Post Looks remain distinct from workflow presets",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.9"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Preset UI present; separate Looks behavior unevidenced (no Looks impl).",
+    "legacy_evidence": "blueprint 2.9 Looks vs presets",
+    "vue_evidence": "PlaygroundView.vue:318-335 preset UI only",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  }
+]

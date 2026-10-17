@@ -1,0 +1,379 @@
+[
+  {
+    "id": "INFRA-WORKSPACES",
+    "contract_type": "product_behavior",
+    "area": "manage modal",
+    "behavior": "Workspace list + active workspace normalized",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.1; 6.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Active ID + rows normalized; behavior unproven.",
+    "legacy_evidence": "web/studio-backend-api.js:942-949 workspace APIs",
+    "vue_evidence": "stores/infrastructure.ts:59-115; api/infrastructure.ts:15-16",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "INFRA-SWITCH",
+    "contract_type": "product_behavior",
+    "area": "manage modal",
+    "behavior": "Workspace switch activates with rollback on failure",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 9.1"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Activation + rollback exist; behavior unproven.",
+    "legacy_evidence": "legacy workspace activation",
+    "vue_evidence": "stores/infrastructure.ts:185-207",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "INFRA-FROZEN-TARGET",
+    "contract_type": "product_behavior",
+    "area": "manage modal",
+    "behavior": "In-flight infra operation records frozen workspace target",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 9.1"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Frozen ID recorded for infra ops; race behavior unproven.",
+    "legacy_evidence": "blueprint 9.1 frozen target; 3.1 record workspace when immutable",
+    "vue_evidence": "stores/infrastructure.ts:218-224,308-349",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Generation/experiment starts omit workspaceId (OPS-WS-ID)."
+  },
+  {
+    "id": "INFRA-DEPLOY",
+    "contract_type": "product_behavior",
+    "area": "manage modal",
+    "behavior": "Deploy/redeploy triggers; readiness/status/logs/failure-retry surface",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.5"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Actions + states wired; deploy behavior needs backend proof.",
+    "legacy_evidence": "legacy deploy/status/log APIs",
+    "vue_evidence": "api/infrastructure.ts:13-19; BackendView.vue:107-130,192-193; stores/infrastructure.ts:210-275",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "INFRA-REFRESH",
+    "contract_type": "product_behavior",
+    "area": "manage modal",
+    "behavior": "Inventory refresh with latest-wins; explicit UI refresh semantics",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5 inventory rule"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Latest-wins protects reads; explicit refresh semantics unchecked.",
+    "legacy_evidence": "web/studio-backend-api.js:279-295 inventory refresh",
+    "vue_evidence": "api/infrastructure.ts:20; stores/infrastructure.ts:123-138",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "INFRA-MODELS",
+    "contract_type": "product_behavior",
+    "area": "manage modal",
+    "behavior": "Model list renders presence states distinctly",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 9.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Lists display; presence-state mapping not evidenced.",
+    "legacy_evidence": "web/studio-backend-api.js:465-508 model inventory",
+    "vue_evidence": "stores/infrastructure.ts:67-69,123-138; BackendView.vue:100-103",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "INFRA-INSTALL",
+    "contract_type": "product_behavior",
+    "area": "manage modal",
+    "behavior": "Model install/download full status lifecycle in view",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5 download rule"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Install exists; full lifecycle in view unverified.",
+    "legacy_evidence": "web/studio-backend-api.js:500,904-914 installs",
+    "vue_evidence": "api/infrastructure.ts:46-58; BackendView.vue:208-218",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Operation may continue while user leaves page (blueprint 5)."
+  },
+  {
+    "id": "INFRA-NODES",
+    "contract_type": "product_behavior",
+    "area": "manage modal",
+    "behavior": "Custom-node presence, publication, rebuild wired",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.5"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Refresh/sync/rebuild APIs exist; behavior unproven.",
+    "legacy_evidence": "web/studio-backend-api.js:508-517 node publication",
+    "vue_evidence": "api/infrastructure.ts:42-45; stores/infrastructure.ts:39-45",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "INFRA-CREDS",
+    "contract_type": "product_behavior",
+    "area": "manage modal",
+    "behavior": "Credentials save + status/failure visibility",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Status/save APIs exist; failure/visibility incomplete.",
+    "legacy_evidence": "legacy token routes studio-backend-api.js:25-27",
+    "vue_evidence": "api/infrastructure.ts:63-67; stores/infrastructure.ts:77-80",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "INFRA-OPVIS",
+    "contract_type": "product_behavior",
+    "area": "manage modal",
+    "behavior": "Long operations visible once with IDs/progress/failure (no duplicate busy)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3; 6.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "IDs/progress/failure surfaced; single-visibility + dedup unproven.",
+    "legacy_evidence": "legacy operation UI/API",
+    "vue_evidence": "stores/infrastructure.ts:210-275; BackendView.vue:242",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Overlaps OPS-DUP-BUSY for generation domain."
+  },
+  {
+    "id": "DEPS-STATES",
+    "contract_type": "product_behavior",
+    "area": "dependencies",
+    "behavior": "Dependency presence contract is exhaustive and distinct: local-present, Modal-workspace-present, missing, installing, unknown/unverified (each rendered distinctly, none double-counted)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 9.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Vue retains raw records with no normalized presence contract; installing/unknown not distinctly rendered.",
+    "legacy_evidence": "blueprint 9.2 presence vocabulary; legacy model/node APIs",
+    "vue_evidence": "MISSING normalized contract (searched pages/stores/api)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Corrected: merged DEPS-INSTALLING to end double counting."
+  },
+  {
+    "id": "DEPS-MODEL-GATE",
+    "contract_type": "product_behavior",
+    "area": "dependencies",
+    "behavior": "Missing-model blocks execution attempt (gate, not badge)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 8; 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Flagging surface exists; non-submittable gate needs runtime proof.",
+    "legacy_evidence": "web/modal-node.js:687-725 model-missing blocker",
+    "vue_evidence": "missing flagged via reasons/dependencies; gate unverified",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::DEPS-MISSING (flagging only)"
+    ],
+    "implementation_invariant": "",
+    "notes": "Supersedes original DEPS-MISSING PASS: flagging found, gate unproven. Downgraded. Attempt the blocked action in BROWSER."
+  },
+  {
+    "id": "DEPS-NODE-GATE",
+    "contract_type": "product_behavior",
+    "area": "dependencies",
+    "behavior": "Missing-node gate honors skip_plan_validation interaction",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No matching Vue gate implementation located.",
+    "legacy_evidence": "blueprint 8; legacy validation paths",
+    "vue_evidence": "MISSING (searched frontend/src)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "DEPS-STALE-REFRESH",
+    "contract_type": "product_behavior",
+    "area": "dependencies",
+    "behavior": "Stale inventory refresh never overwrites newer snapshot",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5 inventory rule"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Latest-task wired; race behavior unproven.",
+    "legacy_evidence": "web/studio-backend-api.js:279-295 refresh ordering",
+    "vue_evidence": "stores/infrastructure.ts:123-138; async/latest.ts:59-149",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "MODEL-LIBRARY-PLACE",
+    "contract_type": "migration_architecture",
+    "area": "manage modal",
+    "behavior": "Model Library (inventory, presence, browsing, install/request, dependency visibility, refresh) lives in Manage Modal, not Workflows",
+    "authorities": [
+      {
+        "kind": "owner_decision",
+        "ref": "Binding 2026-10-17: Model Library is unambiguously Manage Modal; supersedes H5 Workflows ownership"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "Vue BackendView hosts model inventory/install/dependency surfaces; no Model Library in Workflows page. Structural placement holds.",
+    "legacy_evidence": "",
+    "vue_evidence": "BackendView.vue model sections; stores/infrastructure.ts; no library in WorkflowsView",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Operational model/dependency experience stays in Manage Modal without collapsing inventory/install/node-publication into one generic sync."
+  }
+]

@@ -1,0 +1,383 @@
+[
+  {
+    "id": "RUN-FRESH-ID",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Fresh frontend run identity per Run click",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.7"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No fresh-controller-per-click evidence on Vue side.",
+    "legacy_evidence": "web/studio-playground-run.js:305-340 createPlaygroundRunController per run",
+    "vue_evidence": "frontend/src/stores/playground.ts:546-580 submit path; newRequestId in buildPayload",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "buildPayload mints newRequestId per submit; controller-per-click ownership unverified."
+  },
+  {
+    "id": "RUN-POST-AUTHORITY",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "POST/result path is terminal authority (not websocket/progress)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.7"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue marks success from POST shape; no end-to-end terminal proof.",
+    "legacy_evidence": "web/studio-playground-run.js:402-419 POST authority",
+    "vue_evidence": "frontend/src/stores/playground.ts:582-600",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RUN-PROMPT-ID",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Prompt ID captured; foreign prompt terminal events rejected",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.7"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No Vue websocket/controller event path found; completion path unverified.",
+    "legacy_evidence": "web/studio-playground-run.js:239-248 prompt capture + foreign rejection",
+    "vue_evidence": "MISSING event consumer (searched api/playground.ts, stores/playground.ts)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "If Vue truly has no websocket consumer, confirm completion/progress/failure path covers all outcomes and close as NOT_APPLICABLE with evidence."
+  },
+  {
+    "id": "RUN-EVENT-ORDER",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Progress before execution-start rejected; foreign experiment progress rejected",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.7"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No Vue event lifecycle path found.",
+    "legacy_evidence": "web/studio-playground-run.js:259-284 ordering + experiment filter",
+    "vue_evidence": "MISSING (searched frontend/src)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RUN-TERMINAL-LOCK",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Terminal state cannot regress; duplicate terminals deduplicated",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.7"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue projection mutates without terminal lock.",
+    "legacy_evidence": "web/studio-playground-run.js:211-215,485-493 terminal lock + dedup",
+    "vue_evidence": "frontend/src/stores/playground.ts:749-756 noteSucceeded/noteFailed",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "noteSucceeded/noteFailed mutate projection without lock; exploitability needs RACE proof."
+  },
+  {
+    "id": "RUN-SNAPSHOT-DEDUP",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Snapshot/journal duplicate polls deduplicated",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.7"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue has no run snapshot polling integration.",
+    "legacy_evidence": "web/studio-playground-run.js:458-493 snapshot polling dedup",
+    "vue_evidence": "MISSING (searched frontend/src)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RUN-GOLDEN-PRESENT",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Golden stage progress is presentation-only, never decides completion",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.7"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No Vue run-progress consumer establishes this contract.",
+    "legacy_evidence": "web/studio-playground-run.js:151-156,347-379 presentation-only",
+    "vue_evidence": "MISSING consumer (only Golden API/settings found)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RUN-FAILURE-PATH",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Failure path preserves run identity and details",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue failure clears run ID; controller evidence absent.",
+    "legacy_evidence": "web/studio-playground-run.js:11-17 adapters preserve identity",
+    "vue_evidence": "frontend/src/stores/playground.ts:601-605",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RUN-CANCEL",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Cancel is authoritative and race-safe (cancel-then-success cannot resurrect)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Vue sets canceled before POST and does not update operation registry; resurrection risk visible in source.",
+    "legacy_evidence": "web/studio-playground-run.js controller/adapters cancel path",
+    "vue_evidence": "frontend/src/stores/playground.ts:728-737 cancel Grant; no registry update",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Adversarial test: cancel, then let POST succeed; state must stay canceled."
+  },
+  {
+    "id": "RUN-LATE-EVENT",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Late prior-run events cannot hijack new run",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.7"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No Vue event attach/detach ownership found.",
+    "legacy_evidence": "web/studio-playground-run.js:311-323,428-447 detach + filter",
+    "vue_evidence": "MISSING (searched frontend/src)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RUN-MIDRUN-SWITCH",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Navigation / workflow switch mid-run cannot mutate active run",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.7"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Selection reads guarded; active-run ownership absent.",
+    "legacy_evidence": "web/studio-playground-run.js controller detach/new identity",
+    "vue_evidence": "frontend/src/stores/playground.ts:430-455 selection guards",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RUN-RESULT-ATTACH",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Result attaches to submitted run; recent History converges",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue calls onDone; History attachment + recent projection unshown.",
+    "legacy_evidence": "web/studio-run-model.js result adapters",
+    "vue_evidence": "frontend/src/stores/playground.ts:594-597 onDone only",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RUN-NO-DUP-CACHE",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Current generation stores identity only; entities resolve via History",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.1"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Unit test asserts no second History cache.",
+    "legacy_evidence": "blueprint 4.1 retire playground.results.v1",
+    "vue_evidence": "frontend/src/stores/playground.ts:195-199 persists generation ID only",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.test.ts:229"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RETIRED-RESULTS-CACHE",
+    "contract_type": "retirement",
+    "area": "run lifecycle",
+    "behavior": "Duplicate results.v1 entity cache retired, not ported",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.1"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "NA",
+    "reason": "Blueprint 4.1 explicitly retires this duplicate authority.",
+    "legacy_evidence": "web/studio-playground-state.js results.v1 duplicate Generation cache",
+    "vue_evidence": "Absent by design; historyStore owns entities",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RUN-CONTROLLER-INTEGRATION",
+    "contract_type": "product_behavior",
+    "area": "run lifecycle",
+    "behavior": "Vue run path integrates/ports the accepted run-controller machinery (fresh run identity, event-source attach/detach, execution-start locking, stale/foreign rejection, prompt/Experiment filtering, journal dedupe, terminal freeze, authoritative result integration, Golden-presentation semantics)",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/studio-playground-run.js + studio-run-model.js + studio-run-adapters.js"
+      },
+      {
+        "kind": "migration_contract",
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md section 6 (controller remains authority; operationStore must not wrap it)"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Positive absence: no websocket consumer, no prompt/experiment identity filtering, no event attach/detach, no terminal freeze in the Vue run path (grep websocket/WebSocket/execution_start/promptId over frontend/src: zero implementation hits). Repair needs browser/race proof before PASS.",
+    "legacy_evidence": "web/studio-playground-run.js:211-248,305-340,428-493",
+    "vue_evidence": "MISSING machinery (only a disclaimer comment at stores/operations.ts:22)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Added per binding run-lifecycle correction."
+  }
+]

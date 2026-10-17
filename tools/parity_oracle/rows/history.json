@@ -1,0 +1,527 @@
+[
+  {
+    "id": "HIST-FEED",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "History V2 feed loads generations and experiments",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Feed call exists; loaded-and-rendered behavior unproven.",
+    "legacy_evidence": "web/studio-history.js:63 feed load",
+    "vue_evidence": "api/history.ts:184-198; stores/history.ts:124-151",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Supersedes part of original HV-RETRY-RESUME PASS: feed behavior needs browser proof."
+  },
+  {
+    "id": "HIST-PAGINATION",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Cursor pagination / load-more",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "API shape present; visible load-more unconfirmed.",
+    "legacy_evidence": "web/studio-history-v2.js feed paging",
+    "vue_evidence": "api/history.ts:56-62",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-QUERY",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Search, filter, sort wired to feed",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Controls wired; query-behavior needs browser proof.",
+    "legacy_evidence": "web/studio-history.js:11 filters; picker :217-260",
+    "vue_evidence": "HistoryView.vue:91; stores/history.ts:39,74-93",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-VIEWSTATE",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Filter/sort state persists across reload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Viewstate persisted; reload-restore unproven.",
+    "legacy_evidence": "legacy persisted history view state",
+    "vue_evidence": "stores/history.ts:39,74 persisted viewstate",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-FOCUS",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Record focus state + focus route loads detail on demand",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Store + route focus implemented; focus behavior unproven.",
+    "legacy_evidence": "web/studio-history-v2-detail.js focus/detail",
+    "vue_evidence": "stores/history.ts:44,66,78,157-176; HistoryView.vue:36-48",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-STALE-FOCUS",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Stale detail/query responses cannot steal focus",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5 history rule"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Latest-task guards present; race behavior unproven.",
+    "legacy_evidence": "web/studio-history-v2-detail.js stale guards",
+    "vue_evidence": "stores/history.ts:61,138,159-168; HistoryView.vue:53-60 debounce",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-FAVORITE",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Favorite toggle with optimistic update + rollback + persistence",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Toggle path exists; user-visible toggle + persistence unproven.",
+    "legacy_evidence": "web/studio-history.js:170-206 optimistic favorite",
+    "vue_evidence": "stores/history.ts:181-191; StudioViewer favorite",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-NOTE",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Note save on generation and experiment",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Note endpoints exist; save behavior unproven.",
+    "legacy_evidence": "web/studio-history.js:216+ notes",
+    "vue_evidence": "stores/history.ts:194-202; api note methods",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-DELETE",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Single delete with confirm + feed update",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Confirm + removal wired; behavior unproven.",
+    "legacy_evidence": "legacy history delete flow",
+    "vue_evidence": "stores/history.ts:210-220; StudioViewer.vue:193-197",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-BULK-DELETE",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Bulk delete with selection",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Selection + bulk endpoint wired; behavior unproven.",
+    "legacy_evidence": "legacy bulk delete",
+    "vue_evidence": "stores/history.ts:227-245; HistoryView.vue:166-169",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-RECENT",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Recent runs converge with History (Playground strip)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST; R1.2"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No confirmed recent-run convergence path.",
+    "legacy_evidence": "legacy recent-runs projection",
+    "vue_evidence": "PlaygroundView recent strip refs; stores/history.ts (no explicit recent source)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Conflicting audit signals resolved to UNKNOWN: projection refs exist, convergence path unconfirmed."
+  },
+  {
+    "id": "HIST-ORIGINAL",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Generate Original and Retry Original are distinct actions/endpoints",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7.4 frozen distinctions"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Separate actions exist; distinct user-visible behavior unproven.",
+    "legacy_evidence": "web/studio-history-v2-detail.js distinct Original semantics",
+    "vue_evidence": "stores/history.ts:251-257 generateOriginal + retryOriginal",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-RESUME",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Single Resume resumes generation (not an Original action)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7.4 frozen distinctions"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Resume action exists; behavior unproven.",
+    "legacy_evidence": "web/studio-history-v2-detail.js Single Resume",
+    "vue_evidence": "stores/history.ts:251-257 resumeGeneration",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-CELL-RETRY",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Experiment cell retry from History",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Cell-ID path explicit; retry behavior unproven.",
+    "legacy_evidence": "web/studio-history-v2-experiment.js cell retry",
+    "vue_evidence": "stores/history.ts:264-271 retryExperimentCell",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-EXP-CANCEL-RESUME",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Experiment cancel/resume from History",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Actions represented; behavior unproven.",
+    "legacy_evidence": "web/studio-history-v2-experiment.js cancel/resume",
+    "vue_evidence": "stores/history.ts:264-271",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-DOWNLOAD-EXPORT",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Browser Download (single asset, blob) vs configured-folder Export",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7.4 frozen distinctions"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "API/store paths found; click behavior + configured-export control unproven.",
+    "legacy_evidence": "web/studio-history-v2-detail.js download vs export",
+    "vue_evidence": "api/history.ts download/export; stores/history.ts:276-279",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-IMMUTABLE-REPLAY",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Replay uses immutable execution params (browser never resends)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7.4 frozen distinctions"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Params normalized as record data; immutability unproven by test.",
+    "legacy_evidence": "web/studio-history-v2-detail.js immutable replay",
+    "vue_evidence": "api/history.ts:47,166-167 normalization; no mutation path found",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-GEN-DETAIL",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Generation detail renders full record",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Detail path exists; rendered behavior unproven.",
+    "legacy_evidence": "web/studio-history-v2-detail.js generation detail",
+    "vue_evidence": "stores/history.ts:159-160; StudioViewer",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-EXP-DETAIL",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Experiment detail renders cells/counts",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Model supports cells; full rendered detail unconfirmed.",
+    "legacy_evidence": "web/studio-history-v2-experiment.js experiment detail",
+    "vue_evidence": "api/history.ts:49-52,168-179 normalization",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-COLUMNS",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "Column/density preferences respected + persisted",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.5; 4.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Preference read exists; behavior + persistence unproven.",
+    "legacy_evidence": "legacy column density persisted",
+    "vue_evidence": "HistoryView.vue:25-29 settings column preference",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HIST-PICKER",
+    "contract_type": "product_behavior",
+    "area": "history",
+    "behavior": "History picker filters, paginates, focuses, hands selection",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.3 HistoryPicker"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Dialog exists; filtering/pagination/focus/handoff parity not evidenced.",
+    "legacy_evidence": "web/studio-history-picker.js:217-260,712-794 picker",
+    "vue_evidence": "HistoryPicker.vue:44-51 dialog shell",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  }
+]

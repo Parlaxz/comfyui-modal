@@ -1,0 +1,360 @@
+[
+  {
+    "id": "STYLE-NO-OLD-CSS",
+    "contract_type": "product_behavior",
+    "area": "styling",
+    "behavior": "No legacy Studio CSS imported by Vue",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 10.1; 12 RETIRED"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "Static import search supports isolation; old CSS is contractually retired.",
+    "legacy_evidence": "web/studio-styles.js + testing-styles.js old visual CSS",
+    "vue_evidence": "frontend/src/studio.css:4-8,25-29 fresh scoped layer; no old import",
+    "tests_or_traces": [
+      "STATIC-CHECK: grep studio-styles|testing-styles frontend/src -> no hits"
+    ],
+    "implementation_invariant": "",
+    "notes": "Executable grep invariant: studio-styles|testing-styles over frontend/src -> no hits 2026-10-17."
+  },
+  {
+    "id": "STYLE-TAILWIND",
+    "contract_type": "product_behavior",
+    "area": "styling",
+    "behavior": "Tailwind utilities prefixed; no global Preflight",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 10.2"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "Source directly establishes prefix + theme/utilities only.",
+    "legacy_evidence": "N/A (new isolation contract)",
+    "vue_evidence": "frontend/src/studio.css:4-8,25-29 cmst prefix, no Preflight",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "STYLE-PORTAL",
+    "contract_type": "product_behavior",
+    "area": "styling",
+    "behavior": "Portalled controls render into Studio-owned portal target",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 10.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Target + config exist; runtime containment unverified.",
+    "legacy_evidence": "N/A (new portal contract)",
+    "vue_evidence": "web/studio-vue-host.js:232-245 target; portalTarget.ts:1-22; HistoryPicker.vue:40-76 usage",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Wizard violates this (WZ-PORTAL FAIL)."
+  },
+  {
+    "id": "STYLE-ZINDEX",
+    "contract_type": "product_behavior",
+    "area": "styling",
+    "behavior": "Modal / in-app / portal z-index ordered; focus correct; responsive",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 10.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Numeric ordering static; overlap/focus/responsive needs browser matrix.",
+    "legacy_evidence": "legacy shell z-order",
+    "vue_evidence": "frontend/src/studio.css:410-626 layers; StudioApp.vue:107-139 flex layout",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "STYLE-HOST-SAFE",
+    "contract_type": "product_behavior",
+    "area": "styling",
+    "behavior": "Opening Vue Studio never alters external ComfyUI layout/styles",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 10.2; R1.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No live-host style-leak evidence gathered in this audit.",
+    "legacy_evidence": "N/A (migration safety rule)",
+    "vue_evidence": "Ownership CSS in studio-vue-host.js:162-206; unproven live",
+    "tests_or_traces": [
+      "tests/browser/fake/studio-fake-host-parking.spec.mjs (legacy-side; Vue run needed)"
+    ],
+    "implementation_invariant": "",
+    "notes": "Needs live ComfyUI host inspection (host-parking spec exists: studio-fake-host-parking)."
+  },
+  {
+    "id": "STYLE-REDESIGN",
+    "contract_type": "migration_architecture",
+    "area": "styling",
+    "behavior": "Overall visual redesign vs legacy (not pixel parity)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 10.1; 12 INTENTIONAL"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "INTENTIONAL_CHANGE",
+    "reason": "Blueprint explicitly replaces all old visual styling.",
+    "legacy_evidence": "old Studio visual CSS",
+    "vue_evidence": "Fresh Tailwind/shadcn-vue design system",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RETIRED-OLD-HISTORY",
+    "contract_type": "retirement",
+    "area": "retired",
+    "behavior": "Legacy History UI (studio-history.js) not carried forward",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7.4; 12 RETIRED; 17 deletion candidates"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "NA",
+    "reason": "Blueprint 12 explicitly retires legacy History UI; Vue calls History V2 directly.",
+    "legacy_evidence": "web/studio-history.js legacy gallery; H9 zero importers",
+    "vue_evidence": "api/history.ts History V2 direct (no legacy client)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RETIRED-COMPARE-PROFILES",
+    "contract_type": "retirement",
+    "area": "retired",
+    "behavior": "Comparison Profiles/Runner not resurrected",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 RETIRED; 17"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "NA",
+    "reason": "Blueprint 12/17 retires Comparison Profiles/Runner.",
+    "legacy_evidence": "old modal-comparison.js; H18 zero importers",
+    "vue_evidence": "Absent; transient CompareViewer only",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RETIRED-V1-EXEC",
+    "contract_type": "retirement",
+    "area": "retired",
+    "behavior": "V1/shadow execution UI not carried forward",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 RETIRED"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "NA",
+    "reason": "Blueprint 12 retires V1/shadow execution UI.",
+    "legacy_evidence": "old testing-*/V1 execution UI",
+    "vue_evidence": "Absent; runs.ts-equivalent domain clients only",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RETIRED-PROVIDER-SEL",
+    "contract_type": "retirement",
+    "area": "retired",
+    "behavior": "Old provider-selector architecture not carried forward",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.5; 12 RETIRED"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "NA",
+    "reason": "Blueprint 12 retires provider selector; scope is Modal workspace management.",
+    "legacy_evidence": "old provider selector",
+    "vue_evidence": "Absent; workspace-scoped infra client",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RETIRED-SIX-TAB",
+    "contract_type": "retirement",
+    "area": "retired",
+    "behavior": "Old six/legacy-tab navigation not carried forward",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 RETIRED"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "NA",
+    "reason": "Blueprint 12 retires six/legacy-tab navigation; five pages only.",
+    "legacy_evidence": "old six-tab shell",
+    "vue_evidence": "Five routes exactly (studioRoute.ts)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "RETIRED-RETRY-ALL",
+    "contract_type": "retirement",
+    "area": "retired",
+    "behavior": "Automatic retry-all experiment behavior stays forbidden",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 RETIRED; 15 MAY NOT"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "NA",
+    "reason": "Blueprint 12/15 forbids automatic retry-all.",
+    "legacy_evidence": "per-cell-only experiment retry contract",
+    "vue_evidence": "No retry-all path in api/history.ts or stores",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Behavioral absence; UI absence still needs negative BROWSER verification (EXP-NO-RETRY-ALL)."
+  },
+  {
+    "id": "ARCH-VUE-ROUTER",
+    "contract_type": "migration_architecture",
+    "area": "architecture",
+    "behavior": "vue-router mechanism under frozen hash contract has explicit owner approval",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md sections 4, 7"
+      },
+      {
+        "kind": "legacy_impl",
+        "ref": "frontend/src/app/router/index.ts:44 createRouter; studioHistory.ts custom hash history"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "Revised blueprint approves Vue Router with the frozen hash contract; source proves createRouter over a custom #comfymodal history. Behavioral URL compatibility stays on route rows.",
+    "legacy_evidence": "blueprint 1.2/2.1: do not add Vue Router unless contract undemonstrably maintainable",
+    "vue_evidence": "app/router/index.ts:44 createRouter; studioHistory.ts custom history; vue-router in package.json deps",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Corrected: was UNKNOWN/alleged drift; no owner ruling needed."
+  },
+  {
+    "id": "ARCH-API-LAYER",
+    "contract_type": "migration_architecture",
+    "area": "architecture",
+    "behavior": "Raw page-level fetches consolidated into shared API layer",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7; 12 INTENTIONAL"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "INTENTIONAL_CHANGE",
+    "reason": "Blueprint 12 explicitly moves raw fetches to the shared API layer.",
+    "legacy_evidence": "legacy raw-fetch wrappers per page",
+    "vue_evidence": "frontend/src/api/* domain clients; special transports explicit (7.2)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  }
+]

@@ -1,0 +1,429 @@
+[
+  {
+    "id": "CANVAS-PROMPT",
+    "contract_type": "product_behavior",
+    "area": "canvas compatibility",
+    "behavior": "/prompt interception preserved for canvas path",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.4"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Deferred, no runtime proof.",
+    "legacy_evidence": "web/modal-node.js:680-828 /prompt intercept",
+    "vue_evidence": "compatibility/canvas.ts:7-9,76-85 deferral contract",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Vue explicitly defers to legacy; needs outgoing/intercepted prompt test."
+  },
+  {
+    "id": "CANVAS-PASSTHROUGH",
+    "contract_type": "product_behavior",
+    "area": "canvas compatibility",
+    "behavior": "Cloud/Local pass-through + enable/disable preserved",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.4"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Commented contract only; no enable-state implementation.",
+    "legacy_evidence": "web/modal-settings.js:119-125; modal-node.js:680-687",
+    "vue_evidence": "compatibility/canvas.ts:76-85 comments",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CANVAS-MARKERS",
+    "contract_type": "product_behavior",
+    "area": "canvas compatibility",
+    "behavior": "Production graph markers/bypass preserved",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.4"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue projection does not implement or test markers.",
+    "legacy_evidence": "web/modal-node.js:752-801,865-891 markers/bypass",
+    "vue_evidence": "MISSING (canvas.ts:7-9 only)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CANVAS-PROJECTION",
+    "contract_type": "product_behavior",
+    "area": "canvas compatibility",
+    "behavior": "Output options projected server -> legacy mirror one-way (never read back)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.4"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Write path implemented; one-way effect on canvas unproven.",
+    "legacy_evidence": "web/modal-node.js:92-107 mirror reads",
+    "vue_evidence": "compatibility/canvas.ts:33-73; stores/settings.ts:149-170",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CANVAS-FALLBACK",
+    "contract_type": "product_behavior",
+    "area": "canvas compatibility",
+    "behavior": "localStorage fallback keys keep working during transition",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.4"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Fallback keys written; fallback behavior unproven.",
+    "legacy_evidence": "web/modal-node.js:92-107; modal-settings.js:36-42 fallbacks",
+    "vue_evidence": "compatibility/canvas.ts:63-71",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CANVAS-CURRENT-SETTINGS",
+    "contract_type": "product_behavior",
+    "area": "canvas compatibility",
+    "behavior": "Canvas submission uses current Settings after projection",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.4"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Snapshot/global built; request integration is legacy-only.",
+    "legacy_evidence": "web/modal-node.js:750-804 settings-driven submit",
+    "vue_evidence": "compatibility/canvas.ts:48-72 snapshot",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "CANVAS-POST-CLOSE",
+    "contract_type": "product_behavior",
+    "area": "canvas compatibility",
+    "behavior": "Studio close leaves canvas submission behavior unchanged",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No Vue close/cleanup evidence in compatibility/host code.",
+    "legacy_evidence": "web/modal-node.js:938-942 close behavior",
+    "vue_evidence": "MISSING (searched compatibility, host)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PERSIST-OPTIN",
+    "contract_type": "product_behavior",
+    "area": "persistence",
+    "behavior": "Durable state is explicit opt-in (never whole-store)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.2"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "Opt-in helper contract adequate for this structural invariant.",
+    "legacy_evidence": "web/studio-settings.js:63-96 prefs registry",
+    "vue_evidence": "persistence.ts:1-14,62-77; stores/settings.ts:121-133",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Structural contract; helper enforces opt-in shape."
+  },
+  {
+    "id": "PERSIST-PROHIBITED",
+    "contract_type": "product_behavior",
+    "area": "persistence",
+    "behavior": "Server entities / operation state / compare / run identity / pixels never persist",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.2-4.3"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "Helper contract prohibits; no entity persistence mechanism shown.",
+    "legacy_evidence": "blueprint 4.2-4.3 non-durable list",
+    "vue_evidence": "persistence.ts:3-14 prohibited; entities stay in refs",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Structural contract; reload test would strengthen."
+  },
+  {
+    "id": "PERSIST-MALFORMED",
+    "contract_type": "product_behavior",
+    "area": "persistence",
+    "behavior": "Malformed JSON / old shapes fall back safely (Zod rejection)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Defensive parser + schema fallback directly tested.",
+    "legacy_evidence": "blueprint 4; 12 Zod",
+    "vue_evidence": "persistence.ts:80-97 fallback; tests green",
+    "tests_or_traces": [
+      "frontend/src/persistence/persistence.test.ts"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PERSIST-RELOAD",
+    "contract_type": "product_behavior",
+    "area": "persistence",
+    "behavior": "Browser-only UI preferences restore on reload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Persisted values exist; reload-restore behavior unproven.",
+    "legacy_evidence": "web/studio-settings.js:63-96 reload restore",
+    "vue_evidence": "stores/settings.ts:121-133; persistence.ts:76-113",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split: server-truth half moved to PERSIST-NO-SERVER-AUTH."
+  },
+  {
+    "id": "XTAB-KINDS",
+    "contract_type": "product_behavior",
+    "area": "cross-tab",
+    "behavior": "Settings/workspace/history/workflows broadcast kind-only invalidation",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Equivalent vocabulary wired; no cross-tab test found.",
+    "legacy_evidence": "web/studio-sync.js:16-23,66-76 kinds",
+    "vue_evidence": "compatibility/crossTab.ts:1-12; integrations in settings/workflows/history/infrastructure stores",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "XTAB-NO-ENTITIES",
+    "contract_type": "product_behavior",
+    "area": "cross-tab",
+    "behavior": "Messages carry invalidation only, never entity state",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Payload shape matches; receiver/refetch behavior untested.",
+    "legacy_evidence": "web/studio-sync.js:1-4,32-39 kind/timestamp only",
+    "vue_evidence": "compatibility/crossTab.ts:4-10 {kind,at} only",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "XTAB-REFETCH",
+    "contract_type": "product_behavior",
+    "area": "cross-tab",
+    "behavior": "Receiving tab refetches server truth (no full-entity broadcast)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Refetch-on-invalidate behavior unproven.",
+    "legacy_evidence": "legacy sync refetch on invalidate",
+    "vue_evidence": "Store integrations reference crossTab; refetch path unverified",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Use two tabs/windows where infra permits."
+  },
+  {
+    "id": "XTAB-CLEANUP",
+    "contract_type": "product_behavior",
+    "area": "cross-tab",
+    "behavior": "Listeners cleaned up on dispose; same-tab Pinia never relies on BroadcastChannel",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Removal implemented; cleanup test absent.",
+    "legacy_evidence": "web/studio-sync.js:78-91 listener removal",
+    "vue_evidence": "compatibility/crossTab.ts:5-10 remove + close",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "XTAB-NO-BUS",
+    "contract_type": "retirement",
+    "area": "cross-tab",
+    "behavior": "Same-tab recent-run entity bus retired (invalidation-only)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.1"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "NA",
+    "reason": "Blueprint 4.1 explicitly retires the same-tab entity bus.",
+    "legacy_evidence": "web/studio-sync.js:93-133 in-memory ID bus",
+    "vue_evidence": "Absent by design; crossTab.ts invalidation-only",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "PERSIST-NO-SERVER-AUTH",
+    "contract_type": "product_behavior",
+    "area": "persistence",
+    "behavior": "Server /config and entity/operation state are never treated as browser authority on reload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md persistence rules; binding decision: split browser prefs from server truth"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "No mechanism persists entities/operations as authority; structural invariant holds.",
+    "legacy_evidence": "",
+    "vue_evidence": "persistence.ts opt-in only; entities stay in refs",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from PERSIST-RELOAD per binding decision."
+  }
+]

@@ -1,0 +1,11 @@
+{
+  "oracle": "legacy Studio is the behavioral specification; Vue must match it or carry explicit Ahmed approval",
+  "authoritative_legacy_sha": "86d9d1b765b6d075f726794013d7c0f0c7b666fd",
+  "authoritative_vue_sha": "86d9d1b765b6d075f726794013d7c0f0c7b666fd",
+  "legacy_launcher_open_path": "web/modal-testing.js :: open_testing_modal(tabName) -> mountStudioShell (web/studio-shell.js) -> renderPlayground (web/studio-playground.js:1098); hash contract web/studio-routing.js (#comfymodal=<page>[&focus=<id>])",
+  "vue_launcher_open_path": "web/modal-testing.js :: window.__comfymodalOpenVueStudio -> web/studio-vue-host.js :: openStudioVue(page) -> frontend/src/app/router (hash #comfymodal=<page>) -> frontend/src/pages/*.vue; bundle served from web/assets/studio/studio.mjs",
+  "legacy_entry_files": ["web/modal-testing.js", "web/studio-shell.js", "web/studio-playground.js", "web/studio-routing.js"],
+  "vue_entry_files": ["web/studio-vue-host.js", "frontend/src/studio.ts", "frontend/src/app/StudioApp.vue", "frontend/src/app/router/index.ts"],
+  "side_by_side_rule": "legacy remains runnable; do not move or delete legacy code; Vue parks (never removes) the legacy overlay while open (studio-vue-host.js _parkLegacyOverlay)",
+  "frozen_on": "2026-10-17"
+}

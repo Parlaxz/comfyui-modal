@@ -1,0 +1,258 @@
+[
+  {
+    "id": "SK-OPEN",
+    "contract_type": "product_behavior",
+    "area": "generate/sketch",
+    "behavior": "Sketch editor opens with base image selection",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2 Sketch"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Base selection shell exists; no drawing surface, behavior unproven.",
+    "legacy_evidence": "web/studio-playground.js:1356-1361; sketch shell import",
+    "vue_evidence": "PlaygroundView.vue:529-545 base shell; no canvas editor",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: comfyui-comfysketch by Vitor Silva (Mexes1978), MIT, https://github.com/Mexes1978/comfyui-comfysketch (js/comfysketch.js DrawingPad). Engine: web/studio-sketch-engine.js; layers: web/studio-sketch-layers.js; panels: web/studio-sketch-panels.js; shell bridge: web/studio-sketch-shell.js."
+  },
+  {
+    "id": "SK-STROKES",
+    "contract_type": "product_behavior",
+    "area": "generate/sketch",
+    "behavior": "Stroke creation, eraser, clear, undo/redo",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Only a local stroke-count array; no editor operations.",
+    "legacy_evidence": "legacy sketch shell editor ops",
+    "vue_evidence": "MISSING (PlaygroundView.vue:26-27,541-543 count only)",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::SUB-SKETCH"
+    ],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Split from original SUB-SKETCH FAIL. Provenance verified 2026-10-17: comfyui-comfysketch by Vitor Silva (Mexes1978), MIT, https://github.com/Mexes1978/comfyui-comfysketch (js/comfysketch.js DrawingPad). Engine: web/studio-sketch-engine.js; layers: web/studio-sketch-layers.js; panels: web/studio-sketch-panels.js; shell bridge: web/studio-sketch-shell.js."
+  },
+  {
+    "id": "SK-FLATTEN-UPLOAD",
+    "contract_type": "product_behavior",
+    "area": "generate/sketch",
+    "behavior": "Sketch flattens and uploads with sketch identity as source",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No flatten path (no toBlob/toDataURL/uploadSketch); strokes local-only.",
+    "legacy_evidence": "web/studio-sketch-shell.js:60-208 flatten + POST /upload/image studio-sketch-*.png",
+    "vue_evidence": "MISSING (generic source upload only; stores/playground.ts:357-390)",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::SUB-SKETCH"
+    ],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Core of original SUB-SKETCH FAIL: visible tool without real behavior. Provenance verified 2026-10-17: comfyui-comfysketch by Vitor Silva (Mexes1978), MIT, https://github.com/Mexes1978/comfyui-comfysketch (js/comfysketch.js DrawingPad). Engine: web/studio-sketch-engine.js; layers: web/studio-sketch-layers.js; panels: web/studio-sketch-panels.js; shell bridge: web/studio-sketch-shell.js."
+  },
+  {
+    "id": "SK-BASE-SWITCH",
+    "contract_type": "product_behavior",
+    "area": "generate/sketch",
+    "behavior": "Base switch clears strokes/layers, preserves tool settings",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Explicit clearing wired in source; transition behavior unproven.",
+    "legacy_evidence": "legacy sketch shell base replacement semantics",
+    "vue_evidence": "PlaygroundView.vue:95-119,226-229,265-269 clearing on workflow/version/source change",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: comfyui-comfysketch by Vitor Silva (Mexes1978), MIT, https://github.com/Mexes1978/comfyui-comfysketch (js/comfysketch.js DrawingPad). Engine: web/studio-sketch-engine.js; layers: web/studio-sketch-layers.js; panels: web/studio-sketch-panels.js; shell bridge: web/studio-sketch-shell.js."
+  },
+  {
+    "id": "SK-SETTINGS-GUARD",
+    "contract_type": "product_behavior",
+    "area": "generate/sketch",
+    "behavior": "Sketch tool settings preserved; stale completion guarded",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No sketch settings or sketch-specific stale guard in Vue.",
+    "legacy_evidence": "legacy sketch settings snapshot import",
+    "vue_evidence": "MISSING (PlaygroundView.vue:26-27; stores/playground.ts:357-390 generic guard)",
+    "tests_or_traces": [],
+    "implementation_invariant": "reuse_existing_upstream_derived_engine",
+    "notes": "Provenance verified 2026-10-17: comfyui-comfysketch by Vitor Silva (Mexes1978), MIT, https://github.com/Mexes1978/comfyui-comfysketch (js/comfysketch.js DrawingPad). Engine: web/studio-sketch-engine.js; layers: web/studio-sketch-layers.js; panels: web/studio-sketch-panels.js; shell bridge: web/studio-sketch-shell.js."
+  },
+  {
+    "id": "GUI-LOOKUP",
+    "contract_type": "product_behavior",
+    "area": "generate/guidance",
+    "behavior": "Guidance mapping lookup for workflow/version",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2 Guidance"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Workflows store fetches mappings; Playground has no guidance lookup/use.",
+    "legacy_evidence": "web/studio-guidance.js via playground :122,1889-1946",
+    "vue_evidence": "MISSING (stores/workflows.ts:119-146 fetch only; PlaygroundView.vue:188-200)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "GUI-KEY",
+    "contract_type": "product_behavior",
+    "area": "generate/guidance",
+    "behavior": "Guidance keyed by exact (model_sha256, mode)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.11"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No model hash/mode handling in Vue.",
+    "legacy_evidence": "web/studio-guidance.js model hash + mode key",
+    "vue_evidence": "MISSING (PlaygroundView.vue; stores/playground.ts:530-544 generic extras)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "GUI-MODES",
+    "contract_type": "product_behavior",
+    "area": "generate/guidance",
+    "behavior": "Guidance modes, unsupported states, and selection UI",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No guidance UI, mode state, or unsupported-state rendering.",
+    "legacy_evidence": "web/studio-guidance.js modes; playground :1889-1946",
+    "vue_evidence": "MISSING (PlaygroundView.vue:354-367)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "GUI-PAYLOAD",
+    "contract_type": "product_behavior",
+    "area": "generate/guidance",
+    "behavior": "Guidance mutates request and persists per version",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "applySubmissionExtras accepts guidance generically; no producer or persisted mapping state.",
+    "legacy_evidence": "web/studio-playground.js:3389-3410 guidance in payload",
+    "vue_evidence": "MISSING producer (stores/playground.ts:530-544; :184-193)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "GUI-NO-BRANCH",
+    "contract_type": "product_behavior",
+    "area": "generate/guidance",
+    "behavior": "No model/provider-family frontend branching",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.11; 15 MAY NOT"
+      }
+    ],
+    "required_evidence": [
+      "STATIC"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "PASS",
+    "reason": "No provider mentions in Vue source; invariant holds vacuously (no Guidance impl to branch in).",
+    "legacy_evidence": "legacy guidance provider/mapping logic (mechanism-driven)",
+    "vue_evidence": "No hits in frontend/src *.{ts,vue}",
+    "tests_or_traces": [
+      "STATIC-CHECK: grep [Ii]deogram|[Qq]wen|[Ff]lux frontend/src -> no hits"
+    ],
+    "implementation_invariant": "",
+    "notes": "Executable grep invariant (case-insensitive Ideogram|Qwen|Flux over frontend/src): clean on 2026-10-17. Must re-run when Guidance lands; vacuous until implementation exists."
+  }
+]

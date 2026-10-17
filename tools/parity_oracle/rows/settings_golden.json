@@ -1,0 +1,402 @@
+[
+  {
+    "id": "SET-CONFIG-AUTH",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "/config is durable server authority; UI reflects acknowledged state",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.5; 8"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Read/save/reread implemented; authority behavior needs integration proof.",
+    "legacy_evidence": "web/studio-settings.js:13-16 config authority",
+    "vue_evidence": "stores/settings.ts:104-170; api/settings.ts:25",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SET-GPU",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Selected GPU persists through /config",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.5"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "GPU derives from config in source; behavior unproven.",
+    "legacy_evidence": "web/studio-settings.js:75-80 GPU setting",
+    "vue_evidence": "stores/settings.ts:135-149; api/settings.ts:17-25",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SET-OUTPUTS",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Output settings save + project to canvas mirror one-way",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.4"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Patch/reread/projection exist; end-to-end behavior unproven.",
+    "legacy_evidence": "web/studio-settings.js:38-45,75-82 outputs",
+    "vue_evidence": "stores/settings.ts:163-185; compatibility/canvas.ts:33-73",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SET-DATASAVER",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Data Saver semantics preserved end to end",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Projection exists; exact UI/save semantics unverified.",
+    "legacy_evidence": "web/studio-settings.js:148-164 Data Saver",
+    "vue_evidence": "stores/settings.ts:40-60; canvas.ts:41-60",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SET-SKIP-SEMANTICS",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "skip_plan_validation exact key/value semantics (local 1/0 + server boolean)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 8"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Shapes match in source; behavior unproven.",
+    "legacy_evidence": "web/studio-settings.js:23-27,95 skip key",
+    "vue_evidence": "stores/settings.ts:203-220",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SET-MODEL-BLOCK",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Model-missing stays a blocker when skip_plan_validation is on",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No Vue missing-model gate found in inspected files.",
+    "legacy_evidence": "web/modal-node.js:687-725 model-missing block",
+    "vue_evidence": "MISSING (searched pages/stores/api)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "May be covered by run-context reasons/runnable gate; unverified."
+  },
+  {
+    "id": "SET-NODE-RELAX",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "skip flag relaxes custom-node validation only",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Gate lives outside Settings implementation; unlocated.",
+    "legacy_evidence": "blueprint 8 relax node reasons, keep model blockers",
+    "vue_evidence": "MISSING (searched frontend/src)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SET-ROLLBACK",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Failed saves roll back to acknowledged server/browser state",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5 settings rule"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Reread/restore implemented; failure behavior unproven.",
+    "legacy_evidence": "web/studio-settings.js:13-16 reread on failure",
+    "vue_evidence": "stores/settings.ts:163-182 config; :203-220 skip key; :187-200 tracing",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SET-ACK",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Successful mutation applies only after server acknowledgement (reread)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 5"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Reread implemented; ack behavior unproven.",
+    "legacy_evidence": "web/studio-settings.js:13-16 ack via reread",
+    "vue_evidence": "stores/settings.ts:167-170",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SET-CROSSTAB",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Cross-tab settings change invalidates and refetches (kind-only message)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Publish visible; listener/refetch behavior not fully verified.",
+    "legacy_evidence": "web/studio-settings.js:18-22,100-105 sync",
+    "vue_evidence": "stores/settings.ts:25,171,195 cross-tab wiring",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SET-BROWSER-PREFS",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Browser-only prefs persist; excluded from /config",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.5; 4.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Separate persisted refs exist; reload behavior unproven.",
+    "legacy_evidence": "web/studio-settings.js:63-96 prefs registry",
+    "vue_evidence": "stores/settings.ts:39-61,121-133; persistence.ts:70-113",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SET-TRACING",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Tracing/profile selected vs effective level; failure rolls back",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.5"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Selected/effective split + restore implemented; behavior unproven.",
+    "legacy_evidence": "web/studio-settings.js:236-241 tracing",
+    "vue_evidence": "stores/settings.ts:187-200; api/settings.ts:22,27",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "GOLDEN-CATALOG",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Golden catalog + server selection with fallback",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 8; 7.8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Catalog/selection implemented; behavior unproven.",
+    "legacy_evidence": "web/studio-settings.js:28-34 Golden catalog",
+    "vue_evidence": "stores/settings.ts:222-266; api/settings.ts:28-31",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "GOLDEN-SEPARATION",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Normal GPU, Golden profile, deploy config, active A/B kept distinct",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 8; 15 MAY NOT"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Distinct paths exist; no negative-write assertion; run-time consumption unevidenced.",
+    "legacy_evidence": "blueprint 8 five distinct concepts",
+    "vue_evidence": "stores/settings.ts:135-138,277-319; api/settings.ts:18-31",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "GOLDEN-AB-NEXT-RUN",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Active A/B order applies to next run without redeploy",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 8"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "API update exists; run-time consumption not evidenced.",
+    "legacy_evidence": "web/studio-settings.js:29-34; blueprint 8",
+    "vue_evidence": "stores/settings.ts:277-282",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "GOLDEN-DEPLOY",
+    "contract_type": "product_behavior",
+    "area": "settings",
+    "behavior": "Golden deploy operation + status polling owned by Settings/infrastructure",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7.8"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Polling + operation status exist; deploy behavior unproven.",
+    "legacy_evidence": "legacy Golden deploy/status",
+    "vue_evidence": "stores/settings.ts:284-319",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  }
+]

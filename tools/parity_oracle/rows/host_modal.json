@@ -1,0 +1,508 @@
+[
+  {
+    "id": "HOST-LAUNCHER",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Sidebar launcher opens Studio",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2, 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Both openers exist in source; no browser proof of launcher behavior.",
+    "legacy_evidence": "web/modal-testing.js:743-756 sidebar buttons call open_testing_modal",
+    "vue_evidence": "web/studio-vue-host.js:380-391 openStudioVue; StudioApp.vue:91-97 close path",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-FALLBACK",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Fallback launcher when sidebar registration unavailable",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue host assumes host caller; no independent fallback implemented or tested.",
+    "legacy_evidence": "web/modal-testing.js:821-847 fallback created when registration fails",
+    "vue_evidence": "MISSING (searched web/studio-vue-host.js; assumes host caller)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-WINDOW-API",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "window.open_testing_modal / window.close_testing_modal entrypoints preserved",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Entrypoint names not compared at runtime.",
+    "legacy_evidence": "web/modal-testing.js exposes window entrypoints",
+    "vue_evidence": "window.__comfymodalOpenVueStudio wired in studio-vue-host.js; legacy-compat names unverified",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Verify exact global names on both sides in browser."
+  },
+  {
+    "id": "HOST-SINGLE-MOUNT",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Vue app mounts once, reused across opens",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Mount-count guard exists; not browser-verified.",
+    "legacy_evidence": "web/modal-testing.js:564-610 cached shell reused",
+    "vue_evidence": "web/studio-vue-host.js:287-306 _handle/_mountPromise single mount",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-FOCUS-CAPTURE",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Open captures trigger element",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Source shows capture, not runtime focus outcome.",
+    "legacy_evidence": "web/modal-testing.js:553-554 captures _triggerEl",
+    "vue_evidence": "web/studio-vue-host.js:380-384 captures _triggerEl",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-FOCUS-RESTORE",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Close restores focus to opener",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No browser focus assertion found.",
+    "legacy_evidence": "web/modal-testing.js:701-705 focuses _triggerEl",
+    "vue_evidence": "web/studio-vue-host.js:440-444 same restoration",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-SCROLL-LOCK",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Body scroll locked while open, released on close",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "CSS/source only; no repeated open/close browser test.",
+    "legacy_evidence": "web/modal-testing.js:558-560 add, :701 remove class",
+    "vue_evidence": "web/studio-vue-host.js:383 add, :440 remove; CSS 150-172",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-INERT",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Background inert + aria-hidden applied and restored (incl. pre-existing attrs)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Restoration of pre-existing attributes needs runtime proof.",
+    "legacy_evidence": "web/modal-testing.js:22-49,561-562 inert apply/restore",
+    "vue_evidence": "web/studio-vue-host.js:95-123,384 Vue-prefixed apply/restore",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-ARIA-MODAL",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "aria-modal=true represents normal modal ownership",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No DOM-state browser evidence.",
+    "legacy_evidence": "web/modal-testing.js:344-350 dialog aria-modal; :65-68 invariant",
+    "vue_evidence": "web/studio-vue-host.js:220-223 frame aria-modal; :60-68 seam",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-ESCAPE",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Escape closes topmost layer; nested portalled layers own Escape first",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No browser test for nested Escape ordering.",
+    "legacy_evidence": "web/modal-testing.js:621-632 layer handler closes shell",
+    "vue_evidence": "web/studio-vue-host.js:309-340 nested-layer suppression",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-BACKDROP",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Backdrop click closes main modal",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No browser interaction evidence.",
+    "legacy_evidence": "web/modal-testing.js:617-619 overlay-target click closes",
+    "vue_evidence": "web/studio-vue-host.js:256-259 equivalent target check",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-CLOSE-SUPPRESS",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Explicit close suppresses refresh auto-reopen",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue documents no auto-reopen (preview); no refresh test.",
+    "legacy_evidence": "web/modal-testing.js:77-107 session flag cleared on close",
+    "vue_evidence": "web/studio-vue-host.js:14-15 no auto-reopen (preview posture)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-AUTOREOPEN",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Same-tab refresh auto-reopens Studio on last page (explicit close suppresses)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Vue preview explicitly skips auto-reopen; blueprint 2.2 MUST requires refresh/session reopen.",
+    "legacy_evidence": "web/modal-testing.js:77-170 reload flag/draft resume",
+    "vue_evidence": "web/studio-vue-host.js:14-15 explicitly no auto-reopen",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split: wizard-draft half moved to HOST-WIZARD-REOPEN."
+  },
+  {
+    "id": "HOST-EXPLICIT-OPENER",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Reopen honors hash unless explicit opener supplies page",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Router precedence unit-tested; host opener integration unverified.",
+    "legacy_evidence": "web/modal-testing.js:592-605; web/studio-shell.js:63-87 explicit route wins",
+    "vue_evidence": "web/studio-vue-host.js:393-407; studioRoute.ts:130-148",
+    "tests_or_traces": [
+      "frontend/src/app/router/studioRoute.test.ts:101-116"
+    ],
+    "implementation_invariant": "",
+    "notes": "Host integration beyond pure router untested."
+  },
+  {
+    "id": "HOST-NO-DUP-ESC",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Repeated open/close does not duplicate Escape listeners",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.2"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Listener guards exist both sides; no race evidence.",
+    "legacy_evidence": "web/modal-testing.js:566-582,688-695 guarded cached handler",
+    "vue_evidence": "web/studio-vue-host.js:309-322,372-375 idempotent add/remove",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Needs repeated-cycle race test."
+  },
+  {
+    "id": "HOST-NO-DUP-WIZ",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Repeated mount does not duplicate wizard listeners",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.3"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue guard exists; no race evidence.",
+    "legacy_evidence": "web/modal-testing.js:852-864 open-section guarded",
+    "vue_evidence": "web/studio-vue-host.js:261-273 _wizardListenersRegistered",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-WIZARD-MODE",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Wizard graph mode releases inert + aria-modal; close restores containment",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.3"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Seam exists; no browser proof with real wizard open.",
+    "legacy_evidence": "web/modal-testing.js:52-68 wizard invariant + events",
+    "vue_evidence": "web/studio-vue-host.js:60-68 setGraphInteractionEnabled; :261-271 events",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Vue wizard UI itself not yet shown; seam only."
+  },
+  {
+    "id": "HOST-CLOSE-BUTTON",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Single Studio close affordance; host fallback hidden after bundle ready",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.1"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No visual/focus browser verification.",
+    "legacy_evidence": "web/modal-testing.js:445-448 single close affordance",
+    "vue_evidence": "web/studio-vue-host.js:166-170; StudioApp.vue:127-136 in-app close",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-LEGACY-RESTORE",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Close restores parked legacy overlay and host chrome",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 10"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Source-supported but unverified in mixed legacy/Vue runtime.",
+    "legacy_evidence": "web/modal-testing.js:684-705 close restores inert/scroll/focus",
+    "vue_evidence": "web/studio-vue-host.js:125-148 park/restore; :432-440 ownership removal",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "HOST-WIZARD-REOPEN",
+    "contract_type": "product_behavior",
+    "area": "host/modal",
+    "behavior": "Pending wizard draft forces reload back to Workflows so the draft can resume",
+    "authorities": [
+      {
+        "kind": "legacy_impl",
+        "ref": "web/modal-testing.js wizard-draft reload path"
+      },
+      {
+        "kind": "migration_contract",
+        "ref": "docs/VUE_MIGRATION_BLUEPRINT.md (wizard draft resume contracts)"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue session draft + resume exist in source; reload-forced reopen behavior unproven.",
+    "legacy_evidence": "web/modal-testing.js wizard draft reload",
+    "vue_evidence": "stores/workflows.ts draft + resume (reload path unverified)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Split from HOST-AUTOREOPEN; independently testable."
+  }
+]

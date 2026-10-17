@@ -1,0 +1,377 @@
+[
+  {
+    "id": "TXT-PROMPT",
+    "contract_type": "product_behavior",
+    "area": "generate/text",
+    "behavior": "Prompt + negative prompt entry and display",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2 Text"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Prompt roles render; entry/display behavior unproven.",
+    "legacy_evidence": "web/studio-playground.js:1550-1620 prompt controls",
+    "vue_evidence": "PlaygroundControls.vue:30-32,88-103,222-234",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "TXT-PAYLOAD",
+    "contract_type": "product_behavior",
+    "area": "generate/text",
+    "behavior": "Text serialized into request with workflow/version ownership",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7.3"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Payload mapping exists; accepted-by-backend shape unproven.",
+    "legacy_evidence": "web/studio-playground.js:605-663,3322-3410 text in payload",
+    "vue_evidence": "stores/playground.ts:517-518,530-543; style composition to prompt",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "TXT-RESULT",
+    "contract_type": "product_behavior",
+    "area": "generate/text",
+    "behavior": "Generated result displays; recent History converges",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Identity-only projection exists; display + convergence unproven.",
+    "legacy_evidence": "web/studio-playground.js:153-219 result display + history",
+    "vue_evidence": "PlaygroundView.vue:31-45,488-495; stores/playground.ts:497-505",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "REF-ADD-REMOVE",
+    "contract_type": "product_behavior",
+    "area": "generate/references",
+    "behavior": "Add and remove references (ordered cards)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2 References"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Cards exist; interaction behavior unproven.",
+    "legacy_evidence": "web/studio-playground.js:2159-2165 reference shelf",
+    "vue_evidence": "PlaygroundView.vue:498-525; stores/playground.ts:393-401",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "REF-REPLACE",
+    "contract_type": "product_behavior",
+    "area": "generate/references",
+    "behavior": "Replace a reference in place",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Vue exposes add/remove only; no replace action.",
+    "legacy_evidence": "web/studio-bindable-inputs.js:362-389 reference shelf replace",
+    "vue_evidence": "MISSING (PlaygroundView.vue:498-525 add/remove only)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "REF-ORDER",
+    "contract_type": "product_behavior",
+    "area": "generate/references",
+    "behavior": "Multiple references keep order into payload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Array order retained in source; ordering behavior unproven.",
+    "legacy_evidence": "web/studio-bindable-inputs.js:343-359 ordered bindings",
+    "vue_evidence": "stores/playground.ts:393-400; PlaygroundView.vue:508-525",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "REF-WEIGHTS",
+    "contract_type": "product_behavior",
+    "area": "generate/references",
+    "behavior": "Reference strength/weight settings exist exactly for real Reference Methods that support them (no universal slider)",
+    "authorities": [
+      {
+        "kind": "owner_decision",
+        "ref": "binding: weights only when the selected real Reference Method supports them"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Vue has no reference-method UI at all, so method-conditional weights cannot exist. Part of the broader methods gap.",
+    "legacy_evidence": "web/studio-bindable-inputs.js:329-359 weighted reference payload",
+    "vue_evidence": "MISSING weights (stores/playground.ts:232-234,563-567)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Corrected: was a universal-weights requirement; universal slider would be fake parity."
+  },
+  {
+    "id": "REF-DRAFT-PERSIST",
+    "contract_type": "product_behavior",
+    "area": "generate/references",
+    "behavior": "Reference draft metadata persists across reload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "References not covered by Vue draft persistence.",
+    "legacy_evidence": "web/studio-playground-state.js:587-630 reference drafts",
+    "vue_evidence": "MISSING (stores/playground.ts:232-234,289-295,393-400)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "REF-UPLOAD-RACE",
+    "contract_type": "product_behavior",
+    "area": "generate/references",
+    "behavior": "Reference upload ownership; stale reference upload discarded",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8; 5 upload rule"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Reference upload path has no ownership/stale guard.",
+    "legacy_evidence": "web/studio-field-blocks.js:191-203,246-304 guarded uploads",
+    "vue_evidence": "stores/playground.ts:225-229,357-390 source guard only; no reference upload path",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Source-image guard is strong (UNIT); reference uploads lack ownership."
+  },
+  {
+    "id": "REF-SOURCE-SEPARATION",
+    "contract_type": "product_behavior",
+    "area": "generate/references",
+    "behavior": "Source image kept distinct from references in payload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Separation exists in source; serialization behavior unproven.",
+    "legacy_evidence": "web/studio-playground.js:605-663; bindable reference payload",
+    "vue_evidence": "PlaygroundView.vue:505-507; stores/playground.ts:563-567 references outside controls",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "REF-BINDING",
+    "contract_type": "product_behavior",
+    "area": "generate/references",
+    "behavior": "Reference candidate/method/binding structure matches mapping",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 12 MUST (mappings)"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue sends filenames/items; legacy candidate/method/binding structure absent.",
+    "legacy_evidence": "web/studio-bindable-inputs.js:329-359 candidate/method/binding",
+    "vue_evidence": "stores/playground.ts:563-567 filenames only",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "LAY-OPEN",
+    "contract_type": "product_behavior",
+    "area": "generate/layout",
+    "behavior": "Layout editor opens with boxes/captions/geometry",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2 Layout"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Layout editor UI in Vue.",
+    "legacy_evidence": "web/studio-layout-editor.js via playground :59,1356",
+    "vue_evidence": "MISSING (PlaygroundView.vue:354-367,498-545)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Playground has aspect-ratio preview only."
+  },
+  {
+    "id": "LAY-GEOMETRY",
+    "contract_type": "product_behavior",
+    "area": "generate/layout",
+    "behavior": "Layout geometry/coordinate conversion/resize",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No layout model in Vue.",
+    "legacy_evidence": "web/studio-layout-editor.js geometry/coords",
+    "vue_evidence": "MISSING (only empty-artboard aspect preview :371-468)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "LAY-TEMPLATES",
+    "contract_type": "product_behavior",
+    "area": "generate/layout",
+    "behavior": "Layout templates, drafts, clear/reset persist",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 4.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No layout template or draft state in Vue.",
+    "legacy_evidence": "legacy layout editor/template integration; LS keys",
+    "vue_evidence": "MISSING (PlaygroundView.vue:498-545; stores/playground.ts:236-237)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Blueprint 4.2 requires layout draft/templates persistence."
+  },
+  {
+    "id": "LAY-PAYLOAD",
+    "contract_type": "product_behavior",
+    "area": "generate/layout",
+    "behavior": "Layout serializes into request with image/base ownership",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No layout field or request mutation path in Vue.",
+    "legacy_evidence": "web/studio-playground.js:3322-3410 layout in payload",
+    "vue_evidence": "MISSING (api/playground.ts:44-59; stores/playground.ts:509-527)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  }
+]

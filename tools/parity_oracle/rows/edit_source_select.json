@@ -1,0 +1,608 @@
+[
+  {
+    "id": "SRC-UPLOAD",
+    "contract_type": "product_behavior",
+    "area": "edit/source",
+    "behavior": "Source upload binds real filename into controls",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Upload path exists; runtime binding unproven.",
+    "legacy_evidence": "web/studio-field-blocks.js:151-167 uploadImageBlob",
+    "vue_evidence": "stores/playground.ts:382-390 uploadSource -> controlValues.source_image",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SRC-LATEST-WINS",
+    "contract_type": "product_behavior",
+    "area": "edit/source",
+    "behavior": "Latest upload wins; token+owner guard discards stale completions",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8; 5 upload rule"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Token+owner guard unit-tested; true concurrency race unproven.",
+    "legacy_evidence": "web/studio-field-blocks.js:188-196 createUploadGuard",
+    "vue_evidence": "stores/playground.ts:357-390 beginUpload/commitUpload/failUpload",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.test.ts:124,135; tools/parity_oracle/scenarios.py::UP-GUARD"
+    ],
+    "implementation_invariant": "",
+    "notes": "Strong UNIT (delayed-upload-discard test); adversarial RACE still required. Supersedes original UP-GUARD PASS: mechanism parity proven, race behavior not. Downgraded."
+  },
+  {
+    "id": "SRC-OWNER-SWITCH",
+    "contract_type": "product_behavior",
+    "area": "edit/source",
+    "behavior": "Owner change (workflow/tool switch) invalidates pending upload",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "RACE"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Context-switch discard unit-tested; mid-upload switch race unproven.",
+    "legacy_evidence": "web/studio-field-blocks.js:188-196 guard keyed to selection",
+    "vue_evidence": "stores/playground.ts:366-379 owner check in commit/fail",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.test.ts:124"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SRC-FAIL-OWNER",
+    "contract_type": "product_behavior",
+    "area": "edit/source",
+    "behavior": "Upload failure surfaces only on current owner",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No runtime failure-path evidence.",
+    "legacy_evidence": "web/studio-field-blocks.js:199-203 failure path",
+    "vue_evidence": "stores/playground.ts:376-380 failUpload owner check",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SRC-FROM-HISTORY",
+    "contract_type": "product_behavior",
+    "area": "edit/source",
+    "behavior": "Source from History/previous generation binds real file",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Browse event exists; end-to-end history-to-source binding absent.",
+    "legacy_evidence": "web/studio-field-blocks.js:169-185 history browse binds filename",
+    "vue_evidence": "PlaygroundControls.vue:246-253 browse event; picker binding MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SRC-DRAGDROP",
+    "contract_type": "product_behavior",
+    "area": "edit/source",
+    "behavior": "Drag/drop ingests source image",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue drag/drop evidence found.",
+    "legacy_evidence": "web/studio-field-blocks.js:281-292 drop handlers",
+    "vue_evidence": "MISSING (searched frontend/src)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SRC-PASTE",
+    "contract_type": "product_behavior",
+    "area": "edit/source",
+    "behavior": "Paste ingests source image",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue paste evidence found.",
+    "legacy_evidence": "web/studio-field-blocks.js:293-303 paste handlers",
+    "vue_evidence": "MISSING (searched frontend/src)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SRC-CLEAR-MASK",
+    "contract_type": "product_behavior",
+    "area": "edit/source",
+    "behavior": "Clear source also clears dependent mask/selection state",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Vue clear exists; legacy parity of dependent clearing unverified.",
+    "legacy_evidence": "web/studio-field-blocks.js:349-357 Clear with dependents",
+    "vue_evidence": "stores/playground.ts:348-354 clearSourceOwnership",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SRC-SHARED-IDENTITY",
+    "contract_type": "product_behavior",
+    "area": "edit/source",
+    "behavior": "Source identity shared correctly across Edit subtools",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 3.4"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Ownership refs exist; no cross-subtool identity test.",
+    "legacy_evidence": "web/studio-playground.js source ownership path",
+    "vue_evidence": "stores/playground.ts:225-229,340-346",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-BRUSH",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Brush selection paints mask",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2 Select/Inpaint"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue selection editor.",
+    "legacy_evidence": "web/studio-playground.js selection editor",
+    "vue_evidence": "MISSING (only generic schema controls PlaygroundControls.vue:56-69)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "SEL-UNDO groups undo/redo/clear."
+  },
+  {
+    "id": "SEL-ERASE",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Erase selection",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue evidence.",
+    "legacy_evidence": "web/studio-playground.js selection editor",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-LASSO",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Lasso selection",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue evidence.",
+    "legacy_evidence": "web/studio-playground.js selection editor",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-RECT",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Rectangle selection",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue evidence.",
+    "legacy_evidence": "web/studio-playground.js selection editor",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-MASK-OPS",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Combine/add, grow, feather, invert mask ops",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue evidence.",
+    "legacy_evidence": "web/studio-playground.js mask ops",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-UNDO",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Selection undo/redo/clear",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue evidence.",
+    "legacy_evidence": "web/studio-playground.js selection history",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-SAM3",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "SAM3 object selection (points/boxes)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue SAM route/UI evidence.",
+    "legacy_evidence": "web/studio-playground.js:7559-7644 SAM endpoints + UI",
+    "vue_evidence": "MISSING (searched Vue source)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-DETECT",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "SAM3 text/detect selection",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue Detect path.",
+    "legacy_evidence": "web/studio-playground.js SAM text/detect endpoints",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-OWNERSHIP",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Mask + source share widget identity in request",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "REAL_BACKEND"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Generic role detection is not shared-editor ownership proof; exact binding needs backend.",
+    "legacy_evidence": "web/studio-playground.js mask/source binding",
+    "vue_evidence": "PlaygroundControls.vue:34-37,104-105 role detection; no mask editor",
+    "tests_or_traces": [
+      "tools/parity_oracle/scenarios.py::SUB-EDIT-MASK (types only)"
+    ],
+    "implementation_invariant": "",
+    "notes": "Supersedes original SUB-EDIT-MASK PASS: type parity is not ownership proof. Downgraded."
+  },
+  {
+    "id": "SEL-MASK-GATE",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Mask-required run gating blocks maskless inpaint submit",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No Select-specific mask gate; blocked-run behavior unproven.",
+    "legacy_evidence": "web/studio-playground.js mask-required validation",
+    "vue_evidence": "stores/playground.ts:141-181 generic required validation",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Generic required-field validation is UNIT-tested but not mask-specific."
+  },
+  {
+    "id": "SEL-CROPSTITCH",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Crop+Stitch execution method",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue method implementation.",
+    "legacy_evidence": "web/studio-playground.js inpaint methods",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-COND-CROP",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Conditioning + Crop-Stitch method",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue method implementation.",
+    "legacy_evidence": "web/studio-playground.js inpaint methods",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-DEDICATED",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Dedicated override method + method switching preserves mask/source",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 6.2"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "No Vue method state.",
+    "legacy_evidence": "web/studio-playground.js override + switching",
+    "vue_evidence": "MISSING",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-PAYLOAD",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Inpaint request serializes source, mask, method exactly",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 7.3"
+      }
+    ],
+    "required_evidence": [
+      "INTEGRATION"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Generic payload freeze is not Select mapping proof; needs exact capture.",
+    "legacy_evidence": "web/studio-playground.js inpaint payload",
+    "vue_evidence": "stores/playground.ts:84-98,141-181 generic freeze; no Select mapping",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "SEL-STALE-MASK",
+    "contract_type": "product_behavior",
+    "area": "edit/select",
+    "behavior": "Source replacement clears stale mask/SAM result",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.8"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Clear path clears mask; replacement-path invalidation unproven.",
+    "legacy_evidence": "web/studio-playground.js stale invalidation",
+    "vue_evidence": "stores/playground.ts:348-354 clears on clear only",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  }
+]

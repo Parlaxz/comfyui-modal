@@ -1,0 +1,1 @@
+{"axes": [{"role": "seed", "values": [1, 2, 3]}, {"role": "step_count", "values": [20, 30]}], "base": "txt2img_basic", "fixture": "experiment_axes"}

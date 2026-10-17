@@ -1,0 +1,266 @@
+[
+  {
+    "id": "ROUTE-CODEC",
+    "contract_type": "product_behavior",
+    "area": "routing",
+    "behavior": "Five canonical pages parse and serialize identically",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "All five route round trips directly unit-tested.",
+    "legacy_evidence": "web/studio-routing.js:18-19,42-89",
+    "vue_evidence": "studioRoute.ts:20-28,67-107; studioRoute.test.ts round trips",
+    "tests_or_traces": [
+      "frontend/src/app/router/studioRoute.test.ts:31-37"
+    ],
+    "implementation_invariant": "",
+    "notes": "Strongest PASS in matrix; still needs browser Back/Forward proof (ROUTE-BACK)."
+  },
+  {
+    "id": "ROUTE-FOCUS-CODEC",
+    "contract_type": "product_behavior",
+    "area": "routing",
+    "behavior": "Focus values opaque, encoded, round-trip",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Focus encoding/decoding directly tested.",
+    "legacy_evidence": "web/studio-routing.js:58-71,80-88",
+    "vue_evidence": "studioRoute.ts:83-107; tests",
+    "tests_or_traces": [
+      "frontend/src/app/router/studioRoute.test.ts:39-52"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "ROUTE-FAILSOFT",
+    "contract_type": "product_behavior",
+    "area": "routing",
+    "behavior": "Unknown/malformed/unrelated hashes fail soft, never throw",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Unrelated and malformed cases explicitly tested.",
+    "legacy_evidence": "web/studio-routing.js:25-33,51-56",
+    "vue_evidence": "studioRoute.ts:59-81; tests",
+    "tests_or_traces": [
+      "frontend/src/app/router/studioRoute.test.ts:54-82"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "ROUTE-PUSH-REPLACE",
+    "contract_type": "product_behavior",
+    "area": "routing",
+    "behavior": "Page change pushes; same-page focus replaces; identical does nothing",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "History action matrix and writes directly tested.",
+    "legacy_evidence": "web/studio-routing.js:91-107; web/studio-shell.js:718-741",
+    "vue_evidence": "studioHistory.ts:151-176; studioRoute.test.ts:84-99",
+    "tests_or_traces": [
+      "frontend/src/app/router/studioHistory.test.ts:76-103"
+    ],
+    "implementation_invariant": "",
+    "notes": "Negative control recommended: invert push/replace and watch tests fail."
+  },
+  {
+    "id": "ROUTE-BACK",
+    "contract_type": "product_behavior",
+    "area": "routing",
+    "behavior": "Back/Forward restores Studio page and focus",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Unit tests use fake history contract; no browser validation.",
+    "legacy_evidence": "web/studio-shell.js:747-760 hashchange applies route",
+    "vue_evidence": "studioHistory.ts:116-123,177-185",
+    "tests_or_traces": [
+      "frontend/src/app/router/studioHistory.test.ts:118-185"
+    ],
+    "implementation_invariant": "",
+    "notes": "Needs BROWSER: drive router.back()/forward() in live Studio."
+  },
+  {
+    "id": "ROUTE-UNTOUCHED",
+    "contract_type": "product_behavior",
+    "area": "routing",
+    "behavior": "Unrelated host hashes never rewritten during init/navigation",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "PASS",
+    "reason": "Explicit unit coverage for untouched unrelated hashes.",
+    "legacy_evidence": "web/studio-shell.js:718-743 only canonical routes written",
+    "vue_evidence": "studioHistory.ts:104-112,126-132,160-176",
+    "tests_or_traces": [
+      "frontend/src/app/router/studioHistory.test.ts:105-116,145-162"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "ROUTE-OPENER-WINS",
+    "contract_type": "product_behavior",
+    "area": "routing",
+    "behavior": "Explicit programmatic opener beats stale hash for that invocation",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "UNIT"
+    ],
+    "status": "UNKNOWN",
+    "reason": "Pure router precedence tested; host opener integration not.",
+    "legacy_evidence": "web/studio-shell.js:63-87",
+    "vue_evidence": "studioRoute.ts:130-148",
+    "tests_or_traces": [
+      "frontend/src/app/router/studioHistory.test.ts:136-143"
+    ],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "ROUTE-NO-REOPEN",
+    "contract_type": "product_behavior",
+    "area": "routing",
+    "behavior": "Close-then-hash does not auto-reopen Studio",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No browser test for close-then-hash sequence.",
+    "legacy_evidence": "web/modal-testing.js:135-147,684-699 hash alone never opens",
+    "vue_evidence": "web/studio-vue-host.js:14-15 no auto-reopen; no close/hash coordinator",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  },
+  {
+    "id": "ROUTE-SETTINGS-FOCUS",
+    "contract_type": "product_behavior",
+    "area": "routing",
+    "behavior": "Settings focus selects the requested section (focus=outputs defect fixed, not removed)",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1 intentional fix"
+      }
+    ],
+    "required_evidence": [
+      "BROWSER"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "FAIL",
+    "reason": "Vue route adapter carries focus but no Settings section-focus behavior found.",
+    "legacy_evidence": "web/studio-shell.js:763-793 maps outputs, scrolls/highlights",
+    "vue_evidence": "MISSING (searched router, StudioApp 53-76, SettingsView; codec only)",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": "Blueprint authorizes fixing the defect, not dropping section focus."
+  },
+  {
+    "id": "ROUTE-FOCUS-SAFE",
+    "contract_type": "product_behavior",
+    "area": "routing",
+    "behavior": "Focus values never become executable markup",
+    "authorities": [
+      {
+        "kind": "migration_contract",
+        "ref": "blueprint 2.1"
+      }
+    ],
+    "required_evidence": [
+      "UNIT"
+    ],
+    "current_evidence": [
+      "STATIC"
+    ],
+    "status": "UNKNOWN",
+    "reason": "No explicit opaque-focus security test on Vue side.",
+    "legacy_evidence": "web/studio-routing.js:10-12 opaque identifiers",
+    "vue_evidence": "studioRoute.ts:59-64,83-90; StudioApp.vue:182-198 route values not HTML",
+    "tests_or_traces": [],
+    "implementation_invariant": "",
+    "notes": ""
+  }
+]
