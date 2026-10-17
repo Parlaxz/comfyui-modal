@@ -54,6 +54,11 @@ export const useHistoryStore = defineStore("studio-history", () => {
   const detailError = ref<string | null>(null);
   const compareA = ref<string | null>(null);
   const compareB = ref<string | null>(null);
+  // Recent run convergence (HIST-RECENT): id-only references to runs the
+  // Playground completed in this session. The entities themselves always
+  // resolve through records (History V2 authority); this list never caches
+  // entities, so Playground stays free of a second Generation cache.
+  const recentRunIds = ref<Array<{ id: string; kind: HistoryRecord["kind"] }>>([]);
   const selection = ref<Set<string>>(new Set());
   const viewerOpen = ref(false);
   const actionMessage = ref<string | null>(null);
@@ -117,6 +122,17 @@ export const useHistoryStore = defineStore("studio-history", () => {
     if (compareA.value === id) compareA.value = null;
     if (compareB.value === id) compareB.value = null;
     selection.value.delete(`${kind}:${id}`);
+  }
+
+  /**
+   * Shared run-result ownership entry point (HIST-RECENT / RUN-RESULT-ATTACH).
+   * Called by the Playground run controller path on authoritative completion.
+   * Records the id only — never an entity — so no second Generation cache
+   * can form here. Feed refresh (server truth) converges the full record.
+   */
+  function noteRunResult(id: string, kind: HistoryRecord["kind"] = "generation"): void {
+    if (!id) return;
+    recentRunIds.value = [{ id, kind }, ...recentRunIds.value.filter((entry) => entry.id !== id)].slice(0, 20);
   }
 
   async function loadFeed(append = false): Promise<void> {
@@ -323,8 +339,9 @@ export const useHistoryStore = defineStore("studio-history", () => {
     records, selected, selectedId, focused, focusId, query, sort, favoriteOnly,
     kindFilter, statusFilter, cursor, hasMore, loading, error, detailError,
     compareA, compareB, compareRecords, selection: selectionList, viewerOpen,
-    actionMessage,
+    actionMessage, recentRunIds,
     setFocus, setQuery, setSort, setFavoriteOnly, setKindFilter, setStatusFilter,
+    upsertRecord, noteRunResult,
     loadFeed, loadDetail, applyRouteFocus,
     setFavorite, setNote, setFeatured, remove,
     toggleSelection, clearSelection, removeSelected,

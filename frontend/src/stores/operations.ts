@@ -88,6 +88,7 @@ export interface PatchOperationInput {
   status?: ActiveOperationStatus;
   progress?: number;
   message?: string;
+  /** Accepted but ignored: the workspace target freezes at start(). */
   workspaceId?: string;
 }
 
@@ -161,6 +162,11 @@ export const useOperationsStore = defineStore("studio-operations", () => {
     if (!existing) return;
     const { status, ...rest } = input;
     const next = { ...existing, ...rest };
+    // The accepted workspace target is immutable: patch() may update
+    // presentation, but it can never retarget an accepted operation to a
+    // different workspace (plain-JS callers bypass the type). Future
+    // operations capture the then-active id at start() instead.
+    next.workspaceId = existing.workspaceId;
     // Status moves only between active states, and never out of terminal:
     // terminal entry has one canonical path each (finish/fail/cancel), so
     // a terminal value here is dropped, not applied. (The type system
