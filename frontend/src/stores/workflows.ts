@@ -20,10 +20,15 @@ import { createCrossTabInvalidation, publishCrossTabInvalidation } from "../comp
 import { useOperationsStore } from "./operations";
 import {
   buildManagerPackIndex,
+  buildManagerModelIndex,
   getManagerMappings,
+  getManagerModels,
   getManagerPackList,
+  matchManagerModel,
+  normalizeManagerSavePath,
   performManagerInstall,
   resolveNodeInstall,
+  type ManagerModelRecord,
   type ManagerPackIndex,
 } from "../api/manager";
 import { useInfrastructureStore } from "./infrastructure";
@@ -59,6 +64,12 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
   const manifestPreview = ref<unknown>(null);
   const detailTask = createLatestTask();
   const managerIndex = ref<ManagerPackIndex | null>(null);
+  const managerModels = ref<Record<string, ManagerModelRecord> | null>(null);
+  /** Prefilled Model Library search from a dependency-row handoff. */
+  const libraryQuery = ref("");
+  /** Session-derived reverse usage: model filename → workflow names whose
+    dependency reports referenced it (legacy I6 parity, no new endpoint). */
+  const modelUsage = ref<Record<string, string[]>>({});
   const dependencyInstallMessage = ref<Record<string, string>>({});
   let stopCrossTab: (() => void) | null = null;
 
@@ -122,6 +133,10 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
     versionState.value = result.value.stateResponse;
     const presetValue = result.value.presetsResponse as { presets?: unknown[] };
     presets.value = presetValue.presets ?? [];
+    // Lazy Manager catalogs only when this report actually needs them.
+    void ensureManagerContext(result.value.dependencyResponse);
+    // Session reverse-usage for the Model Library "Used by" line.
+    recordModelUsage(result.value.dependencyResponse);
     if (selectedWorkflow.value && id) {
       methodCompat.value = await getMethodCompat(selectedWorkflow.value.workflow_id, id).catch(() => null);
     }
@@ -270,6 +285,96 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
     if (!selectedId.value) return;
     await setNonessentialDependencies(selectedId.value, keys);
     if (selectedVersion.value) await selectVersion(selectedVersion.value.workflow_version_id);
+  }
+
+  /** Lazy Manager model catalog (loaded once; resolves source-less models). */
+  async function loadManagerModels(): Promise<Record<string, ManagerModelRecord> | null> {
+    if (managerModels.value) return managerModels.value;
+    try {
+      const response = await getManagerModels();
+      const data = (response?.data ?? {}) as Record<string, unknown>;
+      const list = Array.isArray(data.models) ? data.models : Array.isArray(data) ? data : [];
+      managerModels.value = buildManagerModelIndex(list);
+    } catch {
+      managerModels.value = null;
+    }
+    return managerModels.value;
+  }
+
+  /** Match a missing model row against the Manager catalog (basename-safe). */
+  function resolveModelMatch(row: { filename?: unknown; folder?: unknown; role?: unknown }): ManagerModelRecord | null {
+    if (!managerModels.value) return null;
+    return matchManagerModel(
+      { filename: row.filename, role: (row as Record<string, unknown>).role ?? row.folder },
+      managerModels.value,
+    );
+  }
+
+  /** Resolve a custom-node install plan through the cached pack index. */
+  function resolveNodePlan(node: Record<string, unknown>): ReturnType<typeof resolveNodeInstall> {
+    return resolveNodeInstall(node, managerIndex.value);
+  }
+
+  /**
+   * Effective install target for a missing model row: direct source URL wins,
+   * otherwise a basename-safe Manager catalog match. Mirrors the legacy row
+   * (source link + queue/install actions; manager URL when the record
+   * carries none).
+   */
+  function modelInstallTarget(row: Record<string, unknown>): { url: string; savePath: string; viaManager: boolean } {
+    const sources = Array.isArray(row.source_urls) ? row.source_urls.map(String).filter(Boolean) : [];
+    const direct = sources[0] ?? "";
+    if (direct) {
+      return { url: direct, savePath: String(row.folder || ""), viaManager: false };
+    }
+    const match = resolveModelMatch(row);
+    if (match && match.url) {
+      return {
+        url: match.url,
+        savePath: normalizeManagerSavePath(match.savePath, match.type) || String(row.folder || ""),
+        viaManager: true,
+      };
+    }
+    return { url: "", savePath: String(row.folder || ""), viaManager: false };
+  }
+
+  /**
+   * Session reverse-usage for the Model Library "Used by" line: every model
+   * filename referenced by a loaded dependency report maps to the owning
+   * workflow name. Advisory only — no endpoint, no persistence.
+   */
+  function recordModelUsage(deps: unknown): void {
+    if (!deps || typeof deps !== "object") return;
+    const name = selectedWorkflow.value?.name;
+    if (!name) return;
+    const models = (deps as Record<string, unknown>).models;
+    if (!Array.isArray(models)) return;
+    const next = { ...modelUsage.value };
+    for (const item of models) {
+      const filename = String((item as Record<string, unknown> | null)?.filename || "");
+      if (!filename) continue;
+      const names = next[filename] ?? [];
+      if (!names.includes(name)) names.push(name);
+      next[filename] = names;
+    }
+    modelUsage.value = next;
+  }
+  async function ensureManagerContext(deps: unknown): Promise<void> {
+    if (!deps || typeof deps !== "object") return;
+    const record = deps as Record<string, unknown>;
+    if (record.status !== "ok") return;
+    const models = Array.isArray(record.models) ? record.models : [];
+    const nodes = Array.isArray(record.custom_nodes) ? record.custom_nodes : [];
+    const modelNeeds = models.some((item) => {
+      const row = (item ?? {}) as Record<string, unknown>;
+      return row.state !== "installed" && !(Array.isArray(row.source_urls) && row.source_urls.length > 0);
+    });
+    const nodeNeeds = nodes.some((item) => {
+      const row = (item ?? {}) as Record<string, unknown>;
+      return row.state === "missing" && !row.repository_url;
+    });
+    if (modelNeeds) void loadManagerModels().catch(() => null);
+    if (nodeNeeds) void loadManagerIndex().catch(() => null);
   }
 
   /** Lazy Manager pack index (loaded once; shared by all dependency rows). */
@@ -450,6 +555,7 @@ export const useWorkflowsStore = defineStore("studio-workflows", () => {
     toggleFavorite, createNewWorkflow, importNewWorkflow, deleteSelectedWorkflow,
     createFolder, captureVersion, saveMapping,
     markNonessential, saveCompatibility, recheckPortability, loadManagerIndex,
+    loadManagerModels, resolveModelMatch, resolveNodePlan, modelInstallTarget, libraryQuery, modelUsage,
     installDependencyNode, dependencyInstallMessage,
     exportManifest, previewManifestImport, commitManifestImport,
     sanitizePresetState, createPreset, savePreset, removePreset,

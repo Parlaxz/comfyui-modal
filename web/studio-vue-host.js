@@ -352,6 +352,18 @@ export async function cancelStudioGraphBinding() {
   _graphCaptureCancel = null;
 }
 
+/** Center/highlight a graph node for an already-bound wizard row. */
+export async function viewStudioGraphNode(nodeId) {
+  const binding = await import("./studio-graph-binding.js");
+  return binding.viewGraphNode(nodeId);
+}
+
+/** Graph-backed binding suggestions (proposals only; never auto-binds). */
+export async function suggestStudioGraphTargets(patterns, limit) {
+  const binding = await import("./studio-graph-binding.js");
+  return binding.findCanvasNodeTargets(patterns, limit) || [];
+}
+
 function _removeEscListener() {
   if (!_escListener) return;
   document.removeEventListener("keydown", _escListener, true);
@@ -402,6 +414,8 @@ export async function openStudioVue(page) {
     window.__comfymodalSetGraphInteractionEnabled = setGraphInteractionEnabled;
     window.__comfymodalBeginStudioGraphBinding = beginStudioGraphBinding;
     window.__comfymodalCancelStudioGraphBinding = cancelStudioGraphBinding;
+    window.__comfymodalViewStudioGraphNode = viewStudioGraphNode;
+    window.__comfymodalSuggestStudioGraphTargets = suggestStudioGraphTargets;
   } catch (_) {}
   return handle;
 }

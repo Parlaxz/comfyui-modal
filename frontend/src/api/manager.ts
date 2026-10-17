@@ -68,6 +68,8 @@ export async function listManagerInstalled() {
 }
 
 export async function getManagerModels() {
+  // Root paths (no /manager prefix): ComfyUI-Manager serves its API at the
+  // server root — the same convention as every other call in this file.
   const fresh = await managerFetch("/externalmodel/getlist?mode=default");
   if (fresh && fresh.ok) return fresh;
   return managerFetch("/externalmodel/getlist?mode=cache");
@@ -293,4 +295,106 @@ export async function performManagerInstall(
   } catch (err) {
     return { ok: false, message: `Install failed: ${(err as Error)?.message || "request failed"}` };
   }
+}
+
+// ── Manager model catalog (dependency fallback) ─────────────────────
+// Port of web/studio-model-library.js matchManagerModel /
+// buildManagerModelIndex / normalizeManagerSavePath: exact filename wins,
+// path-like dependency filenames match the catalog basename, and a match is
+// rejected when dependency role and catalog type map to different folders.
+
+const MANAGER_TYPE_FOLDERS: Record<string, string> = {
+  checkpoint: "checkpoints",
+  checkpoints: "checkpoints",
+  unclip: "checkpoints",
+  lora: "loras",
+  loras: "loras",
+  lycoris: "loras",
+  vae: "vae",
+  clip: "text_encoders",
+  text_encoder: "text_encoders",
+  text_encoders: "text_encoders",
+  unet: "diffusion_models",
+  diffusion_model: "diffusion_models",
+  diffusion_models: "diffusion_models",
+  t2i_adapter: "controlnet",
+  "t2i-adapter": "controlnet",
+  "t2i-style": "controlnet",
+  controlnet: "controlnet",
+  clip_vision: "clip_vision",
+  gligen: "gligen",
+  upscale: "upscale_models",
+};
+
+export function managerModelFolder(type: unknown): string {
+  const key = String(type == null ? "" : type).trim().toLowerCase();
+  return (key && MANAGER_TYPE_FOLDERS[key]) || "";
+}
+
+export function normalizeManagerSavePath(savePath: unknown, type: unknown): string {
+  const raw = String(savePath == null ? "" : savePath).trim();
+  if (raw && raw.toLowerCase() !== "default") return raw;
+  return managerModelFolder(type) || "";
+}
+
+export interface ManagerModelRecord {
+  url: string;
+  reference: string;
+  savePath: string;
+  type: string;
+  name: string;
+  installed: unknown;
+}
+
+function folderFromSavePath(savePath: string): string {
+  const raw = String(savePath || "").trim();
+  if (!raw || raw.toLowerCase() === "default") return "";
+  const head = raw.split("/")[0] || "";
+  return MANAGER_TYPE_FOLDERS[head.toLowerCase()] || head;
+}
+
+function roleMatchesType(role: unknown, record: ManagerModelRecord): boolean {
+  if (!role || !record || typeof record !== "object") return true;
+  const roleFolder = managerModelFolder(role) || String(role).toLowerCase();
+  const recordFolder = managerModelFolder(record.type) || folderFromSavePath(record.savePath);
+  if (!roleFolder || !recordFolder) return true;
+  return roleFolder === recordFolder;
+}
+
+export function buildManagerModelIndex(models: unknown): Record<string, ManagerModelRecord> {
+  const map: Record<string, ManagerModelRecord> = {};
+  for (const item of Array.isArray(models) ? models : []) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (!record.filename) continue;
+    const entry: ManagerModelRecord = {
+      url: String(record.url || ""),
+      reference: String(record.reference || ""),
+      savePath: normalizeManagerSavePath(record.save_path, record.type),
+      type: String(record.type || ""),
+      name: String(record.name || ""),
+      installed: record.installed,
+    };
+    const filename = String(record.filename);
+    if (!map[filename]) map[filename] = entry;
+    const base = basename(filename);
+    if (base && base !== filename && !map[base]) map[base] = entry;
+  }
+  return map;
+}
+
+export function matchManagerModel(
+  dep: { filename?: unknown; role?: unknown },
+  map: Record<string, ManagerModelRecord> | null,
+): ManagerModelRecord | null {
+  if (!map || !dep || !dep.filename) return null;
+  const filename = String(dep.filename);
+  const keys = [filename];
+  const base = basename(filename);
+  if (base && base !== filename) keys.push(base);
+  for (const key of keys) {
+    const record = map[key];
+    if (record && roleMatchesType(dep.role, record)) return record;
+  }
+  return null;
 }

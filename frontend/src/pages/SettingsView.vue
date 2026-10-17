@@ -22,6 +22,28 @@ const confirmResetAll = ref(false);
 
 const config = computed(() => settings.config);
 const gpuOptions = computed(() => config.value?.available_gpus ?? []);
+
+// Active GPU order display for the selected Golden profile (legacy parity:
+// order A/B summaries + runtime-active radio, no redeploy on swap).
+const goldenOrderProfile = computed(() => {
+  const name = settings.selectedGoldenProfile;
+  if (!name) return null;
+  return settings.goldenProfiles.find((profile) => profile.name === name) ?? null;
+});
+
+const goldenActiveOrder = computed(() => {
+  const name = settings.selectedGoldenProfile;
+  return (name && settings.goldenGpuOrder[name]) || "A";
+});
+
+function goldenOrderText(order: unknown): string {
+  const list = (Array.isArray(order) ? order : []).map(String);
+  if (!list.length) return "—";
+  return list.map((value) => {
+    const match = gpuOptions.value.find((option) => String(option.value).toLowerCase() === value.toLowerCase());
+    return match?.label || match?.value || value;
+  }).join(" → ");
+}
 const closeBtn = ref<HTMLElement | null>(null);
 
 // Closing the Preferences layer returns to a deterministic Studio home.
@@ -222,6 +244,23 @@ async function resetAll() {
                 <option value="">None</option>
                 <option v-for="profile in settings.goldenProfiles" :key="profile.name" :value="profile.name">{{ profile.name }}</option>
               </select>
+            </div>
+            <div v-if="goldenOrderProfile" class="cmst-setting-row">
+              <div class="cmst-min-w-0">
+                <p class="cmst:text-[13px] cmst:font-medium">Active GPU order</p>
+                <p class="cmst-type-meta cmst:mt-0.5">A: {{ goldenOrderText(goldenOrderProfile.gpu_order_a) }}</p>
+                <p v-if="(goldenOrderProfile.gpu_order_b as unknown[] | undefined)?.length" class="cmst-type-meta cmst:mt-0.5">B: {{ goldenOrderText(goldenOrderProfile.gpu_order_b) }}</p>
+              </div>
+              <div class="cmst:flex cmst:items-center cmst:gap-3" role="radiogroup" aria-label="Active GPU order">
+                <label class="cmst:flex cmst:cursor-pointer cmst:items-center cmst:gap-1.5 cmst:text-[13px]">
+                  <input type="radio" name="vue-golden-order" value="A" :checked="goldenActiveOrder !== 'B'" data-testid="vue-settings-golden-order-a" @change="settings.setGoldenGpuOrder(goldenOrderProfile.name, 'A')" />
+                  A
+                </label>
+                <label v-if="(goldenOrderProfile.gpu_order_b as unknown[] | undefined)?.length" class="cmst:flex cmst:cursor-pointer cmst:items-center cmst:gap-1.5 cmst:text-[13px]">
+                  <input type="radio" name="vue-golden-order" value="B" :checked="goldenActiveOrder === 'B'" data-testid="vue-settings-golden-order-b" @change="settings.setGoldenGpuOrder(goldenOrderProfile.name, 'B')" />
+                  B
+                </label>
+              </div>
             </div>
           </div>
           <p v-if="config?.engine_migration_notice" class="cmst:mt-2 cmst:text-xs cmst:text-cmst-muted">{{ config.engine_migration_notice }}</p>

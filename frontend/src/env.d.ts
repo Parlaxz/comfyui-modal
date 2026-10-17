@@ -19,4 +19,9 @@ interface Window {
     onCancel: (reason: string) => void;
   }) => Promise<(() => void) | null>;
   __comfymodalCancelStudioGraphBinding?: () => Promise<void>;
+  __comfymodalViewStudioGraphNode?: (nodeId: string) => Promise<{ ok: boolean; reason?: string } | null>;
+  __comfymodalSuggestStudioGraphTargets?: (
+    patterns: Array<{ nodeType: string; widget?: string }>,
+    limit?: number,
+  ) => Promise<Array<{ nodeId: string | number; nodeType?: string; nodeTitle?: string; widgetName?: string }>>;
 }

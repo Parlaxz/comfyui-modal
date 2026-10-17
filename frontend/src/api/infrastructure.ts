@@ -21,6 +21,7 @@ export async function refreshInventory(maxAge?: number) { const suffix = maxAge 
 export async function listModels(params: { search?: string; type?: string; state?: string } = {}) { const query = new URLSearchParams(); if (params.search) query.set("search", params.search); if (params.type) query.set("type", params.type); if (params.state) query.set("state", params.state); const suffix = query.toString() ? `?${query}` : ""; return requestJson<InventoryEnvelope>(`/studio/models${suffix}`); }
 export async function rescanModels(forceRehash = false) { return requestJson<InventoryEnvelope>("/studio/models/rescan", { method: "POST", body: { force_rehash: forceRehash } }); }
 export async function listCustomNodes() { return requestJson<InventoryEnvelope>("/studio/custom-nodes"); }
+export async function updateModelRecord(modelId: string, body: Record<string, unknown>) { return requestJson<Record<string, unknown>>(`/studio/models/${encodeURIComponent(modelId)}`, { method: "PATCH", body }); }
 export async function refreshCustomNodes() { return requestJson<InventoryEnvelope>("/studio/custom-nodes/refresh", { method: "POST" }); }
 export async function upsertWorkspace(payload: Record<string, unknown>) { return requestJson<WorkspaceEnvelope>("/workspaces", { method: "POST", body: payload }); }
 export async function requestWorkspaceSwap(payload: Record<string, unknown>) { return requestJson<Record<string, unknown>>("/workspaces/swap", { method: "POST", body: payload }); }

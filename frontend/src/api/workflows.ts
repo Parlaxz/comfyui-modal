@@ -67,6 +67,85 @@ export function normalizeWorkflowType(value: unknown): string {
 export const WIZARD_STEPS = ["feature-type", "required-bindings", "exposed-controls", "details"] as const;
 export type WizardStep = (typeof WIZARD_STEPS)[number];
 
+// ── Semantic binding roles (code-owned catalog) ─────────────────────
+// Port of web/studio-bindable-inputs.js role sets + the static
+// ROLE_SUGGESTIONS hints from web/studio-workflow-setup-wizard.js: the finite
+// vocabulary a workflow field can map to. The workflow type decides which
+// roles are required/optional; the output binding is always required.
+export interface WizardRoleDef {
+  key: string;
+  label: string;
+  /** Static "look for" hint shown on unbound rows (node type → widget). */
+  hint: string;
+}
+
+const WIZARD_ROLE_DEFS: Record<string, WizardRoleDef> = {
+  prompt: { key: "prompt", label: "Prompt", hint: "CLIPTextEncode · text" },
+  seed: { key: "seed", label: "Seed", hint: "KSampler · seed" },
+  step_count: { key: "step_count", label: "Step count", hint: "KSampler · steps" },
+  cfg_scale: { key: "cfg_scale", label: "CFG scale", hint: "KSampler · cfg" },
+  sampler: { key: "sampler", label: "Sampler", hint: "KSampler · sampler_name" },
+  width: { key: "width", label: "Width", hint: "EmptyLatentImage · width" },
+  height: { key: "height", label: "Height", hint: "EmptyLatentImage · height" },
+  model_unet: { key: "model_unet", label: "Model", hint: "UNETLoader · unet_name" },
+  vae: { key: "vae", label: "VAE", hint: "VAELoader · vae_name" },
+  clip: { key: "clip", label: "CLIP", hint: "CLIPLoader · clip_name" },
+  source_image: { key: "source_image", label: "Source image", hint: "LoadImage · image" },
+  mask: { key: "mask", label: "Mask", hint: "Bind the exact input this workflow reads" },
+  output: { key: "output", label: "Output", hint: "SaveImage · images" },
+};
+
+const WIZARD_REQUIRED_ROLES: Record<string, string[]> = {
+  t2i: ["prompt", "seed", "model_unet", "vae", "clip"],
+  i2i: ["prompt", "seed", "model_unet", "vae", "clip", "source_image"],
+  inpaint: ["prompt", "seed", "model_unet", "vae", "clip", "source_image", "mask"],
+  sketch: ["prompt", "seed", "model_unet", "vae", "clip", "source_image"],
+  outpaint: ["prompt", "seed", "model_unet", "vae", "clip", "source_image"],
+};
+
+const WIZARD_OPTIONAL_ROLES: Record<string, string[]> = {
+  t2i: ["step_count", "cfg_scale", "sampler", "width", "height"],
+  i2i: ["step_count", "cfg_scale", "sampler", "width", "height", "mask"],
+  inpaint: ["step_count", "cfg_scale", "sampler", "width", "height"],
+  sketch: ["step_count", "cfg_scale", "sampler", "width", "height", "mask"],
+  outpaint: ["step_count", "cfg_scale", "sampler", "width", "height", "mask"],
+};
+
+export function wizardRoleDef(key: string): WizardRoleDef {
+  return WIZARD_ROLE_DEFS[key] ?? { key, label: key, hint: "" };
+}
+
+export function requiredWizardRoles(featureType: string): string[] {
+  return WIZARD_REQUIRED_ROLES[normalizeWorkflowType(featureType)] ?? WIZARD_REQUIRED_ROLES.t2i;
+}
+
+export function optionalWizardRoles(featureType: string): string[] {
+  return WIZARD_OPTIONAL_ROLES[normalizeWorkflowType(featureType)] ?? WIZARD_OPTIONAL_ROLES.t2i;
+}
+
+// Static per-role "look for" patterns for graph-backed suggestions (port of
+// the legacy ROLE_SUGGESTIONS map). Proposals only — binding always requires
+// an explicit graph click.
+const WIZARD_ROLE_SUGGESTIONS: Record<string, Array<{ nodeType: string; widget?: string }>> = {
+  prompt: [{ nodeType: "CLIPTextEncode", widget: "text" }],
+  seed: [{ nodeType: "KSampler", widget: "seed" }],
+  step_count: [{ nodeType: "KSampler", widget: "steps" }],
+  cfg_scale: [{ nodeType: "KSampler", widget: "cfg" }],
+  sampler: [{ nodeType: "KSampler", widget: "sampler_name" }],
+  width: [{ nodeType: "EmptyLatentImage", widget: "width" }],
+  height: [{ nodeType: "EmptyLatentImage", widget: "height" }],
+  model_unet: [{ nodeType: "UNETLoader", widget: "unet_name" }, { nodeType: "CheckpointLoaderSimple", widget: "ckpt_name" }],
+  vae: [{ nodeType: "VAELoader", widget: "vae_name" }, { nodeType: "CheckpointLoaderSimple", widget: "ckpt_name" }],
+  clip: [{ nodeType: "CLIPLoader", widget: "clip_name" }, { nodeType: "CheckpointLoaderSimple", widget: "ckpt_name" }],
+  source_image: [{ nodeType: "LoadImage", widget: "image" }],
+  mask: [],
+  output: [{ nodeType: "SaveImage" }, { nodeType: "PreviewImage" }],
+};
+
+export function wizardRoleSuggestions(roleKey: string): Array<{ nodeType: string; widget?: string }> {
+  return WIZARD_ROLE_SUGGESTIONS[roleKey] ?? [];
+}
+
 export interface WizardDraft {
   v: 1;
   workflowId: string;

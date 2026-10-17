@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { Database, Import, Layers, RefreshCw, Search, Star, WandSparkles, X } from "@lucide/vue";
 import { useWorkflowsStore } from "../stores/workflows";
 import { useInfrastructureStore } from "../stores/infrastructure";
-import { WIZARD_STEPS } from "../api/workflows";
+import { WIZARD_STEPS, requiredWizardRoles, optionalWizardRoles, wizardRoleDef, wizardRoleSuggestions } from "../api/workflows";
 import StudioButton from "../components/StudioButton.vue";
 import { studioPageClass } from "../components/studioPanels";
 
@@ -11,7 +11,6 @@ const workflows = useWorkflowsStore();
 const infrastructure = useInfrastructureStore();
 const query = ref("");
 const tab = ref<"workflows" | "models">("workflows");
-const bindingInput = ref("");
 const controlLabel = ref("");
 const wizardMessage = ref("");
 const editName = ref("");
@@ -23,6 +22,7 @@ const presetName = ref("");
 const guidanceSha = ref("");
 const guidanceMode = ref("txt2img");
 const mappingText = ref("");
+const showManifestImport = ref(false);
 
 const wizardStepIndex = computed(() => Math.max(0, WIZARD_STEPS.indexOf(workflows.wizardDraft?.step ?? "feature-type")));
 const wizardStep = computed(() => WIZARD_STEPS[wizardStepIndex.value]);
@@ -76,6 +76,9 @@ const WIZARD_STEP_LABELS: Record<string, string> = {
 };
 
 const wizardStepLabel = computed(() => WIZARD_STEP_LABELS[wizardStep.value] ?? wizardStep.value);
+
+const requiredBindingRoles = computed(() => requiredWizardRoles(workflows.wizardDraft?.featureType ?? "t2i"));
+const optionalBindingRoles = computed(() => optionalWizardRoles(workflows.wizardDraft?.featureType ?? "t2i"));
 
 // Display-only binding helpers. The graph-binding engine (capture callbacks,
 // confirmed flags, draft shape) is untouched; these just read it for the
@@ -145,26 +148,87 @@ onUnmounted(() => {
   document.removeEventListener("keydown", onDocumentKeydown);
 });
 
-async function captureBinding() {
-  if (!bindingInput.value.trim()) return;
-  const fallbackTarget = bindingInput.value.trim();
+async function captureBinding(bindingKey: string) {
+  const label = wizardRoleDef(bindingKey).label;
   if (window.__comfymodalBeginStudioGraphBinding) {
-    wizardMessage.value = "Click a node in the ComfyUI graph…";
+    wizardMessage.value = `Click a node in the ComfyUI graph for ${label}…`;
     await window.__comfymodalBeginStudioGraphBinding({
-      bindingKey: "prompt",
-      label: "prompt",
+      bindingKey,
+      label,
       allowOutput: false,
       onCapture: (result) => {
-        workflows.updateWizard({ bindings: { ...(workflows.wizardDraft?.bindings ?? {}), prompt: { ...result, confirmed: true } } });
-        wizardMessage.value = `Confirmed ${String(result.nodeTitle ?? result.nodeId ?? "graph target")}`;
+        workflows.updateWizard({ bindings: { ...(workflows.wizardDraft?.bindings ?? {}), [bindingKey]: { ...result, confirmed: true } } });
+        wizardMessage.value = `${label} bound to ${String(result.nodeTitle ?? result.nodeId ?? "graph target")}`;
       },
       onCancel: (reason) => { wizardMessage.value = reason; },
     });
     return;
   }
-  workflows.updateWizard({ bindings: { ...(workflows.wizardDraft?.bindings ?? {}), prompt: { target: fallbackTarget, confirmed: true } } });
-  wizardMessage.value = `Confirmed graph target ${fallbackTarget}`;
+  workflows.updateWizard({ bindings: { ...(workflows.wizardDraft?.bindings ?? {}), [bindingKey]: { target: bindingKey, confirmed: true } } });
+  wizardMessage.value = `${label} recorded without a live graph`;
 }
+
+function roleBinding(roleKey: string): unknown {
+  const bindings = (workflows.wizardDraft?.bindings ?? {}) as Record<string, unknown>;
+  return bindings[roleKey] ?? null;
+}
+
+async function viewRoleBinding(roleKey: string) {
+  const binding = roleBinding(roleKey) as Record<string, unknown> | null;
+  const nodeId = binding ? String(binding.nodeId ?? binding.node_id ?? "") : "";
+  if (!nodeId || !window.__comfymodalViewStudioGraphNode) {
+    wizardMessage.value = "Open the graph to locate this target";
+    return;
+  }
+  const result = (await window.__comfymodalViewStudioGraphNode(nodeId).catch(() => null)) as { ok?: boolean; reason?: string } | null;
+  wizardMessage.value = result && result.ok !== false
+    ? `Centered ${wizardRoleDef(roleKey).label} on the graph`
+    : String((result as { reason?: string } | null)?.reason || "Node not found on the canvas");
+}
+
+interface RoleSuggestion {
+  nodeId: string | number;
+  nodeType?: string;
+  nodeTitle?: string;
+  widgetName?: string;
+}
+
+const roleSuggestions = ref<Record<string, RoleSuggestion[]>>({});
+
+async function suggestRoleBinding(roleKey: string) {
+  if (!window.__comfymodalSuggestStudioGraphTargets) {
+    wizardMessage.value = "Suggestions need the live graph";
+    return;
+  }
+  const patterns = wizardRoleSuggestions(roleKey);
+  if (!patterns.length) {
+    wizardMessage.value = `No static hint for ${wizardRoleDef(roleKey).label} — capture against the exact input`;
+    return;
+  }
+  try {
+    const found = (await window.__comfymodalSuggestStudioGraphTargets(patterns, 3)) as RoleSuggestion[];
+    roleSuggestions.value = { ...roleSuggestions.value, [roleKey]: Array.isArray(found) ? found : [] };
+    if (!roleSuggestions.value[roleKey].length) wizardMessage.value = "No matching nodes on this graph";
+  } catch {
+    wizardMessage.value = "Suggestion lookup failed";
+  }
+}
+
+async function viewSuggestedNode(nodeId: string | number) {
+  if (!window.__comfymodalViewStudioGraphNode) return;
+  await window.__comfymodalViewStudioGraphNode(String(nodeId)).catch(() => null);
+}
+
+// Save gate: required roles for the chosen feature type plus the output
+// binding must be confirmed before the mapping can be saved.
+const missingRequiredLabels = computed(() => {
+  const featureType = workflows.wizardDraft?.featureType ?? "t2i";
+  const missing = requiredWizardRoles(featureType)
+    .filter((key) => !bindingConfirmed(roleBinding(key)))
+    .map((key) => wizardRoleDef(key).label);
+  if (!bindingConfirmed(workflows.wizardDraft?.outputBinding)) missing.push("Output");
+  return missing;
+});
 
 async function captureOutput() {
   if (window.__comfymodalBeginStudioGraphBinding) {
@@ -186,6 +250,10 @@ async function captureOutput() {
 }
 
 async function saveWizard() {
+  if (missingRequiredLabels.value.length > 0) {
+    wizardMessage.value = `Still needed: ${missingRequiredLabels.value.join(", ")}`;
+    return;
+  }
   wizardMessage.value = "";
   try {
     await workflows.saveWizardMapping();
@@ -215,6 +283,74 @@ function addControl() {
   const controls = [...(workflows.wizardDraft?.controls ?? []), { label: controlLabel.value.trim(), enabled: true }];
   workflows.updateWizard({ controls });
   controlLabel.value = "";
+}
+
+function presetKey(preset: unknown): string {
+  const record = (preset ?? {}) as Record<string, unknown>;
+  return String(record.preset_id || record.id || "");
+}
+
+const renamingPresetId = ref("");
+const renameDraft = ref("");
+const presetCopyTargets = ref<Record<string, string>>({});
+
+function startPresetRename(preset: unknown) {
+  renamingPresetId.value = presetKey(preset);
+  renameDraft.value = String((preset as Record<string, unknown>).name || "");
+}
+
+async function savePresetRename(preset: unknown) {
+  const id = presetKey(preset);
+  const name = renameDraft.value.trim();
+  renamingPresetId.value = "";
+  if (!id || !name) return;
+  await workflows.savePreset(id, { name }).catch(() => undefined);
+}
+
+async function copyPresetToVersion(preset: unknown) {
+  const id = presetKey(preset);
+  const target = presetCopyTargets.value[id];
+  if (!id || !target) return;
+  await workflows.copyPresetForward(id, target).catch(() => undefined);
+}
+
+const guidanceResult = ref<unknown>(null);
+
+async function loadGuidanceEntry() {
+  guidanceResult.value = null;
+  try {
+    guidanceResult.value = await workflows.loadGuidance(guidanceSha.value, guidanceMode.value);
+  } catch {
+    // Errors surface through store error state.
+  }
+}
+
+async function removeGuidanceEntry() {
+  if (!guidanceSha.value.trim()) return;
+  await workflows.removeGuidance(guidanceSha.value.trim(), guidanceMode.value).catch(() => undefined);
+  guidanceResult.value = null;
+}
+
+const manifestText = ref("");
+const manifestError = ref("");
+
+async function previewManifest() {
+  manifestError.value = "";
+  try {
+    await workflows.previewManifestImport(JSON.parse(manifestText.value || "{}") as Record<string, unknown>);
+  } catch (cause) {
+    manifestError.value = cause instanceof Error ? cause.message : "Preview failed";
+  }
+}
+
+async function commitManifest() {
+  manifestError.value = "";
+  try {
+    await workflows.commitManifestImport(JSON.parse(manifestText.value || "{}") as Record<string, unknown>);
+    manifestText.value = "";
+  } catch (cause) {
+    manifestError.value = cause instanceof Error ? cause.message : "Import failed";
+  }
 }
 
 async function doImport() {
@@ -307,15 +443,25 @@ const dependencyNodeRows = computed<DependencyNodeRow[]>(() => {
 });
 
 const dependencySummaryLine = computed(() => {
-  const summary = dependencyPayload.value.summary;
-  if (summary && typeof summary === "object") {
-    const record = summary as Record<string, unknown>;
-    const installed = Number(record.installed ?? 0);
-    const missing = Number(record.missing ?? 0);
-    return `${installed} installed · ${missing} missing · ${missing === 0 ? "ready" : "attention"}`;
-  }
   if (!workflows.dependencies) return "not loaded";
-  return `${dependencyModelRows.value.length + dependencyNodeRows.value.length} requirements`;
+  const modelRows = dependencyModelRows.value;
+  const nodeRows = dependencyNodeRows.value;
+  const requiredMissing = [
+    ...modelRows.filter((row) => row.state === "missing" && !row.nonessential),
+    ...nodeRows.filter((row) => row.state === "missing"),
+  ].length;
+  const optionalMissing = modelRows.filter((row) => row.state === "missing" && row.nonessential).length;
+  const installed = [
+    ...modelRows.filter((row) => row.state === "installed" || row.state === "ready"),
+    ...nodeRows.filter((row) => row.state === "installed"),
+  ].length;
+  // The backend summary excludes nonessential rows from its missing count,
+  // so derive truth from the visible rows: required-missing gates readiness,
+  // optional-missing is reported explicitly instead of contradicting it.
+  if (requiredMissing > 0) return `${installed} installed · ${requiredMissing} missing · attention`;
+  if (optionalMissing > 0) return `${installed} installed · ${optionalMissing} optional missing · ready`;
+  if (!modelRows.length && !nodeRows.length) return "no requirements";
+  return `${installed} installed · ready`;
 });
 
 const runnableText = computed(() => {
@@ -351,6 +497,110 @@ async function installDependencyModel(row: DependencyRow) {
     : { filename: row.filename, folder: row.folder };
   try {
     await infrastructure.installModel(payload);
+  } catch {
+    // Errors surface through the operations registry + infrastructure error.
+  }
+}
+
+// Per-row explicit source URL for source-less missing rows (legacy parity:
+// the URL goes to the existing backend install routes; never auto-fetched).
+const rowSourceUrls = ref<Record<string, string>>({});
+
+function modelTarget(row: DependencyRow): { url: string; savePath: string; viaManager: boolean } {
+  return workflows.modelInstallTarget(row.raw);
+}
+
+function rowSourceUrl(row: DependencyRow): string {
+  const sources = Array.isArray(row.raw.source_urls) ? row.raw.source_urls : [];
+  return sources.map(String).find(Boolean) ?? "";
+}
+
+async function queueDependencyModel(row: DependencyRow, url: string) {
+  const target = url.trim();
+  if (!target) return;
+  workflows.dependencyInstallMessage[row.key] = "Queueing…";
+  try {
+    await infrastructure.installModelRequest({ url: target, filename: row.filename, save_path: row.folder });
+    workflows.dependencyInstallMessage[row.key] = "Queued for download";
+  } catch (cause) {
+    workflows.dependencyInstallMessage[row.key] = cause instanceof Error ? cause.message : "Queue failed";
+  }
+}
+
+async function installDependencyModelUrl(row: DependencyRow, url: string) {
+  const target = url.trim();
+  if (!target) return;
+  try {
+    await infrastructure.installModel({ url: target, filename: row.filename, save_path: row.folder });
+  } catch {
+    // Errors surface through the operations registry + infrastructure error.
+  }
+}
+
+// Contextual handoff: a dependency row opens the shared Model Library tab
+// with the search prefilled to that filename. Filter on the canonical list —
+// no second model-management implementation.
+function findInLibrary(query: string) {
+  workflows.libraryQuery = query;
+  tab.value = "models";
+}
+
+// ── Model Library browser (shared infrastructure inventory) ──
+const libraryType = ref("");
+const libraryDetailKey = ref("");
+const libraryNotes = ref<Record<string, string>>({});
+
+const libraryModelTypes = computed(() => {
+  const types = new Set<string>();
+  for (const item of infrastructure.models) {
+    const type = String(item.model_type || item.folder || "");
+    if (type) types.add(type);
+  }
+  return [...types].sort();
+});
+
+const filteredLibraryModels = computed(() => {
+  const query = workflows.libraryQuery.trim().toLowerCase();
+  return infrastructure.models.filter((item) => {
+    if (libraryType.value && String(item.model_type || item.folder || "") !== libraryType.value) return false;
+    if (!query) return true;
+    const haystack = [item.display_name, item.filename, item.folder, item.model_type, item.provider]
+      .map((part) => String(part || "").toLowerCase()).join(" ");
+    return haystack.includes(query);
+  });
+});
+
+const filteredLibraryNodes = computed(() => {
+  const query = workflows.libraryQuery.trim().toLowerCase();
+  if (!query) return infrastructure.customNodes;
+  return infrastructure.customNodes.filter((node) => {
+    const classes = Array.isArray(node.classes) ? node.classes.map(String).join(" ") : "";
+    const haystack = [node.title, node.name, node.id, classes].map((part) => String(part || "").toLowerCase()).join(" ");
+    return haystack.includes(query);
+  });
+});
+
+function formatBytes(value: unknown): string | null {
+  const bytes = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return null;
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let scaled = bytes / 1024;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return `${scaled >= 100 ? Math.round(scaled) : scaled.toFixed(1)} ${units[unit]}`;
+}
+
+async function saveLibraryModelMeta(model: Record<string, unknown>) {
+  const key = String(model.model_id || model.filename || "");
+  const note = (libraryNotes.value[key] ?? "").trim();
+  if (!model.model_id || !note) return;
+  try {
+    await infrastructure.updateModelNotes(String(model.model_id), { notes: note });
+    libraryNotes.value[key] = "";
   } catch {
     // Errors surface through the operations registry + infrastructure error.
   }
@@ -588,7 +838,30 @@ async function installDependencyNode(row: DependencyNodeRow) {
                   <input type="checkbox" :checked="row.nonessential" @change="toggleNonessential(row.key, ($event.target as HTMLInputElement).checked)" />
                   Optional
                 </label>
-                <StudioButton v-if="row.state === 'missing' && row.hasSource" size="sm" variant="ghost" data-testid="dependency-model-install-now" @click="installDependencyModel(row)">Install now</StudioButton>
+                <template v-if="row.state === 'missing'">
+                  <a
+                    v-if="rowSourceUrl(row)"
+                    :href="rowSourceUrl(row)"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="cmst:text-xs cmst:text-cmst-muted cmst:hover:text-cmst-fg"
+                  >source</a>
+                  <template v-if="modelTarget(row).url">
+                    <StudioButton size="sm" variant="ghost" data-testid="dependency-model-install-now" :title="modelTarget(row).viaManager ? 'Manager catalog match' : 'Direct source'" @click="installDependencyModel(row)">Install now</StudioButton>
+                    <StudioButton size="sm" variant="ghost" data-testid="dependency-model-queue" @click="queueDependencyModel(row, modelTarget(row).url)">Queue install</StudioButton>
+                  </template>
+                  <template v-else>
+                    <input
+                      v-model="rowSourceUrls[row.key]"
+                      class="cmst-field cmst:w-44 cmst:max-w-full cmst:font-mono cmst:text-xs"
+                      placeholder="Paste source URL"
+                      :aria-label="`Source URL for ${row.filename}`"
+                      :data-testid="`dependency-model-url-${row.key}`"
+                    />
+                    <StudioButton size="sm" variant="ghost" data-testid="dependency-model-install-url" @click="installDependencyModelUrl(row, rowSourceUrls[row.key] ?? '')">Install</StudioButton>
+                  </template>
+                  <StudioButton size="sm" variant="ghost" data-testid="dependency-model-find" @click="findInLibrary(row.filename)">Find in library</StudioButton>
+                </template>
                 <span v-if="row.message" class="cmst:w-full cmst:text-xs cmst:text-cmst-muted" data-testid="dependency-model-install-note">{{ row.message }}</span>
               </li>
               <li
@@ -603,7 +876,10 @@ async function installDependencyNode(row: DependencyNodeRow) {
                   aria-hidden="true"
                 />
                 <span class="cmst:min-w-0 cmst:flex-1">{{ row.name }} · {{ row.state }}</span>
-                <StudioButton v-if="row.state === 'missing'" size="sm" variant="ghost" data-testid="dependency-node-install-now" @click="installDependencyNode(row)">Install now</StudioButton>
+                <template v-if="row.state === 'missing'">
+                  <StudioButton v-if="workflows.resolveNodePlan(row.raw).kind !== 'none'" size="sm" variant="ghost" data-testid="dependency-node-install-now" @click="installDependencyNode(row)">Install now</StudioButton>
+                  <StudioButton size="sm" variant="ghost" data-testid="dependency-node-find" @click="findInLibrary(row.name)">Find in registry</StudioButton>
+                </template>
                 <span v-if="row.message" class="cmst:w-full cmst:text-xs cmst:text-cmst-muted" data-testid="dependency-node-install-note">{{ row.message }}</span>
               </li>
             </ul>
@@ -615,6 +891,18 @@ async function installDependencyNode(row: DependencyNodeRow) {
             <div class="cmst:mt-2 cmst:flex cmst:gap-1.5">
               <StudioButton size="sm" variant="ghost" @click="workflows.recheckPortability()">Recheck</StudioButton>
               <StudioButton size="sm" variant="ghost" data-testid="vue-manifest-export" @click="workflows.exportManifest()">Export manifest</StudioButton>
+              <StudioButton size="sm" variant="ghost" data-testid="vue-manifest-import-toggle" @click="showManifestImport = !showManifestImport">Import manifest</StudioButton>
+            </div>
+            <div v-if="showManifestImport" class="cmst:mt-2">
+              <label class="cmst-field-label">Manifest JSON
+                <textarea v-model="manifestText" rows="3" class="cmst-field cmst:w-full cmst:font-mono cmst:text-xs" placeholder='{"workflows": [...]}' data-testid="vue-manifest-import-input" />
+              </label>
+              <p v-if="manifestError" class="cmst:mt-1 cmst:text-xs cmst:text-cmst-danger" role="alert">{{ manifestError }}</p>
+              <pre v-if="workflows.manifestPreview" class="cmst:mt-2 cmst:max-h-32 cmst:overflow-auto cmst:rounded cmst:bg-cmst-matte cmst:p-2 cmst:font-mono cmst:text-xs cmst:text-cmst-secondary-text" data-testid="vue-manifest-preview">{{ JSON.stringify(workflows.manifestPreview, null, 1).slice(0, 800) }}</pre>
+              <div class="cmst:mt-1.5 cmst:flex cmst:gap-1.5">
+                <StudioButton size="sm" variant="secondary" data-testid="vue-manifest-preview" @click="previewManifest">Preview import</StudioButton>
+                <StudioButton size="sm" variant="ghost" data-testid="vue-manifest-commit" :disabled="!workflows.manifestPreview" @click="commitManifest">Commit import</StudioButton>
+              </div>
             </div>
           </section>
 
@@ -629,10 +917,44 @@ async function installDependencyNode(row: DependencyNodeRow) {
               <li
                 v-for="(preset, index) in workflows.presets"
                 :key="index"
-                class="cmst:flex cmst:items-center cmst:justify-between cmst:gap-2 cmst:rounded-md cmst:px-2 cmst:py-1.5 cmst:text-[13px] cmst:hover:bg-cmst-hover"
+                class="cmst:rounded-md cmst:px-2 cmst:py-1.5 cmst:text-[13px] cmst:hover:bg-cmst-hover"
               >
-                <span class="cmst:truncate">{{ String((preset as Record<string, unknown>).name || `preset ${index}`) }}</span>
-                <StudioButton size="sm" variant="ghost" @click="workflows.removePreset(String((preset as Record<string, unknown>).preset_id || (preset as Record<string, unknown>).id || ''))">Delete</StudioButton>
+                <div class="cmst:flex cmst:items-center cmst:justify-between cmst:gap-2">
+                  <template v-if="renamingPresetId === presetKey(preset)">
+                    <input
+                      v-model="renameDraft"
+                      class="cmst-field cmst:min-w-0 cmst:flex-1 cmst:text-xs"
+                      :aria-label="`Rename ${String((preset as Record<string, unknown>).name || 'preset')}`"
+                      @keyup.enter="savePresetRename(preset)"
+                      @keyup.esc="renamingPresetId = ''"
+                    />
+                    <StudioButton size="sm" variant="secondary" @click="savePresetRename(preset)">Save</StudioButton>
+                    <StudioButton size="sm" variant="ghost" @click="renamingPresetId = ''">Cancel</StudioButton>
+                  </template>
+                  <template v-else>
+                    <span class="cmst:truncate">{{ String((preset as Record<string, unknown>).name || `preset ${index}`) }}</span>
+                    <span class="cmst:flex cmst:shrink-0 cmst:gap-1">
+                      <StudioButton size="sm" variant="ghost" @click="startPresetRename(preset)">Rename</StudioButton>
+                      <StudioButton size="sm" variant="ghost" @click="workflows.duplicateCurrentPreset(presetKey(preset))">Duplicate</StudioButton>
+                      <StudioButton size="sm" variant="ghost" @click="workflows.removePreset(presetKey(preset))">Delete</StudioButton>
+                    </span>
+                  </template>
+                </div>
+                <div v-if="workflows.versions.length > 1" class="cmst:mt-1 cmst:flex cmst:items-center cmst:gap-1.5">
+                  <span class="cmst:text-xs cmst:text-cmst-muted">Copy to</span>
+                  <select
+                    v-model="presetCopyTargets[presetKey(preset)]"
+                    class="cmst-field cmst:min-w-0 cmst:flex-1 cmst:text-xs"
+                    :aria-label="`Copy ${String((preset as Record<string, unknown>).name || 'preset')} to version`"
+                  >
+                    <option
+                      v-for="version in workflows.versions"
+                      :key="version.workflow_version_id"
+                      :value="version.workflow_version_id"
+                    >v{{ version.version ?? version.workflow_version_id }}</option>
+                  </select>
+                  <StudioButton size="sm" variant="ghost" @click="copyPresetToVersion(preset)">Copy</StudioButton>
+                </div>
               </li>
             </ul>
           </section>
@@ -645,8 +967,10 @@ async function installDependencyNode(row: DependencyNodeRow) {
                 <option value="txt2img">txt2img</option>
                 <option value="i2i">i2i</option>
               </select>
-              <StudioButton size="sm" variant="outline" @click="workflows.loadGuidance(guidanceSha, guidanceMode)">Load</StudioButton>
+              <StudioButton size="sm" variant="outline" data-testid="vue-guidance-load" @click="loadGuidanceEntry">Load</StudioButton>
+              <StudioButton v-if="guidanceResult" size="sm" variant="ghost" data-testid="vue-guidance-remove" @click="removeGuidanceEntry">Remove</StudioButton>
             </div>
+            <pre v-if="guidanceResult" class="cmst:mt-2 cmst:max-h-32 cmst:overflow-auto cmst:rounded cmst:bg-cmst-matte cmst:p-2 cmst:font-mono cmst:text-xs cmst:text-cmst-secondary-text" data-testid="vue-guidance-result">{{ JSON.stringify(guidanceResult, null, 1).slice(0, 800) }}</pre>
           </section>
         </div>
         <p v-else class="cmst:py-8 cmst:text-[13px] cmst:text-cmst-muted">
@@ -658,10 +982,75 @@ async function installDependencyNode(row: DependencyNodeRow) {
         <div class="cmst:min-w-0">
           <h2 class="cmst-type-view">Shared models &amp; nodes</h2>
           <p class="cmst:mt-0.5 cmst:text-[13px] cmst:text-cmst-muted">Models: {{ infrastructure.models.length }} · Custom nodes: {{ infrastructure.customNodes.length }}</p>
-          <div class="cmst:mt-3 cmst:flex cmst:gap-2">
-            <StudioButton size="sm" variant="outline" @click="infrastructure.rescanModelsNow(true)">Rescan models</StudioButton>
-            <StudioButton size="sm" variant="outline" @click="infrastructure.refreshCustomNodesNow()">Refresh nodes</StudioButton>
+          <div class="cmst:mt-3 cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-2">
+            <div class="cmst:relative cmst:min-w-0 cmst:flex-1">
+              <Search class="cmst:pointer-events-none cmst:absolute cmst:left-2.5 cmst:top-1/2 cmst:size-4 cmst:-translate-y-1/2 cmst:text-cmst-muted" aria-hidden="true" />
+              <input
+                v-model="workflows.libraryQuery"
+                class="cmst-field cmst:w-full cmst:pl-8"
+                placeholder="Search models and nodes"
+                aria-label="Search models and nodes"
+                data-testid="vue-library-search"
+              />
+            </div>
+            <select v-model="libraryType" class="cmst-field" aria-label="Filter by model type" data-testid="vue-library-type">
+              <option value="">All types</option>
+              <option v-for="type in libraryModelTypes" :key="type" :value="type">{{ type }}</option>
+            </select>
+            <StudioButton size="sm" variant="outline" data-testid="vue-library-rescan" @click="infrastructure.rescanModelsNow(true)">Rescan</StudioButton>
+            <StudioButton size="sm" variant="outline" data-testid="vue-library-refresh-nodes" @click="infrastructure.refreshCustomNodesNow()">Refresh nodes</StudioButton>
           </div>
+
+          <h3 class="cmst-type-section cmst:mt-5">Models <span class="cmst-type-meta">{{ filteredLibraryModels.length }}</span></h3>
+          <ul class="cmst:mt-1 cmst:flex cmst:max-h-80 cmst:flex-col cmst:gap-1 cmst:overflow-auto" data-testid="vue-library-models">
+            <li v-for="model in filteredLibraryModels" :key="String(model.model_id || model.filename)" class="cmst:rounded-md cmst:px-2 cmst:py-2 cmst:hover:bg-cmst-hover" data-testid="vue-library-model-row">
+              <button
+                type="button"
+                class="cmst:flex cmst:w-full cmst:cursor-pointer cmst:items-center cmst:gap-2 cmst:bg-transparent cmst:text-left"
+                :aria-expanded="libraryDetailKey === `model:${String(model.model_id || model.filename)}`"
+                @click="libraryDetailKey = libraryDetailKey === `model:${String(model.model_id || model.filename)}` ? '' : `model:${String(model.model_id || model.filename)}`"
+              >
+                <span class="cmst-min-w-0 cmst:flex-1 cmst:truncate cmst:text-[13px] cmst:font-medium">{{ String(model.display_name || model.filename) }}</span>
+                <span class="cmst-type-meta cmst:shrink-0">{{ String(model.model_type || model.folder || "") }}</span>
+              </button>
+              <div v-if="libraryDetailKey === `model:${String(model.model_id || model.filename)}`" class="cmst:mt-1 cmst:pl-1 cmst:text-xs cmst:text-cmst-muted">
+                <p class="cmst-type-meta">{{ String(model.filename) }} · {{ String(model.folder || "") }}<template v-if="formatBytes(model.size)"> · {{ formatBytes(model.size) }}</template><template v-if="model.hash"> · hash {{ String(model.hash).slice(0, 12) }}</template></p>
+                <p v-if="model.provider || model.revision" class="cmst-type-meta cmst:mt-0.5">{{ [model.provider, model.revision].filter(Boolean).join(" · ") }}</p>
+                <p v-if="(workflows.modelUsage[String(model.filename)] ?? []).length" class="cmst-type-meta cmst:mt-0.5" :title="(workflows.modelUsage[String(model.filename)] ?? []).join(', ')">
+                  Used by {{ (workflows.modelUsage[String(model.filename)] ?? []).length }} workflow{{ (workflows.modelUsage[String(model.filename)] ?? []).length === 1 ? "" : "s" }}
+                  <button type="button" class="cmst:ml-1 cmst:text-cmst-secondary-text cmst:hover:text-cmst-fg" @click="tab = 'workflows'">View</button>
+                </p>
+                <p v-if="Array.isArray(model.tags) && model.tags.length" class="cmst-type-meta cmst:mt-0.5">Tags: {{ (model.tags as unknown[]).map(String).join(", ") }}</p>
+                <p v-if="model.notes" class="cmst:mt-0.5 cmst:text-[13px] cmst:text-cmst-secondary-text">{{ String(model.notes) }}</p>
+                <div class="cmst:mt-1.5 cmst:flex cmst:flex-wrap cmst:gap-1.5">
+                  <input v-model="libraryNotes[String(model.model_id || model.filename)]" class="cmst-field cmst:min-w-0 cmst:flex-1 cmst:text-xs" placeholder="Note" :aria-label="`Note for ${String(model.filename)}`" />
+                  <StudioButton size="sm" variant="ghost" @click="saveLibraryModelMeta(model)">Save note</StudioButton>
+                </div>
+              </div>
+            </li>
+            <li v-if="!filteredLibraryModels.length" class="cmst:py-3 cmst:text-[13px] cmst:text-cmst-muted">No models match.</li>
+          </ul>
+
+          <h3 class="cmst-type-section cmst:mt-5">Custom nodes <span class="cmst-type-meta">{{ filteredLibraryNodes.length }}</span></h3>
+          <ul class="cmst:mt-1 cmst:flex cmst:max-h-80 cmst:flex-col cmst:gap-1 cmst:overflow-auto" data-testid="vue-library-nodes">
+            <li v-for="node in filteredLibraryNodes" :key="String(node.name || node.id)" class="cmst:rounded-md cmst:px-2 cmst:py-2 cmst:hover:bg-cmst-hover" data-testid="vue-library-node-row">
+              <button
+                type="button"
+                class="cmst:flex cmst:w-full cmst:cursor-pointer cmst:items-center cmst:gap-2 cmst:bg-transparent cmst:text-left"
+                :aria-expanded="libraryDetailKey === `node:${String(node.name || node.id)}`"
+                @click="libraryDetailKey = libraryDetailKey === `node:${String(node.name || node.id)}` ? '' : `node:${String(node.name || node.id)}`"
+              >
+                <span class="cmst-min-w-0 cmst:flex-1 cmst:truncate cmst:text-[13px] cmst:font-medium">{{ String(node.title || node.name || node.id) }}</span>
+                <span v-if="node.version" class="cmst-type-meta cmst:shrink-0">{{ String(node.version) }}</span>
+              </button>
+              <div v-if="libraryDetailKey === `node:${String(node.name || node.id)}`" class="cmst:mt-1 cmst:pl-1 cmst:text-xs cmst:text-cmst-muted">
+                <p v-if="node.repository_url" class="cmst-type-meta cmst:truncate">{{ String(node.repository_url) }}</p>
+                <p v-if="node.installed_commit" class="cmst-type-meta cmst:mt-0.5">Commit {{ String(node.installed_commit).slice(0, 12) }}</p>
+                <p v-if="Array.isArray(node.classes) && node.classes.length" class="cmst-type-meta cmst:mt-0.5">{{ (node.classes as unknown[]).slice(0, 8).map(String).join(" · ") }}<template v-if="(node.classes as unknown[]).length > 8"> · +{{ (node.classes as unknown[]).length - 8 }} more</template></p>
+              </div>
+            </li>
+            <li v-if="!filteredLibraryNodes.length" class="cmst:py-3 cmst:text-[13px] cmst:text-cmst-muted">No custom nodes match.</li>
+          </ul>
         </div>
       </template>
     </div>
@@ -732,29 +1121,67 @@ async function installDependencyNode(row: DependencyNodeRow) {
           <template v-else-if="wizardStep === 'required-bindings'">
             <h3 class="cmst-type-object">2 · Bindings</h3>
             <p class="cmst:mt-1 cmst:text-[13px] cmst:text-cmst-muted">
-              Select the prompt control in the ComfyUI graph — click the node input
-              (for example, the Steps control on a KSampler node) — then confirm the binding here.
+              Bind each control to its graph target — click Capture, then click
+              the node input in the ComfyUI graph.
             </p>
-            <div class="cmst:mt-3 cmst:flex cmst:gap-2">
-              <input v-model="bindingInput" class="cmst-field cmst:flex-1" placeholder="Node input target" aria-label="Node input target" />
-              <StudioButton size="sm" variant="secondary" @click="captureBinding">Confirm binding</StudioButton>
-            </div>
-            <ul v-if="Object.keys(workflows.wizardDraft?.bindings ?? {}).length" class="cmst:mt-3">
+            <p v-if="dependencySummaryLine.includes('attention')" class="cmst:mt-2 cmst:text-xs cmst:text-cmst-warn" role="status">
+              Dependencies need attention ({{ dependencySummaryLine }}) — bindings still work, but runs may fail until models arrive.
+            </p>
+            <h4 class="cmst-micro cmst:mt-4">Required</h4>
+            <ul class="cmst:mt-1">
               <li
-                v-for="(binding, key) in (workflows.wizardDraft?.bindings ?? {})"
-                :key="String(key)"
-                class="cmst:flex cmst:items-center cmst:gap-2 cmst:border-t cmst:border-solid cmst:border-cmst-border cmst:py-1.5 cmst:text-[13px] first:cmst:border-t-0"
+                v-for="roleKey in requiredBindingRoles"
+                :key="roleKey"
+                class="cmst:rounded-md cmst:px-2 cmst:py-2 cmst:hover:bg-cmst-hover"
+                :data-testid="`vue-wizard-role-${roleKey}`"
               >
-                <span
-                  class="cmst:inline-block cmst:size-1.5 cmst:shrink-0 cmst:rounded-full"
-                  :class="bindingConfirmed(binding) ? 'cmst:bg-cmst-ok' : 'cmst:bg-cmst-warn'"
-                  aria-hidden="true"
-                />
-                <span class="cmst:min-w-0 cmst:flex-1 cmst:truncate">{{ String(key) }} → {{ bindingTarget(binding) }}</span>
-                <span
-                  class="cmst:rounded cmst:px-1.5 cmst:py-0.5 cmst:text-[11px] cmst:font-medium"
-                  :class="bindingConfirmed(binding) ? 'cmst:bg-cmst-ok/15 cmst:text-cmst-ok' : 'cmst:bg-cmst-warn/15 cmst:text-cmst-warn'"
-                >{{ bindingConfirmed(binding) ? "Bound" : "Pending" }}</span>
+                <div class="cmst:flex cmst:items-center cmst:gap-2">
+                  <span
+                    class="cmst:inline-block cmst:size-1.5 cmst:shrink-0 cmst:rounded-full"
+                    :class="bindingConfirmed(roleBinding(roleKey)) ? 'cmst:bg-cmst-ok' : 'cmst:bg-cmst-warn'"
+                    aria-hidden="true"
+                  />
+                  <span class="cmst:min-w-0 cmst:flex-1 cmst:truncate cmst:text-[13px] cmst:font-medium">{{ wizardRoleDef(roleKey).label }}</span>
+                  <StudioButton v-if="!bindingConfirmed(roleBinding(roleKey))" size="sm" variant="secondary" :data-testid="`vue-wizard-capture-${roleKey}`" @click="captureBinding(roleKey)">Capture</StudioButton>
+                  <StudioButton v-else size="sm" variant="ghost" :data-testid="`vue-wizard-view-${roleKey}`" @click="viewRoleBinding(roleKey)">View</StudioButton>
+                </div>
+                <p class="cmst:mt-0.5 cmst:truncate cmst:text-xs cmst:text-cmst-muted">
+                  <template v-if="bindingConfirmed(roleBinding(roleKey))">{{ bindingTarget(roleBinding(roleKey)) }}</template>
+                  <template v-else>Look for: {{ wizardRoleDef(roleKey).hint }}</template>
+                </p>
+                <div v-if="!bindingConfirmed(roleBinding(roleKey)) && roleSuggestions[roleKey]?.length" class="cmst:mt-1 cmst:flex cmst:flex-wrap cmst:gap-1">
+                  <button
+                    v-for="suggestion in roleSuggestions[roleKey]"
+                    :key="`${suggestion.nodeId}:${suggestion.widgetName || ''}`"
+                    type="button"
+                    class="cmst:rounded cmst:bg-cmst-raised cmst:px-1.5 cmst:py-0.5 cmst:font-mono cmst:text-[11px] cmst:text-cmst-secondary-text cmst:hover:text-cmst-fg"
+                    :title="`Show ${suggestion.nodeTitle} on the graph`"
+                    @click="viewSuggestedNode(suggestion.nodeId)"
+                  >{{ suggestion.nodeTitle }}</button>
+                </div>
+                <div v-if="!bindingConfirmed(roleBinding(roleKey))" class="cmst:mt-1">
+                  <StudioButton size="sm" variant="ghost" @click="suggestRoleBinding(roleKey)">Suggest targets</StudioButton>
+                </div>
+              </li>
+            </ul>
+            <h4 class="cmst-micro cmst:mt-4">Optional</h4>
+            <ul class="cmst:mt-1">
+              <li
+                v-for="roleKey in optionalBindingRoles"
+                :key="roleKey"
+                class="cmst:rounded-md cmst:px-2 cmst:py-2 cmst:hover:bg-cmst-hover"
+                :data-testid="`vue-wizard-role-${roleKey}`"
+              >
+                <div class="cmst:flex cmst:items-center cmst:gap-2">
+                  <span
+                    class="cmst:inline-block cmst:size-1.5 cmst:shrink-0 cmst:rounded-full"
+                    :class="bindingConfirmed(roleBinding(roleKey)) ? 'cmst:bg-cmst-ok' : 'cmst:bg-cmst-muted'"
+                    aria-hidden="true"
+                  />
+                  <span class="cmst:min-w-0 cmst:flex-1 cmst:truncate cmst:text-[13px]">{{ wizardRoleDef(roleKey).label }}</span>
+                  <StudioButton v-if="!bindingConfirmed(roleBinding(roleKey))" size="sm" variant="ghost" :data-testid="`vue-wizard-capture-${roleKey}`" @click="captureBinding(roleKey)">Capture</StudioButton>
+                  <StudioButton v-else size="sm" variant="ghost" :data-testid="`vue-wizard-view-${roleKey}`" @click="viewRoleBinding(roleKey)">View</StudioButton>
+                </div>
               </li>
             </ul>
             <p v-if="wizardMessage" class="cmst:mt-2 cmst:text-xs cmst:text-cmst-secondary-text" role="status">{{ wizardMessage }}</p>
@@ -796,10 +1223,13 @@ async function installDependencyNode(row: DependencyNodeRow) {
             <h3 class="cmst-type-object">4 · Review</h3>
             <p class="cmst:mt-1 cmst:text-[13px] cmst:text-cmst-muted">Review the explicit bindings before saving the version mapping.</p>
             <pre class="cmst:mt-2 cmst:max-h-40 cmst:overflow-auto cmst:rounded cmst:bg-cmst-matte cmst:p-2 cmst:font-mono cmst:text-xs cmst:text-cmst-secondary-text">{{ JSON.stringify({ bindings: workflows.wizardDraft?.bindings, output: workflows.wizardDraft?.outputBinding, controls: workflows.wizardDraft?.controls }, null, 1) }}</pre>
+            <p v-if="missingRequiredLabels.length" class="cmst:mt-2 cmst:text-xs cmst:text-cmst-warn" role="status" data-testid="vue-wizard-gate">
+              Still needed: {{ missingRequiredLabels.join(", ") }} — bind them in step 2 before saving.
+            </p>
             <p v-if="workflows.wizardError" class="cmst:mt-2 cmst:text-xs cmst:text-cmst-danger" role="alert">{{ workflows.wizardError }}</p>
             <p v-else-if="wizardMessage" class="cmst:mt-2 cmst:text-xs cmst:text-cmst-secondary-text" role="status">{{ wizardMessage }}</p>
             <div class="cmst:mt-3">
-              <StudioButton size="sm" :disabled="workflows.wizardSaving" data-testid="vue-wizard-save" @click="saveWizard">
+              <StudioButton size="sm" :disabled="workflows.wizardSaving || missingRequiredLabels.length > 0" data-testid="vue-wizard-save" @click="saveWizard">
                 {{ workflows.wizardSaving ? "Saving…" : "Save mapping" }}
               </StudioButton>
             </div>

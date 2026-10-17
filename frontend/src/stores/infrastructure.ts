@@ -37,6 +37,7 @@ import {
   triggerDeploy,
   triggerPushPlugins,
   triggerRebuildDependencies,
+  updateModelRecord,
   upsertWorkspace,
   credentialConfigured,
   type DeployStatus,
@@ -535,6 +536,11 @@ export const useInfrastructureStore = defineStore("studio-infrastructure", () =>
     await loadInventory();
   }
 
+  async function updateModelNotes(modelId: string, body: { notes?: string; tags?: string[]; source_urls?: string[] }): Promise<void> {
+    await updateModelRecord(modelId, body as Record<string, unknown>);
+    await loadInventory();
+  }
+
   async function refreshRemoteInventoryNow(): Promise<void> {
     await refreshInventory(0);
     await loadInventory();
@@ -580,7 +586,7 @@ export const useInfrastructureStore = defineStore("studio-infrastructure", () =>
     deploy, loadCredentials, saveCredential,
     scanRepair, applyRepair, deletePlaceholder,
     loadSyncStatus, pushPlugins, rebuildDependencies,
-    installModel, installModelRequest, installCustomNode,
+    installModel, installModelRequest, installCustomNode, updateModelNotes,
     refreshRemoteInventoryNow, rescanModelsNow,
     refreshCustomNodesNow, loadLog, loadHealth,
   };

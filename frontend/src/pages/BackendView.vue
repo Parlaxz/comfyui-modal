@@ -25,6 +25,50 @@ const modelUrl = ref("");
 const modelFolder = ref("diffusion_models");
 const modelInstallMessage = ref("");
 const showLog = ref(false);
+const repairUrls = ref<Record<string, string>>({});
+const repairKinds = ref<Record<string, string>>({});
+const repairRemovals = ref<Record<string, boolean>>({});
+
+// Repair rows derive from the scan envelope (issues array or bare list).
+// Editing mirrors the legacy repair table: per-issue source URL + kind,
+// remove-on-swap flag, placeholder delete, Save-valid / Skip-all apply.
+const repairIssueRows = computed(() => {
+  const raw = infrastructure.repairIssues as unknown;
+  const list = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object" ? (raw as Record<string, unknown>).issues : null;
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .map((item) => ({
+      folder: String(item.folder || ""),
+      filename: String(item.filename || ""),
+      kind: String(item.source_kind || "unknown"),
+    }));
+});
+
+function repairKey(issue: { folder: string; filename: string }): string {
+  return `${issue.folder}/${issue.filename}`;
+}
+
+async function applyRepairRows(skipAll: boolean) {
+  const updates = repairIssueRows.value.map((issue) => {
+    const key = repairKey(issue);
+    if (skipAll) return { folder: issue.folder, filename: issue.filename, skip: true };
+    return {
+      folder: issue.folder,
+      filename: issue.filename,
+      url: (repairUrls.value[key] ?? "").trim(),
+      source_kind: repairKinds.value[key] || issue.kind,
+      ...(repairRemovals.value[key] ? { remove: true } : {}),
+    };
+  }).filter((row) => skipAll || String((row as Record<string, unknown>).url || "") || (row as Record<string, unknown>).remove);
+  await infrastructure.applyRepair(updates).catch(() => undefined);
+}
+
+async function deleteRepairPlaceholder(issue: { folder: string; filename: string }) {
+  await infrastructure.deletePlaceholder(issue.folder, issue.filename).catch(() => undefined);
+}
 
 const TABS = ["workspaces", "deployment", "models", "nodes"] as const;
 
@@ -282,7 +326,43 @@ async function installFromUrl() {
           <h3 class="cmst-type-section">Manifest repair</h3>
           <StudioButton size="sm" variant="ghost" data-testid="vue-repair-scan" @click="infrastructure.scanRepair()">Scan issues</StudioButton>
         </div>
-        <pre v-if="infrastructure.repairIssues" class="cmst:mt-2 cmst:max-h-48 cmst:overflow-auto cmst:rounded cmst:bg-cmst-matte cmst:p-2 cmst:font-mono cmst:text-xs cmst:text-cmst-secondary-text">{{ JSON.stringify(infrastructure.repairIssues, null, 2) }}</pre>
+        <ul v-if="repairIssueRows.length" class="cmst:mt-2 cmst:flex cmst:flex-col cmst:gap-2" data-testid="vue-repair-rows">
+          <li
+            v-for="issue in repairIssueRows"
+            :key="`${issue.folder}/${issue.filename}`"
+            class="cmst:rounded-md cmst:bg-cmst-surface cmst:p-3"
+          >
+            <p class="cmst:truncate cmst:font-mono cmst:text-xs cmst:text-cmst-secondary-text">{{ issue.filename }} <span class="cmst:text-cmst-muted">({{ issue.folder }})</span></p>
+            <div class="cmst:mt-1.5 cmst:flex cmst:flex-wrap cmst:items-center cmst:gap-1.5">
+              <input
+                v-model="repairUrls[`${issue.folder}/${issue.filename}`]"
+                class="cmst-field cmst:min-w-0 cmst:flex-1 cmst:font-mono cmst:text-xs"
+                placeholder="https://huggingface.co/…"
+                :aria-label="`Source URL for ${issue.filename}`"
+              />
+              <select
+                v-model="repairKinds[`${issue.folder}/${issue.filename}`]"
+                class="cmst-field cmst:text-xs"
+                :aria-label="`Source kind for ${issue.filename}`"
+              >
+                <option value="unknown">unknown</option>
+                <option value="huggingface">huggingface</option>
+                <option value="civitai">civitai</option>
+                <option value="direct">direct</option>
+              </select>
+              <label class="cmst:flex cmst:items-center cmst:gap-1 cmst:text-xs cmst:text-cmst-muted" title="Remove from workspace on next swap">
+                <input v-model="repairRemovals[`${issue.folder}/${issue.filename}`]" type="checkbox" />
+                Remove
+              </label>
+              <StudioButton size="sm" variant="ghost" class="cmst:text-cmst-danger" @click="deleteRepairPlaceholder(issue)">Delete</StudioButton>
+            </div>
+          </li>
+        </ul>
+        <div v-if="repairIssueRows.length" class="cmst:mt-2 cmst:flex cmst:gap-1.5">
+          <StudioButton size="sm" data-testid="vue-repair-apply" @click="applyRepairRows(false)">Save valid</StudioButton>
+          <StudioButton size="sm" variant="ghost" data-testid="vue-repair-skip" @click="applyRepairRows(true)">Skip all</StudioButton>
+        </div>
+        <pre v-if="infrastructure.repairIssues && !repairIssueRows.length" class="cmst:mt-2 cmst:max-h-48 cmst:overflow-auto cmst:rounded cmst:bg-cmst-matte cmst:p-2 cmst:font-mono cmst:text-xs cmst:text-cmst-secondary-text">{{ JSON.stringify(infrastructure.repairIssues, null, 2) }}</pre>
         <p v-if="infrastructure.repairMessage" class="cmst:mt-2 cmst:text-xs cmst:text-cmst-muted" role="status">{{ infrastructure.repairMessage }}</p>
       </section>
     </template>
