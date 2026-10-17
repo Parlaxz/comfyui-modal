@@ -266,14 +266,12 @@ level it still needs. Do not sum groups; manifest counts are the row totals.
 - PRESET-CLEAR-EDITORS [UNKNOWN/product_behavior] presets: Stale editor/direct-manip state cleared on preset apply
 - PRESET-LOOKS-SEPARATE [UNKNOWN/product_behavior] presets: Post Looks remain distinct from workflow presets
 
-## Needs RACE (31)
+## Needs RACE (17)
 
 - LATEST-READS [UNKNOWN/product_behavior] async: Workflow/version/detail reads use latest-wins primitive
 - LATEST-HISTORY [UNKNOWN/product_behavior] async: History feed/detail reads use latest-wins; entity may update cache but never steal focus
 - LATEST-REFRESH [UNKNOWN/product_behavior] async: Inventory/settings refresh reads use latest-wins
-- POLL-ABORT [UNKNOWN/product_behavior] async: Long-running operations (deploy, model install/download, node publication/rebuild, inventory/status): one domain owner; no duplicate poll loops; route navigation does NOT automatically kill the operation; rerender/reopen never creates a second owner; terminal/dispose/replacement stops the poll when appropriate; no zombie timers/listeners; domain owns success/failure semantics
 - WS-MIDOP [UNKNOWN/product_behavior] operations: Workspace switch mid-operation cannot retarget submitted request
-- WS-GUARD [UNKNOWN/product_behavior] operations: Accepted operation stays bound to its accepted workspace; switching active workspace changes future operations only; current operation never retargeted
 - WF-STALE-READ [UNKNOWN/product_behavior] workflows: Stale workflow/version reads cannot commit over newer selection
 - SRC-LATEST-WINS [UNKNOWN/product_behavior] edit/source: Latest upload wins; token+owner guard discards stale completions
 - SRC-OWNER-SWITCH [UNKNOWN/product_behavior] edit/source: Owner change (workflow/tool switch) invalidates pending upload
@@ -285,18 +283,6 @@ level it still needs. Do not sum groups; manifest counts are the row totals.
 - INFRA-REFRESH [UNKNOWN/product_behavior] manage modal: Inventory refresh with latest-wins; explicit UI refresh semantics
 - DEPS-STALE-REFRESH [UNKNOWN/product_behavior] dependencies: Stale inventory refresh never overwrites newer snapshot
 - QUEUE-WORKSPACE-FROZEN [UNKNOWN/product_behavior] queue: Accepted queued execution target cannot be retargeted by a later active-workspace switch (server dispatch owns authority boundary)
-- QUEUE-MUTATION-RACE [UNKNOWN/product_behavior] queue: Later UI edits cannot mutate already-queued request (adversarial A-then-B)
-- QUEUE-IDENTITY-CHECK [FAIL/product_behavior] queue: Queued item executes with its own frozen workflow identity, version, and intent; same-workflow/different-version variants never merge; batch grouping never combines incompatible immutable identity
-- EXP-CELL-IDS [FAIL/product_behavior] experiment: Experiment + cell IDs own status lifecycle in UI state
-- EXP-LATE-EVENT [UNKNOWN/product_behavior] experiment: Late events cannot claim a different experiment
-- RUN-FRESH-ID [UNKNOWN/product_behavior] run lifecycle: Fresh frontend run identity per Run click
-- RUN-PROMPT-ID [UNKNOWN/product_behavior] run lifecycle: Prompt ID captured; foreign prompt terminal events rejected
-- RUN-EVENT-ORDER [UNKNOWN/product_behavior] run lifecycle: Progress before execution-start rejected; foreign experiment progress rejected
-- RUN-TERMINAL-LOCK [UNKNOWN/product_behavior] run lifecycle: Terminal state cannot regress; duplicate terminals deduplicated
-- RUN-SNAPSHOT-DEDUP [UNKNOWN/product_behavior] run lifecycle: Snapshot/journal duplicate polls deduplicated
-- RUN-CANCEL [FAIL/product_behavior] run lifecycle: Cancel is authoritative and race-safe (cancel-then-success cannot resurrect)
-- RUN-LATE-EVENT [UNKNOWN/product_behavior] run lifecycle: Late prior-run events cannot hijack new run
-- RUN-MIDRUN-SWITCH [UNKNOWN/product_behavior] run lifecycle: Navigation / workflow switch mid-run cannot mutate active run
 - EXP2-RACE [FAIL/product_behavior] edit/expand: Stale workflow responses cannot overwrite current Expand state
 - SK-SETTINGS-GUARD [UNKNOWN/product_behavior] generate/sketch: Sketch tool settings preserved; stale completion guarded
 
@@ -316,11 +302,9 @@ level it still needs. Do not sum groups; manifest counts are the row totals.
 - GOLDEN-DEPLOY [UNKNOWN/product_behavior] settings: Golden deploy operation + status polling owned by Settings/infrastructure
 - WZ-CAPTURE [UNKNOWN/product_behavior] wizard: Actual node/widget capture binds exact graph target
 
-## Needs INTEGRATION (40)
+## Needs INTEGRATION (30)
 
 - LATEST-MUTATIONS [UNKNOWN/product_behavior] async: Mutations (favorite/note/delete/save) complete; navigation never cancels server write
-- POLL-RUN [FAIL/product_behavior] async: Run progress/status integrated with run-controller identity and terminal semantics (controller owns semantics, not the generic poller)
-- OPS-DUP-BUSY [UNKNOWN/product_behavior] operations: No second generic operation registry and no conflicting busy authority beside operationStore (domain runState/isBusy as semantic truth is allowed)
 - CANVAS-PROJECTION [UNKNOWN/product_behavior] canvas compatibility: Output options projected server -> legacy mirror one-way (never read back)
 - CANVAS-FALLBACK [UNKNOWN/product_behavior] canvas compatibility: localStorage fallback keys keep working during transition
 - SEL-CROPSTITCH [FAIL/product_behavior] edit/select: Crop+Stitch execution method
@@ -333,20 +317,12 @@ level it still needs. Do not sum groups; manifest counts are the row totals.
 - TXT-PAYLOAD [UNKNOWN/product_behavior] generate/text: Text serialized into request with workflow/version ownership
 - REF-SOURCE-SEPARATION [UNKNOWN/product_behavior] generate/references: Source image kept distinct from references in payload
 - LAY-PAYLOAD [FAIL/product_behavior] generate/layout: Layout serializes into request with image/base ownership
-- HIST-RECENT [UNKNOWN/product_behavior] history: Recent runs converge with History (Playground strip)
 - HIST-IMMUTABLE-REPLAY [UNKNOWN/product_behavior] history: Replay uses immutable execution params (browser never resends)
-- P13-SNAPSHOT [UNKNOWN/product_behavior] integration: Queue snapshot carries subtool, methods, references, style, guidance, workflow/version, controls, request state
 - PG-MODEL-OPTIONS [FAIL/product_behavior] playground: Model dropdown choices populate from graph + backend inventory
 - PG-MODEL-ROLES [UNKNOWN/product_behavior] playground: Model roles registered in control catalog and drive controls
 - PG-PAYLOAD [UNKNOWN/product_behavior] playground: Run request payload shape: workflow/version/controls identity to POST /studio/run
-- EXP-CANCEL-RESUME [UNKNOWN/product_behavior] experiment: Experiment cancel/resume with correct ownership
 - EXP-HISTORY-EXPOSURE [UNKNOWN/product_behavior] experiment: Experiment visible in History with results
 - GUI2-EXEC [UNKNOWN/product_behavior] generate/guidance: Backend receives guidance config; soft reference stays distinct from structural guidance
-- RUN-POST-AUTHORITY [UNKNOWN/product_behavior] run lifecycle: POST/result path is terminal authority (not websocket/progress)
-- RUN-GOLDEN-PRESENT [UNKNOWN/product_behavior] run lifecycle: Golden stage progress is presentation-only, never decides completion
-- RUN-FAILURE-PATH [UNKNOWN/product_behavior] run lifecycle: Failure path preserves run identity and details
-- RUN-RESULT-ATTACH [UNKNOWN/product_behavior] run lifecycle: Result attaches to submitted run; recent History converges
-- RUN-CONTROLLER-INTEGRATION [FAIL/product_behavior] run lifecycle: Vue run path integrates/ports the accepted run-controller machinery (fresh run identity, event-source attach/detach, execution-start locking, stale/foreign rejection, prompt/Experiment filtering, journal dedupe, terminal freeze, authoritative result integration, Golden-presentation semantics)
 - SET-CONFIG-AUTH [UNKNOWN/product_behavior] settings: /config is durable server authority; UI reflects acknowledged state
 - SET-GPU [UNKNOWN/product_behavior] settings: Selected GPU persists through /config
 - SET-OUTPUTS [UNKNOWN/product_behavior] settings: Output settings save + project to canvas mirror one-way
@@ -359,13 +335,8 @@ level it still needs. Do not sum groups; manifest counts are the row totals.
 - GUI-PAYLOAD [FAIL/product_behavior] generate/guidance: Guidance mutates request and persists per version
 - PRESET-NO-SETTINGS [UNKNOWN/product_behavior] presets: Preset output overrides never mutate global Settings
 
-## Needs UNIT (6)
+## Needs UNIT (1)
 
-- QUEUE-EXTRAS-FROZEN [FAIL/product_behavior] queue: Methods/references/layout/guidance frozen at enqueue
-- QUEUE-ORDER [UNKNOWN/product_behavior] queue: FIFO order preserved across drain
-- QUEUE-REMOVE-CLEAR [UNKNOWN/product_behavior] queue: Remove and clear queue semantics
-- EXP-AXIS-ORDER [UNKNOWN/product_behavior] experiment: Axis value ordering deterministic
-- EXP-DEFINITION-FROZEN [UNKNOWN/product_behavior] experiment: Submitted experiment definition immutable post-submit
 - ROUTE-FOCUS-SAFE [UNKNOWN/product_behavior] routing: Focus values never become executable markup
 
 ## Needs STATIC (0)

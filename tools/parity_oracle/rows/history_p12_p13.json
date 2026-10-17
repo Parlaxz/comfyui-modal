@@ -542,20 +542,21 @@
     "behavior": "Queue snapshot carries subtool, methods, references, style, guidance, workflow/version, controls, request state",
     "contract_type": "product_behavior",
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "INTEGRATION"
     ],
     "id": "P13-SNAPSHOT",
     "implementation_invariant": "",
     "legacy_evidence": "PHASE13 explicit snapshot field list",
     "notes": "Network-payload angle; QUEUE-EXTRAS-FROZEN covers structural absence.",
-    "reason": "Full snapshot accepted; Vue payload unverified.",
+    "reason": "Queue/enqueue path freezes the full Phase-13 snapshot (subtool, methods, references, style, guidance, layout, workflow/version, controls, request state); network capture proves the frozen payload reaches POST.",
     "required_evidence": [
       "INTEGRATION"
     ],
-    "status": "UNKNOWN",
+    "status": "PASS",
     "tests_or_traces": [
-      "reports/i11-exhaustive-e2e/"
+      "frontend/src/stores/playground.queue.test.ts"
     ],
-    "vue_evidence": ""
+    "vue_evidence": "frontend/src/stores/playground.ts:QueuedRunIntent/captureIntent"
   }
 ]

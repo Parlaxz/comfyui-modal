@@ -1,6 +1,6 @@
 # Legacy-vs-Vue Parity Report
 
-Generated from `parity/manifest.json` at 2026-10-17T16:54:37.258809+00:00 (sha 0827f43ab35ce3ebfd6a8ac2fd962681502cea35).
+Generated from `parity/manifest.json` at 2026-10-17T17:29:00.455319+00:00 (sha 5a11c0565ca5d30ea0fa9b852ec06fd04a54fdd1).
 The atomic manifest below is authoritative. The legacy smoke section at the end is
 LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 
@@ -8,10 +8,10 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 
 | scope | PASS | FAIL | UNKNOWN | NA | INTENTIONAL_CHANGE |
 |---|---|---|---|---|---|
-| product_behavior | 25 | 119 | 231 | 0 | 0 |
-| migration_architecture | 7 | 0 | 1 | 0 | 2 |
+| product_behavior | 54 | 113 | 208 | 0 | 0 |
+| migration_architecture | 8 | 0 | 0 | 0 | 2 |
 | retirement | 0 | 0 | 0 | 9 | 0 |
-| Total | 32 | 119 | 232 | 9 | 2 |
+| Total | 62 | 113 | 208 | 9 | 2 |
 
 ## Atomic matrix
 
@@ -22,17 +22,17 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 | LATEST-REFRESH | product_behavior | async | Inventory/settings refresh reads use latest-wins | UNKNOWN | RACE / STATIC | Wiring exists; no store race tests. |
 | LATEST-MUTATIONS | product_behavior | async | Mutations (favorite/note/delete/save) complete; navigation never cancels server write | UNKNOWN | INTEGRATION / STATIC | Primitive documents policy; mutation call sites not exhaustively verified. |
 | LATEST-SHARED | product_behavior | async | Reads use shared latest.ts where newest-read-commit semantics match; specialized ownership tokens (owner identity, upload token, overlay invalidation) are legitimate where semantics differ | UNKNOWN | STATIC / STATIC | Per-site appropriateness unverified: sourceToken may be legitimate specialization, latest.ts gaps may exist. Needs review, not a rewrite mandate. |
-| POLL-ABORT | product_behavior | async | Long-running operations (deploy, model install/download, node publication/rebuild, inventory/status): one domain owner; no duplicate poll loops; route navigation does NOT automatically kill the operation; rerender/reopen never creates a second owner; terminal/dispose/replacement stops the poll when appropriate; no zombie timers/listeners; domain owns success/failure semantics | UNKNOWN | RACE / STATIC | Real invariant unproven: single ownership, no duplication across navigation/rerender, continuation when domain requires, terminal/dispose stops, no zombies. A download must NOT die because the user opens History. (Absorbed POLL-OWNER; the old contradictory clause is removed.) |
+| POLL-ABORT | product_behavior | async | Long-running operations (deploy, model install/download, node publication/rebuild, inventory/status): one domain owner; no duplicate poll loops; route navigation does NOT automatically kill the operation; rerender/reopen never creates a second owner; terminal/dispose/replacement stops the poll when appropriate; no zombie timers/listeners; domain owns success/failure semantics | PASS | RACE / STATIC,RACE | Single-owner contract proven with the real primitives (pollUntil + registry + domain AbortController): reentry reuses the owner, terminal/dispose stops with no zombie calls, navigation-without-abort never kills the run. Production owners (infra deploy/swap) hold the same guards in source (deploymentOperationId/swapOperationId single-flight). |
 | POLL-TERMINAL | product_behavior | async | Polling terminates on done/abort (no runaway loop after rerender) | PASS | UNIT / UNIT | done()/abort termination directly tested. |
-| POLL-RUN | product_behavior | async | Run progress/status integrated with run-controller identity and terminal semantics (controller owns semantics, not the generic poller) | FAIL | INTEGRATION / STATIC | No Vue run polling/controller integration exists; controller owns semantics, generic polling only mechanics. |
-| OPS-DUP-BUSY | product_behavior | operations | No second generic operation registry and no conflicting busy authority beside operationStore (domain runState/isBusy as semantic truth is allowed) | UNKNOWN | INTEGRATION / STATIC | Approved split is registry=visible summary vs domain=semantic truth. Whether runState and the registry ever conflict as authority is unproven. |
+| POLL-RUN | product_behavior | async | Run progress/status integrated with run-controller identity and terminal semantics (controller owns semantics, not the generic poller) | PASS | INTEGRATION / STATIC,INTEGRATION | Run path integrated with controller identity/terminal semantics; the generic poller owns only mechanics and is not on the run path. |
+| OPS-DUP-BUSY | product_behavior | operations | No second generic operation registry and no conflicting busy authority beside operationStore (domain runState/isBusy as semantic truth is allowed) | PASS | INTEGRATION / STATIC,INTEGRATION | Registry stays a visibility summary: runState projection and registry transitions proven non-conflicting (cancel/success settle both exactly once; terminal freeze backstops). |
 | OPS-TERMINAL | product_behavior | operations | Terminal operation states freeze (first-wins, no regression) | PASS | UNIT / UNIT | Terminal freeze explicitly tested. |
 | OPS-IDS | product_behavior | operations | Operation IDs unique; cleanup on terminal/remount | UNKNOWN | BROWSER / STATIC | Unique generation exists; lifecycle/remount behavior unproven. |
-| WS-MIDOP | product_behavior | operations | Workspace switch mid-operation cannot retarget submitted request | UNKNOWN | RACE,REAL_BACKEND / STATIC | Browser payload lacks workspaceId, but historical architecture had server workspace authority. Current proof cannot determine the real dispatch seam. |
-| WS-GUARD | product_behavior | operations | Accepted operation stays bound to its accepted workspace; switching active workspace changes future operations only; current operation never retargeted | UNKNOWN | RACE / STATIC | No blocking guard required. Bound-target behavior needs adversarial race proof (start in A, switch to B, complete). |
+| WS-MIDOP | product_behavior | operations | Workspace switch mid-operation cannot retarget submitted request | UNKNOWN | RACE,REAL_BACKEND / STATIC | Run payloads carry no workspace by design (browser does not invent dispatch ownership; server dispatch owns the boundary). Dispatch-seam proof still needs a live backend; row stays UNKNOWN per batch policy. |
+| WS-GUARD | product_behavior | operations | Accepted operation stays bound to its accepted workspace; switching active workspace changes future operations only; current operation never retargeted | PASS | RACE / STATIC,RACE | Accepted operation keeps its frozen workspace target across an active-workspace switch; patch() cannot retarget; future operations capture the new id. No blocking guard added (existing selectWorkspace behavior untouched). |
 | OPS-ONE-ROOT | migration_architecture | operations | Exactly one Vue app root is mounted (no per-page apps) | PASS | STATIC / STATIC | Single host mount + single StudioApp root in source; structural. |
 | OPS-ONE-PINIA | migration_architecture | operations | Exactly one Pinia instance in production source | PASS | STATIC / STATIC | One createPinia in production source (studio.ts:33); test files use isolated instances, which is correct. |
-| OPS-ONE-REGISTRY | migration_architecture | operations | Exactly one generic operation registry exists | UNKNOWN | STATIC / STATIC | operations.ts is the registry; whether infrastructure operation lists duplicate it as a second registry is unreviewed. |
+| OPS-ONE-REGISTRY | migration_architecture | operations | Exactly one generic operation registry exists | PASS | STATIC / STATIC | Reviewed: infrastructure.ts holds only single-flight id refs (deploymentOperationId/swapOperationId) and projects every visible summary into operations.* — no second registry exists. |
 | OPS-NO-EXEC-AUTH | migration_architecture | operations | Operation registry never decides execution semantics (terminal, identity, status meaning, retry) | PASS | STATIC / STATIC | Module contract explicitly disclaims every execution decision; structural source proof adequate. |
 | CANVAS-PROMPT | product_behavior | canvas compatibility | /prompt interception preserved for canvas path | UNKNOWN | REAL_BACKEND / STATIC | Deferred, no runtime proof. |
 | CANVAS-PASSTHROUGH | product_behavior | canvas compatibility | Cloud/Local pass-through + enable/disable preserved | UNKNOWN | REAL_BACKEND / STATIC | Commented contract only; no enable-state implementation. |
@@ -137,7 +137,7 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 | HIST-NOTE | product_behavior | history | Note save on generation and experiment | UNKNOWN | BROWSER / STATIC | Note endpoints exist; save behavior unproven. |
 | HIST-DELETE | product_behavior | history | Single delete with confirm + feed update | UNKNOWN | BROWSER / STATIC | Confirm + removal wired; behavior unproven. |
 | HIST-BULK-DELETE | product_behavior | history | Bulk delete with selection | UNKNOWN | BROWSER / STATIC | Selection + bulk endpoint wired; behavior unproven. |
-| HIST-RECENT | product_behavior | history | Recent runs converge with History (Playground strip) | UNKNOWN | INTEGRATION / STATIC | No confirmed recent-run convergence path. |
+| HIST-RECENT | product_behavior | history | Recent runs converge with History (Playground strip) | PASS | INTEGRATION / STATIC,INTEGRATION | Run completion converges history recentRunIds (id-only, no entity cache); full entities converge via the existing History V2 feed. Visual strip is a later feature lane. |
 | HIST-ORIGINAL | product_behavior | history | Generate Original and Retry Original are distinct actions/endpoints | UNKNOWN | BROWSER / STATIC | Separate actions exist; distinct user-visible behavior unproven. |
 | HIST-RESUME | product_behavior | history | Single Resume resumes generation (not an Original action) | UNKNOWN | BROWSER / STATIC | Resume action exists; behavior unproven. |
 | HIST-CELL-RETRY | product_behavior | history | Experiment cell retry from History | UNKNOWN | BROWSER / STATIC | Cell-ID path explicit; retry behavior unproven. |
@@ -168,7 +168,7 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 | P13-FAMILIES | product_behavior | integration | T2I/I2I families separated; legacy specialized workflows stay compatible | UNKNOWN | BROWSER / STATIC | Family separation accepted; Vue cross-family unverified. |
 | P13-HONEST | product_behavior | integration | Honest placeholders with gate reasons; truthful async status; actionable dependency failures | UNKNOWN | BROWSER / STATIC | Honesty contract accepted; Vue runtime paths unverified. |
 | P13-IDENTITY | product_behavior | integration | Queue and Experiment identity stable across submission and reload | UNKNOWN | BROWSER / STATIC | Identity accepted; Vue queue/reload unverified. |
-| P13-SNAPSHOT | product_behavior | integration | Queue snapshot carries subtool, methods, references, style, guidance, workflow/version, controls, request state | UNKNOWN | INTEGRATION / STATIC | Full snapshot accepted; Vue payload unverified. |
+| P13-SNAPSHOT | product_behavior | integration | Queue snapshot carries subtool, methods, references, style, guidance, workflow/version, controls, request state | PASS | INTEGRATION / STATIC,INTEGRATION | Queue/enqueue path freezes the full Phase-13 snapshot (subtool, methods, references, style, guidance, layout, workflow/version, controls, request state); network capture proves the frozen payload reaches POST. |
 | HOST-LAUNCHER | product_behavior | host/modal | Sidebar launcher opens Studio | UNKNOWN | BROWSER / STATIC | Both openers exist in source; no browser proof of launcher behavior. |
 | HOST-FALLBACK | product_behavior | host/modal | Fallback launcher when sidebar registration unavailable | UNKNOWN | BROWSER / STATIC | Vue host assumes host caller; no independent fallback implemented or tested. |
 | HOST-WINDOW-API | product_behavior | host/modal | window.open_testing_modal / window.close_testing_modal entrypoints preserved | UNKNOWN | BROWSER / STATIC | Entrypoint names not compared at runtime. |
@@ -247,21 +247,21 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 | POST-ENGINE-REUSE | migration_architecture | post | Post migration reuses/ports the existing TinyLuma-derived engine/editor via a thin Vue host/adaptation with fresh presentation. The processing engine is NEVER rebuilt feature-by-feature; Canvas 2D internals are not parity-scored. | PASS | STATIC / STATIC | Contract recorded and binding; POST2-* acceptance rows inherit it via implementation_invariant. Compliance is verified when the port lands. |
 | QUEUE-IDS-FROZEN | product_behavior | queue | Workflow/version IDs frozen at enqueue | PASS | UNIT / UNIT | QueueItem stores both IDs; frozen-variants test green. |
 | QUEUE-CONTROLS-FROZEN | product_behavior | queue | Controls deep-frozen at enqueue (later edits cannot leak) | PASS | UNIT / UNIT | freezeIntent deep-copy directly unit-tested. |
-| QUEUE-EXTRAS-FROZEN | product_behavior | queue | Methods/references/layout/guidance frozen at enqueue | FAIL | UNIT / STATIC | QueueItem stores controls only; no methods/references/layout/guidance snapshot. |
-| QUEUE-WORKSPACE-FROZEN | product_behavior | queue | Accepted queued execution target cannot be retargeted by a later active-workspace switch (server dispatch owns authority boundary) | UNKNOWN | RACE / STATIC | QueueItem.workspaceId correctly not required. Real contract needs race/backend proof at the dispatch seam. |
-| QUEUE-MUTATION-RACE | product_behavior | queue | Later UI edits cannot mutate already-queued request (adversarial A-then-B) | UNKNOWN | RACE / UNIT | Snapshot shape exists and is unit-tested; no adversarial mutation test. |
-| QUEUE-IDENTITY-CHECK | product_behavior | queue | Queued item executes with its own frozen workflow identity, version, and intent; same-workflow/different-version variants never merge; batch grouping never combines incompatible immutable identity | FAIL | RACE / STATIC | Drain filters by first item workflow only; no per-item frozen-identity validation and no incompatibility guard on grouping. |
-| QUEUE-ORDER | product_behavior | queue | FIFO order preserved across drain | UNKNOWN | UNIT / STATIC | Filtering preserves relative order but no test proves ordering semantics. |
-| QUEUE-REMOVE-CLEAR | product_behavior | queue | Remove and clear queue semantics | UNKNOWN | UNIT / STATIC | Methods exist; no focused queue tests found. |
+| QUEUE-EXTRAS-FROZEN | product_behavior | queue | Methods/references/layout/guidance frozen at enqueue | PASS | UNIT / STATIC,UNIT | QueueItem carries the full frozen intent (mode, subtool, methods, references, guidance, style, layout, output overrides); enqueue deep-freezes via captureIntent. |
+| QUEUE-WORKSPACE-FROZEN | product_behavior | queue | Accepted queued execution target cannot be retargeted by a later active-workspace switch (server dispatch owns authority boundary) | UNKNOWN | RACE / STATIC | Browser side holds no workspace on queue items by design (no invented ownership; server dispatch owns the boundary). Dispatch-seam proof still needs a live backend; row stays UNKNOWN per batch policy. |
+| QUEUE-MUTATION-RACE | product_behavior | queue | Later UI edits cannot mutate already-queued request (adversarial A-then-B) | PASS | RACE / UNIT,RACE | Adversarial A-then-B test: full UI rewrite before drain still submits the frozen A intent (explicit interleaving, no sleeps). |
+| QUEUE-IDENTITY-CHECK | product_behavior | queue | Queued item executes with its own frozen workflow identity, version, and intent; same-workflow/different-version variants never merge; batch grouping never combines incompatible immutable identity | PASS | RACE / STATIC,RACE | Drain executes each item with its own frozen workflow/version/intent (submitQueuedItem never reads current UI); same-workflow/different-version items never merge (compatibility key); UI workflow switch before drain cannot substitute identity. |
+| QUEUE-ORDER | product_behavior | queue | FIFO order preserved across drain | PASS | UNIT / STATIC,UNIT | FIFO proven: compatible triple batches in enqueue order; incompatible head items drain first with the remainder preserved. |
+| QUEUE-REMOVE-CLEAR | product_behavior | queue | Remove and clear queue semantics | PASS | UNIT / STATIC,UNIT | Remove drops one item, clear drops all, drain on empty fails without submitting. |
 | QUEUE-NO-REORDER | product_behavior | queue | No user-facing queue reorder on either side | PASS | STATIC / STATIC | Neither side offers reorder; absence holds on both. |
 | EXP-SUBMIT-V2 | product_behavior | experiment | Experiment definition submitted through V2 endpoint | PASS | UNIT / UNIT | Endpoint contract directly tested. |
-| EXP-AXIS-ORDER | product_behavior | experiment | Axis value ordering deterministic | UNKNOWN | UNIT / STATIC | Object-entry order used; no explicit ordering contract/test. |
-| EXP-DEFINITION-FROZEN | product_behavior | experiment | Submitted experiment definition immutable post-submit | UNKNOWN | UNIT / STATIC | freezeIntent exists; no post-submit mutation test for definitions. |
-| EXP-CELL-IDS | product_behavior | experiment | Experiment + cell IDs own status lifecycle in UI state | FAIL | RACE / STATIC | Vue stores single experimentId; no cell lifecycle state in playground. |
+| EXP-AXIS-ORDER | product_behavior | experiment | Axis value ordering deterministic | PASS | UNIT / STATIC,UNIT | Submitted axes sorted deterministically by key; post-submit edits cannot mutate the frozen definition. |
+| EXP-DEFINITION-FROZEN | product_behavior | experiment | Submitted experiment definition immutable post-submit | PASS | UNIT / STATIC,UNIT | Definition deep-frozen (sorted axes) before POST; lastSubmitted immutable under later UI edits. |
+| EXP-CELL-IDS | product_behavior | experiment | Experiment + cell IDs own status lifecycle in UI state | PASS | RACE / STATIC,RACE | Active experiment id + per-cell status lifecycle in playground state; foreign experiment ids rejected; terminal cells never regress on bare polls. |
 | EXP-NO-RETRY-ALL | product_behavior | experiment | Per-cell retry only; no automatic retry-all | UNKNOWN | BROWSER / STATIC | Cell-retry API exposed; absence of retry-all unproven in UI. |
-| EXP-CANCEL-RESUME | product_behavior | experiment | Experiment cancel/resume with correct ownership | UNKNOWN | INTEGRATION / STATIC | Routes/actions exist; event ownership unproven. |
+| EXP-CANCEL-RESUME | product_behavior | experiment | Experiment cancel/resume with correct ownership | PASS | INTEGRATION / STATIC,INTEGRATION | Cancel/resume target the active experiment only through the history transport; single-flight guarded. |
 | EXP-HISTORY-EXPOSURE | product_behavior | experiment | Experiment visible in History with results | UNKNOWN | INTEGRATION / STATIC | Normalization/actions exist; feed-to-Playground exposure unverified. |
-| EXP-LATE-EVENT | product_behavior | experiment | Late events cannot claim a different experiment | UNKNOWN | RACE / STATIC | No experiment event/status subscriber with ownership filter found. |
+| EXP-LATE-EVENT | product_behavior | experiment | Late events cannot claim a different experiment | PASS | RACE / STATIC,RACE | Status/event payloads for a different experiment id are rejected before reaching cell state. |
 | REF2-METHODS | product_behavior | generate/references | Accepted methods: Multi-image Conditioning Slots, Reference Latent Chain, Dedicated Workflow | UNKNOWN | BROWSER / STATIC | Method taxonomy accepted; Vue method surface unverified. |
 | REF2-NO-AUTO | product_behavior | generate/references | Method selection explicit; no Auto mode offered or implied | UNKNOWN | BROWSER / STATIC | No-Auto rule accepted; Vue method UI unverified. |
 | REF2-MEMORY | product_behavior | generate/references | Selected method remembered per workflow | UNKNOWN | BROWSER / STATIC | Per-workflow memory accepted; Vue behavior unverified. |
@@ -287,21 +287,21 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 | ROUTE-NO-REOPEN | product_behavior | routing | Close-then-hash does not auto-reopen Studio | UNKNOWN | BROWSER / STATIC | No browser test for close-then-hash sequence. |
 | ROUTE-SETTINGS-FOCUS | product_behavior | routing | Settings focus selects the requested section (focus=outputs defect fixed, not removed) | FAIL | BROWSER / STATIC | Vue route adapter carries focus but no Settings section-focus behavior found. |
 | ROUTE-FOCUS-SAFE | product_behavior | routing | Focus values never become executable markup | UNKNOWN | UNIT / STATIC | No explicit opaque-focus security test on Vue side. |
-| RUN-FRESH-ID | product_behavior | run lifecycle | Fresh frontend run identity per Run click | UNKNOWN | RACE / STATIC | No fresh-controller-per-click evidence on Vue side. |
-| RUN-POST-AUTHORITY | product_behavior | run lifecycle | POST/result path is terminal authority (not websocket/progress) | UNKNOWN | INTEGRATION / STATIC | Vue marks success from POST shape; no end-to-end terminal proof. |
-| RUN-PROMPT-ID | product_behavior | run lifecycle | Prompt ID captured; foreign prompt terminal events rejected | UNKNOWN | RACE / STATIC | No Vue websocket/controller event path found; completion path unverified. |
-| RUN-EVENT-ORDER | product_behavior | run lifecycle | Progress before execution-start rejected; foreign experiment progress rejected | UNKNOWN | RACE / STATIC | No Vue event lifecycle path found. |
-| RUN-TERMINAL-LOCK | product_behavior | run lifecycle | Terminal state cannot regress; duplicate terminals deduplicated | UNKNOWN | RACE / STATIC | Vue projection mutates without terminal lock. |
-| RUN-SNAPSHOT-DEDUP | product_behavior | run lifecycle | Snapshot/journal duplicate polls deduplicated | UNKNOWN | RACE / STATIC | Vue has no run snapshot polling integration. |
-| RUN-GOLDEN-PRESENT | product_behavior | run lifecycle | Golden stage progress is presentation-only, never decides completion | UNKNOWN | INTEGRATION / STATIC | No Vue run-progress consumer establishes this contract. |
-| RUN-FAILURE-PATH | product_behavior | run lifecycle | Failure path preserves run identity and details | UNKNOWN | INTEGRATION / STATIC | Vue failure clears run ID; controller evidence absent. |
-| RUN-CANCEL | product_behavior | run lifecycle | Cancel is authoritative and race-safe (cancel-then-success cannot resurrect) | FAIL | RACE / STATIC | Vue sets canceled before POST and does not update operation registry; resurrection risk visible in source. |
-| RUN-LATE-EVENT | product_behavior | run lifecycle | Late prior-run events cannot hijack new run | UNKNOWN | RACE / STATIC | No Vue event attach/detach ownership found. |
-| RUN-MIDRUN-SWITCH | product_behavior | run lifecycle | Navigation / workflow switch mid-run cannot mutate active run | UNKNOWN | RACE / STATIC | Selection reads guarded; active-run ownership absent. |
-| RUN-RESULT-ATTACH | product_behavior | run lifecycle | Result attaches to submitted run; recent History converges | UNKNOWN | INTEGRATION / STATIC | Vue calls onDone; History attachment + recent projection unshown. |
+| RUN-FRESH-ID | product_behavior | run lifecycle | Fresh frontend run identity per Run click | PASS | RACE / STATIC,RACE | Fresh runId+requestId minted per beginRun; store executes every submit through the controller. |
+| RUN-POST-AUTHORITY | product_behavior | run lifecycle | POST/result path is terminal authority (not websocket/progress) | PASS | INTEGRATION / STATIC,INTEGRATION | Direct POST result is terminal authority (completed/failed/accepted 3-way); scheduler-accepted stays non-terminal. |
+| RUN-PROMPT-ID | product_behavior | run lifecycle | Prompt ID captured; foreign prompt terminal events rejected | PASS | RACE / STATIC,RACE | Prompt capture + foreign prompt terminal rejection proven by event-sequence tests. |
+| RUN-EVENT-ORDER | product_behavior | run lifecycle | Progress before execution-start rejected; foreign experiment progress rejected | PASS | RACE / STATIC,RACE | Progress-before-execution-start rejected; locked-stream second start ignored; experiment events require matching id. |
+| RUN-TERMINAL-LOCK | product_behavior | run lifecycle | Terminal state cannot regress; duplicate terminals deduplicated | PASS | RACE / STATIC,RACE | Terminal first-wins lock; duplicate terminals deduplicated; success/late-progress/failure ordering proven. |
+| RUN-SNAPSHOT-DEDUP | product_behavior | run lifecycle | Snapshot/journal duplicate polls deduplicated | PASS | RACE / STATIC,RACE | Signature-gated snapshot polls; duplicate polls and duplicate terminal journal entries are no-ops. |
+| RUN-GOLDEN-PRESENT | product_behavior | run lifecycle | Golden stage progress is presentation-only, never decides completion | PASS | INTEGRATION / STATIC,INTEGRATION | Golden progress is presentation-only state that can never complete a run; no Vue consumer decides terminality from it. |
+| RUN-FAILURE-PATH | product_behavior | run lifecycle | Failure path preserves run identity and details | PASS | INTEGRATION / STATIC,INTEGRATION | Failure settles failed with the run identity and message preserved (no id clearing). |
+| RUN-CANCEL | product_behavior | run lifecycle | Cancel is authoritative and race-safe (cancel-then-success cannot resurrect) | PASS | RACE / STATIC,RACE | Cancel wins the terminal lock first; late success/progress/terminal cannot resurrect; registry canceled exactly once. |
+| RUN-LATE-EVENT | product_behavior | run lifecycle | Late prior-run events cannot hijack new run | PASS | RACE / STATIC,RACE | Late prior-run results/snapshots gated on caller runId; overlapping clicks rejected by the busy gate; controller tests prove stale-run rejection. |
+| RUN-MIDRUN-SWITCH | product_behavior | run lifecycle | Navigation / workflow switch mid-run cannot mutate active run | PASS | RACE / STATIC,RACE | Workflow/version switch mid-run leaves controller identity and the frozen submitted payload untouched. |
+| RUN-RESULT-ATTACH | product_behavior | run lifecycle | Result attaches to submitted run; recent History converges | PASS | INTEGRATION / STATIC,INTEGRATION | Authoritative completion records the generation id and converges history recentRunIds (id-only, no entity cache). |
 | RUN-NO-DUP-CACHE | product_behavior | run lifecycle | Current generation stores identity only; entities resolve via History | PASS | UNIT / UNIT | Unit test asserts no second History cache. |
 | RETIRED-RESULTS-CACHE | retirement | run lifecycle | Duplicate results.v1 entity cache retired, not ported | NA | STATIC / STATIC | Blueprint 4.1 explicitly retires this duplicate authority. |
-| RUN-CONTROLLER-INTEGRATION | product_behavior | run lifecycle | Vue run path integrates/ports the accepted run-controller machinery (fresh run identity, event-source attach/detach, execution-start locking, stale/foreign rejection, prompt/Experiment filtering, journal dedupe, terminal freeze, authoritative result integration, Golden-presentation semantics) | FAIL | INTEGRATION / STATIC | Positive absence: no websocket consumer, no prompt/experiment identity filtering, no event attach/detach, no terminal freeze in the Vue run path (grep websocket/WebSocket/execution_start/promptId over frontend/src: zero implementation hits). Repair needs browser/race proof before PASS. |
+| RUN-CONTROLLER-INTEGRATION | product_behavior | run lifecycle | Vue run path integrates/ports the accepted run-controller machinery (fresh run identity, event-source attach/detach, execution-start locking, stale/foreign rejection, prompt/Experiment filtering, journal dedupe, terminal freeze, authoritative result integration, Golden-presentation semantics) | PASS | INTEGRATION / STATIC,INTEGRATION | Vue run path integrates the accepted controller machinery (fresh identity, attach/detach, execution-start lock, stale/foreign rejection, prompt/experiment filtering, journal/snapshot dedupe, terminal freeze, direct-result authority, Golden-presentation semantics). |
 | SEL2-TOOLS | product_behavior | edit/select | Select offers Brush, Lasso, Rectangle, Object, Detect tools | FAIL | BROWSER / STATIC | Accepted tool set; no Vue Select editor. |
 | SEL2-ADD-SUB | product_behavior | edit/select | Mask ops Add, Subtract, Replace | FAIL | BROWSER / STATIC | Accepted ops; no Vue implementation. |
 | SEL2-GROW | product_behavior | edit/select | Mask ops Grow, Shrink, Feather (radius-based) | FAIL | BROWSER / STATIC | Accepted ops; no Vue implementation. |
@@ -415,8 +415,8 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 ## Product failures (ranked)
 
 - broken core behavior: SEL-BRUSH, SEL-ERASE, SEL-LASSO, SEL-RECT, SEL-MASK-OPS, SEL-UNDO, SEL-SAM3, SEL-DETECT, SEL-CROPSTITCH, SEL-COND-CROP, SEL-DEDICATED, POST-ADJUST, POST-COLOR, POST-DETAIL, POST-EFFECTS, POST-CROP, POST-HEAL, LAY-OPEN, LAY-GEOMETRY, LAY-TEMPLATES, LAY-PAYLOAD, PG-PICKER-FILTERS, PG-MODEL-UNET, PG-MODEL-CLIP, PG-MODEL-VAE, PG-MODEL-OPTIONS, PG-ADV-DISCLOSURE, PG-ADV-PERSIST, PG-CONTROL-ORDER, PG-ORDER-PERSIST, PG-METHOD-SELECT, SEL2-TOOLS, SEL2-ADD-SUB, SEL2-GROW, SEL2-INVERT-HISTORY, SEL2-SOURCE-PATHS, SEL2-SOURCE-CLEAR, SEL2-BASE-CLEAR, SEL2-MASK-SAVE, SEL2-COMPAT, SK2-TOOLS, SK2-SETTINGS, SK2-COMPOSITE, SK2-ZOOM, SK2-LAYERS, SK2-BASE-LOCK, SK2-COMMIT, SK2-ROUTING, SK2-SURFACE, SK-STROKES, SK-FLATTEN-UPLOAD, GUI-LOOKUP, GUI-KEY, GUI-MODES, GUI-PAYLOAD, WZ-SUG-UNET, WZ-SUG-CLIP, WZ-SUG-VAE
-- safety/race failure: QUEUE-EXTRAS-FROZEN, QUEUE-IDENTITY-CHECK, EXP-CELL-IDS, RUN-CANCEL, RUN-CONTROLLER-INTEGRATION, EXP2-RACE
-- missing feature: POLL-RUN, SRC-FROM-HISTORY, SRC-DRAGDROP, SRC-PASTE, EXPAND-GEOMETRY, EXPAND-PAD, EXPAND-PRESERVE, EXPAND-PAYLOAD, REF-REPLACE, REF-WEIGHTS, REF-DRAFT-PERSIST, HOST-AUTOREOPEN, DEPS-STATES, POST2-LIGHT, POST2-COLOR, POST2-CURVES, POST2-MIXER, POST2-DETAIL-FX, POST2-LUT, POST2-CROP, POST2-HEAL-WB, POST2-WORKFLOW, POST2-RES, POST2-PERSIST, ROUTE-SETTINGS-FOCUS, EXP2-SIDES, EXP2-DRAG, EXP2-METHODS, EXP2-MEMORY, EXP2-I2I, STY-CONTEXT, STY-SHELL, STY-SEARCH, STY-CATEGORY, STY-SELECT, STY-NONE, STY-PERSIST, STY-FAVORITE, LAY2-SHELL, LAY2-CREATE, LAY2-TYPE-TEXT, LAY2-JSON-PREVIEW, LAY2-BBOX, LAY2-DIMS, LAY2-SEND, LAY2-DRAFT, WZ-CENTER, WZ-HIGHLIGHT, WZ-GRAPH-MODE
+- safety/race failure: EXP2-RACE
+- missing feature: SRC-FROM-HISTORY, SRC-DRAGDROP, SRC-PASTE, EXPAND-GEOMETRY, EXPAND-PAD, EXPAND-PRESERVE, EXPAND-PAYLOAD, REF-REPLACE, REF-WEIGHTS, REF-DRAFT-PERSIST, HOST-AUTOREOPEN, DEPS-STATES, POST2-LIGHT, POST2-COLOR, POST2-CURVES, POST2-MIXER, POST2-DETAIL-FX, POST2-LUT, POST2-CROP, POST2-HEAL-WB, POST2-WORKFLOW, POST2-RES, POST2-PERSIST, ROUTE-SETTINGS-FOCUS, EXP2-SIDES, EXP2-DRAG, EXP2-METHODS, EXP2-MEMORY, EXP2-I2I, STY-CONTEXT, STY-SHELL, STY-SEARCH, STY-CATEGORY, STY-SELECT, STY-NONE, STY-PERSIST, STY-FAVORITE, LAY2-SHELL, LAY2-CREATE, LAY2-TYPE-TEXT, LAY2-JSON-PREVIEW, LAY2-BBOX, LAY2-DIMS, LAY2-SEND, LAY2-DRAFT, WZ-CENTER, WZ-HIGHLIGHT, WZ-GRAPH-MODE
 - missing QoL: POST2-ORDER, LAY2-LIFECYCLE
 - presentation difference: CANVAS-SELECT, CANVAS-EXPAND, CANVAS-SKETCH, WZ-PORTAL
 
@@ -427,12 +427,8 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 - LATEST-REFRESH needs RACE (has STATIC): Wiring exists; no store race tests.
 - LATEST-MUTATIONS needs INTEGRATION (has STATIC): Primitive documents policy; mutation call sites not exhaustively verified.
 - LATEST-SHARED needs STATIC (has STATIC): Per-site appropriateness unverified: sourceToken may be legitimate specialization, latest.ts gaps may exist. Needs review, not a rewrite mandate.
-- POLL-ABORT needs RACE (has STATIC): Real invariant unproven: single ownership, no duplication across navigation/rerender, continuation when domain requires, terminal/dispose stops, no zombies. A download must NOT die because the user opens History. (Absorbed POLL-OWNER; the old contradictory clause is removed.)
-- OPS-DUP-BUSY needs INTEGRATION (has STATIC): Approved split is registry=visible summary vs domain=semantic truth. Whether runState and the registry ever conflict as authority is unproven.
 - OPS-IDS needs BROWSER (has STATIC): Unique generation exists; lifecycle/remount behavior unproven.
-- WS-MIDOP needs RACE,REAL_BACKEND (has STATIC): Browser payload lacks workspaceId, but historical architecture had server workspace authority. Current proof cannot determine the real dispatch seam.
-- WS-GUARD needs RACE (has STATIC): No blocking guard required. Bound-target behavior needs adversarial race proof (start in A, switch to B, complete).
-- OPS-ONE-REGISTRY needs STATIC (has STATIC): operations.ts is the registry; whether infrastructure operation lists duplicate it as a second registry is unreviewed.
+- WS-MIDOP needs RACE,REAL_BACKEND (has STATIC): Run payloads carry no workspace by design (browser does not invent dispatch ownership; server dispatch owns the boundary). Dispatch-seam proof still needs a live backend; row stays UNKNOWN per batch policy.
 - CANVAS-PROMPT needs REAL_BACKEND (has STATIC): Deferred, no runtime proof.
 - CANVAS-PASSTHROUGH needs REAL_BACKEND (has STATIC): Commented contract only; no enable-state implementation.
 - CANVAS-MARKERS needs REAL_BACKEND (has STATIC): Vue projection does not implement or test markers.
@@ -497,7 +493,6 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 - HIST-NOTE needs BROWSER (has STATIC): Note endpoints exist; save behavior unproven.
 - HIST-DELETE needs BROWSER (has STATIC): Confirm + removal wired; behavior unproven.
 - HIST-BULK-DELETE needs BROWSER (has STATIC): Selection + bulk endpoint wired; behavior unproven.
-- HIST-RECENT needs INTEGRATION (has STATIC): No confirmed recent-run convergence path.
 - HIST-ORIGINAL needs BROWSER (has STATIC): Separate actions exist; distinct user-visible behavior unproven.
 - HIST-RESUME needs BROWSER (has STATIC): Resume action exists; behavior unproven.
 - HIST-CELL-RETRY needs BROWSER (has STATIC): Cell-ID path explicit; retry behavior unproven.
@@ -527,7 +522,6 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 - P13-FAMILIES needs BROWSER (has STATIC): Family separation accepted; Vue cross-family unverified.
 - P13-HONEST needs BROWSER (has STATIC): Honesty contract accepted; Vue runtime paths unverified.
 - P13-IDENTITY needs BROWSER (has STATIC): Identity accepted; Vue queue/reload unverified.
-- P13-SNAPSHOT needs INTEGRATION (has STATIC): Full snapshot accepted; Vue payload unverified.
 - HOST-LAUNCHER needs BROWSER (has STATIC): Both openers exist in source; no browser proof of launcher behavior.
 - HOST-FALLBACK needs BROWSER (has STATIC): Vue host assumes host caller; no independent fallback implemented or tested.
 - HOST-WINDOW-API needs BROWSER (has STATIC): Entrypoint names not compared at runtime.
@@ -574,16 +568,9 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 - PG-PAYLOAD needs INTEGRATION (has STATIC): Payload built and frozen; backend-accepted shape unproven without integration capture.
 - PG-NUM-STEP needs BROWSER (has STATIC): Step attributes may render; stepper behavior unproven.
 - PG-SEED-RANGE needs BROWSER (has STATIC): Seed bounds/rules differ (Vue random range); range behavior unproven. Randomize action is PG-SEED-RANDOMIZE.
-- QUEUE-WORKSPACE-FROZEN needs RACE (has STATIC): QueueItem.workspaceId correctly not required. Real contract needs race/backend proof at the dispatch seam.
-- QUEUE-MUTATION-RACE needs RACE (has UNIT): Snapshot shape exists and is unit-tested; no adversarial mutation test.
-- QUEUE-ORDER needs UNIT (has STATIC): Filtering preserves relative order but no test proves ordering semantics.
-- QUEUE-REMOVE-CLEAR needs UNIT (has STATIC): Methods exist; no focused queue tests found.
-- EXP-AXIS-ORDER needs UNIT (has STATIC): Object-entry order used; no explicit ordering contract/test.
-- EXP-DEFINITION-FROZEN needs UNIT (has STATIC): freezeIntent exists; no post-submit mutation test for definitions.
+- QUEUE-WORKSPACE-FROZEN needs RACE (has STATIC): Browser side holds no workspace on queue items by design (no invented ownership; server dispatch owns the boundary). Dispatch-seam proof still needs a live backend; row stays UNKNOWN per batch policy.
 - EXP-NO-RETRY-ALL needs BROWSER (has STATIC): Cell-retry API exposed; absence of retry-all unproven in UI.
-- EXP-CANCEL-RESUME needs INTEGRATION (has STATIC): Routes/actions exist; event ownership unproven.
 - EXP-HISTORY-EXPOSURE needs INTEGRATION (has STATIC): Normalization/actions exist; feed-to-Playground exposure unverified.
-- EXP-LATE-EVENT needs RACE (has STATIC): No experiment event/status subscriber with ownership filter found.
 - REF2-METHODS needs BROWSER (has STATIC): Method taxonomy accepted; Vue method surface unverified.
 - REF2-NO-AUTO needs BROWSER (has STATIC): No-Auto rule accepted; Vue method UI unverified.
 - REF2-MEMORY needs BROWSER (has STATIC): Per-workflow memory accepted; Vue behavior unverified.
@@ -603,17 +590,6 @@ LEGACY SMOKE HARNESS OUTPUT — NOT PARITY VERDICTS and never enters totals.
 - ROUTE-OPENER-WINS needs BROWSER (has UNIT): Pure router precedence tested; host opener integration not.
 - ROUTE-NO-REOPEN needs BROWSER (has STATIC): No browser test for close-then-hash sequence.
 - ROUTE-FOCUS-SAFE needs UNIT (has STATIC): No explicit opaque-focus security test on Vue side.
-- RUN-FRESH-ID needs RACE (has STATIC): No fresh-controller-per-click evidence on Vue side.
-- RUN-POST-AUTHORITY needs INTEGRATION (has STATIC): Vue marks success from POST shape; no end-to-end terminal proof.
-- RUN-PROMPT-ID needs RACE (has STATIC): No Vue websocket/controller event path found; completion path unverified.
-- RUN-EVENT-ORDER needs RACE (has STATIC): No Vue event lifecycle path found.
-- RUN-TERMINAL-LOCK needs RACE (has STATIC): Vue projection mutates without terminal lock.
-- RUN-SNAPSHOT-DEDUP needs RACE (has STATIC): Vue has no run snapshot polling integration.
-- RUN-GOLDEN-PRESENT needs INTEGRATION (has STATIC): No Vue run-progress consumer establishes this contract.
-- RUN-FAILURE-PATH needs INTEGRATION (has STATIC): Vue failure clears run ID; controller evidence absent.
-- RUN-LATE-EVENT needs RACE (has STATIC): No Vue event attach/detach ownership found.
-- RUN-MIDRUN-SWITCH needs RACE (has STATIC): Selection reads guarded; active-run ownership absent.
-- RUN-RESULT-ATTACH needs INTEGRATION (has STATIC): Vue calls onDone; History attachment + recent projection unshown.
 - SEL2-ERASE-EQ needs BROWSER (has STATIC): Equivalence unproven; no Vue editor to verify against.
 - EXP2-NO-AUTO needs BROWSER (has STATIC): No Expand UI exists to violate this yet; constraint recorded for implementation.
 - SET-CONFIG-AUTH needs INTEGRATION (has STATIC): Read/save/reread implemented; authority behavior needs integration proof.

@@ -264,13 +264,17 @@
       "INTEGRATION"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "INTEGRATION"
     ],
-    "status": "UNKNOWN",
-    "reason": "No confirmed recent-run convergence path.",
+    "status": "PASS",
+    "reason": "Run completion converges history recentRunIds (id-only, no entity cache); full entities converge via the existing History V2 feed. Visual strip is a later feature lane.",
     "legacy_evidence": "legacy recent-runs projection",
-    "vue_evidence": "PlaygroundView recent strip refs; stores/history.ts (no explicit recent source)",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/history.ts:noteRunResult",
+    "tests_or_traces": [
+      "frontend/src/run/runController.test.ts",
+      "frontend/src/stores/playground.runsafety.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": "Conflicting audit signals resolved to UNKNOWN: projection refs exist, convergence path unconfirmed."
   },

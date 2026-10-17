@@ -68,13 +68,16 @@
       "UNIT"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "UNIT"
     ],
-    "status": "FAIL",
-    "reason": "QueueItem stores controls only; no methods/references/layout/guidance snapshot.",
+    "status": "PASS",
+    "reason": "QueueItem carries the full frozen intent (mode, subtool, methods, references, guidance, style, layout, output overrides); enqueue deep-freezes via captureIntent.",
     "legacy_evidence": "blueprint 2.6 lists methods/references/style/guidance",
-    "vue_evidence": "frontend/src/stores/playground.ts:62-68 QueueItem shape",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/playground.ts:QueuedRunIntent/captureIntent",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.queue.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": "Verified: QueueItem has only id/label/workflowId/workflowVersionId/controlValues."
   },
@@ -96,7 +99,7 @@
       "STATIC"
     ],
     "status": "UNKNOWN",
-    "reason": "QueueItem.workspaceId correctly not required. Real contract needs race/backend proof at the dispatch seam.",
+    "reason": "Browser side holds no workspace on queue items by design (no invented ownership; server dispatch owns the boundary). Dispatch-seam proof still needs a live backend; row stays UNKNOWN per batch policy.",
     "legacy_evidence": "blueprint 2.6 workspace target; 3.1 frozen target",
     "vue_evidence": "MISSING in QueueItem (playground.ts:62-68)",
     "tests_or_traces": [],
@@ -118,14 +121,15 @@
       "RACE"
     ],
     "current_evidence": [
-      "UNIT"
+      "UNIT",
+      "RACE"
     ],
-    "status": "UNKNOWN",
-    "reason": "Snapshot shape exists and is unit-tested; no adversarial mutation test.",
+    "status": "PASS",
+    "reason": "Adversarial A-then-B test: full UI rewrite before drain still submits the frozen A intent (explicit interleaving, no sleeps).",
     "legacy_evidence": "blueprint 2.6 snapshot invariant",
-    "vue_evidence": "frontend/src/stores/playground.ts:617-619,663-675",
+    "vue_evidence": "frontend/src/stores/playground.ts:enqueueCurrent/captureIntent",
     "tests_or_traces": [
-      "frontend/src/stores/playground.test.ts:163 (shape only)"
+      "frontend/src/stores/playground.queue.test.ts"
     ],
     "implementation_invariant": "",
     "notes": "Needs adversarial test: enqueue A, change UI to B, execute, verify A intent."
@@ -145,13 +149,16 @@
       "RACE"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "RACE"
     ],
-    "status": "FAIL",
-    "reason": "Drain filters by first item workflow only; no per-item frozen-identity validation and no incompatibility guard on grouping.",
+    "status": "PASS",
+    "reason": "Drain executes each item with its own frozen workflow/version/intent (submitQueuedItem never reads current UI); same-workflow/different-version items never merge (compatibility key); UI workflow switch before drain cannot substitute identity.",
     "legacy_evidence": "blueprint 2.6: must not run against different workflow after UI change",
-    "vue_evidence": "frontend/src/stores/playground.ts:637-647 drain filter",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/playground.ts:queueCompatibilityKey/submitQueuedItem/drainQueue",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.queue.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": "Corrected: correctness must not depend on current mutable UI selection."
   },
@@ -170,13 +177,16 @@
       "UNIT"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "UNIT"
     ],
-    "status": "UNKNOWN",
-    "reason": "Filtering preserves relative order but no test proves ordering semantics.",
+    "status": "PASS",
+    "reason": "FIFO proven: compatible triple batches in enqueue order; incompatible head items drain first with the remainder preserved.",
     "legacy_evidence": "legacy queue implementation web/studio-playground*.js",
-    "vue_evidence": "frontend/src/stores/playground.ts:637-641",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/playground.ts:drainQueue",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.queue.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": ""
   },
@@ -195,13 +205,16 @@
       "UNIT"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "UNIT"
     ],
-    "status": "UNKNOWN",
-    "reason": "Methods exist; no focused queue tests found.",
+    "status": "PASS",
+    "reason": "Remove drops one item, clear drops all, drain on empty fails without submitting.",
     "legacy_evidence": "legacy queue implementation",
-    "vue_evidence": "frontend/src/stores/playground.ts:624-629",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/playground.ts:removeQueued/clearQueue",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.queue.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": ""
   },
@@ -274,13 +287,16 @@
       "UNIT"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "UNIT"
     ],
-    "status": "UNKNOWN",
-    "reason": "Object-entry order used; no explicit ordering contract/test.",
+    "status": "PASS",
+    "reason": "Submitted axes sorted deterministically by key; post-submit edits cannot mutate the frozen definition.",
     "legacy_evidence": "legacy experiment definition/history code",
-    "vue_evidence": "frontend/src/stores/playground.ts:281-283,704-708",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/playground.ts:submitExperimentDef",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.experiment.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": ""
   },
@@ -299,13 +315,16 @@
       "UNIT"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "UNIT"
     ],
-    "status": "UNKNOWN",
-    "reason": "freezeIntent exists; no post-submit mutation test for definitions.",
+    "status": "PASS",
+    "reason": "Definition deep-frozen (sorted axes) before POST; lastSubmitted immutable under later UI edits.",
     "legacy_evidence": "legacy experiment snapshot path",
-    "vue_evidence": "frontend/src/stores/playground.ts:704-709",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/playground.ts:submitExperimentDef",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.experiment.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": ""
   },
@@ -324,13 +343,16 @@
       "RACE"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "RACE"
     ],
-    "status": "FAIL",
-    "reason": "Vue stores single experimentId; no cell lifecycle state in playground.",
+    "status": "PASS",
+    "reason": "Active experiment id + per-cell status lifecycle in playground state; foreign experiment ids rejected; terminal cells never regress on bare polls.",
     "legacy_evidence": "web/studio-playground-run.js:277-299; history repository cell states",
-    "vue_evidence": "MISSING cell state (searched stores/playground.ts, history.ts)",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/playground.ts:applyExperimentStatus/applyExperimentEvent",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.experiment.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": ""
   },
@@ -374,13 +396,16 @@
       "INTEGRATION"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "INTEGRATION"
     ],
-    "status": "UNKNOWN",
-    "reason": "Routes/actions exist; event ownership unproven.",
+    "status": "PASS",
+    "reason": "Cancel/resume target the active experiment only through the history transport; single-flight guarded.",
     "legacy_evidence": "web/history-v2-repository.js:1508-1523",
-    "vue_evidence": "frontend/src/api/history.ts:241-250; stores/history.ts:264-272",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/playground.ts:cancelExperimentRun/resumeExperimentRun + ../api/history",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.experiment.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": ""
   },
@@ -424,13 +449,16 @@
       "RACE"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "RACE"
     ],
-    "status": "UNKNOWN",
-    "reason": "No experiment event/status subscriber with ownership filter found.",
+    "status": "PASS",
+    "reason": "Status/event payloads for a different experiment id are rejected before reaching cell state.",
     "legacy_evidence": "web/studio-playground-run.js:277-299 experiment filter",
-    "vue_evidence": "MISSING subscriber (searched frontend/src)",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/playground.ts:applyExperimentStatus/applyExperimentEvent",
+    "tests_or_traces": [
+      "frontend/src/stores/playground.experiment.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": "Depends on status path: if Vue polls experiment status, ownership filter required."
   }

@@ -141,13 +141,17 @@
       "RACE"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "RACE"
     ],
-    "status": "UNKNOWN",
-    "reason": "Real invariant unproven: single ownership, no duplication across navigation/rerender, continuation when domain requires, terminal/dispose stops, no zombies. A download must NOT die because the user opens History. (Absorbed POLL-OWNER; the old contradictory clause is removed.)",
+    "status": "PASS",
+    "reason": "Single-owner contract proven with the real primitives (pollUntil + registry + domain AbortController): reentry reuses the owner, terminal/dispose stops with no zombie calls, navigation-without-abort never kills the run. Production owners (infra deploy/swap) hold the same guards in source (deploymentOperationId/swapOperationId single-flight).",
     "legacy_evidence": "legacy lifecycle cleanup",
-    "vue_evidence": "async/polling.ts:24-77; stores/infrastructure.ts:300-520 without abort owner",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/async/polling.ts + pollUntil; stores/infrastructure.ts:368,224 single-flight guards",
+    "tests_or_traces": [
+      "frontend/src/async/pollOwnership.test.ts",
+      "frontend/src/async/polling.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": "Corrected invariant per binding decision."
   },
@@ -197,13 +201,17 @@
       "INTEGRATION"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "INTEGRATION"
     ],
-    "status": "FAIL",
-    "reason": "No Vue run polling/controller integration exists; controller owns semantics, generic polling only mechanics.",
+    "status": "PASS",
+    "reason": "Run path integrated with controller identity/terminal semantics; the generic poller owns only mechanics and is not on the run path.",
     "legacy_evidence": "web/studio-playground-run.js:458-497 run polling",
-    "vue_evidence": "MISSING (searched frontend/src)",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/run/runController.ts (port of web/studio-playground-run.js + studio-run-model.js semantics) + frontend/src/stores/playground.ts (executeRunPayload/submitQueuedItem/cancelRun via controller)",
+    "tests_or_traces": [
+      "frontend/src/run/runController.test.ts",
+      "frontend/src/stores/playground.runsafety.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": "Corrected: no longer claims the controller must own the loop."
   },
@@ -222,13 +230,18 @@
       "INTEGRATION"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "INTEGRATION"
     ],
-    "status": "UNKNOWN",
-    "reason": "Approved split is registry=visible summary vs domain=semantic truth. Whether runState and the registry ever conflict as authority is unproven.",
+    "status": "PASS",
+    "reason": "Registry stays a visibility summary: runState projection and registry transitions proven non-conflicting (cancel/success settle both exactly once; terminal freeze backstops).",
     "legacy_evidence": "blueprint 3: domain owns semantics; extract shared record only when needed",
-    "vue_evidence": "stores/playground.ts:279,573-580 runState vs stores/operations.ts:128-155",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/playground.ts:syncRunStateFromController; frontend/src/stores/operations.ts terminal freeze",
+    "tests_or_traces": [
+      "frontend/src/run/runController.test.ts",
+      "frontend/src/stores/playground.runsafety.test.ts",
+      "frontend/src/stores/operations.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": "Corrected: domain lifecycle state is not a failure."
   },
@@ -303,7 +316,7 @@
       "STATIC"
     ],
     "status": "UNKNOWN",
-    "reason": "Browser payload lacks workspaceId, but historical architecture had server workspace authority. Current proof cannot determine the real dispatch seam.",
+    "reason": "Run payloads carry no workspace by design (browser does not invent dispatch ownership; server dispatch owns the boundary). Dispatch-seam proof still needs a live backend; row stays UNKNOWN per batch policy.",
     "legacy_evidence": "blueprint 9.1 subsequent ops follow new workspace; submitted keep target",
     "vue_evidence": "stores/playground.ts:509-527 payload without workspace",
     "tests_or_traces": [],
@@ -325,13 +338,16 @@
       "RACE"
     ],
     "current_evidence": [
-      "STATIC"
+      "STATIC",
+      "RACE"
     ],
-    "status": "UNKNOWN",
-    "reason": "No blocking guard required. Bound-target behavior needs adversarial race proof (start in A, switch to B, complete).",
+    "status": "PASS",
+    "reason": "Accepted operation keeps its frozen workspace target across an active-workspace switch; patch() cannot retarget; future operations capture the new id. No blocking guard added (existing selectWorkspace behavior untouched).",
     "legacy_evidence": "legacy workspace guard",
-    "vue_evidence": "stores/infrastructure.ts:187-190 guard",
-    "tests_or_traces": [],
+    "vue_evidence": "frontend/src/stores/operations.ts:start/patch workspace freeze",
+    "tests_or_traces": [
+      "frontend/src/stores/operations.workspace.test.ts"
+    ],
     "implementation_invariant": "",
     "notes": "Corrected invariant per binding decision."
   },
@@ -402,10 +418,10 @@
     "current_evidence": [
       "STATIC"
     ],
-    "status": "UNKNOWN",
-    "reason": "operations.ts is the registry; whether infrastructure operation lists duplicate it as a second registry is unreviewed.",
+    "status": "PASS",
+    "reason": "Reviewed: infrastructure.ts holds only single-flight id refs (deploymentOperationId/swapOperationId) and projects every visible summary into operations.* \u2014 no second registry exists.",
     "legacy_evidence": "",
-    "vue_evidence": "stores/operations.ts vs stores/infrastructure.ts:210-275",
+    "vue_evidence": "frontend/src/stores/operations.ts vs stores/infrastructure.ts op call sites",
     "tests_or_traces": [],
     "implementation_invariant": "",
     "notes": "Split from OPS-REGISTRY per binding decision."
