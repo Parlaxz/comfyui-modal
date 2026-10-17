@@ -747,6 +747,13 @@ function buildSidebarPanel() {
     "aria-label": "Open Studio",
   });
   openStudioBtn.addEventListener("click", _wrapSidebarOpener(function () { return open_testing_modal(); }, statusEl));
+  const openVueStudioBtn = el("button", {
+    text: "Open Vue Studio",
+    type: "button",
+    "data-testid": "sidebar-open-vue-studio",
+    "aria-label": "Open Vue Studio",
+  });
+  openVueStudioBtn.addEventListener("click", _wrapSidebarOpener(function () { return openStudioVue("playground"); }, statusEl));
   const openSettingsBtn = el("button", {
     text: "Open Settings",
     type: "button",
@@ -764,6 +771,7 @@ function buildSidebarPanel() {
     el("div", { class: "launcher-title", text: "Modal GPU" }),
     el("div", { class: "launcher-subtitle", text: "Playground, History, Backend, Settings" }),
     openStudioBtn,
+    openVueStudioBtn,
     openSettingsBtn,
     statusEl,
   ]);
